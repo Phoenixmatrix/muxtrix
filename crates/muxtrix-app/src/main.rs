@@ -308,6 +308,20 @@ struct TerminalRuntime {
     has_selection: bool,
 }
 
+impl Drop for TerminalRuntime {
+    fn drop(&mut self) {
+        // A session actor can be inside a blocked host/IPC operation when the
+        // window or pane is closed. `LiveSession::drop` joins that actor, so
+        // doing it here would make Iced's UI teardown wait indefinitely — and
+        // one busy pane would hold up every runtime dropped after it. Detach on
+        // a disposal thread instead; explicit pane close has already queued
+        // `terminate`, while whole-app shutdown preserves daemon-owned PTYs.
+        if let Some(session) = self.session.take() {
+            dispose_live_session(session);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TerminalLaunchState {
     PreparingHost,
@@ -18598,6 +18612,132 @@ mod tests {
         }
         fn exit_clean(&mut self) -> bool {
             true
+        }
+    }
+
+    /// A daemon-like backend whose writer is stuck long enough to prove that
+    /// dropping UI state never joins its session actor on the calling thread.
+    struct SlowWriteBackend {
+        reader: Option<ParkedReader>,
+        entered: std::sync::mpsc::Sender<()>,
+        finished: std::sync::mpsc::Sender<()>,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl muxtrix_terminal::SessionBackend for SlowWriteBackend {
+        fn take_reader(&mut self) -> Result<Box<dyn std::io::Read + Send>, String> {
+            self.reader
+                .take()
+                .map(|reader| Box::new(reader) as Box<dyn std::io::Read + Send>)
+                .ok_or_else(|| "the slow writer's reader was already taken".to_owned())
+        }
+        fn write_all(&mut self, _bytes: &[u8]) -> Result<(), String> {
+            let _ = self.entered.send(());
+            let (lock, ready) = &*self.gate;
+            let mut released = lock.lock().expect("slow-write gate");
+            while !*released {
+                released = ready.wait(released).expect("slow-write gate wait");
+            }
+            Ok(())
+        }
+        fn resize(&self, _size: PtySize) -> Result<(), String> {
+            Ok(())
+        }
+        fn kill(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+        fn poll_exit(&mut self) -> Result<Option<bool>, String> {
+            Ok(None)
+        }
+        fn exit_clean(&mut self) -> bool {
+            false
+        }
+        fn kill_on_detach(&self) -> bool {
+            false
+        }
+    }
+
+    impl Drop for SlowWriteBackend {
+        fn drop(&mut self) {
+            let _ = self.finished.send(());
+        }
+    }
+
+    #[test]
+    fn dropping_six_terminal_runtimes_never_waits_for_blocked_session_actors() {
+        const PANE_COUNT: usize = 6;
+        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let mut reader_lifetimes = Vec::new();
+        let mut runtimes = Vec::new();
+
+        for index in 0..PANE_COUNT {
+            let (reader_sender, reader_receiver) = std::sync::mpsc::channel();
+            reader_lifetimes.push(reader_sender);
+            let session = LiveSession::spawn_remote(
+                Box::new(SlowWriteBackend {
+                    reader: Some(ParkedReader {
+                        bytes: reader_receiver,
+                    }),
+                    entered: entered_sender.clone(),
+                    finished: finished_sender.clone(),
+                    gate: Arc::clone(&gate),
+                }),
+                initial_pty_size(),
+                TerminalOptions {
+                    cols: initial_pty_size().cols,
+                    rows: initial_pty_size().rows,
+                    max_scrollback: 10_000,
+                },
+                TerminalThemeId::default().preset().terminal_theme(),
+                None,
+            )
+            .expect("the slow remote session should start");
+            session
+                .input(vec![b'0' + index as u8])
+                .expect("the blocking write should be queued");
+            let mut runtime = TerminalRuntime::suppressed("Shell");
+            runtime.session = Some(session);
+            runtime.launch_state = TerminalLaunchState::Running;
+            runtimes.push(runtime);
+        }
+
+        for _ in 0..PANE_COUNT {
+            entered_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("every session actor should enter its blocked write");
+        }
+
+        // The watchdog keeps a regressed implementation from hanging the test
+        // forever. Correct teardown returns well before it opens the gate;
+        // joining session actors on this thread can only return afterward.
+        let release_gate = Arc::clone(&gate);
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let (lock, ready) = &*release_gate;
+            *lock.lock().expect("slow-write gate") = true;
+            ready.notify_all();
+        });
+        let started = std::time::Instant::now();
+        drop(runtimes);
+        let drop_elapsed = started.elapsed();
+        watchdog.join().expect("slow-write watchdog should finish");
+        assert!(
+            drop_elapsed < std::time::Duration::from_millis(500),
+            "dropping GUI runtimes waited for their session actors"
+        );
+
+        // Let the detached PTY readers and disposal threads finish before the
+        // test ends, without putting either wait back on the UI-drop path.
+        drop(reader_lifetimes);
+        for _ in 0..PANE_COUNT {
+            finished_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("every detached session actor should finish");
         }
     }
 
