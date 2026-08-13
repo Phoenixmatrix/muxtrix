@@ -1,0 +1,80 @@
+name: Bug report
+description: Report something that does not work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Muxtrix runs across native Linux, native Windows, WSL2-hosted sessions,
+        and WSLg, on a wide range of GPUs. Most bugs turn out to be specific to
+        one of those combinations, so the environment details below are what
+        make a report actionable.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Muxtrix with ...
+        2. Split the pane ...
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Muxtrix version
+      description: Output of `muxtrix --version`, or the commit if built from source.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux (native)
+        - Linux under WSLg
+        - Windows (native shells)
+        - Windows with sessions in WSL2
+        - macOS (built from source)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version and distribution
+      placeholder: "Ubuntu 24.04 / Windows 11 23H2 / ..."
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: >
+        Rendering and WSLg issues are usually GPU-specific. If the window fails
+        to appear or renders incorrectly, see docs/GPU.md for the adapter probe
+        and paste its output here.
+      placeholder: "NVIDIA RTX 3060, driver 550.x, Mesa D3D12 via WSLg"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Anything printed to the terminal, or a screenshot of the issue.
+    validations:
+      required: false

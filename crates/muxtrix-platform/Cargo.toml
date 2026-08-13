@@ -1,0 +1,15 @@
+[package]
+name = "muxtrix-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+muxtrix-domain = { path = "../muxtrix-domain" }
+portable-pty.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

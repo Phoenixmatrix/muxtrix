@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Muxtrix capture gallery</title>
+<style>
+  :root {
+    --app: #0a0d12;
+    --panel: #10141c;
+    --panel-2: #161b25;
+    --line: #232a38;
+    --line-strong: #333d52;
+    --text: #dde3ee;
+    --muted: #8b95a8;
+    --accent: #7aa2f7;
+    --ok: #6dd39a;
+    --flag: #f0a45d;
+    --bad: #ef6f6f;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--app);
+    color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, "Segoe UI", Ubuntu, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  code, .mono { font-family: ui-monospace, "FiraCode Nerd Font Mono", "DejaVu Sans Mono", monospace; }
+
+  header {
+    position: sticky; top: 0; z-index: 30;
+    background: rgba(10,13,18,.92);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--line);
+    padding: 14px 20px 10px;
+  }
+  .titlebar { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+  .sub { color: var(--muted); font-size: 12.5px; }
+  .spacer { flex: 1; }
+  .stat { font-size: 12.5px; color: var(--muted); }
+  .stat b { color: var(--text); font-weight: 600; }
+  .stat .bad { color: var(--bad); }
+
+  .controls { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  input[type=search], select {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 6px 10px; font: inherit; font-size: 13px; outline: none;
+  }
+  input[type=search] { min-width: 260px; }
+  input[type=search]:focus, select:focus { border-color: var(--line-strong); }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    border: 1px solid var(--line); background: transparent; color: var(--muted);
+    border-radius: 999px; padding: 4px 11px; font-size: 12.5px; cursor: pointer;
+  }
+  .chip:hover { border-color: var(--line-strong); color: var(--text); }
+  .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #0a0d12; font-weight: 600; }
+  .chip .n { opacity: .65; margin-left: 5px; font-variant-numeric: tabular-nums; }
+
+  main { padding: 18px 20px 80px; }
+  section > h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .09em;
+    color: var(--muted); margin: 26px 0 10px; font-weight: 600;
+  }
+  section:first-child > h2 { margin-top: 4px; }
+
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(var(--card), 1fr)); }
+  body { --card: 340px; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); overflow: hidden; cursor: pointer;
+    display: flex; flex-direction: column; transition: border-color .12s, transform .12s;
+  }
+  .card:hover { border-color: var(--line-strong); transform: translateY(-1px); }
+  .card.ok { border-left: 3px solid var(--ok); }
+  .card.flag { border-left: 3px solid var(--flag); }
+  .card.failed { border-color: var(--bad); }
+  .card.moved { border-left: 3px solid var(--accent); }
+  .badge.moved { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+  .shot { background: #05070a; aspect-ratio: 16 / 10; display: block; width: 100%; object-fit: contain; }
+  .card figcaption { padding: 9px 11px 11px; border-top: 1px solid var(--line); }
+  .card .name { font-size: 13.5px; font-weight: 600; }
+  .card .meta { color: var(--muted); font-size: 11.5px; margin-top: 3px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .card .meta .mono { color: #7d8aa3; }
+  .badge { font-size: 10.5px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line-strong); color: var(--muted); }
+  .badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+  .badge.flag { color: var(--flag); border-color: color-mix(in srgb, var(--flag) 45%, transparent); }
+  .badge.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 50%, transparent); }
+
+  /* ── detail overlay ─────────────────────────────────────────────── */
+  dialog#detail {
+    border: none; padding: 0; margin: 0; width: 100vw; max-width: 100vw;
+    height: 100vh; max-height: 100vh; background: rgba(5,7,10,.97); color: var(--text);
+  }
+  dialog#detail::backdrop { background: rgba(0,0,0,.7); }
+  .detail { display: grid; grid-template-columns: 1fr 340px; height: 100vh; }
+  .stage { position: relative; overflow: auto; display: grid; place-items: center; padding: 20px; }
+  .stage img { max-width: 100%; max-height: calc(100vh - 40px); image-rendering: -webkit-optimize-contrast; }
+  .stage.zoom { place-items: start; }
+  .stage.zoom img { max-width: none; max-height: none; cursor: grab; }
+  .side {
+    border-left: 1px solid var(--line); background: var(--panel);
+    padding: 18px; overflow: auto; display: flex; flex-direction: column; gap: 14px;
+  }
+  .side h3 { margin: 0; font-size: 15px; }
+  .side .group { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+  .check { background: var(--panel-2); border: 1px solid var(--line); border-left: 2px solid var(--accent);
+           border-radius: 6px; padding: 10px 12px; font-size: 13px; color: #c3ccdb; }
+  table.props { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.props td { padding: 4px 0; vertical-align: top; border-bottom: 1px solid var(--line); }
+  table.props td:first-child { color: var(--muted); width: 42%; padding-right: 10px; }
+  table.props td:last-child { font-family: ui-monospace, monospace; font-size: 12px; word-break: break-word; }
+  .verdicts { display: flex; gap: 8px; }
+  .verdicts button {
+    flex: 1; border-radius: 8px; padding: 8px; font: inherit; font-size: 13px; cursor: pointer;
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+  }
+  .verdicts button:hover { border-color: var(--line-strong); }
+  .verdicts button[aria-pressed="true"][data-v="ok"] { background: var(--ok); border-color: var(--ok); color: #08120c; font-weight: 600; }
+  .verdicts button[aria-pressed="true"][data-v="flag"] { background: var(--flag); border-color: var(--flag); color: #1a1005; font-weight: 600; }
+  textarea {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+    color: var(--text); font: inherit; font-size: 13px; padding: 9px 10px; resize: vertical; min-height: 92px;
+  }
+  textarea:focus { outline: none; border-color: var(--line-strong); }
+  .navrow { display: flex; gap: 8px; align-items: center; }
+  .navrow button, .ghost {
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 8px; padding: 7px 12px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  .navrow button:hover, .ghost:hover { border-color: var(--line-strong); }
+  .keys { color: var(--muted); font-size: 11.5px; line-height: 1.7; margin-top: auto; }
+  .keys kbd {
+    background: var(--panel-2); border: 1px solid var(--line); border-bottom-width: 2px;
+    border-radius: 4px; padding: 0 5px; font-family: ui-monospace, monospace; font-size: 11px;
+  }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+  @media (max-width: 900px) { .detail { grid-template-columns: 1fr; } .side { border-left: none; border-top: 1px solid var(--line); } }
+</style>
+</head>
+<body>
+<script>/*__DATA__*/</script>
+
+<header>
+  <div class="titlebar">
+    <h1>Muxtrix capture gallery</h1>
+    <span class="sub" id="generated"></span>
+    <span class="spacer"></span>
+    <span class="stat" id="stats"></span>
+  </div>
+  <div class="controls">
+    <input type="search" id="q" placeholder="Search title, capture flag, setting…" autocomplete="off">
+    <select id="verdict">
+      <option value="todo">Needs review</option>
+      <option value="">Everything</option>
+      <option value="unreviewed">Never reviewed</option>
+      <option value="changed">Changed since review</option>
+      <option value="ok">Marked OK</option>
+      <option value="flag">Flagged</option>
+      <option value="failed">Capture failed</option>
+    </select>
+    <select id="size">
+      <option value="340">Medium cards</option>
+      <option value="260">Small cards</option>
+      <option value="520">Large cards</option>
+    </select>
+    <span class="spacer"></span>
+    <div class="chips" id="groups"></div>
+  </div>
+</header>
+
+<main id="main"></main>
+
+<dialog id="detail">
+  <div class="detail">
+    <div class="stage" id="stage"><img id="stageImg" alt=""></div>
+    <aside class="side">
+      <div>
+        <div class="group" id="dGroup"></div>
+        <h3 id="dTitle"></h3>
+      </div>
+      <div class="check" id="dCheck"></div>
+      <table class="props"><tbody id="dProps"></tbody></table>
+      <div class="verdicts">
+        <button data-v="ok">Looks right</button>
+        <button data-v="flag">Flag</button>
+      </div>
+      <textarea id="dNote" placeholder="What is wrong with this frame?"></textarea>
+      <div class="navrow">
+        <button id="prev">← Prev</button>
+        <button id="next">Next →</button>
+        <span class="spacer"></span>
+        <button id="zoom">1:1</button>
+        <button id="close">Close</button>
+      </div>
+      <div class="keys">
+        <kbd>←</kbd> <kbd>→</kbd> move · <kbd>1</kbd> looks right · <kbd>2</kbd> flag ·
+        <kbd>z</kbd> zoom · <kbd>Esc</kbd> close · <kbd>/</kbd> search
+      </div>
+    </aside>
+  </div>
+</dialog>
+
+<script type="module">
+const data = window.__GALLERY__;
+const cases = data.cases;
+const notes = data.notes ?? {};
+
+const el = (id) => document.getElementById(id);
+// "Needs review" is the landing state: on a second pass the only frames worth
+// a reviewer's attention are the ones never looked at and the ones that moved
+// since they were.
+const state = { q: "", group: "", verdict: "todo", index: -1, list: [] };
+
+const verdictOf = (c) => (c.ok ? notes[c.slug]?.verdict ?? null : "failed");
+// A note taken against a different frame than the one on screen is stale: the
+// capture has been redone and the verdict predates the change.
+const changedSince = (c) => {
+  const note = notes[c.slug];
+  if (!note?.verdict) return false;
+  // A note with no recorded frame predates hashing, or was written against a
+  // capture that has since been replaced. Either way the safe reading is that
+  // the verdict may no longer describe what is on screen.
+  if (!note.hash) return true;
+  return Boolean(c.hash && note.hash !== c.hash);
+};
+const needsReview = (c) => c.ok && (!notes[c.slug]?.verdict || changedSince(c));
+
+const groups = [...new Set(cases.map((c) => c.group))];
+el("generated").textContent =
+  `${cases.length} states · captured ${new Date(data.generated).toLocaleString()} in ${data.seconds}s`;
+
+function renderStats() {
+  const reviewed = cases.filter((c) => notes[c.slug]?.verdict).length;
+  const flagged = cases.filter((c) => notes[c.slug]?.verdict === "flag").length;
+  const failed = cases.filter((c) => !c.ok).length;
+  const moved = cases.filter(changedSince).length;
+  el("stats").innerHTML =
+    `<b>${reviewed}</b>/${cases.length} reviewed · <b>${flagged}</b> flagged` +
+    (moved ? ` · <b>${moved}</b> changed since review` : "") +
+    (failed ? ` · <span class="bad"><b>${failed}</b> capture failures</span>` : "");
+}
+
+function renderGroups() {
+  const wrap = el("groups");
+  wrap.innerHTML = "";
+  const all = document.createElement("button");
+  all.className = "chip";
+  all.textContent = "All";
+  all.setAttribute("aria-pressed", state.group === "");
+  all.onclick = () => { state.group = ""; render(); };
+  wrap.append(all);
+  for (const g of groups) {
+    const b = document.createElement("button");
+    b.className = "chip";
+    b.innerHTML = `${g}<span class="n">${cases.filter((c) => c.group === g).length}</span>`;
+    b.setAttribute("aria-pressed", state.group === g);
+    b.onclick = () => { state.group = state.group === g ? "" : g; render(); };
+    wrap.append(b);
+  }
+}
+
+function matches(c) {
+  if (state.group && c.group !== state.group) return false;
+  const v = verdictOf(c);
+  if (state.verdict === "todo" && !(needsReview(c) || v === "failed")) return false;
+  if (state.verdict === "unreviewed" && v) return false;
+  if (state.verdict === "changed" && !changedSince(c)) return false;
+  if (
+    state.verdict &&
+    !["todo", "unreviewed", "changed"].includes(state.verdict) &&
+    v !== state.verdict
+  ) {
+    return false;
+  }
+  if (!state.q) return true;
+  const hay = [c.title, c.slug, c.group, c.capture, c.viewport, c.check, JSON.stringify(c.settings ?? {})]
+    .join(" ").toLowerCase();
+  return state.q.toLowerCase().split(/\s+/).every((t) => hay.includes(t));
+}
+
+function card(c) {
+  const v = verdictOf(c);
+  const fig = document.createElement("figure");
+  fig.className = `card ${v ?? ""}${changedSince(c) ? " moved" : ""}`;
+  fig.style.margin = 0;
+  const settings = c.settings
+    ? Object.entries(c.settings).map(([k, val]) => `${k}=${val}`).join(" ")
+    : "";
+  fig.innerHTML = `
+    <img class="shot" loading="lazy" src="${c.image}" alt="${c.title}">
+    <figcaption>
+      <div class="name">${c.title}</div>
+      <div class="meta">
+        <span class="mono">${c.viewport}</span>
+        <span class="mono">${c.capture}</span>
+        ${settings ? `<span class="mono">${settings}</span>` : ""}
+        ${v === "ok" ? '<span class="badge ok">ok</span>' : ""}
+        ${v === "flag" ? '<span class="badge flag">flagged</span>' : ""}
+        ${v === "failed" ? '<span class="badge bad">capture failed</span>' : ""}
+        ${changedSince(c) ? '<span class="badge moved">changed since review</span>' : ""}
+      </div>
+    </figcaption>`;
+  fig.onclick = () => open(state.list.indexOf(c));
+  return fig;
+}
+
+function render() {
+  renderGroups();
+  renderStats();
+  state.list = cases.filter(matches);
+  const main = el("main");
+  main.innerHTML = "";
+  if (state.list.length === 0) {
+    main.innerHTML = '<p class="empty">Nothing matches those filters.</p>';
+    return;
+  }
+  for (const g of groups) {
+    const items = state.list.filter((c) => c.group === g);
+    if (!items.length) continue;
+    const section = document.createElement("section");
+    const h = document.createElement("h2");
+    h.textContent = `${g} · ${items.length}`;
+    const grid = document.createElement("div");
+    grid.className = "grid";
+    for (const c of items) grid.append(card(c));
+    section.append(h, grid);
+    main.append(section);
+  }
+}
+
+// ── detail ──────────────────────────────────────────────────────────
+const dialog = el("detail");
+
+function open(index) {
+  if (index < 0 || index >= state.list.length) return;
+  state.index = index;
+  const c = state.list[index];
+  el("dGroup").textContent = `${c.group} · ${index + 1} of ${state.list.length}`;
+  el("dTitle").textContent = c.title;
+  el("dCheck").textContent = c.check;
+  const rows = [
+    ["slug", c.slug],
+    ["capture flag", c.capture],
+    ["viewport", c.viewport],
+    ...Object.entries(c.settings ?? {}).map(([k, v]) => [k.replaceAll("_", " "), String(v)]),
+    ["png", `${Math.round(c.bytes / 1024)} kB`],
+    ...(changedSince(c)
+      ? [["note taken on", `an earlier frame (${notes[c.slug].at?.slice(0, 16) ?? "unknown"})`]]
+      : []),
+  ];
+  el("dProps").innerHTML = rows
+    .map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`)
+    .join("");
+  el("stageImg").src = c.image;
+  el("stageImg").alt = c.title;
+  el("stage").classList.remove("zoom");
+  el("dNote").value = notes[c.slug]?.note ?? "";
+  syncVerdictButtons();
+  if (!dialog.open) dialog.showModal();
+}
+
+function syncVerdictButtons() {
+  const c = state.list[state.index];
+  const v = notes[c.slug]?.verdict ?? null;
+  for (const b of document.querySelectorAll(".verdicts button")) {
+    b.setAttribute("aria-pressed", b.dataset.v === v);
+  }
+}
+
+async function save(slug, patch) {
+  notes[slug] = { verdict: null, note: "", ...notes[slug], ...patch };
+  if (!notes[slug].verdict && !notes[slug].note) delete notes[slug];
+  await fetch("/api/notes", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      slug,
+      hash: cases.find((c) => c.slug === slug)?.hash ?? null,
+      ...(notes[slug] ?? { verdict: null, note: "" }),
+    }),
+  });
+  renderStats();
+}
+
+for (const b of document.querySelectorAll(".verdicts button")) {
+  b.onclick = async () => {
+    const c = state.list[state.index];
+    const current = notes[c.slug]?.verdict ?? null;
+    await save(c.slug, { verdict: current === b.dataset.v ? null : b.dataset.v });
+    syncVerdictButtons();
+  };
+}
+
+el("dNote").addEventListener("change", () => {
+  const c = state.list[state.index];
+  save(c.slug, { note: el("dNote").value.trim() });
+});
+el("prev").onclick = () => open(state.index - 1);
+el("next").onclick = () => open(state.index + 1);
+el("close").onclick = () => dialog.close();
+el("zoom").onclick = () => el("stage").classList.toggle("zoom");
+el("stage").onclick = (event) => {
+  if (event.target.id === "stageImg") el("stage").classList.toggle("zoom");
+};
+
+dialog.addEventListener("close", render);
+dialog.addEventListener("keydown", (event) => {
+  if (event.target.tagName === "TEXTAREA") return;
+  if (event.key === "ArrowRight" || event.key === "j") { event.preventDefault(); open(state.index + 1); }
+  if (event.key === "ArrowLeft" || event.key === "k") { event.preventDefault(); open(state.index - 1); }
+  if (event.key === "1") document.querySelector('.verdicts button[data-v="ok"]').click();
+  if (event.key === "2") document.querySelector('.verdicts button[data-v="flag"]').click();
+  if (event.key === "z") el("stage").classList.toggle("zoom");
+});
+
+el("q").addEventListener("input", (event) => { state.q = event.target.value; render(); });
+el("verdict").addEventListener("change", (event) => { state.verdict = event.target.value; render(); });
+el("size").addEventListener("change", (event) => {
+  document.body.style.setProperty("--card", `${event.target.value}px`);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "/" && document.activeElement !== el("q") && !dialog.open) {
+    event.preventDefault();
+    el("q").focus();
+  }
+});
+
+render();
+</script>
+</body>
+</html>

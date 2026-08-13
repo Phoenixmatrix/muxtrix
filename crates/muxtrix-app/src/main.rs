@@ -1,0 +1,21506 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
+#[cfg(target_os = "windows")]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::hash::{Hash, Hasher};
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
+use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use iced::futures::StreamExt as _;
+use iced::keyboard::{self, Key, Modifiers, key::Named};
+use iced::mouse::{self, ScrollDelta};
+use iced::widget::{
+    button, canvas, column, container, mouse_area, opaque, pick_list, rich_text, row, scrollable,
+    sensor, slider, span, stack, svg, text, text_input, toggler, tooltip,
+};
+use iced::{
+    Alignment, Border, Color, Element, Fill, Font, Length, Padding, Pixels, Point, Shadow, Size,
+    Subscription, Task, Theme, Vector, font,
+};
+use libghostty_vt::TerminalOptions;
+use muxtrix_control::{
+    Agent, AgentState, ControlRequest, ControlResponse, ControlServer, HookAction, HookManager,
+    HookScope, HookStatus, PaneSummary, SplitDirection,
+};
+use muxtrix_domain::{
+    LaunchProfile, Pane, PaneAgent, PaneId, PaneTree, ProcessBackend, ProfileId, SessionState,
+    SplitAxis, SplitRatio, Surface, TabId, TerminalSurface, Workspace, WorkspaceId, WorkspaceTab,
+};
+use muxtrix_platform::{LaunchPlan, PtySize};
+use muxtrix_terminal::{
+    EventNotifier, GridSnapshot, LiveSession, LiveSessionEvent, ScrollbarSnapshot, TerminalActor,
+    TerminalNotification, TerminalTheme,
+};
+
+mod agent_screen;
+mod agents_roster;
+mod box_drawing;
+mod commands;
+mod ellipsized_text;
+mod github;
+mod metrics;
+mod popover;
+mod process;
+mod settings;
+mod themes;
+
+#[cfg(feature = "e2e")]
+mod e2e;
+
+use commands::CommandAction;
+use ellipsized_text::EllipsizedText;
+use popover::Popover;
+use process::console_command;
+#[cfg(any(target_os = "windows", test))]
+use settings::WindowsShellBackend;
+use settings::{
+    AppSettings, Appearance, FleetView, FontWeight, InstalledFontCatalog, TerminalFont, UiFont,
+    font_with_style,
+};
+use themes::{TerminalThemeId, TerminalThemePreset};
+
+/*
+THESIS
+Muxtrix is a calm native control room for many concurrent terminals and coding agents.
+
+OWN-WORLD
+Its visual world is a dark live gate board: ruled fleet entries, precise signals, quiet chrome,
+and terminal content as the dominant surface.
+
+STORY
+See global exceptions only when present; scan every task and agent state; jump directly to work;
+operate each pane from its own compact tab; tune the environment without leaving the app.
+
+FIRST VIEWPORT
+At launch, the fleet rail and active terminal fill the window. No dashboard, inbox, or decorative
+status chrome competes with live work.
+
+FORM
+Category standard, chosen via canon. Direction seed: eb790489.
+
+FINISH
+unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
+*/
+
+pub fn main() -> iced::Result {
+    // Session daemon mode: no window, no GPU — just PTYs on a socket. It
+    // lives inside this binary so packages ship no extra executable.
+    let arguments: Vec<String> = std::env::args().collect();
+    if arguments.iter().any(|argument| argument == "--sessiond") {
+        run_session_daemon(&arguments);
+        return Ok(());
+    }
+    NO_TERMINAL_STARTUP.store(no_terminal_requested(&arguments), Ordering::Relaxed);
+    if let Err(error) = muxtrix::gpu::ensure_wsl_gpu_defaults() {
+        eprintln!("failed to apply process-local WSL GPU defaults: {error}");
+    }
+
+    let (startup_settings, _) = AppSettings::load();
+    iced::application(Muxtrix::boot, Muxtrix::update, Muxtrix::view)
+        .title(Muxtrix::title)
+        .theme(Muxtrix::theme)
+        .subscription(Muxtrix::subscription)
+        .window(muxtrix_window_settings())
+        .settings(iced::Settings {
+            antialiasing: true,
+            default_font: startup_settings.ui_font(),
+            ..iced::Settings::default()
+        })
+        .run()
+}
+
+fn muxtrix_window_settings() -> iced::window::Settings {
+    let mut settings = iced::window::Settings {
+        size: Size::new(1_280.0, 800.0),
+        min_size: Some(Size::new(720.0, 480.0)),
+        icon: muxtrix_window_icon(),
+        ..iced::window::Settings::default()
+    };
+    #[cfg(target_os = "linux")]
+    {
+        // Match muxtrix.desktop so Wayland compositors associate the window
+        // with the installed launcher and its hicolor icon.
+        settings.platform_specific.application_id = "muxtrix".into();
+    }
+    settings
+}
+
+fn no_terminal_requested(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| argument == "--no-terminal")
+}
+
+fn run_session_daemon(arguments: &[String]) {
+    let value_of = |flag: &str| {
+        arguments
+            .iter()
+            .position(|argument| argument == flag)
+            .and_then(|index| arguments.get(index + 1))
+            .cloned()
+    };
+    let Some(id) = value_of("--session-id").and_then(|raw| raw.parse().ok()) else {
+        eprintln!("--sessiond requires --session-id <uuid>");
+        std::process::exit(2);
+    };
+    let name = value_of("--session-name").unwrap_or_else(|| "session".into());
+    let endpoint =
+        value_of("--session-endpoint").unwrap_or_else(|| muxtrix_sessions::session_endpoint(id));
+    if let Err(error) = muxtrix_sessions::daemon::run(id, name, endpoint) {
+        eprintln!("session daemon failed: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn muxtrix_window_icon() -> Option<iced::window::Icon> {
+    iced::window::icon::from_rgba(
+        include_bytes!("../assets/muxtrix-icon.rgba").to_vec(),
+        256,
+        256,
+    )
+    .ok()
+}
+
+struct Muxtrix {
+    session: SessionState,
+    terminals: BTreeMap<PaneId, TerminalRuntime>,
+    status: String,
+    cursor_phase_visible: bool,
+    active_view: ActiveView,
+    settings_page: SettingsPage,
+    palette: CommandPalette,
+    settings: AppSettings,
+    settings_draft: AppSettings,
+    installed_fonts: InstalledFontCatalog,
+    available_terminal_fonts: Vec<TerminalFont>,
+    available_terminal_font_weights: Vec<FontWeight>,
+    available_ui_fonts: Vec<UiFont>,
+    available_ui_font_weights: Vec<FontWeight>,
+    available_wsl_distributions: Vec<WslDistributionChoice>,
+    workspace_name_draft: String,
+    rename_prompt: Option<RenameTarget>,
+    rename_draft: String,
+    worktree_prompt: Option<WorktreePrompt>,
+    worktree_name_draft: String,
+    worktree_manager: Option<WorktreeManagerState>,
+    worktree_manager_generation: u64,
+    session_picker: Option<SessionPickerState>,
+    last_layout_hash: u64,
+    /// Transient confirmation pill (bottom-center, iTerm2/Ghostty style);
+    /// cleared by the blink tick once it has been visible ~2s. Keyboard-mode
+    /// guidance is derived from `prefix_armed`/`rail_nav` instead, so it stays
+    /// visible for the full lifetime of those modes.
+    toast: Option<(String, std::time::Instant)>,
+    /// Ctrl+G was pressed; a recognized follow-up picks an unlocked action
+    /// and Escape cancels (Zellij-style prefix).
+    prefix_armed: bool,
+    /// Keyboard cursor walking the rail (workspaces, then fleet).
+    rail_nav: Option<RailTarget>,
+    workspace_create_visible: bool,
+    close_workspace_prompt: Option<WorkspaceId>,
+    tab_drag: Option<TabDrag>,
+    notifications: Vec<AgentNotification>,
+    global_alerts: Vec<GlobalAlert>,
+    github_auth: github::AuthStatus,
+    github_auth_busy: bool,
+    github_panel: Option<GitHubPanelState>,
+    sidebar_collapsed: bool,
+    maximized_pane: Option<PaneId>,
+    pane_menu: Option<PaneId>,
+    window_id: Option<iced::window::Id>,
+    window_size: Size,
+    cursor_position: Point,
+    keyboard_modifiers: Modifiers,
+    split_sizes: BTreeMap<SplitKey, Size>,
+    split_drag: Option<SplitDrag>,
+    pane_layouts: BTreeMap<TabId, PaneLayout>,
+    base_pane_layouts: BTreeMap<TabId, PaneTree>,
+    pane_resize_history: BTreeMap<TabId, PaneResizeHistory>,
+    hovered_terminal: Option<PaneId>,
+    terminal_pointer_positions: BTreeMap<PaneId, Point>,
+    terminal_scrollbar_positions: BTreeMap<PaneId, Point>,
+    terminal_scroll_drag: Option<TerminalScrollDrag>,
+    /// A possible terminal selection gesture. The emulator owns an actual
+    /// selection only after this crosses the drag threshold; an ordinary
+    /// click merely clears the previous selection and focuses the pane.
+    terminal_selection_drag: Option<TerminalSelectionDrag>,
+    terminal_command_buffers: BTreeMap<PaneId, String>,
+    event_notifier: EventNotifier,
+    event_receiver: async_channel::Receiver<()>,
+    terminal_launcher: Arc<dyn TerminalLauncher>,
+    terminal_launch_completions: Arc<Mutex<VecDeque<TerminalLaunchCompletion>>>,
+    next_terminal_launch_attempt: u64,
+    launch_in_background: bool,
+    startup_terminal_pending: Option<PaneId>,
+    /// A restart requested while this pane's first launch is still in flight.
+    /// Daemon launches reuse the durable pane ID, so replacements must wait
+    /// for the current worker to hand its session back before starting.
+    queued_terminal_restarts: BTreeSet<PaneId>,
+    pending_terminal_input: BTreeMap<PaneId, Vec<Vec<u8>>>,
+    control: Option<ControlServer>,
+    control_endpoint: Option<String>,
+    agent_statuses: BTreeMap<PaneId, AgentPaneStatus>,
+    /// Terminal-frame revision that was current when a pane most recently
+    /// entered Running. An Idle classification may only demote it after a
+    /// newer frame arrives; this preserves the hook/frame race guard without
+    /// making Running sticky forever.
+    agent_running_frame_revisions: BTreeMap<PaneId, u64>,
+    /// Panes whose agent status came from process-tree detection rather than
+    /// lifecycle hooks, with the instant detection first saw them. Hook
+    /// events take ownership; detected entries self-clean when the process
+    /// disappears.
+    detected_agents: BTreeMap<PaneId, std::time::Instant>,
+    /// Panes currently showing Claude Code's Agents view. Their rows project
+    /// `agents_roster` instead of one conversation's lifecycle.
+    agents_view_panes: BTreeSet<PaneId>,
+    /// Latest machine-wide roster, or `None` until the first read lands. An
+    /// error leaves the previous roster in place rather than inventing counts.
+    agents_roster: Option<agents_roster::AgentsRoster>,
+    /// One roster read at a time: polls must not stack up behind a slow harness.
+    agents_roster_pending: bool,
+    /// Why the last read failed, while no roster has ever landed. A roll-up
+    /// that cannot run — the configured Claude Code is not on this process's
+    /// `PATH`, say — otherwise leaves the row saying `Agents` forever with
+    /// nothing to act on.
+    agents_roster_error: Option<String>,
+    /// When the roster was last read. Cleared on entering the view so the first
+    /// read is immediate rather than waiting out the cadence.
+    agents_roster_checked: Option<std::time::Instant>,
+    /// Repository labels resolved from each pane's live working directory.
+    /// Resolution runs off the UI thread because WSL panes require git inside
+    /// the selected distribution. Empty results are cached too, keeping
+    /// ordinary terminal repaints free of filesystem and process work.
+    pane_repositories: BTreeMap<PaneId, PaneRepository>,
+    pending_repository_directories: BTreeMap<PaneId, std::path::PathBuf>,
+    hook_statuses: Vec<HookStatus>,
+    integration_generation: u64,
+    integration_refreshing: bool,
+    #[cfg(feature = "e2e")]
+    e2e: Option<e2e::Scenario>,
+}
+
+struct TerminalRuntime {
+    preview: String,
+    snapshot: Option<GridSnapshot>,
+    snapshot_revision: u64,
+    session: Option<LiveSession>,
+    fallback_title: String,
+    display_title: String,
+    size: PtySize,
+    viewport: Option<Size>,
+    launch_state: TerminalLaunchState,
+    /// Whether this pane has a selection worth offering to copy. The emulator
+    /// holds the selection itself; this only spares the view a round trip to
+    /// the session thread on every frame.
+    has_selection: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalLaunchState {
+    PreparingHost,
+    Starting { attempt_id: u64 },
+    Running,
+    Failed(String),
+    Suppressed,
+    Exited,
+}
+
+struct TerminalLaunchRequest {
+    profile: LaunchProfile,
+    directory_policy: CreationDirectoryPolicy,
+    wsl_distribution: String,
+    pane_id: PaneId,
+    theme: TerminalTheme,
+    notifier: EventNotifier,
+    control_endpoint: Option<String>,
+    target_size: PtySize,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    previous_session: Option<LiveSession>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreationDirectoryPolicy {
+    /// Use the profile directory exactly. Explicit worktree creation and pane
+    /// restarts must never be redirected away from their requested target.
+    Exact,
+    /// Keep an ordinary directory, but leave a linked worktree for the
+    /// repository's GitHub-default checkout before starting the shell.
+    Regular,
+}
+
+trait TerminalLauncher: Send + Sync {
+    fn launch(&self, request: TerminalLaunchRequest) -> Result<LaunchedTerminal, String>;
+
+    /// Why the terminal host refused to start this pane's process, when it
+    /// did. A daemon spawn is a request written to a socket: it reports
+    /// success as soon as the host accepts it, and a refusal arrives later.
+    fn spawn_failure(&self, _pane_id: PaneId) -> Option<String> {
+        None
+    }
+}
+
+#[derive(Default)]
+struct SystemTerminalLauncher {
+    /// Tests can inject a daemon client without publishing it through the
+    /// process-global application host used by unrelated parallel tests.
+    client: Option<Arc<muxtrix_sessions::SessionClient>>,
+}
+
+impl TerminalLauncher for SystemTerminalLauncher {
+    fn launch(&self, request: TerminalLaunchRequest) -> Result<LaunchedTerminal, String> {
+        let pane_id = request.pane_id;
+        self.launch_session(request).map_err(|error| {
+            // A refused spawn takes the pane's byte channel down with it, so
+            // what surfaces here is usually the channel closing rather than
+            // the refusal. Prefer the host's own reason, allowing for it
+            // arriving just after the symptom did.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            loop {
+                if let Some(reason) = self.spawn_failure(pane_id) {
+                    return reason;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return error;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        })
+    }
+
+    fn spawn_failure(&self, pane_id: PaneId) -> Option<String> {
+        self.client
+            .clone()
+            .or_else(|| session_host().map(|(_, client)| client))?
+            .pane_spawn_failure(pane_id.as_uuid())
+    }
+}
+
+impl SystemTerminalLauncher {
+    fn launch_session(&self, request: TerminalLaunchRequest) -> Result<LaunchedTerminal, String> {
+        let mut profile = request.profile.clone();
+        if request.directory_policy == CreationDirectoryPolicy::Regular
+            && let Some(directory) = profile.working_directory.as_deref()
+        {
+            profile.working_directory = Some(resolve_regular_creation_directory(
+                directory,
+                &request.wsl_distribution,
+            ));
+        }
+        if let Some(previous_session) = request.previous_session {
+            previous_session.terminate();
+            drop(previous_session);
+        }
+        let session = start_live_session_with_client(
+            &profile,
+            request.pane_id,
+            request.theme,
+            request.notifier,
+            request.control_endpoint.as_deref(),
+            self.client
+                .clone()
+                .or_else(|| session_host().map(|(_, client)| client)),
+        )?;
+        if terminal_grid_changed(initial_pty_size(), request.target_size) {
+            session
+                .resize(
+                    request.target_size,
+                    request.cell_width_px,
+                    request.cell_height_px,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        let snapshot = session.snapshot().map_err(|error| error.to_string())?;
+        Ok(LaunchedTerminal {
+            session,
+            snapshot,
+            size: request.target_size,
+            working_directory: profile.working_directory,
+        })
+    }
+}
+
+struct LaunchedTerminal {
+    session: LiveSession,
+    snapshot: GridSnapshot,
+    size: PtySize,
+    working_directory: Option<std::path::PathBuf>,
+}
+
+struct TerminalLaunchCompletion {
+    pane_id: PaneId,
+    attempt_id: u64,
+    result: Result<LaunchedTerminal, String>,
+}
+
+static NO_TERMINAL_STARTUP: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveView {
+    Workspace,
+    Settings,
+    /// Full-screen theme browsing, entered from Settings; every preset
+    /// renders as a live terminal preview and Esc/Back returns.
+    ThemeGallery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    Preferences,
+    Worktrees,
+}
+
+#[derive(Debug, Clone)]
+struct GitHubPanelState {
+    repository: github::Repository,
+    data: Option<github::PanelData>,
+    loading: bool,
+    error: Option<String>,
+    merge_confirmation: bool,
+    merging: bool,
+    file_scroll_offset: f32,
+}
+
+impl GitHubPanelState {
+    fn loading(repository: github::Repository) -> Self {
+        Self {
+            repository,
+            data: None,
+            loading: true,
+            error: None,
+            merge_confirmation: false,
+            merging: false,
+            file_scroll_offset: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GlobalAlert {
+    title: String,
+    body: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameTarget {
+    Workspace(WorkspaceId),
+    Tab(WorkspaceId, TabId),
+    Pane(PaneId),
+}
+
+#[derive(Debug, Clone)]
+struct WorktreePrompt {
+    target: WorktreePromptTarget,
+    /// None when the focused pane is not inside a git repository — the
+    /// dialog still opens and says so, because the status bar is hidden by
+    /// default and a status-line message would be invisible.
+    repo_root: Option<std::path::PathBuf>,
+    /// Why creation is impossible, diagnosed when the dialog opened: no
+    /// shell-reported directory, unreachable WSL distribution, vanished
+    /// directory, missing git, or genuinely not a repository.
+    failure: Option<String>,
+    /// Where new worktrees for this repository land, resolved when the
+    /// dialog opens (on Windows+WSL this costs a wsl.exe launch).
+    base_directory: Option<std::path::PathBuf>,
+    /// Directory names already present under `base_directory`, listed once
+    /// at open so the per-keystroke conflict check never touches the
+    /// filesystem.
+    taken_names: BTreeSet<String>,
+    /// Inline error shown in the dialog (name conflicts, git failures).
+    error: Option<String>,
+    /// A creation is in flight; the dialog stays open until it resolves.
+    busy: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreePromptTarget {
+    Open(commands::WorktreeKind),
+    RestartPane(PaneId),
+}
+
+/// A rail entry the prefix-key navigation cursor can rest on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RailTarget {
+    Workspace(WorkspaceId),
+    FleetTab(WorkspaceId, TabId),
+    FleetGroup(WorkspaceId, PaneId),
+    FleetPane(WorkspaceId, PaneId),
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeManagerState {
+    mode: WorktreeManagerMode,
+    generation: u64,
+    /// None when the focused pane is not inside a repository; `failure`
+    /// carries the explanation instead.
+    repo_root: Option<std::path::PathBuf>,
+    failure: Option<String>,
+    entries: Vec<WorktreeManagerEntry>,
+    /// Repository and per-checkout Git metadata are loaded off the UI thread.
+    loading: bool,
+    selected: usize,
+    busy: bool,
+    error: Option<String>,
+    /// The selected row while the destructive restart confirmation is open.
+    restart_target: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeManagerDiscovery {
+    repo_root: Option<std::path::PathBuf>,
+    failure: Option<String>,
+    entries: Vec<WorktreeManagerEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeManagerMode {
+    Manage,
+    RestartPane(PaneId),
+}
+
+struct SessionPickerState {
+    entries: Vec<SessionPickerEntry>,
+    selected: usize,
+    error: Option<String>,
+    /// Opened at boot because unattached sessions exist: resuming also
+    /// shuts down the throwaway session this instance just created, and
+    /// the dialog offers "Start new session" instead of "Close".
+    startup: bool,
+}
+
+struct SessionPickerEntry {
+    record: muxtrix_sessions::SessionRecord,
+    alive: bool,
+    pane_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct WorktreeManagerEntry {
+    path: std::path::PathBuf,
+    branch: Option<String>,
+    /// Commits reachable from this checkout's HEAD but from no configured
+    /// remote. This is local-only status: opening the manager never fetches.
+    unpushed_commits: usize,
+    /// Why deletion is forbidden. The primary worktree is always protected;
+    /// the GitHub default branch is protected too, with main/master as the
+    /// conservative fallback when the remote HEAD is unavailable.
+    deletion_blocker: Option<String>,
+    /// Title of a pane currently working inside this worktree, if any —
+    /// such worktrees cannot be deleted.
+    used_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardAction {
+    Copy,
+    Paste,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneLayout {
+    Base,
+    Vertical,
+    Horizontal,
+    Stacked,
+    HalfStacked,
+}
+
+impl PaneLayout {
+    const ALL: [Self; 5] = [
+        Self::Base,
+        Self::Vertical,
+        Self::Horizontal,
+        Self::Stacked,
+        Self::HalfStacked,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Base => "Base",
+            Self::Vertical => "Vertical",
+            Self::Horizontal => "Horizontal",
+            Self::Stacked => "Stacked",
+            Self::HalfStacked => "Half-stacked",
+        }
+    }
+
+    const fn supports(self, pane_count: usize) -> bool {
+        match self {
+            Self::Base | Self::Vertical | Self::Horizontal => pane_count >= 2,
+            // Muxtrix applies constraints to terminal panes only and keeps
+            // the useful two-pane stack available.
+            Self::Stacked => pane_count >= 2,
+            Self::HalfStacked => pane_count >= 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutCycle {
+    Previous,
+    Next,
+}
+
+#[derive(Debug, Clone)]
+struct PaneResizeSnapshot {
+    root: PaneTree,
+    maximized_pane: Option<PaneId>,
+}
+
+#[derive(Debug, Clone)]
+struct PaneResizeHistory {
+    pane_id: PaneId,
+    snapshots: Vec<PaneResizeSnapshot>,
+}
+
+/// A pane's normalized rectangle within its tab, derived from split ratios.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PaneRect {
+    pane_id: PaneId,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+#[derive(Debug, Clone)]
+struct AgentNotification {
+    pane_id: PaneId,
+    unread: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AgentPaneStatus {
+    agent: String,
+    /// Best pane-local identity below an explicit user rename: a title emitted
+    /// by the harness, or the linked-worktree directory while it starts.
+    display_name: Option<String>,
+    state: AgentState,
+    activity: Option<String>,
+    session_id: Option<String>,
+    cwd: Option<String>,
+    git_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneRepository {
+    directory: std::path::PathBuf,
+    name: Option<String>,
+    worktree_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FleetRepositoryGroup {
+    name: String,
+    entries: Vec<(WorkspaceId, PaneId)>,
+}
+
+fn should_accept_agent_state(
+    current: Option<&AgentPaneStatus>,
+    incoming_state: AgentState,
+    incoming_session_id: Option<&str>,
+) -> bool {
+    if incoming_state != AgentState::Idle {
+        return true;
+    }
+
+    let Some(current) = current else {
+        return true;
+    };
+    if current.state != AgentState::Running {
+        return true;
+    }
+
+    matches!(
+        (current.session_id.as_deref(), incoming_session_id),
+        (Some(current), Some(incoming)) if current != incoming
+    )
+}
+
+#[derive(Debug, Clone)]
+struct IntegrationDiscovery {
+    wsl_distributions: Vec<WslDistributionChoice>,
+    hook_statuses: Result<Vec<HookStatus>, String>,
+}
+
+#[derive(Debug, Clone)]
+struct HookOperationResult {
+    message: String,
+    statuses: Vec<HookStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalCellPosition {
+    row: u64,
+    column: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalLink {
+    uri: String,
+    row: u64,
+    start_column: usize,
+    end_column: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalScrollDrag {
+    pane_id: PaneId,
+    pane_top: f32,
+    grab_offset: f32,
+    track_height: f32,
+    last_offset: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalSelectionDrag {
+    pane_id: PaneId,
+    origin: Point,
+    anchor: (u16, u16),
+    active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum SplitBranch {
+    First,
+    Second,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct SplitKey {
+    workspace_id: WorkspaceId,
+    tab_id: TabId,
+    path: Vec<SplitBranch>,
+}
+
+#[derive(Debug, Clone)]
+struct SplitDrag {
+    key: SplitKey,
+    axis: SplitAxis,
+    start_coordinate: f32,
+    start_ratio: u16,
+    extent: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TabDrag {
+    tab_id: TabId,
+    target_workspace_id: WorkspaceId,
+    target_index: usize,
+}
+
+#[derive(Clone)]
+struct EventSubscription(async_channel::Receiver<()>);
+
+impl Hash for EventSubscription {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "muxtrix-event-subscription".hash(state);
+    }
+}
+
+#[derive(Debug, Default)]
+struct CommandPalette {
+    visible: bool,
+    query: String,
+    selected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WslDistributionChoice(Option<String>);
+
+impl WslDistributionChoice {
+    const fn default_distribution() -> Self {
+        Self(None)
+    }
+}
+
+impl std::fmt::Display for WslDistributionChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0.as_deref().unwrap_or("Windows default"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteMove {
+    Next,
+    Previous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneSignalKind {
+    Subtle,
+    Neutral,
+    Warning,
+    Active,
+    Danger,
+}
+
+impl PaneSignalKind {
+    const fn color(self, tokens: DesignTokens) -> Color {
+        match self {
+            Self::Subtle => tokens.faint,
+            Self::Neutral => tokens.muted,
+            Self::Warning => tokens.warning,
+            Self::Active => tokens.success,
+            Self::Danger => tokens.danger,
+        }
+    }
+
+    const fn label_color(self, tokens: DesignTokens) -> Color {
+        match self {
+            Self::Warning => tokens.warning,
+            Self::Active => tokens.success,
+            Self::Danger => tokens.danger,
+            Self::Subtle | Self::Neutral => tokens.muted,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Message {
+    #[cfg(test)]
+    Split(SplitAxis),
+    SplitFrom(PaneId, SplitAxis),
+    Focus(PaneId),
+    FocusFleetPane(WorkspaceId, PaneId),
+    ClosePane(PaneId),
+    RestartPane(PaneId),
+    StartTerminal(PaneId),
+    CancelTerminalLaunch(PaneId),
+    SessionHostInitialized(PaneId, Result<Vec<muxtrix_sessions::SessionRecord>, String>),
+    PollTerminal,
+    AgentsRosterLoaded(Result<agents_roster::AgentsRoster, String>),
+    PaneRepositoriesLoaded(Result<Vec<(PaneId, PaneRepository)>, String>),
+    BlinkCursor,
+    Keyboard(keyboard::Event),
+    ResizePane(PaneId, Size),
+    ResizeSplit(SplitKey, Size),
+    BeginSplitDrag(SplitKey, SplitAxis),
+    PointerMoved(Point),
+    EndPointerInteraction,
+    EnterTerminal(PaneId),
+    LeaveTerminal(PaneId),
+    TerminalPointerMoved(PaneId, Point),
+    TerminalScrollbarMoved(PaneId, Point),
+    BeginTerminalScroll(PaneId),
+    BeginTerminalSelection(PaneId),
+    EndTerminalSelection(PaneId),
+    OpenPaneContextMenu(PaneId),
+    CopyTerminalSelection(PaneId),
+    PastePane(PaneId),
+    ClipboardPasted(PaneId, Option<String>),
+    TerminalLinkOpened(String, Result<(), String>),
+    ScrollTerminal(PaneId, ScrollDelta),
+    ScrollHoveredTerminal(ScrollDelta),
+    WindowOpened(iced::window::Id, Size),
+    WindowResized(Size),
+    CloseCommandPalette,
+    ToggleCommandPalette,
+    CommandQueryChanged(String),
+    CommandSelected(usize),
+    RunCommand(CommandAction),
+    NewWorkspace,
+    CreateWorkspace,
+    CancelWorkspaceCreate,
+    SwitchWorkspace(WorkspaceId),
+    WorkspaceNameChanged(String),
+    RenameDraftChanged(String),
+    ConfirmRename,
+    CancelRename,
+    WorktreeNameChanged(String),
+    ConfirmWorktree,
+    CancelWorktree,
+    WorktreeCreated(WorktreePromptTarget, Result<std::path::PathBuf, String>),
+    CloseWorktreeManager,
+    WorktreeManagerLoaded(u64, Result<WorktreeManagerDiscovery, String>),
+    RefreshWorktreeManager,
+    WorktreeManagerDelete(usize),
+    WorktreeManagerDeleteUnused,
+    WorktreeManagerDeleted(Vec<std::path::PathBuf>, Result<(), String>),
+    OpenPaneWorktreePrompt(PaneId),
+    WorktreeManagerRestart(usize),
+    ConfirmWorktreeManagerRestart,
+    CancelWorktreeManagerRestart,
+    CloseSessionPicker,
+    SessionPickerResume(usize),
+    SessionPickerKill(usize),
+    SessionPickerKillAll,
+    NewTab,
+    CloseTab(WorkspaceId, TabId),
+    ConfirmCloseWorkspace(WorkspaceId),
+    CancelCloseWorkspace,
+    BeginTabDrag(WorkspaceId, TabId, usize),
+    TabDragOver(WorkspaceId, usize),
+    OpenSettings,
+    OpenSettingsPage(SettingsPage),
+    GitHubStatusPressed,
+    BeginGitHubAuth,
+    GitHubAuthChecked(github::AuthStatus),
+    GitHubAuthFinished(Result<github::AuthStatus, String>),
+    CloseGitHubPanel,
+    RefreshGitHubPanel,
+    GitHubPanelLoaded(std::path::PathBuf, Box<Result<github::PanelData, String>>),
+    GitHubFileScrolled(f32),
+    OpenGitHubPullRequest(String),
+    RequestGitHubMerge,
+    CancelGitHubMerge,
+    ConfirmGitHubMerge,
+    GitHubMergeFinished(std::path::PathBuf, Result<String, String>),
+    ToggleSidebar,
+    ToggleMaximize(PaneId),
+    ToggleMaximizeFromPaneMenu(PaneId),
+    TogglePaneMenu(PaneId),
+    DismissPaneMenu,
+    DismissGlobalAlert(usize),
+    ManageHooks(Agent, HookAction),
+    RefreshHookStatus,
+    IntegrationDiscoveryFinished(u64, Result<IntegrationDiscovery, String>),
+    HookOperationFinished(u64, Result<HookOperationResult, String>),
+    SettingsTerminalFont(TerminalFont),
+    SettingsTerminalFontWeight(FontWeight),
+    SettingsTerminalTheme(TerminalThemeId),
+    SettingsAppearance(Appearance),
+    SettingsShowStatusBar(bool),
+    SettingsUiFont(UiFont),
+    SettingsUiFontWeight(FontWeight),
+    SettingsTerminalFontSize(f32),
+    SettingsLineHeight(f32),
+    SettingsUiFontSize(f32),
+    SetFleetView(FleetView),
+    SettingsCodexCommand(String),
+    SettingsClaudeCommand(String),
+    #[cfg(target_os = "windows")]
+    SettingsWindowsShellBackend(WindowsShellBackend),
+    #[cfg(target_os = "windows")]
+    SettingsWslDistribution(WslDistributionChoice),
+    #[cfg(target_os = "windows")]
+    RefreshWslDistributions,
+    SaveSettings,
+    CancelSettings,
+    OpenThemeGallery,
+    CloseThemeGallery,
+    GalleryThemeChosen(TerminalThemeId),
+    #[cfg(feature = "e2e")]
+    E2eTick,
+    #[cfg(feature = "e2e")]
+    E2eScreenshot(iced::window::Screenshot),
+    #[cfg(feature = "e2e")]
+    E2eWindowMissing,
+}
+
+const TERMINAL_PADDING: f32 = 16.0;
+/// Ignore the tiny pointer movement desktop toolkits can report during an
+/// ordinary click. Crossing this distance turns the gesture into selection.
+const TERMINAL_SELECTION_DRAG_THRESHOLD: f32 = 3.0;
+/// How often the Claude Code roster is re-read while a pane projects it. The
+/// read spawns a short-lived process, so it is paced well below the frame rate;
+/// entering the view bypasses this for an immediate first read.
+const AGENTS_ROSTER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const SIDEBAR_WIDTH: f32 = 272.0;
+/// Width available to fleet entry copy: the rail less its 1px border, the
+/// entry's own 16px horizontal padding, and a reserve so the ellipsis fires
+/// before copy can sit flush against the edge.
+const FLEET_ENTRY_TEXT_WIDTH: f32 = SIDEBAR_WIDTH - 1.0 - 16.0 - 12.0;
+/// Advance of one character of mixed-case UI copy relative to its type size.
+///
+/// The UI face is proportional, so this is an average rather than a measurable
+/// cell: wide copy runs past it and narrow copy stops short. Anywhere it sizes
+/// something that must not displace its neighbours, back it with a real bound
+/// (see the pane header's clipped title).
+const UI_TEXT_ADVANCE_RATIO: f32 = 0.55;
+const COLLAPSED_SIDEBAR_WIDTH: f32 = 46.0;
+/// Anatomy of the rail footer's GitHub status. The mark and its login are sized
+/// to read as a pair at the same weight as the rest of the rail rather than as
+/// a hairline afterthought, so the icon matches the one the GitHub panel's own
+/// header wears.
+const GITHUB_STATUS_ICON_SIZE: f32 = 19.0;
+const GITHUB_STATUS_DOT_SIZE: f32 = 7.0;
+const GITHUB_STATUS_ROW_SPACING: f32 = 7.0;
+/// Where the footer's login stops: the rail less its 1px border and the
+/// footer's 16px of side padding, less the 31px collapse button, the status
+/// button's own 16px padding, its icon, its two internal gaps and its dot, and
+/// a reserve so the ellipsis lands before the two controls could sit flush
+/// against each other. The login is measured against this cap rather than
+/// estimated into it, so it is a real bound at every interface size.
+const GITHUB_STATUS_LABEL_WIDTH: f32 = SIDEBAR_WIDTH
+    - 1.0
+    - 16.0
+    - 31.0
+    - 16.0
+    - GITHUB_STATUS_ICON_SIZE
+    - GITHUB_STATUS_ROW_SPACING * 2.0
+    - GITHUB_STATUS_DOT_SIZE
+    - 12.0;
+const GITHUB_PANEL_WIDTH: f32 = 372.0;
+const GITHUB_FILE_ROW_HEIGHT: f32 = 42.0;
+const GITHUB_FILE_OVERSCAN: usize = 5;
+/// Keep installed-font menus scannable instead of letting a large system font
+/// catalog consume the window. Iced's menu overlay uses the resulting height
+/// when choosing the side with more available viewport space, and scrolls any
+/// remaining options.
+const FONT_FAMILY_MENU_MAX_HEIGHT: f32 = 320.0;
+const SPLIT_HANDLE_SIZE: f32 = 8.0;
+const PALETTE_INPUT_ID: &str = "muxtrix-command-palette-input";
+const PALETTE_SCROLL_ID: &str = "muxtrix-command-palette-scroll";
+const GITHUB_FILE_SCROLL_ID: &str = "muxtrix-github-file-scroll";
+const WORKSPACE_CREATE_INPUT_ID: &str = "muxtrix-workspace-create-input";
+const RENAME_INPUT_ID: &str = "muxtrix-rename-input";
+const WORKTREE_INPUT_ID: &str = "muxtrix-worktree-input";
+const NO_REPO_GROUP: &str = "No Repo";
+/// Worktrees live under a hidden app folder rather than littering the
+/// visible home directory. The dot hides it on Linux/WSL; native Windows
+/// additionally gets the Hidden attribute set at creation.
+const WORKTREE_HOME_FOLDER: &str = ".muxtrix/worktrees";
+
+#[derive(Debug, Clone, Copy)]
+struct DesignTokens {
+    app: Color,
+    rail: Color,
+    panel: Color,
+    panel_raised: Color,
+    /// Floating surfaces — menus, palette, dialogs, tooltips — sit above the
+    /// terminal, so this is the lightest step of the dark ramp.
+    overlay: Color,
+    line: Color,
+    line_strong: Color,
+    /// Backdrop dim behind modal dialogs; the only translucent surface
+    /// token, appearance-aware where the old literal was not.
+    scrim: Color,
+    text: Color,
+    muted: Color,
+    faint: Color,
+    accent: Color,
+    success: Color,
+    warning: Color,
+    danger: Color,
+}
+
+impl DesignTokens {
+    fn for_appearance(appearance: Appearance) -> Self {
+        match appearance {
+            Appearance::Light => Self {
+                app: Color::from_rgb8(241, 243, 246),
+                rail: Color::from_rgb8(249, 250, 252),
+                panel: Color::WHITE,
+                panel_raised: Color::from_rgb8(233, 236, 241),
+                overlay: Color::WHITE,
+                line: Color::from_rgb8(205, 210, 219),
+                line_strong: Color::from_rgb8(162, 170, 184),
+                scrim: Color::from_rgba8(24, 28, 38, 0.42),
+                text: Color::from_rgb8(30, 34, 42),
+                muted: Color::from_rgb8(91, 99, 113),
+                faint: Color::from_rgb8(126, 134, 148),
+                accent: Color::from_rgb8(27, 111, 214),
+                success: Color::from_rgb8(42, 145, 78),
+                warning: Color::from_rgb8(196, 126, 0),
+                danger: Color::from_rgb8(194, 54, 59),
+            },
+            // The "Muxtrix Polished" world: chrome sits on a slate rail,
+            // terminal panes are darker cards floating on the app field, and
+            // hairlines are translucent white so they read on any surface.
+            Appearance::System | Appearance::Dark => Self {
+                app: Color::from_rgb8(11, 14, 20),
+                rail: Color::from_rgb8(18, 22, 31),
+                panel: Color::from_rgb8(12, 15, 21),
+                panel_raised: Color::from_rgb8(20, 26, 38),
+                overlay: Color::from_rgb8(27, 32, 41),
+                line: Color::from_rgba8(255, 255, 255, 0.06),
+                line_strong: Color::from_rgba8(255, 255, 255, 0.12),
+                scrim: Color::from_rgba8(4, 5, 10, 0.72),
+                text: Color::from_rgb8(232, 236, 244),
+                muted: Color::from_rgb8(152, 161, 184),
+                faint: Color::from_rgb8(132, 142, 164),
+                accent: Color::from_rgb8(92, 157, 255),
+                success: Color::from_rgb8(85, 199, 126),
+                warning: Color::from_rgb8(242, 177, 78),
+                danger: Color::from_rgb8(240, 122, 110),
+            },
+        }
+    }
+}
+
+impl Muxtrix {
+    fn boot() -> (Self, Task<Message>) {
+        let mut app = Self::new();
+        let discovery = app.refresh_integrations();
+        let github_auth = perform_blocking(github::auth_status, |result| {
+            Message::GitHubAuthChecked(result.unwrap_or(github::AuthStatus::Unavailable {
+                reason: "GitHub authentication could not be checked.".into(),
+            }))
+        });
+        (app, Task::batch([discovery, github_auth]))
+    }
+
+    fn prepare_session_host(&mut self, pane_id: PaneId) -> Task<Message> {
+        if let Some(runtime) = self.terminals.get_mut(&pane_id) {
+            runtime.launch_state = TerminalLaunchState::PreparingHost;
+            runtime.preview =
+                "Preparing terminal host…\n\nThe workspace remains usable while this runs.".into();
+        }
+        if session_host().is_some() || local_pty_allowed() {
+            if let Err(error) = self.launch_terminal_for_pane(pane_id) {
+                self.mark_terminal_launch_failed(pane_id, error);
+            }
+            return Task::none();
+        }
+        perform_blocking(
+            move || {
+                let host = start_session_host().ok_or_else(|| {
+                    "The terminal host did not become ready. Check WSL or the selected shell, then retry."
+                        .to_owned()
+                })?;
+                let own = host.id;
+                if let Ok(mut active) = SESSION_HOST.lock() {
+                    *active = Some(host);
+                }
+                Ok(muxtrix_sessions::resumable_sessions(Some(own)))
+            },
+            move |result| {
+                Message::SessionHostInitialized(pane_id, result.and_then(std::convert::identity))
+            },
+        )
+    }
+
+    fn launch_terminal_for_pane(&mut self, pane_id: PaneId) -> Result<(), String> {
+        let (profile_id, surface_directory) = self
+            .session
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.pane(pane_id))
+            .and_then(|pane| pane.active_surface())
+            .and_then(|surface| match &surface.kind {
+                muxtrix_domain::SurfaceKind::Terminal(terminal) => {
+                    Some((terminal.profile_id, terminal.working_directory.clone()))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| format!("pane {pane_id:?} has no terminal profile"))?;
+        let mut profile = self
+            .session
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+            .ok_or_else(|| "terminal launch profile is missing".to_owned())?;
+        if let Some(directory) = surface_directory {
+            profile.working_directory = Some(directory);
+        }
+        let fallback_title = self.terminals.get(&pane_id).map_or_else(
+            || "terminal".to_owned(),
+            |runtime| runtime.fallback_title.clone(),
+        );
+        self.request_terminal_launch(profile, pane_id, fallback_title)
+    }
+
+    fn request_terminal_launch(
+        &mut self,
+        profile: LaunchProfile,
+        pane_id: PaneId,
+        fallback_title: String,
+    ) -> Result<(), String> {
+        self.request_terminal_launch_with_policy(
+            profile,
+            pane_id,
+            fallback_title,
+            CreationDirectoryPolicy::Exact,
+        )
+    }
+
+    fn request_regular_terminal_launch(
+        &mut self,
+        profile: LaunchProfile,
+        pane_id: PaneId,
+        fallback_title: String,
+    ) -> Result<(), String> {
+        self.request_terminal_launch_with_policy(
+            profile,
+            pane_id,
+            fallback_title,
+            CreationDirectoryPolicy::Regular,
+        )
+    }
+
+    fn request_terminal_launch_with_policy(
+        &mut self,
+        profile: LaunchProfile,
+        pane_id: PaneId,
+        fallback_title: String,
+        directory_policy: CreationDirectoryPolicy,
+    ) -> Result<(), String> {
+        self.next_terminal_launch_attempt = self.next_terminal_launch_attempt.wrapping_add(1);
+        let attempt_id = self.next_terminal_launch_attempt;
+        let viewport = self
+            .terminals
+            .get(&pane_id)
+            .and_then(|runtime| runtime.viewport);
+        let previous_session = self
+            .terminals
+            .get_mut(&pane_id)
+            .and_then(|runtime| runtime.session.take());
+        let target_size = viewport.map_or_else(initial_pty_size, |viewport| {
+            pty_size_for_pane(viewport, &self.settings)
+        });
+        self.terminals.insert(
+            pane_id,
+            TerminalRuntime::starting(&fallback_title, attempt_id, viewport),
+        );
+        let request = TerminalLaunchRequest {
+            profile,
+            directory_policy,
+            wsl_distribution: self.settings.wsl_distribution.clone(),
+            pane_id,
+            theme: self.settings.terminal_theme.preset().terminal_theme(),
+            notifier: Arc::clone(&self.event_notifier),
+            control_endpoint: self.control_endpoint.clone(),
+            target_size,
+            cell_width_px: self.settings.terminal_cell_width().round() as u32,
+            cell_height_px: self.settings.terminal_cell_height().round() as u32,
+            previous_session,
+        };
+        if !self.launch_in_background {
+            let result = self.terminal_launcher.launch(request);
+            self.finish_terminal_launch(TerminalLaunchCompletion {
+                pane_id,
+                attempt_id,
+                result,
+            });
+            return self
+                .terminals
+                .get(&pane_id)
+                .and_then(|runtime| match &runtime.launch_state {
+                    TerminalLaunchState::Failed(error) => Some(Err(error.clone())),
+                    _ => None,
+                })
+                .unwrap_or(Ok(()));
+        }
+
+        let launcher = Arc::clone(&self.terminal_launcher);
+        let completions = Arc::clone(&self.terminal_launch_completions);
+        let notifier = Arc::clone(&self.event_notifier);
+        if let Err(error) = std::thread::Builder::new()
+            .name(format!("muxtrix-terminal-launch-{attempt_id}"))
+            .spawn(move || {
+                let result = launcher.launch(request);
+                if let Ok(mut queue) = completions.lock() {
+                    queue.push_back(TerminalLaunchCompletion {
+                        pane_id,
+                        attempt_id,
+                        result,
+                    });
+                }
+                notifier();
+            })
+        {
+            let error = format!("Could not start terminal launch worker: {error}");
+            self.mark_terminal_launch_failed(pane_id, error.clone());
+            return Err(error);
+        }
+        self.status = "Starting terminal in the background…".into();
+        Ok(())
+    }
+
+    fn drain_terminal_launches(&mut self) {
+        let completions: Vec<_> = self
+            .terminal_launch_completions
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default();
+        for completion in completions {
+            self.finish_terminal_launch(completion);
+        }
+    }
+
+    fn finish_terminal_launch(&mut self, completion: TerminalLaunchCompletion) {
+        let current = self
+            .terminals
+            .get(&completion.pane_id)
+            .is_some_and(|runtime| {
+                matches!(
+                    runtime.launch_state,
+                    TerminalLaunchState::Starting { attempt_id }
+                        if attempt_id == completion.attempt_id
+                )
+            });
+        if !current {
+            if let Ok(launched) = completion.result {
+                if self.terminals.contains_key(&completion.pane_id) {
+                    // A newer attempt for this same pane is in flight, and it
+                    // shares the pane's identity with the daemon: killing this
+                    // session would kill the pane that replaced it.
+                    dispose_live_session(launched.session);
+                } else {
+                    // The pane was closed while its launch was still running,
+                    // so the close never had a session to end. Nothing will
+                    // attach to this one again.
+                    terminate_live_session(launched.session, completion.pane_id);
+                }
+            }
+            return;
+        }
+        let restart_queued = self.queued_terminal_restarts.remove(&completion.pane_id);
+        match completion.result {
+            Ok(launched) => {
+                let working_directory = launched.working_directory.clone();
+                let pending_viewport = self
+                    .terminals
+                    .get(&completion.pane_id)
+                    .and_then(|runtime| runtime.viewport);
+                if let Some(runtime) = self.terminals.get_mut(&completion.pane_id) {
+                    runtime.session = Some(launched.session);
+                    runtime.snapshot = Some(launched.snapshot);
+                    runtime.snapshot_revision = runtime.snapshot_revision.wrapping_add(1);
+                    runtime.size = launched.size;
+                    runtime.launch_state = TerminalLaunchState::Running;
+                    runtime.preview = "Starting terminal…".into();
+                }
+                // A queued restart already wrote the directory it was chosen
+                // for onto the surface, and that is where the replacement
+                // this hand-off is about to start must land. Recording where
+                // the launch that is being replaced ended up would send it
+                // back to the directory the user just left.
+                if !restart_queued
+                    && let Some(pane) = self
+                        .session
+                        .workspaces
+                        .iter_mut()
+                        .find_map(|workspace| workspace.pane_mut(completion.pane_id))
+                    && let Some(surface) = pane
+                        .surfaces
+                        .iter_mut()
+                        .find(|surface| surface.id == pane.active_surface_id)
+                    && let muxtrix_domain::SurfaceKind::Terminal(terminal) = &mut surface.kind
+                {
+                    terminal.working_directory = working_directory;
+                }
+                // Input typed after a restart was queued belongs to the
+                // replacement, not the briefly completed original launch.
+                if !restart_queued
+                    && let Some(inputs) = self.pending_terminal_input.remove(&completion.pane_id)
+                {
+                    for input in inputs {
+                        let _ = self.send_terminal_input_to(completion.pane_id, input);
+                    }
+                }
+                self.status = "Live terminal — GPU compositor: Iced/wgpu".into();
+                // A pane measured while its launch was still in flight had no
+                // session to resize, and the launch just restored the size it
+                // was requested with. Replay the pane's own viewport so the
+                // PTY matches what the pane draws; the sensor only reports
+                // size *changes*, so nothing else would correct it until the
+                // pane happens to be resized by hand.
+                if let Some(viewport) = pending_viewport
+                    && let Err(error) = self.resize_terminal(completion.pane_id, viewport)
+                {
+                    self.status = format!("Terminal resize failed: {error}");
+                }
+            }
+            Err(error) => self.mark_terminal_launch_failed(completion.pane_id, error),
+        }
+        if restart_queued {
+            self.status = "Restarting terminal after its current launch finished…".into();
+            if let Err(error) = self.launch_terminal_for_pane(completion.pane_id) {
+                self.mark_terminal_launch_failed(completion.pane_id, error);
+            }
+        }
+    }
+
+    fn mark_terminal_launch_failed(&mut self, pane_id: PaneId, error: String) {
+        if let Some(runtime) = self.terminals.get_mut(&pane_id) {
+            runtime.preview = format!(
+                "Terminal unavailable\n\n{error}\n\nRetry, change the terminal backend in Settings, or close this pane."
+            );
+            runtime.launch_state = TerminalLaunchState::Failed(error.clone());
+            runtime.session = None;
+        }
+        self.status = format!("Terminal unavailable: {error}");
+    }
+
+    fn new() -> Self {
+        let (mut settings, mut settings_warning) = AppSettings::load();
+        let installed_fonts = InstalledFontCatalog::discover();
+        // Cell width must come from the measured face before any pane is sized.
+        installed_fonts.install_metrics();
+        let available_ui_fonts = installed_fonts.ui_fonts();
+        if !available_ui_fonts.contains(&settings.ui_font) {
+            let unavailable = format!(
+                "{} is not installed; interface font reset to System sans serif",
+                settings.ui_font
+            );
+            settings.ui_font = UiFont::SystemSans;
+            settings_warning = Some(settings_warning.map_or(unavailable.clone(), |warning| {
+                format!("{warning}; {unavailable}")
+            }));
+        }
+        let mut available_ui_font_weights = installed_fonts.ui_weights(&settings.ui_font);
+        if available_ui_font_weights.is_empty() {
+            available_ui_font_weights.push(FontWeight::Normal);
+        }
+        if !available_ui_font_weights.contains(&settings.ui_font_weight) {
+            let replacement = available_ui_font_weights[0];
+            let unavailable = format!(
+                "{} is not installed for {}; interface font weight reset to {}",
+                settings.ui_font_weight, settings.ui_font, replacement
+            );
+            settings.ui_font_weight = replacement;
+            settings_warning = Some(settings_warning.map_or(unavailable.clone(), |warning| {
+                format!("{warning}; {unavailable}")
+            }));
+        }
+        let available_terminal_fonts = installed_fonts.terminal_fonts();
+        if !available_terminal_fonts.contains(&settings.terminal_font) {
+            let unavailable = format!(
+                "{} is not installed; terminal font reset to System monospace",
+                settings.terminal_font
+            );
+            settings.terminal_font = TerminalFont::SystemMonospace;
+            settings_warning = Some(settings_warning.map_or(unavailable.clone(), |warning| {
+                format!("{warning}; {unavailable}")
+            }));
+        }
+        let mut available_terminal_font_weights =
+            installed_fonts.terminal_weights(&settings.terminal_font);
+        if available_terminal_font_weights.is_empty() {
+            available_terminal_font_weights.push(FontWeight::Normal);
+        }
+        if !available_terminal_font_weights.contains(&settings.terminal_font_weight) {
+            let replacement = available_terminal_font_weights[0];
+            let unavailable = format!(
+                "{} is not installed for {}; terminal font weight reset to {}",
+                settings.terminal_font_weight, settings.terminal_font, replacement
+            );
+            settings.terminal_font_weight = replacement;
+            settings_warning = Some(settings_warning.map_or(unavailable.clone(), |warning| {
+                format!("{warning}; {unavailable}")
+            }));
+        }
+        let profile = default_profile(&settings);
+        let surface = terminal_surface(profile.id, "shell 1");
+        let workspace = Workspace::new("muxtrix", surface);
+        let workspace_name_draft = workspace.name.clone();
+        let initial_pane_id = workspace
+            .active_tab()
+            .expect("new workspace should contain its default tab")
+            .focused_pane_id;
+        let (event_sender, event_receiver) = async_channel::bounded(1);
+        let event_notifier: EventNotifier = Arc::new(move || {
+            let _ = event_sender.try_send(());
+        });
+        let (control, control_status) = start_control_server(Arc::clone(&event_notifier));
+        let control_endpoint = control
+            .as_ref()
+            .map(|server| server.endpoint_environment_value().to_owned());
+        let launch_in_background = !cfg!(test);
+        let no_terminal = NO_TERMINAL_STARTUP.load(Ordering::Relaxed);
+        let (runtime, terminal_status) = if launch_in_background {
+            let runtime = if no_terminal {
+                TerminalRuntime::suppressed("shell 1")
+            } else {
+                TerminalRuntime::preparing_host("shell 1")
+            };
+            let status = if no_terminal {
+                "Opened without starting a terminal".into()
+            } else {
+                "Preparing terminal host…".into()
+            };
+            (runtime, status)
+        } else {
+            TerminalRuntime::launch(
+                &profile,
+                initial_pane_id,
+                "shell 1",
+                settings.terminal_theme.preset().terminal_theme(),
+                Arc::clone(&event_notifier),
+                control_endpoint.as_deref(),
+            )
+        };
+        let mut global_alerts = Vec::new();
+        if let Some(body) = settings_warning.as_ref() {
+            global_alerts.push(GlobalAlert {
+                title: "Settings need review".into(),
+                body: body.clone(),
+            });
+        }
+        if let Some(body) = control_status.as_ref() {
+            global_alerts.push(GlobalAlert {
+                title: "Local control unavailable".into(),
+                body: body.clone(),
+            });
+        }
+        #[cfg(feature = "e2e")]
+        let e2e = e2e::Scenario::from_environment(initial_pane_id);
+        let mut available_wsl_distributions = vec![WslDistributionChoice::default_distribution()];
+        if !settings.wsl_distribution.trim().is_empty()
+            && !available_wsl_distributions
+                .iter()
+                .any(|choice| choice.0.as_deref() == Some(settings.wsl_distribution.trim()))
+        {
+            available_wsl_distributions.push(WslDistributionChoice(Some(
+                settings.wsl_distribution.trim().to_owned(),
+            )));
+        }
+
+        Self {
+            session: SessionState::new(workspace, vec![profile]),
+            terminals: BTreeMap::from([(initial_pane_id, runtime)]),
+            status: settings_warning
+                .or(control_status)
+                .unwrap_or(terminal_status),
+            cursor_phase_visible: true,
+            active_view: ActiveView::Workspace,
+            settings_page: SettingsPage::Preferences,
+            palette: CommandPalette::default(),
+            settings_draft: settings.clone(),
+            settings,
+            installed_fonts,
+            available_terminal_fonts,
+            available_terminal_font_weights,
+            available_ui_fonts,
+            available_ui_font_weights,
+            available_wsl_distributions,
+            workspace_name_draft,
+            rename_prompt: None,
+            rename_draft: String::new(),
+            worktree_prompt: None,
+            worktree_name_draft: String::new(),
+            worktree_manager: None,
+            worktree_manager_generation: 0,
+            session_picker: None,
+            last_layout_hash: 0,
+            toast: None,
+            prefix_armed: false,
+            rail_nav: None,
+            workspace_create_visible: false,
+            close_workspace_prompt: None,
+            tab_drag: None,
+            notifications: Vec::new(),
+            global_alerts,
+            github_auth: github::AuthStatus::Checking,
+            github_auth_busy: false,
+            github_panel: None,
+            sidebar_collapsed: false,
+            maximized_pane: None,
+            pane_menu: None,
+            window_id: None,
+            window_size: Size::new(1_280.0, 800.0),
+            cursor_position: Point::ORIGIN,
+            keyboard_modifiers: Modifiers::empty(),
+            split_sizes: BTreeMap::new(),
+            split_drag: None,
+            pane_layouts: BTreeMap::new(),
+            base_pane_layouts: BTreeMap::new(),
+            pane_resize_history: BTreeMap::new(),
+            hovered_terminal: None,
+            terminal_pointer_positions: BTreeMap::new(),
+            terminal_scrollbar_positions: BTreeMap::new(),
+            terminal_scroll_drag: None,
+            terminal_selection_drag: None,
+            terminal_command_buffers: BTreeMap::new(),
+            event_notifier,
+            event_receiver,
+            terminal_launcher: Arc::new(SystemTerminalLauncher::default()),
+            terminal_launch_completions: Arc::new(Mutex::new(VecDeque::new())),
+            next_terminal_launch_attempt: 0,
+            launch_in_background,
+            startup_terminal_pending: (launch_in_background && !no_terminal)
+                .then_some(initial_pane_id),
+            queued_terminal_restarts: BTreeSet::new(),
+            pending_terminal_input: BTreeMap::new(),
+            control,
+            control_endpoint,
+            agent_statuses: BTreeMap::new(),
+            agent_running_frame_revisions: BTreeMap::new(),
+            detected_agents: BTreeMap::new(),
+            agents_view_panes: BTreeSet::new(),
+            agents_roster: None,
+            agents_roster_pending: false,
+            agents_roster_error: None,
+            agents_roster_checked: None,
+            pane_repositories: BTreeMap::new(),
+            pending_repository_directories: BTreeMap::new(),
+            hook_statuses: Vec::new(),
+            integration_generation: 0,
+            integration_refreshing: false,
+            #[cfg(feature = "e2e")]
+            e2e,
+        }
+    }
+
+    fn title(&self) -> String {
+        self.active_workspace().map_or_else(
+            |_| "Muxtrix".into(),
+            |workspace| {
+                workspace.active_tab().map_or_else(
+                    || format!("{} — Muxtrix", workspace.name),
+                    |tab| {
+                        format!(
+                            "{} — {} — Muxtrix",
+                            self.pane_title(workspace, tab.focused_pane_id),
+                            tab.name
+                        )
+                    },
+                )
+            },
+        )
+    }
+
+    fn theme(&self) -> Theme {
+        match self.settings.appearance {
+            Appearance::Light => Theme::Light,
+            Appearance::System | Appearance::Dark => Theme::TokyoNight,
+        }
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let subscriptions = vec![
+            Subscription::run_with(
+                EventSubscription(self.event_receiver.clone()),
+                event_subscription,
+            ),
+            iced::time::every(std::time::Duration::from_millis(500)).map(|_| Message::BlinkCursor),
+            iced::event::listen_with(app_event),
+        ];
+        #[cfg(feature = "e2e")]
+        let subscriptions = if self.e2e.is_some() {
+            let mut with_e2e = subscriptions;
+            with_e2e.push(
+                iced::time::every(std::time::Duration::from_millis(50)).map(|_| Message::E2eTick),
+            );
+            with_e2e
+        } else {
+            subscriptions
+        };
+        Subscription::batch(subscriptions)
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        let result = match message {
+            #[cfg(test)]
+            Message::Split(axis) => self.split_terminal(axis),
+            Message::SplitFrom(pane_id, axis) => self
+                .focus_pane(pane_id)
+                .and_then(|()| self.split_terminal(axis)),
+            Message::Focus(pane_id) => {
+                self.cursor_phase_visible = true;
+                self.active_view = ActiveView::Workspace;
+                self.focus_pane(pane_id)
+            }
+            Message::FocusFleetPane(workspace_id, pane_id) => self
+                .switch_workspace(workspace_id)
+                .and_then(|()| self.focus_pane(pane_id)),
+            Message::ClosePane(pane_id) => self.close_pane(pane_id),
+            Message::RestartPane(pane_id) if session_host().is_none() && !local_pty_allowed() => {
+                return self.prepare_session_host(pane_id);
+            }
+            Message::RestartPane(pane_id) => self.restart_pane(pane_id),
+            Message::StartTerminal(pane_id) => {
+                return self.prepare_session_host(pane_id);
+            }
+            Message::CancelTerminalLaunch(pane_id) => {
+                self.queued_terminal_restarts.remove(&pane_id);
+                if let Some(runtime) = self.terminals.get_mut(&pane_id)
+                    && matches!(
+                        runtime.launch_state,
+                        TerminalLaunchState::PreparingHost | TerminalLaunchState::Starting { .. }
+                    )
+                {
+                    runtime.launch_state = TerminalLaunchState::Suppressed;
+                    runtime.preview =
+                        "Terminal launch cancelled. The workspace is still usable.".into();
+                    self.status = "Terminal launch cancelled".into();
+                }
+                return Task::none();
+            }
+            Message::SessionHostInitialized(pane_id, result) => {
+                let still_waiting = self.terminals.get(&pane_id).is_some_and(|runtime| {
+                    matches!(runtime.launch_state, TerminalLaunchState::PreparingHost)
+                });
+                if !still_waiting {
+                    return Task::none();
+                }
+                match result {
+                    Ok(candidates) if !candidates.is_empty() => {
+                        self.open_session_picker_from_records(candidates, true);
+                    }
+                    Ok(_) => {
+                        if let Err(error) = self.launch_terminal_for_pane(pane_id) {
+                            self.mark_terminal_launch_failed(pane_id, error);
+                        }
+                    }
+                    Err(error) => self.mark_terminal_launch_failed(pane_id, error),
+                }
+                return Task::none();
+            }
+            Message::PollTerminal => {
+                self.poll_terminal();
+                self.poll_control();
+                return self.refresh_background_metadata();
+            }
+            Message::AgentsRosterLoaded(result) => {
+                self.agents_roster_pending = false;
+                // A failed read keeps the last roster rather than inventing
+                // counts or blanking a row that is still showing the view. It
+                // is still recorded: with no roster to fall back on, the reason
+                // is the only thing the row can honestly report.
+                match result {
+                    Ok(roster) => {
+                        self.agents_roster = Some(roster);
+                        self.agents_roster_error = None;
+                    }
+                    Err(error) => self.agents_roster_error = Some(error),
+                }
+                return Task::none();
+            }
+            Message::PaneRepositoriesLoaded(result) => {
+                let repositories = match result {
+                    Ok(repositories) => repositories,
+                    Err(error) => {
+                        self.pending_repository_directories.clear();
+                        self.status = format!("Repository grouping unavailable: {error}");
+                        return Task::none();
+                    }
+                };
+                for (pane_id, repository) in repositories {
+                    if self.pending_repository_directories.get(&pane_id)
+                        == Some(&repository.directory)
+                    {
+                        self.pending_repository_directories.remove(&pane_id);
+                        if self.pane_working_directory(pane_id).as_ref()
+                            == Some(&repository.directory)
+                        {
+                            self.pane_repositories.insert(pane_id, repository);
+                        }
+                    }
+                }
+                return Task::none();
+            }
+            Message::BlinkCursor => {
+                self.cursor_phase_visible = !self.cursor_phase_visible;
+                // The notifier channel deliberately coalesces wakeups. A
+                // periodic drain is the safety net when a launch completion
+                // and its first resized frame arrive under one wake token.
+                self.poll_terminal();
+                self.detect_agent_processes();
+                if self
+                    .toast
+                    .as_ref()
+                    .is_some_and(|(_, shown)| shown.elapsed() >= std::time::Duration::from_secs(2))
+                {
+                    self.toast = None;
+                }
+                self.sync_session_layout();
+                return self.refresh_background_metadata();
+            }
+            Message::Keyboard(event) => {
+                return self.handle_keyboard(event);
+            }
+            Message::ResizePane(pane_id, size) => {
+                if let Err(error) = self.resize_terminal(pane_id, size) {
+                    self.status = format!("Terminal resize failed: {error}");
+                }
+                return Task::none();
+            }
+            Message::ResizeSplit(key, size) => {
+                self.split_sizes.insert(key, size);
+                return Task::none();
+            }
+            Message::BeginSplitDrag(key, axis) => {
+                if let Err(error) = self.begin_split_drag(key, axis) {
+                    self.status = error;
+                }
+                return Task::none();
+            }
+            Message::PointerMoved(position) => {
+                self.cursor_position = position;
+                if let Err(error) = self.update_split_drag(position) {
+                    self.status = error;
+                    self.split_drag = None;
+                }
+                if let Err(error) = self.update_terminal_scroll_drag(position) {
+                    self.status = error;
+                    self.terminal_scroll_drag = None;
+                }
+                return Task::none();
+            }
+            Message::EndPointerInteraction => {
+                if let Err(error) = self.finish_tab_drag() {
+                    self.status = error;
+                }
+                self.split_drag = None;
+                self.terminal_scroll_drag = None;
+                self.terminal_selection_drag = None;
+                return Task::none();
+            }
+            Message::EnterTerminal(pane_id) => {
+                self.hovered_terminal = Some(pane_id);
+                return Task::none();
+            }
+            Message::LeaveTerminal(pane_id) => {
+                if self.hovered_terminal == Some(pane_id) {
+                    self.hovered_terminal = None;
+                }
+                return Task::none();
+            }
+            Message::TerminalPointerMoved(pane_id, position) => {
+                self.terminal_pointer_positions.insert(pane_id, position);
+                if let Some(mut drag) = self
+                    .terminal_selection_drag
+                    .filter(|drag| drag.pane_id == pane_id)
+                {
+                    let cell = self.terminal_grid_cell_at(pane_id, position);
+                    let result = if drag.active {
+                        self.terminals
+                            .get_mut(&pane_id)
+                            .map(|runtime| runtime.selection_extend(cell))
+                    } else if terminal_selection_drag_started(drag.origin, position) {
+                        drag.active = true;
+                        self.terminals.get_mut(&pane_id).map(|runtime| {
+                            runtime
+                                .selection_start(drag.anchor)
+                                .and_then(|()| runtime.selection_extend(cell))
+                        })
+                    } else {
+                        None
+                    };
+                    self.terminal_selection_drag = Some(drag);
+                    if let Some(Err(error)) = result {
+                        self.status = format!("Selection failed: {error}");
+                    }
+                }
+                return Task::none();
+            }
+            Message::TerminalScrollbarMoved(pane_id, position) => {
+                self.terminal_scrollbar_positions.insert(pane_id, position);
+                return Task::none();
+            }
+            Message::BeginTerminalScroll(pane_id) => {
+                if let Err(error) = self.begin_terminal_scroll(pane_id) {
+                    self.status = error;
+                } else {
+                    #[cfg(feature = "e2e")]
+                    if let Some(scenario) = &mut self.e2e {
+                        scenario.observe_terminal_scrollbar();
+                    }
+                }
+                return Task::none();
+            }
+            Message::BeginTerminalSelection(pane_id) => {
+                if terminal_link_modifiers(self.keyboard_modifiers)
+                    && let Some(link) = self.hovered_terminal_link(pane_id)
+                {
+                    let uri = link.uri;
+                    let target = uri.clone();
+                    return Task::perform(
+                        async move { open_web_url(&target).map_err(|error| error.to_string()) },
+                        move |result| Message::TerminalLinkOpened(uri.clone(), result),
+                    );
+                }
+                let position = self
+                    .terminal_pointer_positions
+                    .get(&pane_id)
+                    .copied()
+                    .unwrap_or(Point::ORIGIN);
+                let cell = self.terminal_grid_cell_at(pane_id, position);
+                if let Some(runtime) = self.terminals.get_mut(&pane_id)
+                    && let Err(error) = runtime.selection_clear()
+                {
+                    self.status = format!("Selection failed: {error}");
+                }
+                self.terminal_selection_drag = Some(TerminalSelectionDrag {
+                    pane_id,
+                    origin: position,
+                    anchor: cell,
+                    active: false,
+                });
+                let _ = self.focus_pane(pane_id);
+                return Task::none();
+            }
+            Message::EndTerminalSelection(pane_id) => {
+                if self
+                    .terminal_selection_drag
+                    .is_some_and(|drag| drag.pane_id == pane_id)
+                {
+                    self.terminal_selection_drag = None;
+                }
+                return Task::none();
+            }
+            Message::OpenPaneContextMenu(pane_id) => {
+                let _ = self.focus_pane(pane_id);
+                self.pane_menu = Some(pane_id);
+                return Task::none();
+            }
+            Message::CopyTerminalSelection(pane_id) => {
+                self.pane_menu = None;
+                let Some(text) = self.selected_terminal_text(pane_id) else {
+                    return Task::none();
+                };
+                return iced::clipboard::write(text);
+            }
+            Message::PastePane(pane_id) => {
+                self.pane_menu = None;
+                let _ = self.focus_pane(pane_id);
+                return iced::clipboard::read()
+                    .map(move |contents| Message::ClipboardPasted(pane_id, contents));
+            }
+            Message::ClipboardPasted(pane_id, contents) => {
+                if let Some(text) = contents.filter(|text| !text.is_empty()) {
+                    self.cursor_phase_visible = true;
+                    if let Err(error) = self.paste_into_pane(pane_id, &text) {
+                        self.status = format!("Paste failed: {error}");
+                    }
+                }
+                return Task::none();
+            }
+            Message::TerminalLinkOpened(uri, result) => {
+                self.status = match result {
+                    Ok(()) => format!("Opened {uri}"),
+                    Err(error) => format!("Could not open {uri}: {error}"),
+                };
+                return Task::none();
+            }
+            Message::ScrollTerminal(pane_id, delta) => {
+                match self.scroll_terminal(pane_id, delta) {
+                    Ok(()) =>
+                    {
+                        #[cfg(feature = "e2e")]
+                        if let Some(scenario) = &mut self.e2e {
+                            scenario.observe_terminal_scroll();
+                        }
+                    }
+                    Err(error) => self.status = format!("Terminal scroll failed: {error}"),
+                }
+                return Task::none();
+            }
+            Message::ScrollHoveredTerminal(delta) => {
+                let Some(pane_id) = self.hovered_terminal else {
+                    return Task::none();
+                };
+                let result = self.scroll_terminal(pane_id, delta);
+                match result {
+                    Ok(()) =>
+                    {
+                        #[cfg(feature = "e2e")]
+                        if let Some(scenario) = &mut self.e2e {
+                            scenario.observe_terminal_scroll();
+                        }
+                    }
+                    Err(error) => self.status = format!("Terminal scroll failed: {error}"),
+                }
+                return Task::none();
+            }
+            Message::WindowOpened(window_id, size) => {
+                self.window_id = Some(window_id);
+                self.window_size = size;
+                let resize = self.window_resize_increment_task();
+                let terminal = self
+                    .startup_terminal_pending
+                    .take()
+                    .map_or_else(Task::none, |pane_id| self.prepare_session_host(pane_id));
+                return Task::batch([resize, terminal]);
+            }
+            Message::WindowResized(size) => {
+                self.window_size = size;
+                return Task::none();
+            }
+            Message::CloseCommandPalette => {
+                self.close_command_palette();
+                return Task::none();
+            }
+            Message::ToggleCommandPalette => return self.toggle_command_palette(),
+            Message::CommandQueryChanged(query) => {
+                self.palette.query = query;
+                let commands = commands::filtered(&self.palette.query);
+                let enabled: Vec<_> = commands
+                    .iter()
+                    .map(|command| self.command_enabled(command.action))
+                    .collect();
+                self.palette.selected = first_enabled_palette_command(&enabled);
+                return Task::none();
+            }
+            Message::CommandSelected(index) => {
+                let commands = commands::filtered(&self.palette.query);
+                if let Some(command) = commands
+                    .get(index)
+                    .filter(|command| self.command_enabled(command.action))
+                {
+                    return self.run_command(command.action);
+                }
+                return Task::none();
+            }
+            Message::RunCommand(action) => return self.run_command(action),
+            Message::NewWorkspace => return self.open_workspace_create(),
+            Message::CreateWorkspace => self.create_workspace(),
+            Message::CancelWorkspaceCreate => {
+                self.workspace_create_visible = false;
+                return Task::none();
+            }
+            Message::SwitchWorkspace(workspace_id) => self.switch_workspace(workspace_id),
+            Message::WorkspaceNameChanged(name) => {
+                self.workspace_name_draft = name;
+                return Task::none();
+            }
+            Message::RenameDraftChanged(name) => {
+                self.rename_draft = name;
+                return Task::none();
+            }
+            Message::ConfirmRename => {
+                let result = self.apply_rename();
+                if result.is_ok() {
+                    self.rename_prompt = None;
+                }
+                result
+            }
+            Message::CancelRename => {
+                self.rename_prompt = None;
+                return Task::none();
+            }
+            Message::WorktreeNameChanged(name) => {
+                self.worktree_name_draft = name;
+                return Task::none();
+            }
+            Message::ConfirmWorktree => return self.confirm_worktree(),
+            Message::CancelWorktree => {
+                self.worktree_prompt = None;
+                return Task::none();
+            }
+            Message::WorktreeCreated(target, result) => {
+                match result.and_then(|path| {
+                    self.open_created_worktree(target, path.clone())
+                        .map(|()| path)
+                }) {
+                    Ok(path) => {
+                        self.worktree_prompt = None;
+                        self.status = match target {
+                            WorktreePromptTarget::Open(commands::WorktreeKind::Pane(_)) => {
+                                format!("Opened worktree {} in a new pane", path.display())
+                            }
+                            WorktreePromptTarget::Open(commands::WorktreeKind::Tab) => {
+                                format!("Opened worktree {} in a new tab", path.display())
+                            }
+                            WorktreePromptTarget::RestartPane(_) => {
+                                format!("Restarted pane in new worktree {}", path.display())
+                            }
+                        };
+                    }
+                    Err(error) => {
+                        // The dialog stays open with the failure inline, so
+                        // the user can fix the name and retry.
+                        if let Some(prompt) = self.worktree_prompt.as_mut() {
+                            prompt.busy = false;
+                            prompt.error = Some(error);
+                        }
+                    }
+                }
+                return Task::none();
+            }
+            Message::NewTab => self.new_tab(),
+            Message::CloseTab(workspace_id, tab_id) => self.close_tab(workspace_id, tab_id),
+            Message::ConfirmCloseWorkspace(workspace_id) => {
+                self.close_workspace_prompt = None;
+                self.close_workspace_by_id(workspace_id)
+            }
+            Message::CloseSessionPicker => {
+                let startup = self
+                    .session_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.startup);
+                self.session_picker = None;
+                let pane_id = self
+                    .active_workspace()
+                    .ok()
+                    .and_then(|workspace| workspace.active_tab())
+                    .map(|tab| tab.focused_pane_id);
+                if startup
+                    && let Some(pane_id) = pane_id
+                    && let Err(error) = self.launch_terminal_for_pane(pane_id)
+                {
+                    self.mark_terminal_launch_failed(pane_id, error);
+                }
+                return Task::none();
+            }
+            Message::SessionPickerResume(index) => {
+                self.resume_session(index);
+                return Task::none();
+            }
+            Message::SessionPickerKill(index) => {
+                self.kill_picked_session(index);
+                return Task::none();
+            }
+            Message::SessionPickerKillAll => {
+                let count = self
+                    .session_picker
+                    .as_ref()
+                    .map_or(0, |picker| picker.entries.len());
+                for index in (0..count).rev() {
+                    self.kill_picked_session(index);
+                }
+                return Task::none();
+            }
+            Message::CloseWorktreeManager => {
+                self.worktree_manager = None;
+                if self.active_view == ActiveView::Settings
+                    && self.settings_page == SettingsPage::Worktrees
+                {
+                    self.active_view = ActiveView::Workspace;
+                }
+                return Task::none();
+            }
+            Message::WorktreeManagerLoaded(generation, result) => {
+                let current = self
+                    .worktree_manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.generation == generation);
+                if !current {
+                    return Task::none();
+                }
+                match result {
+                    Ok(mut discovery) => {
+                        for entry in &mut discovery.entries {
+                            entry.used_by = self.pane_using_directory(&entry.path);
+                        }
+                        if let Some(manager) = self.worktree_manager.as_mut() {
+                            manager.loading = false;
+                            manager.repo_root = discovery.repo_root;
+                            manager.failure = discovery.failure;
+                            manager.entries = discovery.entries;
+                            manager.selected = 0;
+                            manager.error = None;
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(manager) = self.worktree_manager.as_mut() {
+                            manager.loading = false;
+                            manager.failure = None;
+                            manager.entries.clear();
+                            manager.error = Some(format!(
+                                "Could not load worktrees. Check that Git is available, then try again. {error}"
+                            ));
+                        }
+                    }
+                }
+                return Task::none();
+            }
+            Message::RefreshWorktreeManager => {
+                let Some(pane_id) = self
+                    .active_workspace()
+                    .ok()
+                    .and_then(Workspace::active_tab)
+                    .map(|tab| tab.focused_pane_id)
+                else {
+                    return Task::none();
+                };
+                return self.open_worktree_list(WorktreeManagerMode::Manage, pane_id);
+            }
+            Message::WorktreeManagerDelete(index) => return self.delete_worktree_entry(index),
+            Message::WorktreeManagerDeleteUnused => return self.delete_unused_worktrees(),
+            Message::OpenPaneWorktreePrompt(pane_id) => {
+                return self.open_worktree_prompt(WorktreePromptTarget::RestartPane(pane_id));
+            }
+            Message::WorktreeManagerRestart(index) => {
+                if let Some(manager) = self.worktree_manager.as_mut()
+                    && matches!(manager.mode, WorktreeManagerMode::RestartPane(_))
+                    && index < manager.entries.len()
+                {
+                    manager.restart_target = Some(index);
+                    manager.error = None;
+                }
+                return Task::none();
+            }
+            Message::ConfirmWorktreeManagerRestart => {
+                self.confirm_worktree_restart();
+                return Task::none();
+            }
+            Message::CancelWorktreeManagerRestart => {
+                if let Some(manager) = self.worktree_manager.as_mut() {
+                    manager.restart_target = None;
+                }
+                return Task::none();
+            }
+            Message::WorktreeManagerDeleted(removed, result) => {
+                if let Some(manager) = self.worktree_manager.as_mut() {
+                    manager.busy = false;
+                    manager
+                        .entries
+                        .retain(|entry| !removed.contains(&entry.path));
+                    if manager.selected >= manager.entries.len() {
+                        manager.selected = manager.entries.len().saturating_sub(1);
+                    }
+                    manager.error = result.err();
+                    if !removed.is_empty() {
+                        self.status = if removed.len() == 1 {
+                            format!("Removed worktree {}", worktree_display_name(&removed[0]))
+                        } else {
+                            format!("Removed {} worktrees", removed.len())
+                        };
+                    }
+                }
+                return Task::none();
+            }
+            Message::CancelCloseWorkspace => {
+                self.close_workspace_prompt = None;
+                return Task::none();
+            }
+            Message::BeginTabDrag(workspace_id, tab_id, index) => {
+                let _ = self.switch_workspace(workspace_id);
+                let _ = self.switch_tab(tab_id);
+                self.tab_drag = Some(TabDrag {
+                    tab_id,
+                    target_workspace_id: workspace_id,
+                    target_index: index,
+                });
+                return Task::none();
+            }
+            Message::TabDragOver(workspace_id, index) => {
+                if let Some(drag) = &mut self.tab_drag {
+                    drag.target_workspace_id = workspace_id;
+                    drag.target_index = index;
+                }
+                return Task::none();
+            }
+            Message::OpenSettings => {
+                self.open_settings();
+                return Task::none();
+            }
+            Message::GitHubStatusPressed => {
+                return match self.github_auth {
+                    github::AuthStatus::Authenticated { .. } => self.open_github_panel(),
+                    github::AuthStatus::Checking => Task::none(),
+                    github::AuthStatus::NeedsAuthentication
+                    | github::AuthStatus::Unavailable { .. } => self.begin_github_auth(),
+                };
+            }
+            Message::BeginGitHubAuth => return self.begin_github_auth(),
+            Message::GitHubAuthChecked(status) => {
+                self.github_auth = status;
+                return Task::none();
+            }
+            Message::GitHubAuthFinished(result) => {
+                self.github_auth_busy = false;
+                match result {
+                    Ok(status) => {
+                        self.github_auth = status;
+                        self.status = "Connected to GitHub".into();
+                        if self.github_panel.is_some() {
+                            return self.refresh_github_panel();
+                        }
+                    }
+                    Err(error) => {
+                        self.github_auth = github::AuthStatus::NeedsAuthentication;
+                        if let Some(panel) = self.github_panel.as_mut() {
+                            panel.error = Some(error.clone());
+                        }
+                        self.status = error;
+                    }
+                }
+                return Task::none();
+            }
+            Message::CloseGitHubPanel => {
+                self.github_panel = None;
+                return Task::none();
+            }
+            Message::RefreshGitHubPanel => return self.refresh_github_panel(),
+            Message::GitHubPanelLoaded(root, result) => {
+                let Some(panel) = self
+                    .github_panel
+                    .as_mut()
+                    .filter(|panel| panel.repository.root == root)
+                else {
+                    return Task::none();
+                };
+                panel.loading = false;
+                match *result {
+                    Ok(data) => {
+                        panel.data = Some(data);
+                        panel.error = None;
+                        panel.file_scroll_offset = 0.0;
+                    }
+                    Err(error) => panel.error = Some(error),
+                }
+                return Task::none();
+            }
+            Message::GitHubFileScrolled(offset) => {
+                if let Some(panel) = self.github_panel.as_mut() {
+                    panel.file_scroll_offset = offset.max(0.0);
+                }
+                return Task::none();
+            }
+            Message::OpenGitHubPullRequest(url) => {
+                let target = url.clone();
+                return Task::perform(
+                    async move { open_web_url(&target).map_err(|error| error.to_string()) },
+                    move |result| Message::TerminalLinkOpened(url.clone(), result),
+                );
+            }
+            Message::RequestGitHubMerge => {
+                if let Some(panel) = self.github_panel.as_mut() {
+                    panel.merge_confirmation = true;
+                }
+                return Task::none();
+            }
+            Message::CancelGitHubMerge => {
+                if let Some(panel) = self.github_panel.as_mut() {
+                    panel.merge_confirmation = false;
+                }
+                return Task::none();
+            }
+            Message::ConfirmGitHubMerge => return self.confirm_github_merge(),
+            Message::GitHubMergeFinished(root, result) => {
+                let Some(panel) = self
+                    .github_panel
+                    .as_mut()
+                    .filter(|panel| panel.repository.root == root)
+                else {
+                    return Task::none();
+                };
+                panel.merging = false;
+                panel.merge_confirmation = false;
+                match result {
+                    Ok(status) => {
+                        self.status = status;
+                        return self.refresh_github_panel();
+                    }
+                    Err(error) => {
+                        panel.error = Some(error.clone());
+                        self.status = error;
+                    }
+                }
+                return Task::none();
+            }
+            Message::OpenSettingsPage(SettingsPage::Preferences) => {
+                self.settings_page = SettingsPage::Preferences;
+                return Task::none();
+            }
+            Message::OpenSettingsPage(SettingsPage::Worktrees) => {
+                self.settings_page = SettingsPage::Worktrees;
+                let Some(pane_id) = self
+                    .active_workspace()
+                    .ok()
+                    .and_then(Workspace::active_tab)
+                    .map(|tab| tab.focused_pane_id)
+                else {
+                    return Task::none();
+                };
+                return self.open_worktree_list(WorktreeManagerMode::Manage, pane_id);
+            }
+            Message::ToggleSidebar => {
+                self.sidebar_collapsed = !self.sidebar_collapsed;
+                return Task::none();
+            }
+            Message::ToggleMaximize(pane_id) => {
+                self.maximized_pane = if self.maximized_pane == Some(pane_id) {
+                    None
+                } else {
+                    Some(pane_id)
+                };
+                let _ = self.focus_pane(pane_id);
+                return Task::none();
+            }
+            Message::ToggleMaximizeFromPaneMenu(pane_id) => {
+                self.pane_menu = None;
+                return self.update(Message::ToggleMaximize(pane_id));
+            }
+            Message::TogglePaneMenu(pane_id) => {
+                if self.pane_menu == Some(pane_id) {
+                    self.pane_menu = None;
+                } else {
+                    // Focus follows the menu so its actions and the clipboard
+                    // chords always target the same pane.
+                    let _ = self.focus_pane(pane_id);
+                    self.pane_menu = Some(pane_id);
+                }
+                return Task::none();
+            }
+            Message::DismissPaneMenu => {
+                self.pane_menu = None;
+                return Task::none();
+            }
+            Message::DismissGlobalAlert(index) => {
+                if index < self.global_alerts.len() {
+                    self.global_alerts.remove(index);
+                }
+                return Task::none();
+            }
+            Message::ManageHooks(agent, action) => {
+                return self.manage_hooks(agent, action);
+            }
+            Message::RefreshHookStatus => {
+                return self.refresh_integrations();
+            }
+            Message::IntegrationDiscoveryFinished(generation, result) => {
+                if generation != self.integration_generation {
+                    return Task::none();
+                }
+                self.integration_refreshing = false;
+                match result {
+                    Ok(discovery) => {
+                        self.available_wsl_distributions = discovery.wsl_distributions;
+                        match discovery.hook_statuses {
+                            Ok(statuses) => {
+                                self.hook_statuses = statuses;
+                                self.update_stale_hook_alert();
+                            }
+                            Err(error) => {
+                                self.hook_statuses.clear();
+                                self.status = format!("Could not refresh agent hooks: {error}");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.hook_statuses.clear();
+                        self.status = format!("Could not inspect agent integrations: {error}");
+                    }
+                }
+                return Task::none();
+            }
+            Message::HookOperationFinished(generation, result) => {
+                if generation != self.integration_generation {
+                    return Task::none();
+                }
+                self.integration_refreshing = false;
+                match result {
+                    Ok(result) => {
+                        self.status = result.message;
+                        self.hook_statuses = result.statuses;
+                        self.update_stale_hook_alert();
+                    }
+                    Err(error) => self.status = format!("Could not update agent hooks: {error}"),
+                }
+                return Task::none();
+            }
+            Message::SettingsTerminalFont(font) => {
+                self.settings_draft.terminal_font = font;
+                self.available_terminal_font_weights = self
+                    .installed_fonts
+                    .terminal_weights(&self.settings_draft.terminal_font);
+                if self.available_terminal_font_weights.is_empty() {
+                    self.available_terminal_font_weights
+                        .push(FontWeight::Normal);
+                }
+                if !self
+                    .available_terminal_font_weights
+                    .contains(&self.settings_draft.terminal_font_weight)
+                {
+                    self.settings_draft.terminal_font_weight =
+                        self.available_terminal_font_weights[0];
+                }
+                return Task::none();
+            }
+            Message::SettingsTerminalFontWeight(weight) => {
+                self.settings_draft.terminal_font_weight = weight;
+                return Task::none();
+            }
+            Message::SettingsTerminalTheme(theme) => {
+                self.settings_draft.terminal_theme = theme;
+                return Task::none();
+            }
+            Message::SettingsAppearance(appearance) => {
+                self.settings_draft.appearance = appearance;
+                return Task::none();
+            }
+            Message::SettingsShowStatusBar(show) => {
+                self.settings_draft.show_status_bar = show;
+                return Task::none();
+            }
+            Message::SettingsUiFont(font) => {
+                self.settings_draft.ui_font = font;
+                self.available_ui_font_weights = self
+                    .installed_fonts
+                    .ui_weights(&self.settings_draft.ui_font);
+                if self.available_ui_font_weights.is_empty() {
+                    self.available_ui_font_weights.push(FontWeight::Normal);
+                }
+                if !self
+                    .available_ui_font_weights
+                    .contains(&self.settings_draft.ui_font_weight)
+                {
+                    self.settings_draft.ui_font_weight = self.available_ui_font_weights[0];
+                }
+                return Task::none();
+            }
+            Message::SettingsUiFontWeight(weight) => {
+                self.settings_draft.ui_font_weight = weight;
+                return Task::none();
+            }
+            Message::SettingsTerminalFontSize(size) => {
+                self.settings_draft.terminal_font_size = size;
+                return Task::none();
+            }
+            Message::SettingsLineHeight(height) => {
+                self.settings_draft.terminal_line_height = height;
+                return Task::none();
+            }
+            Message::SettingsUiFontSize(size) => {
+                self.settings_draft.ui_font_size = size;
+                return Task::none();
+            }
+            Message::SetFleetView(view) => {
+                self.set_fleet_view(view);
+                return self.refresh_pane_repositories();
+            }
+            Message::SettingsCodexCommand(command) => {
+                self.settings_draft.codex_command = command;
+                return Task::none();
+            }
+            Message::SettingsClaudeCommand(command) => {
+                self.settings_draft.claude_command = command;
+                return Task::none();
+            }
+            #[cfg(target_os = "windows")]
+            Message::SettingsWindowsShellBackend(backend) => {
+                self.settings_draft.windows_shell_backend = backend;
+                return self.refresh_integrations();
+            }
+            #[cfg(target_os = "windows")]
+            Message::SettingsWslDistribution(distribution) => {
+                self.settings_draft.wsl_distribution = distribution.0.unwrap_or_default();
+                return self.refresh_integrations();
+            }
+            #[cfg(target_os = "windows")]
+            Message::RefreshWslDistributions => {
+                return self.refresh_integrations();
+            }
+            Message::SaveSettings => {
+                return self.save_settings();
+            }
+            Message::OpenThemeGallery => {
+                self.active_view = ActiveView::ThemeGallery;
+                return Task::none();
+            }
+            Message::CloseThemeGallery => {
+                self.active_view = ActiveView::Settings;
+                return Task::none();
+            }
+            Message::GalleryThemeChosen(theme) => {
+                // The gallery's accent ring reads as a commitment, so the
+                // click IS the commit: draft, settings, and live panes all
+                // move together.
+                self.settings_draft.terminal_theme = theme;
+                self.settings.terminal_theme = theme;
+                let terminal_theme = self.settings.terminal_theme.preset().terminal_theme();
+                for runtime in self.terminals.values() {
+                    if let Some(session) = &runtime.session {
+                        let _ = session.apply_theme(terminal_theme);
+                    }
+                }
+                return Task::none();
+            }
+            Message::CancelSettings => {
+                self.settings_draft = self.settings.clone();
+                self.active_view = ActiveView::Workspace;
+                self.status = "Settings changes discarded".into();
+                return Task::none();
+            }
+            #[cfg(feature = "e2e")]
+            Message::E2eTick => return self.drive_e2e(),
+            #[cfg(feature = "e2e")]
+            Message::E2eScreenshot(screenshot) => return self.finish_e2e(screenshot),
+            #[cfg(feature = "e2e")]
+            Message::E2eWindowMissing => return self.fail_e2e("Iced window was not available"),
+        };
+
+        self.status = match result {
+            Ok(()) => "Workspace updated".into(),
+            Err(error) => error,
+        };
+        Task::none()
+    }
+
+    fn window_resize_increment_task(&self) -> Task<Message> {
+        let Some(window_id) = self.window_id else {
+            return Task::none();
+        };
+        let Some(increments) = wsl_wayland_resize_increments(
+            muxtrix::gpu::is_wsl(),
+            std::env::var_os("WAYLAND_DISPLAY").is_some(),
+            std::env::var_os("WINIT_UNIX_BACKEND")
+                .is_some_and(|backend| backend.to_string_lossy().eq_ignore_ascii_case("x11")),
+            &self.settings,
+        ) else {
+            return Task::none();
+        };
+        iced::window::set_resize_increments(window_id, Some(increments))
+    }
+
+    fn split_terminal(&mut self, axis: SplitAxis) -> Result<(), String> {
+        if self.maximized_pane.is_some() {
+            return Err("Restore panes before splitting the focused pane".into());
+        }
+        let mut profile = self
+            .session
+            .profiles
+            .first()
+            .cloned()
+            .ok_or_else(|| "terminal launch profile is missing".to_owned())?;
+        if let Some(directory) = self.regular_creation_directory() {
+            profile.working_directory = Some(directory);
+        }
+        let pane_count = self
+            .active_workspace()?
+            .active_tab()
+            .ok_or_else(|| "active tab is missing".to_owned())?
+            .panes
+            .len();
+        let tab_id = self
+            .active_workspace()?
+            .active_tab()
+            .ok_or_else(|| "active tab is missing".to_owned())?
+            .id;
+        self.clear_manual_layout_history(tab_id);
+        let title = format!("shell {}", pane_count + 1);
+        let surface = Surface::terminal(
+            &title,
+            TerminalSurface {
+                profile_id: profile.id,
+                working_directory: profile.working_directory.clone(),
+            },
+        );
+        let pane_id = self
+            .active_workspace_mut()?
+            .split_focused(axis, SplitRatio::EQUAL, surface)
+            .map_err(|error| error.to_string())?;
+        self.request_regular_terminal_launch(profile, pane_id, title)
+    }
+
+    fn clear_manual_layout_history(&mut self, tab_id: TabId) {
+        self.pane_layouts.remove(&tab_id);
+        self.base_pane_layouts.remove(&tab_id);
+        self.pane_resize_history.remove(&tab_id);
+        self.split_sizes.retain(|key, _| key.tab_id != tab_id);
+        if self
+            .split_drag
+            .as_ref()
+            .is_some_and(|drag| drag.key.tab_id == tab_id)
+        {
+            self.split_drag = None;
+        }
+    }
+
+    fn cycle_pane_layout(&mut self, cycle: LayoutCycle) -> Result<&'static str, String> {
+        if self.maximized_pane.is_some() {
+            return Err("Restore panes before changing their layout".into());
+        }
+        let (tab_id, pane_ids, current_root) = {
+            let tab = self
+                .active_workspace()?
+                .active_tab()
+                .ok_or_else(|| "active tab is missing".to_owned())?;
+            (tab.id, pane_ids_for_layout(tab), tab.root.clone())
+        };
+        if pane_ids.len() < 2 {
+            return Err("Open another pane before changing the layout".into());
+        }
+
+        let layouts: Vec<_> = PaneLayout::ALL
+            .into_iter()
+            .filter(|layout| layout.supports(pane_ids.len()))
+            .collect();
+        let current = self
+            .pane_layouts
+            .get(&tab_id)
+            .copied()
+            .unwrap_or(PaneLayout::Base);
+        let index = layouts
+            .iter()
+            .position(|layout| *layout == current)
+            .unwrap_or(0);
+        let next_index = match cycle {
+            LayoutCycle::Previous => (index + layouts.len() - 1) % layouts.len(),
+            LayoutCycle::Next => (index + 1) % layouts.len(),
+        };
+        let next = layouts[next_index];
+
+        if current == PaneLayout::Base {
+            if same_panes(&current_root.pane_ids(), &pane_ids) {
+                self.base_pane_layouts.insert(tab_id, current_root);
+            } else {
+                // A pane can still be present in the tab and Fleet even if an
+                // older or interrupted layout projection omitted it. Do not
+                // preserve that broken projection as Base: the generated
+                // layout below restores every live pane to the workspace.
+                self.base_pane_layouts.remove(&tab_id);
+            }
+        }
+        let next_root = if next == PaneLayout::Base {
+            self.base_pane_layouts
+                .remove(&tab_id)
+                .filter(|root| same_panes(&root.pane_ids(), &pane_ids))
+                .unwrap_or_else(|| pane_layout_tree(PaneLayout::Vertical, &pane_ids))
+        } else {
+            pane_layout_tree(next, &pane_ids)
+        };
+        self.active_workspace_mut()?
+            .tab_mut(tab_id)
+            .ok_or_else(|| "active tab is missing".to_owned())?
+            .root = next_root;
+        self.pane_layouts.insert(tab_id, next);
+        self.pane_resize_history.remove(&tab_id);
+        self.split_sizes.retain(|key, _| key.tab_id != tab_id);
+        self.split_drag = None;
+        self.maximized_pane = None;
+        self.pane_menu = None;
+        Ok(next.label())
+    }
+
+    fn resize_focused_pane(&mut self, increase: bool) -> Result<&'static str, String> {
+        if self.maximized_pane.is_some() {
+            return Err("Restore panes before resizing the focused pane".into());
+        }
+        let (tab_id, pane_id, root) = {
+            let tab = self
+                .active_workspace()?
+                .active_tab()
+                .ok_or_else(|| "active tab is missing".to_owned())?;
+            (tab.id, tab.focused_pane_id, tab.root.clone())
+        };
+
+        if !increase {
+            let Some(history) = self.pane_resize_history.get(&tab_id) else {
+                return Err("No focused-pane resize to restore".into());
+            };
+            if history.pane_id != pane_id || history.snapshots.is_empty() {
+                self.pane_resize_history.remove(&tab_id);
+                return Err("No focused-pane resize to restore".into());
+            }
+            let (snapshot, history_empty) = {
+                let history = self
+                    .pane_resize_history
+                    .get_mut(&tab_id)
+                    .expect("the resize history was just checked");
+                let snapshot = history
+                    .snapshots
+                    .pop()
+                    .expect("the resize history was just checked as non-empty");
+                (snapshot, history.snapshots.is_empty())
+            };
+            self.active_workspace_mut()?
+                .tab_mut(tab_id)
+                .ok_or_else(|| "active tab is missing".to_owned())?
+                .root = snapshot.root;
+            self.maximized_pane = snapshot.maximized_pane;
+            if history_empty {
+                self.pane_resize_history.remove(&tab_id);
+            }
+            self.split_sizes.retain(|key, _| key.tab_id != tab_id);
+            self.split_drag = None;
+            return Ok("Restored previous pane size");
+        }
+
+        let mut next_root = root.clone();
+        let preferred_direction = zellij_resize_direction(&pane_rects(&root), pane_id);
+        let grew = preferred_direction.is_some_and(|direction| {
+            enlarge_focused_tree_toward(&mut next_root, pane_id, direction)
+        }) || enlarge_focused_tree(&mut next_root, pane_id);
+        if !grew && self.maximized_pane == Some(pane_id) {
+            return Err("The focused pane already fills the workspace".into());
+        }
+        let snapshot = PaneResizeSnapshot {
+            root,
+            maximized_pane: self.maximized_pane,
+        };
+        let history = self
+            .pane_resize_history
+            .entry(tab_id)
+            .or_insert_with(|| PaneResizeHistory {
+                pane_id,
+                snapshots: Vec::new(),
+            });
+        if history.pane_id != pane_id {
+            *history = PaneResizeHistory {
+                pane_id,
+                snapshots: Vec::new(),
+            };
+        }
+        history.snapshots.push(snapshot);
+
+        self.pane_layouts.remove(&tab_id);
+        self.base_pane_layouts.remove(&tab_id);
+        self.split_sizes.retain(|key, _| key.tab_id != tab_id);
+        self.split_drag = None;
+        if grew {
+            self.active_workspace_mut()?
+                .tab_mut(tab_id)
+                .ok_or_else(|| "active tab is missing".to_owned())?
+                .root = next_root;
+            self.maximized_pane = None;
+            Ok("Grew focused pane")
+        } else {
+            self.maximized_pane = Some(pane_id);
+            Ok("Focused pane fills the workspace")
+        }
+    }
+
+    fn open_workspace_create(&mut self) -> Task<Message> {
+        self.workspace_name_draft = format!("Workspace {}", self.session.workspaces.len() + 1);
+        self.workspace_create_visible = true;
+        self.rename_prompt = None;
+        self.close_command_palette();
+        iced::widget::operation::focus(iced::widget::Id::new(WORKSPACE_CREATE_INPUT_ID))
+    }
+
+    fn create_workspace(&mut self) -> Result<(), String> {
+        let mut profile = self
+            .session
+            .profiles
+            .first()
+            .cloned()
+            .ok_or_else(|| "terminal launch profile is missing".to_owned())?;
+        if let Some(directory) = self.regular_creation_directory() {
+            profile.working_directory = Some(directory);
+        }
+        let workspace_name = self.workspace_name_draft.trim().to_owned();
+        if workspace_name.is_empty() {
+            return Err("Workspace names cannot be empty".into());
+        }
+        let title = "shell 1";
+        let workspace = Workspace::new(
+            &workspace_name,
+            Surface::terminal(
+                title,
+                TerminalSurface {
+                    profile_id: profile.id,
+                    working_directory: profile.working_directory.clone(),
+                },
+            ),
+        );
+        let pane_id = workspace
+            .active_tab()
+            .ok_or_else(|| "new workspace is missing its default tab".to_owned())?
+            .focused_pane_id;
+        self.session
+            .add_workspace(workspace)
+            .map_err(|error| error.to_string())?;
+        self.request_regular_terminal_launch(profile, pane_id, title.into())?;
+        self.workspace_name_draft = workspace_name;
+        self.rename_prompt = None;
+        self.workspace_create_visible = false;
+        self.active_view = ActiveView::Workspace;
+        self.maximized_pane = None;
+        self.pane_menu = None;
+        Ok(())
+    }
+
+    fn switch_workspace(&mut self, workspace_id: WorkspaceId) -> Result<(), String> {
+        self.session
+            .switch_workspace(workspace_id)
+            .map_err(|error| error.to_string())?;
+        self.workspace_name_draft = self.active_workspace()?.name.clone();
+        self.rename_prompt = None;
+        self.active_view = ActiveView::Workspace;
+        self.maximized_pane = None;
+        self.pane_menu = None;
+        self.hovered_terminal = None;
+        Ok(())
+    }
+
+    fn apply_rename(&mut self) -> Result<(), String> {
+        let target = self
+            .rename_prompt
+            .ok_or_else(|| "Nothing is being renamed".to_owned())?;
+        match target {
+            RenameTarget::Workspace(workspace_id) => {
+                self.session
+                    .rename_workspace(workspace_id, &self.rename_draft)
+                    .map_err(|error| error.to_string())?;
+                self.workspace_name_draft = self.active_workspace()?.name.clone();
+            }
+            RenameTarget::Tab(workspace_id, tab_id) => {
+                self.session
+                    .workspaces
+                    .iter_mut()
+                    .find(|workspace| workspace.id == workspace_id)
+                    .ok_or_else(|| "workspace is missing".to_owned())?
+                    .rename_tab(tab_id, &self.rename_draft)
+                    .map_err(|error| error.to_string())?;
+            }
+            RenameTarget::Pane(pane_id) => {
+                let name = self.rename_draft.trim().to_owned();
+                let pane = self
+                    .session
+                    .workspaces
+                    .iter_mut()
+                    .find_map(|workspace| workspace.pane_mut(pane_id))
+                    .ok_or_else(|| format!("pane {pane_id:?} is missing"))?;
+                pane.custom_name = (!name.is_empty()).then_some(name);
+            }
+        }
+        Ok(())
+    }
+
+    fn open_rename_prompt(&mut self, target: RenameTarget, current_name: String) -> Task<Message> {
+        self.rename_prompt = Some(target);
+        self.rename_draft = current_name;
+        self.active_view = ActiveView::Workspace;
+        iced::widget::operation::focus(iced::widget::Id::new(RENAME_INPUT_ID))
+    }
+
+    /// The directory the focused pane is working in, best effort: agent
+    /// lifecycle reports first, then terminal-owned sources.
+    fn pane_working_directory(&self, pane_id: PaneId) -> Option<std::path::PathBuf> {
+        if let Some(cwd) = self
+            .agent_statuses
+            .get(&pane_id)
+            .and_then(|status| status.cwd.as_deref())
+            .map(str::trim)
+            .filter(|cwd| !cwd.is_empty())
+        {
+            return Some(std::path::PathBuf::from(cwd));
+        }
+        self.pane_terminal_directory(pane_id)
+    }
+
+    /// A pane directory derived without agent lifecycle state. Destructive
+    /// terminal actions use this path so stale hooks cannot choose their
+    /// target repository or worktree.
+    fn pane_terminal_directory(&self, pane_id: PaneId) -> Option<std::path::PathBuf> {
+        #[cfg(target_os = "linux")]
+        if let Some(process_id) = self
+            .terminals
+            .get(&pane_id)
+            .and_then(|runtime| runtime.session.as_ref())
+            .and_then(LiveSession::process_id)
+            && let Ok(cwd) = std::fs::read_link(format!("/proc/{process_id}/cwd"))
+        {
+            return Some(cwd);
+        }
+        // The shell's own report (OSC 7/9/1337). This is the only live source
+        // on a Windows build with WSL panes, where the process and its
+        // filesystem are on the other side of the VM boundary.
+        if let Some(pwd) = self
+            .terminals
+            .get(&pane_id)
+            .and_then(|runtime| runtime.snapshot.as_ref())
+            .and_then(|snapshot| snapshot.pwd.as_deref())
+            .and_then(decode_reported_pwd)
+        {
+            return Some(pwd);
+        }
+        self.session
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.pane(pane_id))
+            .and_then(Pane::active_surface)
+            .and_then(|surface| match &surface.kind {
+                muxtrix_domain::SurfaceKind::Terminal(terminal) => {
+                    terminal.working_directory.clone().or_else(|| {
+                        self.session
+                            .profiles
+                            .iter()
+                            .find(|profile| profile.id == terminal.profile_id)
+                            .and_then(|profile| profile.working_directory.clone())
+                    })
+                }
+                _ => None,
+            })
+    }
+
+    /// The focused pane's working directory.
+    fn focused_pane_directory(&self) -> Option<std::path::PathBuf> {
+        let pane_id = self
+            .active_workspace()
+            .ok()?
+            .active_tab()
+            .map(|tab| tab.focused_pane_id)?;
+        self.pane_working_directory(pane_id)
+    }
+
+    /// The source directory for regular pane, tab, and workspace creation.
+    /// Worktree routing happens on the terminal-launch worker so reading Git
+    /// or crossing into WSL can never block the UI action.
+    fn regular_creation_directory(&self) -> Option<std::path::PathBuf> {
+        self.focused_pane_directory()
+    }
+
+    fn confirm_worktree(&mut self) -> Task<Message> {
+        let Some(prompt) = self.worktree_prompt.clone() else {
+            return Task::none();
+        };
+        if prompt.busy {
+            return Task::none();
+        }
+        let Some(repo_root) = prompt.repo_root else {
+            return Task::none();
+        };
+        let set_error = |this: &mut Self, message: String| {
+            if let Some(prompt) = this.worktree_prompt.as_mut() {
+                prompt.error = Some(message);
+            }
+        };
+        let name = worktree_name(&self.worktree_name_draft);
+        if name.is_empty() {
+            set_error(self, "Worktree names cannot be empty".into());
+            return Task::none();
+        }
+        let Some(base) = prompt.base_directory.clone() else {
+            set_error(self, "The home directory could not be discovered".into());
+            return Task::none();
+        };
+        if prompt.taken_names.contains(&name) {
+            set_error(self, format!("{name} already exists for this repository"));
+            return Task::none();
+        }
+        let destination = worktree_destination(&base, &name);
+        if let Some(prompt) = self.worktree_prompt.as_mut() {
+            prompt.error = None;
+            prompt.busy = true;
+        }
+        self.status = format!("Creating worktree {name}…");
+        let target = prompt.target;
+        let wsl_distribution = self.settings.wsl_distribution.clone();
+        perform_blocking(
+            move || create_git_worktree(&repo_root, &destination, &name, &wsl_distribution),
+            move |result| Message::WorktreeCreated(target, result.and_then(|inner| inner)),
+        )
+    }
+
+    fn open_worktree_prompt(&mut self, target: WorktreePromptTarget) -> Task<Message> {
+        self.active_view = ActiveView::Workspace;
+        let pane_id = match target {
+            WorktreePromptTarget::Open(_) => self
+                .active_workspace()
+                .ok()
+                .and_then(Workspace::active_tab)
+                .map(|tab| tab.focused_pane_id),
+            WorktreePromptTarget::RestartPane(pane_id) => Some(pane_id),
+        };
+        let probed_directory = pane_id
+            .and_then(|pane_id| match target {
+                WorktreePromptTarget::Open(_) => self.pane_working_directory(pane_id),
+                WorktreePromptTarget::RestartPane(_) => self.pane_terminal_directory(pane_id),
+            })
+            .filter(|directory| reported_path_is_concrete(directory));
+        let wsl_distribution = self.settings.wsl_distribution.clone();
+        let repo_root = probed_directory
+            .as_deref()
+            .and_then(|directory| git_repository_root(directory, &wsl_distribution));
+        let base_directory = repo_root
+            .as_deref()
+            .and_then(|root| worktree_base_directory(root, &wsl_distribution));
+        let taken_names = base_directory
+            .as_deref()
+            .map(|base| worktree_taken_names(base, &wsl_distribution))
+            .unwrap_or_default();
+        let failure = repo_root
+            .is_none()
+            .then(|| worktree_failure_message(probed_directory.as_deref(), &wsl_distribution));
+        self.worktree_name_draft = if repo_root.is_some() {
+            default_worktree_name(&taken_names)
+        } else {
+            String::new()
+        };
+        self.worktree_prompt = Some(WorktreePrompt {
+            target,
+            repo_root,
+            failure,
+            base_directory,
+            taken_names,
+            error: None,
+            busy: false,
+        });
+        iced::widget::operation::focus(iced::widget::Id::new(WORKTREE_INPUT_ID))
+    }
+
+    /// Opens the worktree manager for the focused pane's repository,
+    /// listing every linked worktree with who is using it.
+    fn open_worktree_manager(&mut self) -> Task<Message> {
+        let Some(pane_id) = self
+            .active_workspace()
+            .ok()
+            .and_then(Workspace::active_tab)
+            .map(|tab| tab.focused_pane_id)
+        else {
+            return Task::none();
+        };
+        self.open_settings();
+        self.settings_page = SettingsPage::Worktrees;
+        self.open_worktree_list(WorktreeManagerMode::Manage, pane_id)
+    }
+
+    fn open_worktree_switcher(&mut self, pane_id: PaneId) -> Task<Message> {
+        if let Err(error) = self.focus_pane(pane_id) {
+            self.status = error;
+            return Task::none();
+        }
+        self.open_worktree_list(WorktreeManagerMode::RestartPane(pane_id), pane_id)
+    }
+
+    fn open_worktree_list(&mut self, mode: WorktreeManagerMode, pane_id: PaneId) -> Task<Message> {
+        if matches!(mode, WorktreeManagerMode::RestartPane(_)) {
+            self.active_view = ActiveView::Workspace;
+        }
+        let probed_directory = self
+            .pane_terminal_directory(pane_id)
+            .filter(|directory| reported_path_is_concrete(directory));
+        let wsl_distribution = self.settings.wsl_distribution.clone();
+        self.worktree_manager_generation = self.worktree_manager_generation.wrapping_add(1);
+        let generation = self.worktree_manager_generation;
+        self.worktree_manager = Some(WorktreeManagerState {
+            mode,
+            generation,
+            repo_root: None,
+            failure: None,
+            entries: Vec::new(),
+            loading: true,
+            selected: 0,
+            busy: false,
+            error: None,
+            restart_target: None,
+        });
+        perform_blocking(
+            move || discover_worktree_manager(mode, probed_directory, &wsl_distribution),
+            move |result| {
+                Message::WorktreeManagerLoaded(generation, result.and_then(|value| value))
+            },
+        )
+    }
+
+    /// The title of a pane currently working inside `directory`, if any.
+    fn pane_using_directory(&self, directory: &std::path::Path) -> Option<String> {
+        for workspace in &self.session.workspaces {
+            for tab in &workspace.tabs {
+                for pane_id in tab.panes.keys().copied() {
+                    if self
+                        .pane_terminal_directory(pane_id)
+                        .is_some_and(|cwd| cwd.starts_with(directory))
+                    {
+                        return Some(self.pane_title(workspace, pane_id).to_owned());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn delete_worktree_entry(&mut self, index: usize) -> Task<Message> {
+        let Some(manager) = self.worktree_manager.as_mut() else {
+            return Task::none();
+        };
+        if manager.busy || !matches!(manager.mode, WorktreeManagerMode::Manage) {
+            return Task::none();
+        }
+        let Some(repo_root) = manager.repo_root.clone() else {
+            return Task::none();
+        };
+        let Some(entry) = manager.entries.get(index).cloned() else {
+            return Task::none();
+        };
+        let name = worktree_display_name(&entry.path);
+        if let Some(blocker) = entry.deletion_blocker {
+            manager.error = Some(format!("{name} is the {blocker} and cannot be deleted"));
+            return Task::none();
+        }
+        if entry.used_by.is_some() {
+            manager.error = Some(format!("{name} is in use by a pane and cannot be deleted"));
+            return Task::none();
+        }
+        manager.busy = true;
+        manager.error = None;
+        manager.selected = index;
+        self.status = format!("Removing worktree {name}…");
+        self.remove_worktrees_task(repo_root, vec![entry.path])
+    }
+
+    fn delete_unused_worktrees(&mut self) -> Task<Message> {
+        let Some(manager) = self.worktree_manager.as_mut() else {
+            return Task::none();
+        };
+        if manager.busy || !matches!(manager.mode, WorktreeManagerMode::Manage) {
+            return Task::none();
+        }
+        let Some(repo_root) = manager.repo_root.clone() else {
+            return Task::none();
+        };
+        let paths = unused_worktree_paths(&manager.entries);
+        if paths.is_empty() {
+            return Task::none();
+        }
+        manager.busy = true;
+        manager.error = None;
+        if let Some(first) = manager
+            .entries
+            .iter()
+            .position(|entry| entry.path == paths[0])
+        {
+            manager.selected = first;
+        }
+        self.status = format!("Removing {} unused worktrees…", paths.len());
+        self.remove_worktrees_task(repo_root, paths)
+    }
+
+    fn remove_worktrees_task(
+        &self,
+        repo_root: std::path::PathBuf,
+        paths: Vec<std::path::PathBuf>,
+    ) -> Task<Message> {
+        let wsl_distribution = self.settings.wsl_distribution.clone();
+        perform_blocking(
+            move || remove_git_worktrees(&repo_root, paths, &wsl_distribution),
+            move |result| match result {
+                Ok((removed, result)) => Message::WorktreeManagerDeleted(removed, result),
+                Err(error) => Message::WorktreeManagerDeleted(Vec::new(), Err(error)),
+            },
+        )
+    }
+
+    fn confirm_worktree_restart(&mut self) {
+        let target = self.worktree_manager.as_ref().and_then(|manager| {
+            let WorktreeManagerMode::RestartPane(pane_id) = manager.mode else {
+                return None;
+            };
+            let index = manager.restart_target?;
+            manager
+                .entries
+                .get(index)
+                .cloned()
+                .map(|entry| (pane_id, entry))
+        });
+        let Some((pane_id, entry)) = target else {
+            return;
+        };
+        let name = entry.branch.clone().unwrap_or_else(|| {
+            entry.path.file_name().map_or_else(
+                || entry.path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        });
+        match self.restart_pane_in_directory(pane_id, entry.path.clone()) {
+            Ok(()) => {
+                self.worktree_manager = None;
+                self.status = format!("Restarted pane in {name}");
+            }
+            Err(error) => {
+                if let Some(manager) = self.worktree_manager.as_mut() {
+                    manager.restart_target = None;
+                    manager.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn show_toast(&mut self, message: &str) {
+        self.toast = Some((message.into(), std::time::Instant::now()));
+    }
+
+    /// `weight` snapped to a face the configured interface family installs.
+    ///
+    /// Emphasis levels in the rail are derived, not configured, so nothing
+    /// validates them against the chosen family the way the settings picker
+    /// validates the base weight. A family without the requested face makes the
+    /// shaper substitute a different family for that run, changing the typeface
+    /// and the shape of glyphs like `…` between adjacent rows.
+    fn ui_weight(&self, weight: FontWeight) -> font::Weight {
+        self.installed_fonts
+            .nearest_ui_weight(&self.settings.ui_font, weight)
+            .iced()
+    }
+
+    /// `weight` snapped against the family `Font::DEFAULT` resolves to, for
+    /// chrome that deliberately stays on the system sans.
+    fn default_family_weight(&self, weight: FontWeight) -> font::Weight {
+        self.installed_fonts
+            .nearest_ui_weight(&UiFont::SystemSans, weight)
+            .iced()
+    }
+
+    /// Bottom-center feedback. Prefix and rail-navigation hints are modal,
+    /// not transient confirmations, so the ordinary two-second toast timer
+    /// never controls their lifetime.
+    ///
+    /// The second element says whether the pill announces a live keyboard mode.
+    /// A mode the user is standing in has to be findable at a glance; a toast
+    /// that disappears on its own should not compete with the terminal, so the
+    /// two are drawn differently.
+    fn feedback_message(&self) -> Option<(&str, bool)> {
+        if self.prefix_armed {
+            Some(("Prefix — w workspaces · f fleet · Esc cancel", true))
+        } else if self.rail_nav.is_some() {
+            Some(("Navigate — ↑↓ move · Enter select · Esc exit", true))
+        } else {
+            self.toast
+                .as_ref()
+                .map(|(message, _)| (message.as_str(), false))
+        }
+    }
+
+    /// Every rail entry the prefix navigation can land on, in visual
+    /// order: workspaces first, then the fleet's tabs and panes.
+    fn rail_targets(&self) -> Vec<RailTarget> {
+        let mut targets: Vec<RailTarget> = self
+            .session
+            .workspaces
+            .iter()
+            .map(|workspace| RailTarget::Workspace(workspace.id))
+            .collect();
+
+        match self.effective_fleet_view() {
+            FleetView::Agents => {
+                targets.extend(
+                    self.fleet_entries()
+                        .into_iter()
+                        .map(|(workspace_id, pane_id)| {
+                            RailTarget::FleetPane(workspace_id, pane_id)
+                        }),
+                );
+            }
+            FleetView::Repos => {
+                for group in self.fleet_repository_groups() {
+                    if let Some((workspace_id, first_pane)) = group.entries.first().copied() {
+                        targets.push(RailTarget::FleetGroup(workspace_id, first_pane));
+                    }
+                    targets.extend(group.entries.into_iter().map(|(workspace_id, pane_id)| {
+                        RailTarget::FleetPane(workspace_id, pane_id)
+                    }));
+                }
+            }
+            FleetView::Tabs => {
+                if let Ok(workspace) = self.active_workspace() {
+                    for tab in &workspace.tabs {
+                        // Single-tab workspaces do not render a tab band in the
+                        // fleet, so keyboard navigation must not land on one.
+                        if workspace.tabs.len() > 1 {
+                            targets.push(RailTarget::FleetTab(workspace.id, tab.id));
+                        }
+                        for pane_id in pane_ids_in_layout(&tab.root) {
+                            targets.push(RailTarget::FleetPane(workspace.id, pane_id));
+                        }
+                    }
+                }
+            }
+        }
+        targets
+    }
+
+    /// Pushes the current layout to this session's daemon whenever it
+    /// changes, so the session is resumable exactly as last seen. Runs on
+    /// the blink tick; the hash gate keeps quiet ticks free.
+    fn sync_session_layout(&mut self) {
+        let Some((_, client)) = session_host() else {
+            return;
+        };
+        let session = session_with_agent_identities(&self.session, &self.agent_statuses);
+        let Ok(layout) = serde_json::to_string(&session) else {
+            return;
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        layout.hash(&mut hasher);
+        let hash = hasher.finish();
+        if hash == self.last_layout_hash {
+            return;
+        }
+        self.last_layout_hash = hash;
+        let _ = client.send(&muxtrix_sessions::Request::Layout { data: layout });
+        if let Some(workspace) = self
+            .session
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == self.session.active_workspace_id)
+        {
+            let _ = client.send(&muxtrix_sessions::Request::Rename {
+                name: workspace.name.clone(),
+            });
+        }
+    }
+
+    fn open_session_picker(&mut self, startup: bool) {
+        self.active_view = ActiveView::Workspace;
+        let own = session_host().map(|(id, _)| id);
+        let candidates: Vec<muxtrix_sessions::SessionRecord> = if startup {
+            muxtrix_sessions::resumable_sessions(own)
+        } else {
+            // The palette view also lists dead records so they can be
+            // cleaned up, but never sessions another instance holds.
+            muxtrix_sessions::list_sessions()
+                .into_iter()
+                .filter(|record| Some(record.id) != own)
+                .filter(|record| !record.attached)
+                .collect()
+        };
+        self.open_session_picker_from_records(candidates, startup);
+    }
+
+    fn open_session_picker_from_records(
+        &mut self,
+        candidates: Vec<muxtrix_sessions::SessionRecord>,
+        startup: bool,
+    ) {
+        self.active_view = ActiveView::Workspace;
+        let entries: Vec<SessionPickerEntry> = candidates
+            .into_iter()
+            .map(|record| {
+                // Startup candidates were already probed by
+                // `resumable_sessions` on the background host worker.
+                let alive = startup || muxtrix_sessions::record_is_alive(&record);
+                let pane_count = record
+                    .layout
+                    .as_deref()
+                    .and_then(|layout| serde_json::from_str::<SessionState>(layout).ok())
+                    .map_or(0, |state| {
+                        state
+                            .workspaces
+                            .iter()
+                            .flat_map(|workspace| &workspace.tabs)
+                            .map(|tab| tab.panes.len())
+                            .sum()
+                    });
+                SessionPickerEntry {
+                    record,
+                    alive,
+                    pane_count,
+                }
+            })
+            .collect();
+        self.session_picker = Some(SessionPickerState {
+            entries,
+            selected: 0,
+            error: None,
+            startup,
+        });
+    }
+
+    /// Kills one listed session: live daemons get a shutdown, dead records
+    /// are registry residue and just get removed.
+    fn kill_picked_session(&mut self, index: usize) {
+        let Some(picker) = self.session_picker.as_mut() else {
+            return;
+        };
+        let Some(entry) = picker.entries.get(index) else {
+            return;
+        };
+        if entry.alive {
+            match muxtrix_sessions::SessionClient::connect_endpoint(&entry.record.endpoint) {
+                Ok((client, _, _)) => {
+                    let _ = client.send(&muxtrix_sessions::Request::Shutdown);
+                }
+                Err(error) => {
+                    picker.error = Some(format!("could not reach the session: {error}"));
+                    return;
+                }
+            }
+        }
+        muxtrix_sessions::remove_session_record(entry.record.id);
+        picker.entries.remove(index);
+        if picker.selected >= picker.entries.len() {
+            picker.selected = picker.entries.len().saturating_sub(1);
+        }
+        picker.error = None;
+    }
+
+    /// Switches this window onto a background session: its layout replaces
+    /// the current one and every pane reattaches to the daemon-owned PTY
+    /// (backlog replays into a fresh VT). The session this window was on
+    /// stays alive in the background — that is the multiplexer contract.
+    fn resume_session(&mut self, index: usize) {
+        let Some(picker) = self.session_picker.as_mut() else {
+            return;
+        };
+        let Some(entry) = picker.entries.get(index) else {
+            return;
+        };
+        if !entry.alive {
+            picker.error = Some("that session's daemon is no longer running".into());
+            return;
+        }
+        let record = entry.record.clone();
+        let (client, _, layout) =
+            match muxtrix_sessions::SessionClient::connect_endpoint(&record.endpoint) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    picker.error = Some(format!("could not attach: {error}"));
+                    return;
+                }
+            };
+        let layout = layout.or(record.layout.clone());
+        let Some(state) = layout
+            .as_deref()
+            .and_then(|layout| serde_json::from_str::<SessionState>(layout).ok())
+        else {
+            picker.error = Some("that session never reported a layout".into());
+            return;
+        };
+        // Resuming at startup abandons the pristine session this instance
+        // just created; left alone its live shell would keep an orphan
+        // daemon running forever.
+        if picker.startup
+            && let Some((_, previous)) = session_host()
+        {
+            let _ = previous.send(&muxtrix_sessions::Request::Shutdown);
+        }
+        let client = Arc::new(client);
+        // Register every pane, then re-attach so the daemon replays each
+        // backlog into the channels that now exist to receive it.
+        let mut receivers: std::collections::HashMap<PaneId, std::sync::mpsc::Receiver<Vec<u8>>> =
+            std::collections::HashMap::new();
+        for workspace in &state.workspaces {
+            for tab in &workspace.tabs {
+                for pane_id in tab.panes.keys() {
+                    receivers.insert(*pane_id, client.register_pane(pane_id.as_uuid()));
+                }
+            }
+        }
+        let _ = client.send(&muxtrix_sessions::Request::Attach);
+        if let Ok(mut host) = SESSION_HOST.lock() {
+            *host = Some(SessionHost {
+                id: record.id,
+                client: Arc::clone(&client),
+            });
+        }
+        let theme = self.settings.terminal_theme.preset().terminal_theme();
+        let mut terminals = BTreeMap::new();
+        for workspace in &state.workspaces {
+            for tab in &workspace.tabs {
+                for (pane_id, pane) in &tab.panes {
+                    let title = pane
+                        .custom_name
+                        .clone()
+                        .or_else(|| pane.active_surface().map(|surface| surface.title.clone()))
+                        .unwrap_or_else(|| "shell".into());
+                    let Some(receiver) = receivers.remove(pane_id) else {
+                        continue;
+                    };
+                    let runtime = TerminalRuntime::attach(
+                        *pane_id,
+                        &title,
+                        theme,
+                        Arc::clone(&self.event_notifier),
+                        Arc::clone(&client),
+                        receiver,
+                    );
+                    terminals.insert(*pane_id, runtime);
+                }
+            }
+        }
+        let restored_agent_statuses = agent_statuses_from_session(&state);
+        self.session = state;
+        self.terminals = terminals;
+        self.queued_terminal_restarts.clear();
+        self.session_picker = None;
+        self.maximized_pane = None;
+        self.pane_menu = None;
+        self.hovered_terminal = None;
+        self.agent_statuses = restored_agent_statuses;
+        self.agent_running_frame_revisions.clear();
+        self.detected_agents.clear();
+        self.agents_view_panes.clear();
+        self.pane_layouts.clear();
+        self.base_pane_layouts.clear();
+        self.pane_resize_history.clear();
+        self.split_sizes.clear();
+        self.split_drag = None;
+        self.last_layout_hash = 0;
+        self.status = format!("Resumed session {}", record.name);
+    }
+
+    fn open_created_worktree(
+        &mut self,
+        target: WorktreePromptTarget,
+        directory: std::path::PathBuf,
+    ) -> Result<(), String> {
+        match target {
+            WorktreePromptTarget::Open(kind) => self.open_worktree(kind, directory),
+            WorktreePromptTarget::RestartPane(pane_id) => {
+                self.restart_pane_in_directory(pane_id, directory)
+            }
+        }
+    }
+
+    /// Opens a terminal in `directory` as a sibling pane or a new tab.
+    fn open_worktree(
+        &mut self,
+        kind: commands::WorktreeKind,
+        directory: std::path::PathBuf,
+    ) -> Result<(), String> {
+        if self.maximized_pane.is_some() && matches!(kind, commands::WorktreeKind::Pane(_)) {
+            return Err("Restore panes before opening a worktree beside them".into());
+        }
+        let mut profile = self
+            .session
+            .profiles
+            .first()
+            .cloned()
+            .ok_or_else(|| "terminal launch profile is missing".to_owned())?;
+        profile.working_directory = Some(directory.clone());
+        let title = directory.file_name().map_or_else(
+            || "worktree".into(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let surface = Surface::terminal(
+            &title,
+            TerminalSurface {
+                profile_id: profile.id,
+                working_directory: Some(directory),
+            },
+        );
+        if matches!(kind, commands::WorktreeKind::Pane(_)) {
+            let tab_id = self
+                .active_workspace()?
+                .active_tab()
+                .ok_or_else(|| "active tab is missing".to_owned())?
+                .id;
+            self.clear_manual_layout_history(tab_id);
+        }
+        let pane_id = match kind {
+            commands::WorktreeKind::Pane(axis) => self
+                .active_workspace_mut()?
+                .split_focused(axis, SplitRatio::EQUAL, surface)
+                .map_err(|error| error.to_string())?,
+            commands::WorktreeKind::Tab => {
+                let tab = WorkspaceTab::new(&title, surface);
+                let pane_id = tab.focused_pane_id;
+                self.active_workspace_mut()?
+                    .add_tab(tab)
+                    .map_err(|error| error.to_string())?;
+                self.maximized_pane = None;
+                self.pane_menu = None;
+                pane_id
+            }
+        };
+        self.request_terminal_launch(profile, pane_id, title)
+    }
+
+    /// Moves pane focus in `direction`, spilling across tabs at the layout
+    /// edge: right of the last pane wraps into the next tab's first pane, left
+    /// of the first pane into the previous tab's last pane.
+    fn focus_neighbor_pane(&mut self, direction: NavDirection) -> Result<(), String> {
+        let workspace = self.active_workspace()?;
+        let tab = workspace
+            .active_tab()
+            .ok_or_else(|| "active tab is missing".to_owned())?;
+        if let Some(next) = stacked_neighbor(&tab.root, tab.focused_pane_id, direction) {
+            return self.focus_pane(next);
+        }
+        let rects = pane_rects(&tab.root);
+        if let Some(next) = neighbor_pane(&rects, tab.focused_pane_id, direction) {
+            return self.focus_pane(next);
+        }
+        let tab_count = workspace.tabs.len();
+        let tab_index = workspace
+            .tabs
+            .iter()
+            .position(|candidate| candidate.id == tab.id)
+            .ok_or_else(|| "active tab is missing".to_owned())?;
+        let target = match direction {
+            NavDirection::Right => {
+                let next_tab = &workspace.tabs[(tab_index + 1) % tab_count];
+                pane_ids_in_layout(&next_tab.root).first().copied()
+            }
+            NavDirection::Left => {
+                let previous_tab = &workspace.tabs[(tab_index + tab_count - 1) % tab_count];
+                pane_ids_in_layout(&previous_tab.root).last().copied()
+            }
+            NavDirection::Up | NavDirection::Down => None,
+        };
+        match target {
+            Some(pane_id) if pane_id != tab.focused_pane_id => self.focus_pane(pane_id),
+            _ => Ok(()),
+        }
+    }
+
+    fn new_tab(&mut self) -> Result<(), String> {
+        let mut profile = self
+            .session
+            .profiles
+            .first()
+            .cloned()
+            .ok_or_else(|| "terminal launch profile is missing".to_owned())?;
+        if let Some(directory) = self.regular_creation_directory() {
+            profile.working_directory = Some(directory);
+        }
+        let tab_name = format!("Tab {}", self.active_workspace()?.tabs.len() + 1);
+        let title = "shell 1";
+        let tab = WorkspaceTab::new(
+            &tab_name,
+            Surface::terminal(
+                title,
+                TerminalSurface {
+                    profile_id: profile.id,
+                    working_directory: profile.working_directory.clone(),
+                },
+            ),
+        );
+        let pane_id = tab.focused_pane_id;
+        self.active_workspace_mut()?
+            .add_tab(tab)
+            .map_err(|error| error.to_string())?;
+        self.request_regular_terminal_launch(profile, pane_id, title.into())?;
+        self.maximized_pane = None;
+        self.pane_menu = None;
+        Ok(())
+    }
+
+    fn switch_tab(&mut self, tab_id: TabId) -> Result<(), String> {
+        self.active_workspace_mut()?
+            .switch_tab(tab_id)
+            .map_err(|error| error.to_string())?;
+        self.maximized_pane = None;
+        self.pane_menu = None;
+        self.hovered_terminal = None;
+        Ok(())
+    }
+
+    fn close_workspace(&mut self) -> Result<(), String> {
+        self.close_workspace_by_id(self.session.active_workspace_id)
+    }
+
+    fn close_workspace_by_id(&mut self, workspace_id: WorkspaceId) -> Result<(), String> {
+        let (pane_ids, tab_ids) = self
+            .session
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .map(|workspace| {
+                (
+                    workspace.all_pane_ids(),
+                    workspace.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+                )
+            })
+            .ok_or_else(|| "workspace is missing".to_owned())?;
+        self.session
+            .close_workspace(workspace_id)
+            .map_err(|error| error.to_string())?;
+        for pane_id in pane_ids {
+            self.cleanup_pane_state(pane_id);
+        }
+        for tab_id in tab_ids {
+            self.pane_layouts.remove(&tab_id);
+            self.base_pane_layouts.remove(&tab_id);
+            self.pane_resize_history.remove(&tab_id);
+        }
+        self.split_sizes
+            .retain(|key, _| key.workspace_id != workspace_id);
+        self.terminal_scroll_drag = None;
+        if self
+            .split_drag
+            .as_ref()
+            .is_some_and(|drag| drag.key.workspace_id == workspace_id)
+        {
+            self.split_drag = None;
+        }
+        self.workspace_name_draft = self.active_workspace()?.name.clone();
+        self.rename_prompt = None;
+        self.maximized_pane = None;
+        self.pane_menu = None;
+        self.hovered_terminal = None;
+        Ok(())
+    }
+
+    fn close_focused(&mut self) -> Result<(), String> {
+        let pane_id = self
+            .active_workspace()?
+            .active_tab()
+            .ok_or_else(|| "active tab is missing".to_owned())?
+            .focused_pane_id;
+        self.close_pane(pane_id)
+    }
+
+    fn close_pane(&mut self, pane_id: PaneId) -> Result<(), String> {
+        let (workspace_id, tab_id, pane_count, tab_count) = self
+            .session
+            .workspaces
+            .iter()
+            .find_map(|workspace| {
+                workspace
+                    .tab_containing_pane(pane_id)
+                    .map(|tab| (workspace.id, tab.id, tab.panes.len(), workspace.tabs.len()))
+            })
+            .ok_or_else(|| format!("pane {pane_id:?} is missing"))?;
+        if pane_count == 1 {
+            if tab_count == 1 {
+                self.close_workspace_prompt = Some(workspace_id);
+                return Ok(());
+            }
+            return self.close_tab(workspace_id, tab_id);
+        }
+        self.clear_manual_layout_history(tab_id);
+        self.session
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| "workspace is missing".to_owned())?
+            .close_pane(pane_id)
+            .map_err(|error| error.to_string())?;
+        self.cleanup_pane_state(pane_id);
+        Ok(())
+    }
+
+    fn close_tab(&mut self, workspace_id: WorkspaceId, tab_id: TabId) -> Result<(), String> {
+        let workspace = self
+            .session
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| "workspace is missing".to_owned())?;
+        if workspace.tabs.len() == 1 {
+            self.close_workspace_prompt = Some(workspace_id);
+            return Ok(());
+        }
+        let removed = workspace
+            .close_tab(tab_id)
+            .map_err(|error| error.to_string())?;
+        self.pane_layouts.remove(&tab_id);
+        self.base_pane_layouts.remove(&tab_id);
+        self.pane_resize_history.remove(&tab_id);
+        self.split_sizes.retain(|key, _| key.tab_id != tab_id);
+        for pane_id in removed.root.pane_ids() {
+            self.cleanup_pane_state(pane_id);
+        }
+        self.maximized_pane = None;
+        self.pane_menu = None;
+        Ok(())
+    }
+
+    fn cleanup_pane_state(&mut self, pane_id: PaneId) {
+        // Closing a pane is a decision to end its process — unlike app
+        // exit, where daemon-owned panes must keep running.
+        if let Some(runtime) = self.terminals.remove(&pane_id)
+            && let Some(session) = &runtime.session
+        {
+            session.terminate();
+        }
+        forget_host_pane(pane_id);
+        self.notifications
+            .retain(|notification| notification.pane_id != pane_id);
+        self.agent_statuses.remove(&pane_id);
+        self.agent_running_frame_revisions.remove(&pane_id);
+        self.detected_agents.remove(&pane_id);
+        self.agents_view_panes.remove(&pane_id);
+        self.terminal_pointer_positions.remove(&pane_id);
+        self.terminal_scrollbar_positions.remove(&pane_id);
+        self.terminal_command_buffers.remove(&pane_id);
+        self.queued_terminal_restarts.remove(&pane_id);
+        self.pending_terminal_input.remove(&pane_id);
+        if self.hovered_terminal == Some(pane_id) {
+            self.hovered_terminal = None;
+        }
+        if self.maximized_pane == Some(pane_id) {
+            self.maximized_pane = None;
+        }
+        if self.pane_menu == Some(pane_id) {
+            self.pane_menu = None;
+        }
+        if self
+            .terminal_scroll_drag
+            .is_some_and(|drag| drag.pane_id == pane_id)
+        {
+            self.terminal_scroll_drag = None;
+        }
+    }
+
+    fn finish_tab_drag(&mut self) -> Result<(), String> {
+        let Some(drag) = self.tab_drag.take() else {
+            return Ok(());
+        };
+        self.session
+            .move_tab(drag.tab_id, drag.target_workspace_id, drag.target_index)
+            .map_err(|error| error.to_string())?;
+        self.active_view = ActiveView::Workspace;
+        self.maximized_pane = None;
+        self.pane_menu = None;
+        Ok(())
+    }
+
+    fn restart_pane(&mut self, pane_id: PaneId) -> Result<(), String> {
+        let surface_directory = self
+            .session
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.pane(pane_id))
+            .and_then(|pane| pane.active_surface())
+            .and_then(|surface| match &surface.kind {
+                muxtrix_domain::SurfaceKind::Terminal(terminal) => {
+                    terminal.working_directory.clone()
+                }
+                _ => None,
+            });
+        self.restart_pane_with_directory(pane_id, surface_directory)
+    }
+
+    fn restart_pane_in_directory(
+        &mut self,
+        pane_id: PaneId,
+        directory: std::path::PathBuf,
+    ) -> Result<(), String> {
+        self.restart_pane_with_directory(pane_id, Some(directory))
+    }
+
+    fn restart_pane_with_directory(
+        &mut self,
+        pane_id: PaneId,
+        directory: Option<std::path::PathBuf>,
+    ) -> Result<(), String> {
+        let profile_id = self
+            .session
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.pane(pane_id))
+            .and_then(Pane::active_surface)
+            .and_then(|surface| match &surface.kind {
+                muxtrix_domain::SurfaceKind::Terminal(terminal) => Some(terminal.profile_id),
+                _ => None,
+            })
+            .ok_or_else(|| format!("pane {pane_id:?} has no terminal profile"))?;
+        let mut profile = self
+            .session
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .cloned()
+            .ok_or_else(|| "terminal launch profile is missing".to_owned())?;
+        profile.working_directory = directory.clone().or(profile.working_directory);
+        let fallback_title = self.terminals.get(&pane_id).map_or_else(
+            || "terminal".to_owned(),
+            |runtime| runtime.fallback_title.clone(),
+        );
+        self.notifications
+            .retain(|notification| notification.pane_id != pane_id);
+        self.agent_statuses.remove(&pane_id);
+        self.agent_running_frame_revisions.remove(&pane_id);
+        self.detected_agents.remove(&pane_id);
+        self.agents_view_panes.remove(&pane_id);
+        self.terminal_pointer_positions.remove(&pane_id);
+        self.terminal_scrollbar_positions.remove(&pane_id);
+        self.terminal_command_buffers.remove(&pane_id);
+        self.pending_terminal_input.remove(&pane_id);
+        if self.hovered_terminal == Some(pane_id) {
+            self.hovered_terminal = None;
+        }
+        if self
+            .terminal_scroll_drag
+            .is_some_and(|drag| drag.pane_id == pane_id)
+        {
+            self.terminal_scroll_drag = None;
+        }
+
+        let pane = self
+            .session
+            .workspaces
+            .iter_mut()
+            .find_map(|workspace| workspace.pane_mut(pane_id))
+            .ok_or_else(|| format!("pane {pane_id:?} is missing"))?;
+        pane.attention.unread_count = 0;
+        pane.attention.message = None;
+        let surface = pane
+            .surfaces
+            .iter_mut()
+            .find(|surface| surface.id == pane.active_surface_id)
+            .ok_or_else(|| format!("pane {pane_id:?} has no active surface"))?;
+        let muxtrix_domain::SurfaceKind::Terminal(terminal) = &mut surface.kind else {
+            return Err(format!("pane {pane_id:?} has no terminal profile"));
+        };
+        terminal.working_directory = directory;
+
+        let launch_in_flight = self.terminals.get(&pane_id).is_some_and(|runtime| {
+            matches!(runtime.launch_state, TerminalLaunchState::Starting { .. })
+        });
+        if launch_in_flight {
+            // Starting another daemon session now would reuse the same pane
+            // ID while the first worker still owns it. Let that worker finish,
+            // then replace the session through the ordinary previous-session
+            // handoff. Repeated restart requests collapse to the latest
+            // working directory already stored on the terminal surface.
+            self.queued_terminal_restarts.insert(pane_id);
+            self.status = "Waiting for the current terminal launch before restarting…".into();
+            return Ok(());
+        }
+
+        // The previous session is moved into the background launch request.
+        // The worker terminates and drops it before spawning the replacement,
+        // preserving daemon Kill-before-Spawn ordering without joining a PTY
+        // owner thread on the UI path.
+        self.request_terminal_launch(profile, pane_id, fallback_title)
+    }
+
+    fn handle_keyboard(&mut self, event: keyboard::Event) -> Task<Message> {
+        self.keyboard_modifiers = match &event {
+            keyboard::Event::KeyPressed { modifiers, .. }
+            | keyboard::Event::KeyReleased { modifiers, .. }
+            | keyboard::Event::ModifiersChanged(modifiers) => *modifiers,
+        };
+        let keyboard::Event::KeyPressed {
+            modified_key,
+            modifiers,
+            text,
+            ..
+        } = event
+        else {
+            return Task::none();
+        };
+
+        if self.pane_menu.is_some() && matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
+            self.pane_menu = None;
+            return Task::none();
+        }
+
+        // Zellij-style prefix: Ctrl+G unlocks an action layer that persists
+        // until the user picks a recognized follow-up or presses Escape.
+        if modifiers.control()
+            && !modifiers.shift()
+            && !modifiers.alt()
+            && !modifiers.logo()
+            && character_key_is(modified_key.as_ref(), "g")
+            && self.active_view == ActiveView::Workspace
+            && !self.palette.visible
+        {
+            self.prefix_armed = true;
+            self.rail_nav = None;
+            return Task::none();
+        }
+        if self.prefix_armed {
+            if character_key_is(modified_key.as_ref(), "w") {
+                self.prefix_armed = false;
+                let targets = self.rail_targets();
+                self.rail_nav = targets
+                    .iter()
+                    .find(|target| matches!(target, RailTarget::Workspace(_)))
+                    .copied();
+            } else if character_key_is(modified_key.as_ref(), "f") {
+                self.prefix_armed = false;
+                let targets = self.rail_targets();
+                self.rail_nav = targets
+                    .iter()
+                    .find(|target| !matches!(target, RailTarget::Workspace(_)))
+                    .copied();
+            } else if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
+                self.prefix_armed = false;
+            }
+            // Unrecognized keys leave the prefix armed and are consumed so
+            // partial chords never leak into panes.
+            return Task::none();
+        }
+        if let Some(current) = self.rail_nav {
+            match modified_key.as_ref() {
+                Key::Named(Named::ArrowUp) | Key::Named(Named::ArrowDown) => {
+                    let targets = self.rail_targets();
+                    if let Some(index) = targets.iter().position(|target| *target == current) {
+                        let next = if matches!(modified_key.as_ref(), Key::Named(Named::ArrowDown))
+                        {
+                            (index + 1).min(targets.len().saturating_sub(1))
+                        } else {
+                            index.saturating_sub(1)
+                        };
+                        self.rail_nav = targets.get(next).copied();
+                    } else {
+                        self.rail_nav = targets.first().copied();
+                    }
+                }
+                Key::Named(Named::Enter) => {
+                    self.rail_nav = None;
+                    match current {
+                        RailTarget::Workspace(workspace_id) => {
+                            if let Err(error) = self.switch_workspace(workspace_id) {
+                                self.status = error;
+                            }
+                        }
+                        RailTarget::FleetTab(workspace_id, tab_id) => {
+                            let first_pane = self
+                                .session
+                                .workspaces
+                                .iter()
+                                .find(|workspace| workspace.id == workspace_id)
+                                .and_then(|workspace| {
+                                    workspace.tabs.iter().find(|tab| tab.id == tab_id)
+                                })
+                                .map(|tab| tab.focused_pane_id);
+                            if let Some(pane_id) = first_pane
+                                && let Err(error) = self
+                                    .switch_workspace(workspace_id)
+                                    .and_then(|()| self.switch_tab(tab_id))
+                                    .and_then(|()| self.focus_pane(pane_id))
+                            {
+                                self.status = error;
+                            }
+                        }
+                        RailTarget::FleetGroup(workspace_id, pane_id) => {
+                            if let Err(error) = self
+                                .switch_workspace(workspace_id)
+                                .and_then(|()| self.focus_pane(pane_id))
+                            {
+                                self.status = error;
+                            }
+                        }
+                        RailTarget::FleetPane(workspace_id, pane_id) => {
+                            if let Err(error) = self
+                                .switch_workspace(workspace_id)
+                                .and_then(|()| self.focus_pane(pane_id))
+                            {
+                                self.status = error;
+                            }
+                        }
+                    }
+                }
+                Key::Named(Named::Escape) => self.rail_nav = None,
+                // Rail navigation is a mode. Unrelated keys are consumed but
+                // cannot silently dismiss it or leak into the terminal.
+                _ => {}
+            }
+            return Task::none();
+        }
+
+        if modifiers.command() && character_key_is(modified_key.as_ref(), "p") {
+            return self.toggle_command_palette();
+        }
+        if modifiers.command() && character_key_is(modified_key.as_ref(), ",") {
+            self.open_settings();
+            return Task::none();
+        }
+        if modifiers.command()
+            && let Key::Character(character) = modified_key.as_ref()
+            && let Ok(number) = character.parse::<usize>()
+            && (1..=9).contains(&number)
+        {
+            if let Some((workspace_id, pane_id)) = self.fleet_entries().get(number - 1).copied() {
+                self.active_view = ActiveView::Workspace;
+                let _ = self.switch_workspace(workspace_id);
+                let _ = self.focus_pane(pane_id);
+            }
+            return Task::none();
+        }
+        if let Some(action) = clipboard_shortcut(modified_key.as_ref(), modifiers)
+            && self.active_view == ActiveView::Workspace
+            && !self.palette.visible
+            && !self.workspace_create_visible
+            && self.close_workspace_prompt.is_none()
+            && self.rename_prompt.is_none()
+            && self.worktree_prompt.is_none()
+            && let Ok(workspace) = self.active_workspace()
+            && let Some(tab) = workspace.active_tab()
+        {
+            let pane_id = tab.focused_pane_id;
+            self.pane_menu = None;
+            // Both shortcuts are consumed even when they have nothing to do,
+            // matching Ghostty: an empty copy never reaches the shell as ^C.
+            return match action {
+                ClipboardAction::Copy => match self.selected_terminal_text(pane_id) {
+                    Some(text) => {
+                        self.toast =
+                            Some(("Copied to clipboard".into(), std::time::Instant::now()));
+                        iced::clipboard::write(text)
+                    }
+                    None => Task::none(),
+                },
+                ClipboardAction::Paste => iced::clipboard::read()
+                    .map(move |contents| Message::ClipboardPasted(pane_id, contents)),
+            };
+        }
+        // Workspace chords advertised in the pane menu and tab bar. Consumed
+        // under the same guards as the clipboard chords so they never leak
+        // into the terminal as control bytes.
+        if modifiers.control()
+            && modifiers.shift()
+            && !modifiers.alt()
+            && !modifiers.logo()
+            && self.active_view == ActiveView::Workspace
+            && !self.palette.visible
+            && !self.workspace_create_visible
+            && self.close_workspace_prompt.is_none()
+            && self.rename_prompt.is_none()
+            && self.worktree_prompt.is_none()
+        {
+            if character_key_is(modified_key.as_ref(), "e") {
+                self.status = match self.split_terminal(SplitAxis::Horizontal) {
+                    Ok(()) => "Opened a new terminal pane".into(),
+                    Err(error) => error,
+                };
+                return Task::none();
+            }
+            if character_key_is(modified_key.as_ref(), "o") {
+                self.status = match self.split_terminal(SplitAxis::Vertical) {
+                    Ok(()) => "Opened a new terminal pane".into(),
+                    Err(error) => error,
+                };
+                return Task::none();
+            }
+            if character_key_is(modified_key.as_ref(), "m")
+                && let Ok(workspace) = self.active_workspace()
+                && let Some(tab) = workspace.active_tab()
+            {
+                let pane_id = tab.focused_pane_id;
+                return self.update(Message::ToggleMaximize(pane_id));
+            }
+            if character_key_is(modified_key.as_ref(), "t") {
+                self.status = match self.new_tab() {
+                    Ok(()) => "Created a new tab".into(),
+                    Err(error) => error,
+                };
+                return Task::none();
+            }
+        }
+        if self.palette.visible {
+            match modified_key.as_ref() {
+                Key::Named(Named::Escape) => self.close_command_palette(),
+                Key::Named(Named::ArrowDown) => {
+                    return self.move_palette_selection(PaletteMove::Next);
+                }
+                Key::Named(Named::ArrowUp) => {
+                    return self.move_palette_selection(PaletteMove::Previous);
+                }
+                Key::Named(Named::Tab) => {
+                    return self.move_palette_selection(if modifiers.shift() {
+                        PaletteMove::Previous
+                    } else {
+                        PaletteMove::Next
+                    });
+                }
+                Key::Named(Named::Enter) => {
+                    let commands = commands::filtered(&self.palette.query);
+                    if let Some(command) = commands
+                        .get(self.palette.selected)
+                        .filter(|command| self.command_enabled(command.action))
+                    {
+                        return self.run_command(command.action);
+                    }
+                }
+                _ => {}
+            }
+            return Task::none();
+        }
+
+        // Gallery must precede the generic non-workspace branch, which
+        // would otherwise swallow Esc, discard the draft, and jump to the
+        // workspace instead of back to Settings.
+        if self.active_view == ActiveView::ThemeGallery {
+            if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
+                self.active_view = ActiveView::Settings;
+            }
+            return Task::none();
+        }
+
+        // The Worktrees settings page is a keyboard-operable inventory, not a
+        // static form: it owns Up/Down/Delete and advertises them in its
+        // footer. Without this exemption the generic non-workspace branch
+        // below consumes every key before the worktree handler is reached,
+        // leaving the advertised navigation dead.
+        let worktree_settings_owns_keys = self.worktree_manager.is_some()
+            && self.active_view == ActiveView::Settings
+            && self.settings_page == SettingsPage::Worktrees;
+        if self.active_view != ActiveView::Workspace && !worktree_settings_owns_keys {
+            if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
+                self.settings_draft = self.settings.clone();
+                self.active_view = ActiveView::Workspace;
+            }
+            return Task::none();
+        }
+
+        if self.workspace_create_visible {
+            if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
+                self.workspace_create_visible = false;
+            }
+            return Task::none();
+        }
+
+        if let Some(workspace_id) = self.close_workspace_prompt {
+            match modified_key.as_ref() {
+                Key::Named(Named::Escape) => self.close_workspace_prompt = None,
+                Key::Named(Named::Enter) => {
+                    // Enter confirms when closing is possible; the dialog for
+                    // the last workspace only offers dismissal.
+                    self.close_workspace_prompt = None;
+                    if self.session.workspaces.len() > 1
+                        && let Err(error) = self.close_workspace_by_id(workspace_id)
+                    {
+                        self.status = error;
+                    }
+                }
+                _ => {}
+            }
+            return Task::none();
+        }
+
+        if self.rename_prompt.is_some() {
+            if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
+                self.rename_prompt = None;
+            }
+            return Task::none();
+        }
+
+        if let Some(picker) = &mut self.session_picker {
+            let entry_count = picker.entries.len();
+            let selected = picker.selected;
+            match modified_key.as_ref() {
+                Key::Named(Named::Escape) => self.session_picker = None,
+                Key::Named(Named::Enter) if entry_count > 0 => {
+                    // A dead row cannot resume; Enter does the one thing it
+                    // can — clean it up — instead of printing a refusal.
+                    if self
+                        .session_picker
+                        .as_ref()
+                        .and_then(|picker| picker.entries.get(selected))
+                        .is_some_and(|entry| entry.alive)
+                    {
+                        self.resume_session(selected);
+                    } else {
+                        self.kill_picked_session(selected);
+                    }
+                }
+                Key::Named(Named::Enter) => self.session_picker = None,
+                Key::Named(Named::ArrowUp) if entry_count > 0 => {
+                    picker.selected = selected.saturating_sub(1);
+                }
+                Key::Named(Named::ArrowDown) if entry_count > 0 => {
+                    picker.selected = (selected + 1).min(entry_count - 1);
+                }
+                Key::Named(Named::Delete | Named::Backspace) if entry_count > 0 => {
+                    self.kill_picked_session(selected);
+                }
+                _ => {}
+            }
+            return Task::none();
+        }
+
+        let worktree_manager_is_active = self.worktree_manager.as_ref().is_some_and(|manager| {
+            matches!(manager.mode, WorktreeManagerMode::RestartPane(_))
+                || (self.active_view == ActiveView::Settings
+                    && self.settings_page == SettingsPage::Worktrees)
+        });
+        if worktree_manager_is_active && let Some(manager) = &mut self.worktree_manager {
+            let entry_count = manager.entries.len();
+            if manager.restart_target.is_some() {
+                match modified_key.as_ref() {
+                    Key::Named(Named::Escape) => manager.restart_target = None,
+                    Key::Named(Named::Enter) => self.confirm_worktree_restart(),
+                    _ => {}
+                }
+                return Task::none();
+            }
+            match modified_key.as_ref() {
+                Key::Named(Named::Escape) => {
+                    self.worktree_manager = None;
+                    if self.active_view == ActiveView::Settings {
+                        // Leaving settings by keyboard discards the draft
+                        // wherever it happens, so returning from Worktrees
+                        // cannot strand an edited Preferences draft.
+                        self.settings_draft = self.settings.clone();
+                        self.active_view = ActiveView::Workspace;
+                    }
+                }
+                Key::Named(Named::Enter)
+                    if entry_count > 0
+                        && matches!(manager.mode, WorktreeManagerMode::RestartPane(_)) =>
+                {
+                    manager.restart_target = Some(manager.selected);
+                }
+                // Manage renders only as the settings page, never as a
+                // dismissible dialog. Enter there has nothing to confirm, and
+                // discarding the inventory would strand the page on its
+                // "not loaded" notice.
+                Key::Named(Named::ArrowUp) if entry_count > 0 => {
+                    manager.selected = manager.selected.saturating_sub(1);
+                }
+                Key::Named(Named::ArrowDown) if entry_count > 0 => {
+                    manager.selected = (manager.selected + 1).min(entry_count - 1);
+                }
+                // Delete only. Backspace reads as "go back" on a full-window
+                // page, and the footer advertises Del — an unannounced second
+                // chord that removes a checkout is a trap, not a shortcut.
+                Key::Named(Named::Delete)
+                    if matches!(manager.mode, WorktreeManagerMode::Manage) =>
+                {
+                    let index = manager.selected;
+                    return self.delete_worktree_entry(index);
+                }
+                _ => {}
+            }
+            return Task::none();
+        }
+
+        if let Some(prompt) = &self.worktree_prompt {
+            // Enter drives the primary action so the dialog is fully keyboard
+            // operable: confirm when creation is possible, dismiss the
+            // not-a-repo notice otherwise. A double fire from the input's
+            // on_submit is absorbed by the busy guard in confirm_worktree.
+            let can_confirm = prompt.repo_root.is_some();
+            match modified_key.as_ref() {
+                Key::Named(Named::Escape) => self.worktree_prompt = None,
+                Key::Named(Named::Enter) if can_confirm => return self.confirm_worktree(),
+                Key::Named(Named::Enter) => self.worktree_prompt = None,
+                _ => {}
+            }
+            return Task::none();
+        }
+
+        if modifiers.control() && !modifiers.alt() && !modifiers.logo() {
+            let resize = if character_key_is(modified_key.as_ref(), "+")
+                || character_key_is(modified_key.as_ref(), "=")
+            {
+                Some(true)
+            } else if character_key_is(modified_key.as_ref(), "-") {
+                Some(false)
+            } else {
+                None
+            };
+            if let Some(increase) = resize {
+                self.status = match self.resize_focused_pane(increase) {
+                    Ok(status) => status.into(),
+                    Err(error) => error,
+                };
+                return Task::none();
+            }
+        }
+
+        if modifiers.alt() && !modifiers.control() && !modifiers.shift() && !modifiers.logo() {
+            let cycle = if character_key_is(modified_key.as_ref(), "[") {
+                Some(LayoutCycle::Previous)
+            } else if character_key_is(modified_key.as_ref(), "]") {
+                Some(LayoutCycle::Next)
+            } else {
+                None
+            };
+            if let Some(cycle) = cycle {
+                self.status = match self.cycle_pane_layout(cycle) {
+                    Ok(layout) => format!("Pane layout: {layout}"),
+                    Err(error) => error,
+                };
+                let toast = self.status.clone();
+                self.show_toast(&toast);
+                return Task::none();
+            }
+        }
+
+        if modifiers.alt() && !modifiers.control() && !modifiers.shift() {
+            let direction = match modified_key.as_ref() {
+                Key::Named(Named::ArrowLeft) => Some(NavDirection::Left),
+                Key::Named(Named::ArrowRight) => Some(NavDirection::Right),
+                Key::Named(Named::ArrowUp) => Some(NavDirection::Up),
+                Key::Named(Named::ArrowDown) => Some(NavDirection::Down),
+                _ => None,
+            };
+            if let Some(direction) = direction {
+                if let Err(error) = self.focus_neighbor_pane(direction) {
+                    self.status = error;
+                }
+                return Task::none();
+            }
+        }
+
+        let Some(bytes) = encode_terminal_key(modified_key.as_ref(), modifiers, text.as_deref())
+        else {
+            return Task::none();
+        };
+
+        self.cursor_phase_visible = true;
+        if let Err(error) = self.send_terminal_input(bytes) {
+            self.status = format!("Terminal input failed: {error}");
+        }
+        Task::none()
+    }
+
+    fn move_palette_selection(&mut self, direction: PaletteMove) -> Task<Message> {
+        let commands = commands::filtered(&self.palette.query);
+        let enabled: Vec<_> = commands
+            .iter()
+            .map(|command| self.command_enabled(command.action))
+            .collect();
+        self.palette.selected =
+            enabled_palette_selection(self.palette.selected, &enabled, direction);
+        let count = commands.len();
+        let offset = if count > 1 {
+            self.palette.selected as f32 / (count - 1) as f32
+        } else {
+            0.0
+        };
+        Task::batch([
+            iced::widget::operation::focus(iced::widget::Id::new(PALETTE_INPUT_ID)),
+            iced::widget::operation::snap_to(
+                iced::widget::Id::new(PALETTE_SCROLL_ID),
+                iced::widget::operation::RelativeOffset { x: 0.0, y: offset },
+            ),
+        ])
+    }
+
+    fn toggle_command_palette(&mut self) -> Task<Message> {
+        if self.palette.visible {
+            self.close_command_palette();
+            Task::none()
+        } else {
+            self.palette.visible = true;
+            self.palette.query.clear();
+            let commands = commands::filtered("");
+            let enabled: Vec<_> = commands
+                .iter()
+                .map(|command| self.command_enabled(command.action))
+                .collect();
+            self.palette.selected = first_enabled_palette_command(&enabled);
+            iced::widget::operation::focus(iced::widget::Id::new(PALETTE_INPUT_ID))
+        }
+    }
+
+    fn command_enabled(&self, action: CommandAction) -> bool {
+        self.maximized_pane.is_none() || !action.requires_tiled_panes()
+    }
+
+    fn close_command_palette(&mut self) {
+        self.palette.visible = false;
+        self.palette.query.clear();
+        self.palette.selected = 0;
+    }
+
+    fn open_github_panel(&mut self) -> Task<Message> {
+        self.close_command_palette();
+        let Some(directory) = self.focused_pane_directory() else {
+            self.status = "The focused pane has no working directory.".into();
+            self.show_toast("The focused pane has no working directory");
+            return Task::none();
+        };
+        let repository = match github::repository_from(&directory, &self.settings.wsl_distribution)
+        {
+            Ok(repository) => repository,
+            Err(error) => {
+                self.status = error.clone();
+                self.show_toast(&error);
+                return Task::none();
+            }
+        };
+        let same_repository = self
+            .github_panel
+            .as_ref()
+            .is_some_and(|panel| panel.repository.root == repository.root);
+        if same_repository {
+            if let Some(panel) = self.github_panel.as_mut() {
+                panel.repository = repository;
+            }
+        } else {
+            self.github_panel = Some(GitHubPanelState::loading(repository));
+        }
+        if matches!(self.github_auth, github::AuthStatus::Authenticated { .. }) {
+            self.refresh_github_panel()
+        } else {
+            if let Some(panel) = self.github_panel.as_mut() {
+                panel.loading = false;
+            }
+            Task::none()
+        }
+    }
+
+    fn begin_github_auth(&mut self) -> Task<Message> {
+        if self.github_auth_busy {
+            return Task::none();
+        }
+        self.github_auth_busy = true;
+        self.status = "Finish connecting GitHub in your browser".into();
+        perform_blocking(github::authenticate, |result| {
+            Message::GitHubAuthFinished(result.and_then(std::convert::identity))
+        })
+    }
+
+    fn refresh_github_panel(&mut self) -> Task<Message> {
+        if !matches!(self.github_auth, github::AuthStatus::Authenticated { .. }) {
+            if let Some(panel) = self.github_panel.as_mut() {
+                panel.loading = false;
+            }
+            return Task::none();
+        }
+        let Some(panel) = self.github_panel.as_mut() else {
+            return Task::none();
+        };
+        panel.loading = true;
+        panel.error = None;
+        panel.merge_confirmation = false;
+        let repository = panel.repository.clone();
+        let root = repository.root.clone();
+        perform_blocking(
+            move || github::load(&repository),
+            move |result| {
+                Message::GitHubPanelLoaded(root, Box::new(result.and_then(std::convert::identity)))
+            },
+        )
+    }
+
+    fn confirm_github_merge(&mut self) -> Task<Message> {
+        let Some(panel) = self.github_panel.as_mut() else {
+            return Task::none();
+        };
+        let Some(pull_request) = panel
+            .data
+            .as_ref()
+            .and_then(|data| data.pull_request.as_ref())
+        else {
+            panel.merge_confirmation = false;
+            return Task::none();
+        };
+        if pull_request.readiness() != github::MergeReadiness::Ready {
+            panel.merge_confirmation = false;
+            panel.error = Some("This pull request is not ready to merge yet.".into());
+            return Task::none();
+        }
+        panel.merging = true;
+        let repository = panel.repository.clone();
+        let root = repository.root.clone();
+        let number = pull_request.number;
+        let head_oid = pull_request.head_oid.clone();
+        perform_blocking(
+            move || github::merge(&repository, number, &head_oid),
+            move |result| {
+                Message::GitHubMergeFinished(root, result.and_then(std::convert::identity))
+            },
+        )
+    }
+
+    fn run_command(&mut self, action: CommandAction) -> Task<Message> {
+        if !self.command_enabled(action) {
+            self.status = "Restore panes before changing their layout".into();
+            return Task::none();
+        }
+        self.close_command_palette();
+        match action {
+            CommandAction::Split(axis) => {
+                self.active_view = ActiveView::Workspace;
+                self.status = match self.split_terminal(axis) {
+                    Ok(()) => "Opened a new terminal pane".into(),
+                    Err(error) => error,
+                };
+            }
+            CommandAction::GrowPane => {
+                self.active_view = ActiveView::Workspace;
+                self.status = match self.resize_focused_pane(true) {
+                    Ok(status) => status.into(),
+                    Err(error) => error,
+                };
+            }
+            CommandAction::RestorePaneSize => {
+                self.active_view = ActiveView::Workspace;
+                self.status = match self.resize_focused_pane(false) {
+                    Ok(status) => status.into(),
+                    Err(error) => error,
+                };
+            }
+            CommandAction::PreviousPaneLayout | CommandAction::NextPaneLayout => {
+                self.active_view = ActiveView::Workspace;
+                let cycle = if action == CommandAction::PreviousPaneLayout {
+                    LayoutCycle::Previous
+                } else {
+                    LayoutCycle::Next
+                };
+                self.status = match self.cycle_pane_layout(cycle) {
+                    Ok(layout) => format!("Pane layout: {layout}"),
+                    Err(error) => error,
+                };
+                let toast = self.status.clone();
+                self.show_toast(&toast);
+            }
+            CommandAction::ClosePane => {
+                self.active_view = ActiveView::Workspace;
+                self.status = match self.close_focused() {
+                    Ok(()) if self.close_workspace_prompt.is_some() => {
+                        "Confirm closing the workspace".into()
+                    }
+                    Ok(()) => "Closed the focused pane".into(),
+                    Err(error) => error,
+                };
+            }
+            CommandAction::NewTab => {
+                self.status = match self.new_tab() {
+                    Ok(()) => "Created a new tab".into(),
+                    Err(error) => error,
+                };
+            }
+            CommandAction::CloseTab => {
+                let target = self
+                    .active_workspace()
+                    .map(|workspace| (workspace.id, workspace.active_tab_id));
+                self.status = match target
+                    .and_then(|(workspace_id, tab_id)| self.close_tab(workspace_id, tab_id))
+                {
+                    Ok(()) if self.close_workspace_prompt.is_some() => {
+                        "Confirm closing the workspace".into()
+                    }
+                    Ok(()) => "Closed the tab".into(),
+                    Err(error) => error,
+                };
+            }
+            CommandAction::NewWorkspace => {
+                return self.open_workspace_create();
+            }
+            CommandAction::CloseWorkspace => {
+                self.status = match self.close_workspace() {
+                    Ok(()) => "Closed the workspace".into(),
+                    Err(error) => error,
+                };
+            }
+            CommandAction::CopySelection => {
+                self.active_view = ActiveView::Workspace;
+                if let Ok(workspace) = self.active_workspace()
+                    && let Some(tab) = workspace.active_tab()
+                {
+                    if let Some(text) = self.selected_terminal_text(tab.focused_pane_id) {
+                        return iced::clipboard::write(text);
+                    }
+                    self.status = "Nothing is selected in the focused terminal".into();
+                }
+            }
+            CommandAction::PasteClipboard => {
+                self.active_view = ActiveView::Workspace;
+                if let Ok(workspace) = self.active_workspace()
+                    && let Some(tab) = workspace.active_tab()
+                {
+                    let pane_id = tab.focused_pane_id;
+                    return iced::clipboard::read()
+                        .map(move |contents| Message::ClipboardPasted(pane_id, contents));
+                }
+            }
+            CommandAction::RenameWorkspace => {
+                if let Ok(workspace) = self.active_workspace() {
+                    let target = RenameTarget::Workspace(workspace.id);
+                    let name = workspace.name.clone();
+                    return self.open_rename_prompt(target, name);
+                }
+            }
+            CommandAction::RenameTab => {
+                if let Ok(workspace) = self.active_workspace()
+                    && let Some(tab) = workspace.active_tab()
+                {
+                    let target = RenameTarget::Tab(workspace.id, tab.id);
+                    let name = tab.name.clone();
+                    return self.open_rename_prompt(target, name);
+                }
+            }
+            CommandAction::RenamePane => {
+                if let Ok(workspace) = self.active_workspace()
+                    && let Some(tab) = workspace.active_tab()
+                {
+                    let pane_id = tab.focused_pane_id;
+                    let name = workspace
+                        .pane(pane_id)
+                        .and_then(|pane| pane.custom_name.clone())
+                        .unwrap_or_default();
+                    return self.open_rename_prompt(RenameTarget::Pane(pane_id), name);
+                }
+            }
+            CommandAction::NewWorktree(kind) => {
+                return self.open_worktree_prompt(WorktreePromptTarget::Open(kind));
+            }
+            CommandAction::RestartPaneInWorktree => {
+                if let Ok(workspace) = self.active_workspace()
+                    && let Some(tab) = workspace.active_tab()
+                {
+                    return self.open_worktree_prompt(WorktreePromptTarget::RestartPane(
+                        tab.focused_pane_id,
+                    ));
+                }
+            }
+            CommandAction::RestartPaneInExistingWorktree => {
+                if let Ok(workspace) = self.active_workspace()
+                    && let Some(tab) = workspace.active_tab()
+                {
+                    return self.open_worktree_switcher(tab.focused_pane_id);
+                }
+            }
+            CommandAction::ManageWorktrees => return self.open_worktree_manager(),
+            CommandAction::ManageSessions => {
+                self.open_session_picker(false);
+                return Task::none();
+            }
+            CommandAction::FleetTabs => {
+                self.set_fleet_view(FleetView::Tabs);
+                self.status = "Fleet lists every pane".into();
+            }
+            CommandAction::FleetAgents => {
+                self.set_fleet_view(FleetView::Agents);
+                self.status = "Fleet filters to agent panes".into();
+            }
+            CommandAction::FleetRepos => {
+                self.set_fleet_view(FleetView::Repos);
+                self.status = "Fleet groups panes by repository".into();
+                return self.refresh_pane_repositories();
+            }
+            CommandAction::OpenGitHubPanel => return self.open_github_panel(),
+            CommandAction::OpenSettings => self.open_settings(),
+            CommandAction::LaunchAgent(agent) => {
+                self.active_view = ActiveView::Workspace;
+                self.status = match self.launch_agent(agent) {
+                    Ok(()) => format!("Launched {agent} in a new pane"),
+                    Err(error) => error,
+                };
+            }
+            CommandAction::ReturnToWorkspace => self.active_view = ActiveView::Workspace,
+        }
+        Task::none()
+    }
+
+    fn launch_agent(&mut self, agent: Agent) -> Result<(), String> {
+        let command = match agent {
+            Agent::Codex => self.settings.codex_command.clone(),
+            Agent::Claude => self.settings.claude_command.clone(),
+        };
+        self.split_terminal(SplitAxis::Horizontal)?;
+        let pane_id = self
+            .active_workspace()?
+            .active_tab()
+            .ok_or_else(|| "active tab is missing".to_owned())?
+            .focused_pane_id;
+        let input = format!("{command}\r").into_bytes();
+        if self
+            .terminals
+            .get(&pane_id)
+            .is_some_and(|runtime| runtime.session.is_some())
+        {
+            self.send_terminal_input_to(pane_id, input)?;
+        } else {
+            self.pending_terminal_input
+                .entry(pane_id)
+                .or_default()
+                .push(input);
+        }
+        let agent_name = agent.to_string();
+        let display_name = self.agent_worktree_name(pane_id);
+        self.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                activity: Some(format!("Starting {}", agent_display_name(&agent_name))),
+                agent: agent_name,
+                display_name,
+                state: AgentState::Idle,
+                session_id: None,
+                cwd: None,
+                git_branch: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn open_settings(&mut self) {
+        self.settings_draft = self.settings.clone();
+        self.workspace_name_draft = self
+            .active_workspace()
+            .map_or_else(|_| String::new(), |workspace| workspace.name.clone());
+        self.available_terminal_font_weights = self
+            .installed_fonts
+            .terminal_weights(&self.settings_draft.terminal_font);
+        self.available_ui_font_weights = self
+            .installed_fonts
+            .ui_weights(&self.settings_draft.ui_font);
+        if self.available_ui_font_weights.is_empty() {
+            self.available_ui_font_weights.push(FontWeight::Normal);
+        }
+        if !self.settings_draft.wsl_distribution.trim().is_empty()
+            && !self.available_wsl_distributions.iter().any(|choice| {
+                choice.0.as_deref() == Some(self.settings_draft.wsl_distribution.trim())
+            })
+        {
+            self.available_wsl_distributions
+                .push(WslDistributionChoice(Some(
+                    self.settings_draft.wsl_distribution.trim().to_owned(),
+                )));
+        }
+        self.settings_page = SettingsPage::Preferences;
+        self.active_view = ActiveView::Settings;
+        self.close_command_palette();
+    }
+
+    fn refresh_integrations(&mut self) -> Task<Message> {
+        self.integration_generation = self.integration_generation.wrapping_add(1);
+        let generation = self.integration_generation;
+        self.integration_refreshing = true;
+        let settings = self.settings_draft.clone();
+        perform_blocking(
+            move || {
+                let mut wsl_distributions = discover_wsl_distributions();
+                let selected = settings.wsl_distribution.trim();
+                if !selected.is_empty()
+                    && !wsl_distributions
+                        .iter()
+                        .any(|choice| choice.0.as_deref() == Some(selected))
+                {
+                    wsl_distributions.push(WslDistributionChoice(Some(selected.to_owned())));
+                }
+                IntegrationDiscovery {
+                    wsl_distributions,
+                    hook_statuses: load_hook_statuses(&settings),
+                }
+            },
+            move |result| Message::IntegrationDiscoveryFinished(generation, result),
+        )
+    }
+
+    fn manage_hooks(&mut self, agent: Agent, action: HookAction) -> Task<Message> {
+        self.integration_generation = self.integration_generation.wrapping_add(1);
+        let generation = self.integration_generation;
+        self.integration_refreshing = true;
+        self.status = format!("Updating {agent} hooks…");
+        let settings = self.settings_draft.clone();
+        perform_blocking(
+            move || {
+                let manager = hook_manager(&settings)?;
+                let result = manager
+                    .apply(agent, HookScope::User, action)
+                    .map_err(|error| error.to_string())?;
+                let statuses = Agent::ALL
+                    .into_iter()
+                    .map(|candidate| {
+                        manager
+                            .status(candidate, HookScope::User)
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(HookOperationResult {
+                    message: result.message,
+                    statuses,
+                })
+            },
+            move |result| {
+                Message::HookOperationFinished(generation, result.and_then(|result| result))
+            },
+        )
+    }
+
+    fn update_stale_hook_alert(&mut self) {
+        const TITLE: &str = "Agent hooks need repair";
+        self.global_alerts.retain(|alert| alert.title != TITLE);
+        let stale: Vec<_> = self
+            .hook_statuses
+            .iter()
+            .filter(|status| !status.installed && status.managed_entries > 0)
+            .map(|status| agent_display_name(&status.agent.to_string()).to_owned())
+            .collect();
+        if !stale.is_empty() {
+            self.global_alerts.push(GlobalAlert {
+                title: TITLE.into(),
+                body: format!(
+                    "{} hooks point to another Muxtrix installation. Open Settings and choose Repair.",
+                    stale.join(" and ")
+                ),
+            });
+        }
+    }
+
+    fn save_settings(&mut self) -> Task<Message> {
+        self.settings = self.settings_draft.clone();
+        let terminal_theme = self.settings.terminal_theme.preset().terminal_theme();
+        let mut theme_error = None;
+        for runtime in self.terminals.values() {
+            if let Some(session) = &runtime.session
+                && let Err(error) = session.apply_theme(terminal_theme)
+            {
+                theme_error = Some(error.to_string());
+            }
+        }
+        if let Some(profile) = self.session.profiles.first_mut() {
+            let profile_id = profile.id;
+            *profile = default_profile_with_id(&self.settings, profile_id);
+        }
+        self.active_view = ActiveView::Workspace;
+        let viewports: Vec<(PaneId, Size)> = self
+            .terminals
+            .iter()
+            .filter_map(|(pane_id, runtime)| runtime.viewport.map(|size| (*pane_id, size)))
+            .collect();
+        for (pane_id, viewport) in viewports {
+            if let Err(error) = self.resize_terminal(pane_id, viewport) {
+                self.status = format!("Font saved, but terminal resize failed: {error}");
+                return Task::none();
+            }
+        }
+        self.status = match (self.settings.save(), theme_error) {
+            (Ok(path), None) => format!("Settings saved to {}", path.display()),
+            (Ok(path), Some(error)) => format!(
+                "Settings saved to {}, but a terminal could not update its theme: {error}",
+                path.display()
+            ),
+            (Err(error), _) => format!("Could not save settings: {error}"),
+        };
+        self.window_resize_increment_task()
+    }
+
+    fn send_terminal_input(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        let focused_pane_id = self
+            .active_workspace()?
+            .active_tab()
+            .ok_or_else(|| "active tab is missing".to_owned())?
+            .focused_pane_id;
+        self.send_terminal_input_to(focused_pane_id, bytes)
+    }
+
+    fn send_terminal_input_to(&mut self, pane_id: PaneId, bytes: Vec<u8>) -> Result<(), String> {
+        {
+            let session = self
+                .terminals
+                .get(&pane_id)
+                .and_then(|runtime| runtime.session.as_ref())
+                .ok_or_else(|| format!("pane {pane_id:?} has no live terminal"))?;
+            session
+                .input(bytes.clone())
+                .map_err(|error| error.to_string())?;
+        }
+        self.observe_agent_interrupt(pane_id, &bytes);
+        self.observe_terminal_command(pane_id, &bytes);
+        Ok(())
+    }
+
+    /// Detection beneath the hooks: an agent process running inside a pane is
+    /// an agent even before (or without) any lifecycle hook firing. Hook
+    /// events overwrite and take ownership; a detected entry is removed once
+    /// its process disappears.
+    fn detect_agent_processes(&mut self) {
+        let pane_ids: Vec<PaneId> = self.terminals.keys().copied().collect();
+        for pane_id in pane_ids {
+            if !self.agent_statuses.contains_key(&pane_id) {
+                if let Some(agent) = self.pane_agent_process(pane_id) {
+                    let display_name = self.agent_worktree_name(pane_id);
+                    self.agent_statuses.insert(
+                        pane_id,
+                        AgentPaneStatus {
+                            agent,
+                            display_name,
+                            state: AgentState::Idle,
+                            activity: None,
+                            session_id: None,
+                            cwd: None,
+                            git_branch: None,
+                        },
+                    );
+                    self.detected_agents
+                        .insert(pane_id, std::time::Instant::now());
+                }
+            } else if self
+                .detected_agents
+                .get(&pane_id)
+                .is_some_and(|first_seen| first_seen.elapsed() > std::time::Duration::from_secs(2))
+                && self.pane_agent_process(pane_id).is_none()
+            {
+                self.agent_statuses.remove(&pane_id);
+                self.agent_running_frame_revisions.remove(&pane_id);
+                self.detected_agents.remove(&pane_id);
+            }
+        }
+    }
+
+    /// Walks the pane's process tree via /proc looking for a known agent
+    /// executable. Bounded breadth-first walk; the shell itself is skipped.
+    #[cfg(target_os = "linux")]
+    fn pane_agent_process(&self, pane_id: PaneId) -> Option<String> {
+        let root = self
+            .terminals
+            .get(&pane_id)?
+            .session
+            .as_ref()?
+            .process_id()?;
+        let codex = command_executable(&self.settings.codex_command)
+            .unwrap_or("codex")
+            .to_ascii_lowercase();
+        let claude = command_executable(&self.settings.claude_command)
+            .unwrap_or("claude")
+            .to_ascii_lowercase();
+        let mut queue = std::collections::VecDeque::from([root]);
+        let mut inspected = 0;
+        while let Some(pid) = queue.pop_front() {
+            inspected += 1;
+            if inspected > 32 {
+                break;
+            }
+            if pid != root
+                && let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            {
+                let comm = comm.trim().to_ascii_lowercase();
+                if comm == "codex" || comm == codex {
+                    return Some("codex".into());
+                }
+                if comm == "claude" || comm == "claude-code" || comm == claude {
+                    return Some("claude".into());
+                }
+            }
+            if let Ok(children) =
+                std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+            {
+                queue.extend(
+                    children
+                        .split_whitespace()
+                        .filter_map(|pid| pid.parse::<u32>().ok()),
+                );
+            }
+        }
+        None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn pane_agent_process(&self, _pane_id: PaneId) -> Option<String> {
+        None
+    }
+
+    fn paste_into_pane(&mut self, pane_id: PaneId, text: &str) -> Result<(), String> {
+        self.terminals
+            .get(&pane_id)
+            .and_then(|runtime| runtime.session.as_ref())
+            .ok_or_else(|| "the pane has no live terminal".to_owned())?
+            .paste(text)
+            .map_err(|error| error.to_string())
+    }
+
+    fn observe_agent_interrupt(&mut self, pane_id: PaneId, bytes: &[u8]) {
+        if !bytes.contains(&0x03) {
+            return;
+        }
+        let Some(status) = self.agent_statuses.get_mut(&pane_id) else {
+            return;
+        };
+        if status.state == AgentState::Running {
+            status.state = AgentState::Idle;
+            status.activity = Some("Prompt interrupted".into());
+        }
+    }
+
+    fn observe_terminal_command(&mut self, pane_id: PaneId, bytes: &[u8]) {
+        if self.agent_statuses.contains_key(&pane_id) {
+            return;
+        }
+        let buffer = self.terminal_command_buffers.entry(pane_id).or_default();
+        let mut submitted = None;
+        for byte in bytes {
+            match byte {
+                b'\r' | b'\n' => {
+                    if !buffer.trim().is_empty() {
+                        submitted = Some(std::mem::take(buffer));
+                    } else {
+                        buffer.clear();
+                    }
+                }
+                0x08 | 0x7f => {
+                    buffer.pop();
+                }
+                0x03 | 0x1b => buffer.clear(),
+                byte if byte.is_ascii_graphic() || *byte == b' ' => buffer.push(char::from(*byte)),
+                _ => {}
+            }
+        }
+        let Some(command) = submitted else {
+            return;
+        };
+        let Some(agent) = agent_command(&command, &self.settings) else {
+            return;
+        };
+        let agent_name = agent.to_string();
+        let display_name = self.agent_worktree_name(pane_id);
+        self.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                activity: Some(format!("Starting {}", agent_display_name(&agent_name))),
+                agent: agent_name,
+                display_name,
+                state: AgentState::Idle,
+                session_id: None,
+                cwd: None,
+                git_branch: None,
+            },
+        );
+    }
+
+    fn agent_worktree_name(&self, pane_id: PaneId) -> Option<String> {
+        let directory = self.pane_working_directory(pane_id)?;
+        linked_worktree_name(&directory)
+    }
+
+    fn resize_terminal(&mut self, pane_id: PaneId, size: Size) -> Result<(), String> {
+        self.terminals
+            .get_mut(&pane_id)
+            .ok_or_else(|| format!("pane {pane_id:?} has no terminal runtime"))?
+            .resize(size, &self.settings)
+    }
+
+    fn scroll_terminal(&mut self, pane_id: PaneId, delta: ScrollDelta) -> Result<(), String> {
+        self.focus_pane(pane_id)?;
+        let lines = terminal_scroll_lines(delta, self.settings.terminal_cell_height());
+        if lines == 0 {
+            return Ok(());
+        }
+        let runtime = self
+            .terminals
+            .get(&pane_id)
+            .ok_or_else(|| format!("pane {pane_id:?} has no terminal runtime"))?;
+        // The 1-based pointer cell, for applications that report the mouse.
+        let cell = self
+            .terminal_pointer_positions
+            .get(&pane_id)
+            .map(|position| {
+                let column =
+                    ((position.x - 8.0).max(0.0) / self.settings.terminal_cell_width()) as u16;
+                let row =
+                    ((position.y - 8.0).max(0.0) / self.settings.terminal_cell_height()) as u16;
+                (
+                    (column + 1).min(runtime.size.cols.max(1)),
+                    (row + 1).min(runtime.size.rows.max(1)),
+                )
+            });
+        // Selection remains emulator-owned. If this wheel is answered by a
+        // repainting application, the terminal session preserves the selected
+        // text and re-anchors it after the new frame arrives.
+        runtime.wheel(lines, cell)
+    }
+
+    fn scroll_terminal_to(&mut self, pane_id: PaneId, offset: u64) -> Result<(), String> {
+        self.focus_pane(pane_id)?;
+        let row = usize::try_from(offset)
+            .map_err(|_| "terminal scroll position exceeds this platform's range".to_owned())?;
+        self.terminals
+            .get(&pane_id)
+            .ok_or_else(|| format!("pane {pane_id:?} has no terminal runtime"))?
+            .scroll_to(row)
+    }
+
+    fn begin_terminal_scroll(&mut self, pane_id: PaneId) -> Result<(), String> {
+        let runtime = self
+            .terminals
+            .get(&pane_id)
+            .ok_or_else(|| format!("pane {pane_id:?} has no terminal runtime"))?;
+        let snapshot = runtime
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| "terminal scrollback is not ready yet".to_owned())?;
+        let viewport_height = runtime.viewport.map_or(0.0, |viewport| viewport.height);
+        let geometry = terminal_scrollbar_geometry(snapshot.scrollbar, viewport_height);
+        if geometry.max_offset == 0 {
+            return Ok(());
+        }
+        let local = self
+            .terminal_scrollbar_positions
+            .get(&pane_id)
+            .copied()
+            .unwrap_or(Point::new(0.0, geometry.track_top + geometry.thumb_top));
+        let thumb_start = geometry.track_top + geometry.thumb_top;
+        let thumb_end = thumb_start + geometry.thumb_height;
+        let grab_offset = if (thumb_start..=thumb_end).contains(&local.y) {
+            local.y - thumb_start
+        } else {
+            geometry.thumb_height / 2.0
+        };
+        self.terminal_scroll_drag = Some(TerminalScrollDrag {
+            pane_id,
+            pane_top: self.cursor_position.y - local.y,
+            grab_offset,
+            track_height: viewport_height,
+            last_offset: snapshot.scrollbar.offset,
+        });
+        self.update_terminal_scroll_drag(self.cursor_position)
+    }
+
+    fn update_terminal_scroll_drag(&mut self, position: Point) -> Result<(), String> {
+        let Some(drag) = self.terminal_scroll_drag else {
+            return Ok(());
+        };
+        let scrollbar = self
+            .terminals
+            .get(&drag.pane_id)
+            .and_then(|runtime| runtime.snapshot.as_ref())
+            .map(|snapshot| snapshot.scrollbar)
+            .ok_or_else(|| "terminal scrollback is no longer available".to_owned())?;
+        let geometry = terminal_scrollbar_geometry(scrollbar, drag.track_height);
+        let thumb_top = position.y - drag.pane_top - geometry.track_top - drag.grab_offset;
+        let target = geometry.offset_for_thumb_top(thumb_top);
+        if target == drag.last_offset {
+            return Ok(());
+        }
+        self.scroll_terminal_to(drag.pane_id, target)?;
+        if let Some(active) = &mut self.terminal_scroll_drag {
+            active.last_offset = target;
+        }
+        Ok(())
+    }
+
+    fn begin_split_drag(&mut self, key: SplitKey, axis: SplitAxis) -> Result<(), String> {
+        let tab_id = key.tab_id;
+        let size = self
+            .split_sizes
+            .get(&key)
+            .copied()
+            .ok_or_else(|| "Split handle is not ready yet".to_owned())?;
+        let workspace = self
+            .session
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == key.workspace_id)
+            .ok_or_else(|| "Split workspace is no longer available".to_owned())?;
+        let tab = workspace
+            .tab(key.tab_id)
+            .ok_or_else(|| "Split tab is no longer available".to_owned())?;
+        let start_ratio = split_ratio_at(&tab.root, &key.path)
+            .ok_or_else(|| "Split is no longer available".to_owned())?
+            .permille();
+        let extent = match axis {
+            SplitAxis::Horizontal => size.width,
+            SplitAxis::Vertical => size.height,
+        };
+        if extent <= SPLIT_HANDLE_SIZE {
+            return Err("Split is too small to resize".into());
+        }
+        let start_coordinate = match axis {
+            SplitAxis::Horizontal => self.cursor_position.x,
+            SplitAxis::Vertical => self.cursor_position.y,
+        };
+        self.split_drag = Some(SplitDrag {
+            key,
+            axis,
+            start_coordinate,
+            start_ratio,
+            extent,
+        });
+        self.pane_layouts.remove(&tab_id);
+        self.base_pane_layouts.remove(&tab_id);
+        self.pane_resize_history.remove(&tab_id);
+        Ok(())
+    }
+
+    fn update_split_drag(&mut self, position: Point) -> Result<(), String> {
+        let Some(drag) = self.split_drag.clone() else {
+            return Ok(());
+        };
+        let coordinate = match drag.axis {
+            SplitAxis::Horizontal => position.x,
+            SplitAxis::Vertical => position.y,
+        };
+        let delta = coordinate - drag.start_coordinate;
+        let permille = (f32::from(drag.start_ratio) + delta / drag.extent * 1_000.0)
+            .round()
+            .clamp(f32::from(SplitRatio::MIN), f32::from(SplitRatio::MAX))
+            as u16;
+        let ratio = SplitRatio::new(permille).map_err(|error| error.to_string())?;
+        let workspace = self
+            .session
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == drag.key.workspace_id)
+            .ok_or_else(|| "Split workspace is no longer available".to_owned())?;
+        let tab = workspace
+            .tab_mut(drag.key.tab_id)
+            .ok_or_else(|| "Split tab is no longer available".to_owned())?;
+        if set_split_ratio_at(&mut tab.root, &drag.key.path, ratio) {
+            Ok(())
+        } else {
+            Err("Split is no longer available".into())
+        }
+    }
+
+    fn poll_terminal(&mut self) {
+        self.drain_terminal_launches();
+        let mut notifications = Vec::new();
+        let mut exited = Vec::new();
+        let mut titles = Vec::new();
+        for (pane_id, runtime) in &mut self.terminals {
+            let poll = runtime.poll();
+            if let Some(status) = poll.status {
+                self.status = status;
+            }
+            notifications.extend(
+                poll.notifications
+                    .into_iter()
+                    .map(|notification| (*pane_id, notification)),
+            );
+            if poll.exited {
+                exited.push((*pane_id, poll.exited_clean));
+            }
+            if let Some(title) = poll.title {
+                titles.push((*pane_id, title));
+            }
+        }
+        for (pane_id, title) in titles {
+            if let Some(status) = self.agent_statuses.get_mut(&pane_id)
+                && let Some(title) = harness_terminal_title(&title, &status.agent)
+            {
+                status.display_name = Some(title);
+            }
+            if let Some(surface) = self
+                .session
+                .workspaces
+                .iter_mut()
+                .find_map(|workspace| workspace.pane_mut(pane_id))
+                .and_then(|pane| {
+                    pane.surfaces
+                        .iter_mut()
+                        .find(|surface| surface.id == pane.active_surface_id)
+                })
+            {
+                surface.title = title;
+            }
+        }
+        // Schema-v3 sessions created before durable pane identity (and any
+        // pane whose hook never reached this process) can still recover from
+        // agent-specific chrome in the replayed live screen. This is the
+        // fallback beneath persisted identity and platform process scanning.
+        let recoveries = self
+            .terminals
+            .iter()
+            .filter(|(pane_id, _)| !self.agent_statuses.contains_key(pane_id))
+            .filter_map(|(pane_id, runtime)| {
+                let snapshot = runtime.snapshot.as_ref()?;
+                let identification = agent_screen::identify(snapshot)?;
+                let display_name = snapshot
+                    .title
+                    .as_deref()
+                    .and_then(|title| harness_terminal_title(title, identification.agent))
+                    .or_else(|| self.agent_worktree_name(*pane_id));
+                Some((*pane_id, identification, display_name))
+            })
+            .collect::<Vec<_>>();
+        for (pane_id, identification, display_name) in recoveries {
+            let screen = identification
+                .classification
+                .map_or(agent_screen::ScreenState::Idle, |classification| {
+                    classification.state
+                });
+            self.agent_statuses.insert(
+                pane_id,
+                AgentPaneStatus {
+                    agent: identification.agent.into(),
+                    display_name,
+                    state: screen_state(screen),
+                    activity: Some(agent_state_activity(screen).into()),
+                    session_id: None,
+                    cwd: None,
+                    git_branch: None,
+                },
+            );
+        }
+        // Re-evaluate the retained latest frame as well as newly received
+        // frames. Agent identity may arrive from a hook just after the TUI
+        // painted a stable prompt, with no reason for another repaint.
+        let classifications = self
+            .agent_statuses
+            .iter()
+            .filter_map(|(pane_id, status)| {
+                self.terminals
+                    .get(pane_id)
+                    .and_then(|runtime| {
+                        runtime
+                            .snapshot
+                            .as_ref()
+                            .and_then(|frame| agent_screen::classify(&status.agent, frame))
+                            .map(|classification| (runtime.snapshot_revision, classification))
+                    })
+                    .map(|(revision, classification)| {
+                        (*pane_id, status.agent.clone(), revision, classification)
+                    })
+            })
+            .collect::<Vec<_>>();
+        for (pane_id, agent, revision, classification) in classifications {
+            self.apply_agent_screen_classification(pane_id, &agent, revision, classification);
+        }
+        // Which panes are projecting Claude Code's roster. Derived from the
+        // same frames as the classification above, so entering or leaving the
+        // view is reflected on the very next paint rather than on a poll.
+        let showing_roster = self
+            .agent_statuses
+            .iter()
+            .filter(|(pane_id, status)| {
+                self.terminals.get(pane_id).is_some_and(|runtime| {
+                    runtime
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|frame| agent_screen::agents_view(&status.agent, frame))
+                })
+            })
+            .map(|(pane_id, _)| *pane_id)
+            .collect::<BTreeSet<_>>();
+        if showing_roster != self.agents_view_panes {
+            self.agents_view_panes = showing_roster;
+            // A view change is exactly when the roll-up must be re-read, so
+            // the row never shows the previous view's counts.
+            self.agents_roster_checked = None;
+        }
+        for (pane_id, notification) in notifications {
+            self.record_notification(pane_id, notification);
+        }
+        for (pane_id, clean) in exited {
+            // A pane whose process the host never started did not exit: it
+            // never ran. Saying so in place beats an empty terminal that
+            // looks live and answers nothing.
+            if let Some(error) = self.terminal_launcher.spawn_failure(pane_id) {
+                self.mark_terminal_launch_failed(pane_id, error);
+                continue;
+            }
+            self.agent_statuses.remove(&pane_id);
+            self.agent_running_frame_revisions.remove(&pane_id);
+            self.detected_agents.remove(&pane_id);
+            self.agents_view_panes.remove(&pane_id);
+            self.terminal_command_buffers.remove(&pane_id);
+            // A clean exit closes its pane, cascading exactly like a manual
+            // close: last pane closes the tab, the workspace's final tab
+            // raises the close-workspace confirmation instead of vanishing.
+            // Unclean or unknown exits keep the pane so its output — likely
+            // an error — stays readable, with Restart available.
+            if clean {
+                let _ = self.close_pane(pane_id);
+            }
+        }
+    }
+
+    /// Reads the machine-wide roster while at least one pane projects it.
+    ///
+    /// The read costs a short-lived subprocess, so it is paced rather than run
+    /// per frame, and only one may be in flight. Entering the view clears the
+    /// timestamp, making that first read immediate.
+    fn refresh_agents_roster(&mut self) -> Task<Message> {
+        if self.agents_view_panes.is_empty() {
+            // Nothing projects it any more; drop it so a later view cannot
+            // paint a stale count before its own read lands.
+            self.agents_roster = None;
+            self.agents_roster_error = None;
+            self.agents_roster_checked = None;
+            return Task::none();
+        }
+        let due = self
+            .agents_roster_checked
+            .is_none_or(|read| read.elapsed() >= AGENTS_ROSTER_INTERVAL);
+        if self.agents_roster_pending || !due {
+            return Task::none();
+        }
+        self.agents_roster_pending = true;
+        self.agents_roster_checked = Some(std::time::Instant::now());
+        let command = self.settings.claude_command.clone();
+        perform_blocking(
+            move || agents_roster::load(&command),
+            |result| Message::AgentsRosterLoaded(result.and_then(|roster| roster)),
+        )
+    }
+
+    fn refresh_background_metadata(&mut self) -> Task<Message> {
+        let roster = self.refresh_agents_roster();
+        let repositories = self.refresh_pane_repositories();
+        Task::batch([roster, repositories])
+    }
+
+    /// Resolves repository and worktree names after a pane's working directory
+    /// changes. Every expanded fleet projection shows that identity, so the
+    /// cache stays warm even outside Repos. Git remains off the UI thread; on
+    /// native Windows, a Linux path may require a WSL process.
+    fn refresh_pane_repositories(&mut self) -> Task<Message> {
+        let live_panes = self
+            .session
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .flat_map(|tab| tab.root.pane_ids())
+            .collect::<BTreeSet<_>>();
+        self.pane_repositories
+            .retain(|pane_id, _| live_panes.contains(pane_id));
+        self.pending_repository_directories
+            .retain(|pane_id, _| live_panes.contains(pane_id));
+
+        let pane_ids = self
+            .active_workspace()
+            .into_iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .flat_map(|tab| pane_ids_in_layout(&tab.root))
+            .collect::<Vec<_>>();
+        let mut probes = Vec::new();
+        for pane_id in pane_ids {
+            let Some(directory) = self
+                .pane_working_directory(pane_id)
+                .filter(|directory| reported_path_is_concrete(directory))
+            else {
+                self.pane_repositories.remove(&pane_id);
+                self.pending_repository_directories.remove(&pane_id);
+                continue;
+            };
+            let cached = self
+                .pane_repositories
+                .get(&pane_id)
+                .is_some_and(|repository| repository.directory == directory);
+            let pending = self.pending_repository_directories.get(&pane_id) == Some(&directory);
+            if !cached && !pending {
+                self.pending_repository_directories
+                    .insert(pane_id, directory.clone());
+                probes.push((pane_id, directory));
+            }
+        }
+        if probes.is_empty() {
+            return Task::none();
+        }
+
+        let wsl_distribution = self.settings.wsl_distribution.clone();
+        perform_blocking(
+            move || {
+                probes
+                    .into_iter()
+                    .map(|(pane_id, directory)| {
+                        let worktree_name = linked_worktree_name(&directory);
+                        let name = git_repository_name(&directory, &wsl_distribution);
+                        (
+                            pane_id,
+                            PaneRepository {
+                                directory,
+                                name,
+                                worktree_name,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+            Message::PaneRepositoriesLoaded,
+        )
+    }
+
+    fn poll_control(&mut self) {
+        let mut incoming = Vec::new();
+        if let Some(control) = &self.control {
+            while let Ok(request) = control.try_recv() {
+                incoming.push(request);
+            }
+        }
+        for request in incoming {
+            let response = self.handle_control_request(request.request.clone());
+            request.respond(response);
+        }
+    }
+
+    fn handle_control_request(&mut self, request: ControlRequest) -> ControlResponse {
+        match request {
+            ControlRequest::Ping => ControlResponse::success("pong"),
+            ControlRequest::Notify {
+                title,
+                body,
+                pane_id,
+            } => match self.control_pane_id(pane_id.as_deref()) {
+                Ok(pane_id) => {
+                    self.record_notification(pane_id, TerminalNotification { title, body });
+                    ControlResponse::success("notification recorded")
+                }
+                Err(error) => ControlResponse::error(error),
+            },
+            ControlRequest::AgentEvent {
+                agent,
+                state,
+                event,
+                title,
+                body,
+                pane_id,
+                session_id,
+                cwd,
+            } => match self.control_agent_pane_id(pane_id.as_deref()) {
+                Ok(pane_id) => {
+                    // A pane actively running agent X cannot be the origin
+                    // of agent Y's lifecycle events — that is a stray
+                    // MUXTRIX_PANE_ID inherited by a process outside the
+                    // pane (an agent launched from a descendant shell).
+                    // Applying it would overwrite or demote a live agent
+                    // mid-run.
+                    if let Some(current) = self.agent_statuses.get(&pane_id)
+                        && current.agent != agent
+                        && !matches!(
+                            current.state,
+                            AgentState::Completed | AgentState::Failed | AgentState::Stopped
+                        )
+                    {
+                        return ControlResponse::success(
+                            "event names a different agent than the pane is running; ignored",
+                        );
+                    }
+                    if !should_accept_agent_state(
+                        self.agent_statuses.get(&pane_id),
+                        state,
+                        session_id.as_deref(),
+                    ) {
+                        return ControlResponse::success("stale agent lifecycle state ignored");
+                    }
+                    // PermissionRequest runs before Codex's automatic reviewer,
+                    // and Claude notifications are similarly not proof that a
+                    // person is required. Supported full-screen agents may
+                    // enter Waiting only from positive evidence in a live
+                    // terminal frame. PostToolUse is also too late and can be
+                    // unrelated under parallel tool use, so it cannot clear a
+                    // screen-confirmed prompt.
+                    let screen_managed = agent_screen::supports(&agent);
+                    let advisory_wait = screen_managed && state == AgentState::Waiting;
+                    let post_tool_cannot_clear_wait = screen_managed
+                        && state == AgentState::Running
+                        && event.as_deref() == Some("PostToolUse")
+                        && self
+                            .agent_statuses
+                            .get(&pane_id)
+                            .is_some_and(|current| current.state == AgentState::Waiting);
+                    let git_branch = git_branch_for_directory(cwd.as_deref());
+                    let display_name = self
+                        .agent_statuses
+                        .get(&pane_id)
+                        .and_then(|status| status.display_name.clone())
+                        .or_else(|| {
+                            cwd.as_deref()
+                                .and_then(|cwd| linked_worktree_name(std::path::Path::new(cwd)))
+                        });
+                    let frame_revision = self
+                        .terminals
+                        .get(&pane_id)
+                        .map_or(0, |runtime| runtime.snapshot_revision);
+                    self.detected_agents.remove(&pane_id);
+                    if advisory_wait || post_tool_cannot_clear_wait {
+                        if let Some(current) = self.agent_statuses.get_mut(&pane_id) {
+                            if session_id.is_some() {
+                                current.session_id = session_id;
+                            }
+                            if cwd.is_some() {
+                                current.cwd = cwd;
+                                current.git_branch = git_branch;
+                            }
+                            if current.state != AgentState::Waiting && !body.trim().is_empty() {
+                                current.activity = Some(body.clone());
+                            }
+                        } else {
+                            self.agent_statuses.insert(
+                                pane_id,
+                                AgentPaneStatus {
+                                    agent: agent.clone(),
+                                    display_name,
+                                    state: AgentState::Running,
+                                    activity: (!body.trim().is_empty()).then(|| body.clone()),
+                                    session_id,
+                                    cwd,
+                                    git_branch,
+                                },
+                            );
+                            self.agent_running_frame_revisions
+                                .insert(pane_id, frame_revision);
+                        }
+                        self.status = format!("{agent}: {body}");
+                        return ControlResponse::success(
+                            "agent lifecycle metadata updated; live screen retains state authority",
+                        );
+                    }
+                    if state == AgentState::Stopped {
+                        self.agent_statuses.remove(&pane_id);
+                        self.agent_running_frame_revisions.remove(&pane_id);
+                        self.terminal_command_buffers.remove(&pane_id);
+                    } else {
+                        self.agent_statuses.insert(
+                            pane_id,
+                            AgentPaneStatus {
+                                agent: agent.clone(),
+                                display_name,
+                                state,
+                                activity: (!body.trim().is_empty()).then(|| body.clone()),
+                                session_id,
+                                cwd,
+                                git_branch,
+                            },
+                        );
+                        if state == AgentState::Running {
+                            self.agent_running_frame_revisions
+                                .insert(pane_id, frame_revision);
+                        } else {
+                            self.agent_running_frame_revisions.remove(&pane_id);
+                        }
+                    }
+                    match state {
+                        AgentState::Waiting | AgentState::Failed => {
+                            self.record_notification(pane_id, TerminalNotification { title, body });
+                        }
+                        AgentState::Completed => {
+                            // Completion is useful lifecycle information, not
+                            // a request for the user. It also resolves any
+                            // attention left by an earlier waiting state.
+                            self.clear_pane_attention(pane_id);
+                            self.status = format!("{agent}: {body}");
+                        }
+                        AgentState::Idle | AgentState::Running | AgentState::Stopped => {
+                            self.status = format!("{agent}: {body}");
+                        }
+                    }
+                    ControlResponse::success("agent lifecycle state updated")
+                }
+                Err(error) => ControlResponse::error(error),
+            },
+            ControlRequest::LaunchAgent { agent } => match self.launch_agent(agent) {
+                Ok(()) => ControlResponse::success(format!("launched {agent}")),
+                Err(error) => ControlResponse::error(error),
+            },
+            ControlRequest::Split { direction } => {
+                let axis = match direction {
+                    SplitDirection::Right => SplitAxis::Horizontal,
+                    SplitDirection::Down => SplitAxis::Vertical,
+                };
+                match self.split_terminal(axis) {
+                    Ok(()) => ControlResponse::success("terminal pane created"),
+                    Err(error) => ControlResponse::error(error),
+                }
+            }
+            ControlRequest::Focus { pane_id } => match self.control_pane_id(Some(&pane_id)) {
+                Ok(pane_id) => match self.focus_pane(pane_id) {
+                    Ok(()) => ControlResponse::success("pane focused"),
+                    Err(error) => ControlResponse::error(error),
+                },
+                Err(error) => ControlResponse::error(error),
+            },
+            ControlRequest::Close { pane_id } => match self.control_pane_id(pane_id.as_deref()) {
+                Ok(pane_id) => match self.close_pane(pane_id) {
+                    Ok(()) if self.close_workspace_prompt.is_some() => ControlResponse::error(
+                        "closing the final tab requires workspace confirmation",
+                    ),
+                    Ok(()) => ControlResponse::success("terminal pane closed"),
+                    Err(error) => ControlResponse::error(error),
+                },
+                Err(error) => ControlResponse::error(error),
+            },
+            ControlRequest::SendText { text, pane_id } => {
+                match self.control_pane_id(pane_id.as_deref()) {
+                    Ok(pane_id) => match self.send_terminal_input_to(pane_id, text.into_bytes()) {
+                        Ok(()) => ControlResponse::success("text sent"),
+                        Err(error) => ControlResponse::error(error),
+                    },
+                    Err(error) => ControlResponse::error(error),
+                }
+            }
+            ControlRequest::Capture { pane_id } => match self.control_pane_id(pane_id.as_deref()) {
+                Ok(pane_id) => self
+                    .terminals
+                    .get(&pane_id)
+                    .and_then(|runtime| runtime.snapshot.as_ref())
+                    .map_or_else(
+                        || ControlResponse::error("pane has no terminal snapshot"),
+                        |snapshot| ControlResponse {
+                            ok: true,
+                            message: None,
+                            text: Some(snapshot.text()),
+                            panes: Vec::new(),
+                        },
+                    ),
+                Err(error) => ControlResponse::error(error),
+            },
+            ControlRequest::ListPanes => {
+                let panes = self.active_workspace().map_or_else(
+                    |_| Vec::new(),
+                    |workspace| {
+                        workspace
+                            .tabs
+                            .iter()
+                            .flat_map(|tab| {
+                                tab.panes.values().map(move |pane| PaneSummary {
+                                    pane_id: pane.id.as_uuid().to_string(),
+                                    title: pane.active_surface().map_or_else(
+                                        || "terminal".into(),
+                                        |surface| surface.title.clone(),
+                                    ),
+                                    focused: workspace.active_tab_id == tab.id
+                                        && tab.focused_pane_id == pane.id,
+                                    unread_count: pane.attention.unread_count,
+                                })
+                            })
+                            .collect()
+                    },
+                );
+                ControlResponse {
+                    ok: true,
+                    message: Some(format!("{} panes", panes.len())),
+                    text: None,
+                    panes,
+                }
+            }
+        }
+    }
+
+    fn apply_agent_screen_classification(
+        &mut self,
+        pane_id: PaneId,
+        agent: &str,
+        frame_revision: u64,
+        classification: agent_screen::Classification,
+    ) {
+        let Some(current) = self.agent_statuses.get(&pane_id) else {
+            return;
+        };
+        let state = screen_state(classification.state);
+        // Keep a completed turn visible while its composer is merely idle, but
+        // let positive working evidence start the next turn even if its prompt
+        // hook was delayed or unavailable. Failed and stopped sessions remain
+        // lifecycle-owned so stale terminal chrome cannot revive them.
+        if matches!(current.state, AgentState::Failed | AgentState::Stopped)
+            || (current.state == AgentState::Completed && state != AgentState::Running)
+        {
+            return;
+        }
+        // A retained idle title may predate a just-received prompt hook. Guard
+        // only that exact frame: once the terminal publishes a newer idle
+        // frame, it is positive evidence that the turn really ended.
+        if current.state == AgentState::Running
+            && state == AgentState::Idle
+            && self
+                .agent_running_frame_revisions
+                .get(&pane_id)
+                .is_some_and(|running_revision| frame_revision == *running_revision)
+        {
+            return;
+        }
+        if current.state == state {
+            return;
+        }
+        let resolved_waiting = current.state == AgentState::Waiting && state != AgentState::Waiting;
+        let activity = agent_state_activity(classification.state);
+        if let Some(current) = self.agent_statuses.get_mut(&pane_id) {
+            current.state = state;
+            current.activity = Some(activity.into());
+        }
+        if state == AgentState::Running {
+            self.agent_running_frame_revisions
+                .insert(pane_id, frame_revision);
+        } else {
+            self.agent_running_frame_revisions.remove(&pane_id);
+        }
+        if resolved_waiting {
+            self.clear_pane_attention(pane_id);
+        }
+        if state == AgentState::Waiting {
+            self.record_notification(
+                pane_id,
+                TerminalNotification {
+                    title: agent_display_name(agent).into(),
+                    body: activity.into(),
+                },
+            );
+        } else {
+            debug_assert!(!classification.rule.is_empty());
+            self.status = format!("{agent}: {activity}");
+        }
+    }
+
+    fn control_pane_id(&self, pane_id: Option<&str>) -> Result<PaneId, String> {
+        let workspace = self.active_workspace()?;
+        match pane_id {
+            None => workspace
+                .active_tab()
+                .map(|tab| tab.focused_pane_id)
+                .ok_or_else(|| "active tab is missing".to_owned()),
+            Some(value) => self
+                .session
+                .workspaces
+                .iter()
+                .flat_map(Workspace::all_pane_ids)
+                .find(|pane_id| pane_id.as_uuid().to_string() == value)
+                .ok_or_else(|| format!("pane {value} was not found")),
+        }
+    }
+
+    fn control_agent_pane_id(&self, pane_id: Option<&str>) -> Result<PaneId, String> {
+        let pane_id = pane_id.ok_or_else(|| {
+            "agent lifecycle event has no Muxtrix pane identity; event ignored".to_owned()
+        })?;
+        self.control_pane_id(Some(pane_id))
+    }
+
+    fn focus_pane(&mut self, pane_id: PaneId) -> Result<(), String> {
+        let Some((workspace_id, tab_id)) = self.session.workspaces.iter().find_map(|workspace| {
+            workspace
+                .tab_containing_pane(pane_id)
+                .map(|tab| (workspace.id, tab.id))
+        }) else {
+            return Err(format!("pane {pane_id:?} was not found"));
+        };
+        if workspace_id != self.session.active_workspace_id {
+            self.switch_workspace(workspace_id)?;
+        }
+        let focus_changed = {
+            let workspace = self.active_workspace_mut()?;
+            workspace
+                .switch_tab(tab_id)
+                .map_err(|error| error.to_string())?;
+            let tab = workspace
+                .tab_mut(tab_id)
+                .ok_or_else(|| format!("tab {tab_id:?} was not found"))?;
+            if !tab.panes.contains_key(&pane_id) {
+                return Err(format!("pane {pane_id:?} was not found"));
+            }
+            let focus_changed = tab.focused_pane_id != pane_id;
+            tab.focused_pane_id = pane_id;
+            focus_changed
+        };
+        if focus_changed {
+            self.pane_resize_history.remove(&tab_id);
+        }
+        self.clear_pane_attention(pane_id);
+        Ok(())
+    }
+
+    fn clear_pane_attention(&mut self, pane_id: PaneId) {
+        if let Some(pane) = self
+            .session
+            .workspaces
+            .iter_mut()
+            .find_map(|workspace| workspace.pane_mut(pane_id))
+        {
+            pane.attention = Default::default();
+        }
+        for notification in &mut self.notifications {
+            if notification.pane_id == pane_id {
+                notification.unread = false;
+            }
+        }
+    }
+
+    fn record_notification(&mut self, pane_id: PaneId, notification: TerminalNotification) {
+        let focused = self.active_workspace().is_ok_and(|workspace| {
+            workspace
+                .active_tab()
+                .is_some_and(|tab| tab.focused_pane_id == pane_id)
+        }) && self.active_view == ActiveView::Workspace;
+        if !focused
+            && let Some(pane) = self
+                .session
+                .workspaces
+                .iter_mut()
+                .find_map(|workspace| workspace.pane_mut(pane_id))
+        {
+            pane.attention.unread_count = pane.attention.unread_count.saturating_add(1);
+            pane.attention.message = Some(notification.body.clone());
+        }
+        self.status = format!("{}: {}", notification.title, notification.body);
+        self.notifications.push(AgentNotification {
+            pane_id,
+            unread: !focused,
+        });
+        if self.notifications.len() > 100 {
+            self.notifications.remove(0);
+        }
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        let content = match self.active_view {
+            ActiveView::Workspace => self.workspace_view(),
+            ActiveView::Settings => self.settings_view(),
+            ActiveView::ThemeGallery => self.theme_gallery_view(),
+        };
+        let shell: Element<'_, Message> = if self.active_view == ActiveView::Workspace {
+            let workspace_shell = row![self.sidebar(), content].height(Fill).width(Fill);
+            if self.github_panel.is_some() && self.window_size.width >= 1_080.0 {
+                container(workspace_shell.push(self.github_panel_view(tokens, false)))
+                    .style(move |_| container::Style::default().background(tokens.app))
+                    .into()
+            } else if self.github_panel.is_some() {
+                let base: Element<'_, Message> = container(workspace_shell)
+                    .style(move |_| container::Style::default().background(tokens.app))
+                    .into();
+                let panel = container(self.github_panel_view(tokens, true))
+                    .width(Fill)
+                    .height(Fill)
+                    .align_x(iced::alignment::Horizontal::Right);
+                stack([base, panel.into()]).into()
+            } else {
+                container(workspace_shell)
+                    .style(move |_| container::Style::default().background(tokens.app))
+                    .into()
+            }
+        } else {
+            container(content)
+                .style(move |_| container::Style::default().background(tokens.app))
+                .into()
+        };
+
+        let overlay = if self.workspace_create_visible {
+            Some((
+                Message::CancelWorkspaceCreate,
+                container(opaque(self.workspace_create_dialog()))
+                    .center_x(Fill)
+                    .center_y(Fill),
+            ))
+        } else if self.rename_prompt.is_some() {
+            Some((
+                Message::CancelRename,
+                container(opaque(self.rename_dialog()))
+                    .center_x(Fill)
+                    .center_y(Fill),
+            ))
+        } else if self.session_picker.is_some() {
+            Some((
+                Message::CloseSessionPicker,
+                container(opaque(self.session_picker_dialog()))
+                    .center_x(Fill)
+                    .center_y(Fill),
+            ))
+        } else if self
+            .worktree_manager
+            .as_ref()
+            .is_some_and(|manager| matches!(manager.mode, WorktreeManagerMode::RestartPane(_)))
+        {
+            Some((
+                Message::CloseWorktreeManager,
+                container(opaque(self.worktree_manager_dialog()))
+                    .center_x(Fill)
+                    .center_y(Fill),
+            ))
+        } else if self.worktree_prompt.is_some() {
+            Some((
+                Message::CancelWorktree,
+                container(opaque(self.worktree_dialog()))
+                    .center_x(Fill)
+                    .center_y(Fill),
+            ))
+        } else if let Some(workspace_id) = self.close_workspace_prompt {
+            Some((
+                Message::CancelCloseWorkspace,
+                container(opaque(self.close_workspace_dialog(workspace_id)))
+                    .center_x(Fill)
+                    .center_y(Fill),
+            ))
+        } else if self.palette.visible {
+            Some((
+                Message::CloseCommandPalette,
+                container(opaque(self.command_palette()))
+                    .center_x(Fill)
+                    .align_y(iced::alignment::Vertical::Top)
+                    .padding([72, 0]),
+            ))
+        } else {
+            None
+        };
+        let base: Element<'_, Message> = if let Some((dismiss_message, overlay)) = overlay {
+            let dismiss = mouse_area(
+                container("")
+                    .width(Fill)
+                    .height(Fill)
+                    .style(move |_| container::Style::default().background(tokens.scrim)),
+            )
+            .on_press(dismiss_message);
+            stack([shell, dismiss.into(), overlay.into()]).into()
+        } else {
+            shell
+        };
+        let Some((message, keyboard_mode)) = self.feedback_message() else {
+            return base;
+        };
+        // A live keyboard mode is a state the user is standing in until they
+        // leave it, so it is drawn in the accent the rest of the chrome already
+        // uses for "this is where you are". A toast keeps the quiet neutral
+        // surface: it leaves on its own and must not pull the eye off the
+        // terminal to do it.
+        let border_color = if keyboard_mode {
+            tokens.accent
+        } else {
+            tokens.line_strong
+        };
+        // Plain text and containers never capture pointer events, so the
+        // pill cannot steal clicks from the pane beneath it.
+        let pill = container(text(message).size(self.settings.ui_pixels(9.5)).color(
+            if keyboard_mode {
+                tokens.accent
+            } else {
+                tokens.text
+            },
+        ))
+        .padding([7, 14])
+        .style(move |_| container::Style {
+            background: Some(tokens.overlay.into()),
+            border: iced::Border {
+                color: border_color,
+                width: if keyboard_mode { 1.5 } else { 1.0 },
+                radius: 999.0.into(),
+            },
+            shadow: iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.45),
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 16.0,
+            },
+            ..container::Style::default()
+        });
+        stack([
+            base,
+            container(pill)
+                .center_x(Fill)
+                .align_y(iced::alignment::Vertical::Bottom)
+                .height(Fill)
+                .padding(iced::Padding {
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 26.0,
+                    left: 0.0,
+                })
+                .into(),
+        ])
+        .into()
+    }
+
+    fn workspace_create_dialog(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        container(
+            column![
+                text("New workspace")
+                    .size(self.settings.ui_pixels(18.0))
+                    .font(Font {
+                        weight: font::Weight::Bold,
+                        ..Font::DEFAULT
+                    }),
+                text("Name the workspace before its first tab and terminal are created.")
+                    .size(self.settings.ui_pixels(10.0))
+                    .color(tokens.muted),
+                text_input("Workspace name", &self.workspace_name_draft)
+                    .id(iced::widget::Id::new(WORKSPACE_CREATE_INPUT_ID))
+                    .on_input(Message::WorkspaceNameChanged)
+                    .on_submit(Message::CreateWorkspace)
+                    .padding(10)
+                    .size(self.settings.ui_pixels(11.0)),
+                row![
+                    container("").width(Fill),
+                    settings_action_button(
+                        "Cancel",
+                        Message::CancelWorkspaceCreate,
+                        SettingsButtonKind::Secondary,
+                        &self.settings,
+                    ),
+                    settings_action_button(
+                        "Create workspace",
+                        Message::CreateWorkspace,
+                        SettingsButtonKind::Primary,
+                        &self.settings,
+                    ),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(14),
+        )
+        .padding(18)
+        .width(460)
+        .style(move |_| modal_surface(tokens))
+        .into()
+    }
+
+    fn rename_dialog(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        let (title, hint) = match self.rename_prompt {
+            Some(RenameTarget::Workspace(_)) => ("Rename workspace", "The new workspace name."),
+            Some(RenameTarget::Tab(..)) => ("Rename tab", "The new tab name."),
+            Some(RenameTarget::Pane(_)) => (
+                "Rename pane",
+                "A custom pane name. Leave it empty to restore the automatic title.",
+            ),
+            None => ("Rename", ""),
+        };
+        container(
+            column![
+                text(title).size(self.settings.ui_pixels(18.0)).font(Font {
+                    weight: font::Weight::Bold,
+                    ..Font::DEFAULT
+                }),
+                text(hint)
+                    .size(self.settings.ui_pixels(10.0))
+                    .color(tokens.muted),
+                text_input("Name", &self.rename_draft)
+                    .id(iced::widget::Id::new(RENAME_INPUT_ID))
+                    .on_input(Message::RenameDraftChanged)
+                    .on_submit(Message::ConfirmRename)
+                    .padding(10)
+                    .size(self.settings.ui_pixels(11.0)),
+                row![
+                    container("").width(Fill),
+                    settings_action_button(
+                        "Cancel",
+                        Message::CancelRename,
+                        SettingsButtonKind::Secondary,
+                        &self.settings,
+                    ),
+                    settings_action_button(
+                        "Rename",
+                        Message::ConfirmRename,
+                        SettingsButtonKind::Primary,
+                        &self.settings,
+                    ),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(14),
+        )
+        .padding(18)
+        .width(460)
+        .style(move |_| modal_surface(tokens))
+        .into()
+    }
+
+    fn worktree_dialog(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        let Some(prompt) = &self.worktree_prompt else {
+            return container("").into();
+        };
+        let title = if prompt.repo_root.is_none() {
+            // The dialog exists to explain a failure; titling it with the
+            // action it cannot perform poses a false promise.
+            "Can't create a worktree"
+        } else {
+            match prompt.target {
+                WorktreePromptTarget::Open(commands::WorktreeKind::Pane(SplitAxis::Horizontal)) => {
+                    "New worktree pane right"
+                }
+                WorktreePromptTarget::Open(commands::WorktreeKind::Pane(SplitAxis::Vertical)) => {
+                    "New worktree pane down"
+                }
+                WorktreePromptTarget::Open(commands::WorktreeKind::Tab) => "New worktree tab",
+                WorktreePromptTarget::RestartPane(_) => "Restart in new worktree",
+            }
+        };
+        let mut body = column![text(title).size(self.settings.ui_pixels(18.0)).font(Font {
+            weight: font::Weight::Bold,
+            ..Font::DEFAULT
+        })]
+        .spacing(14);
+        let Some(repo_root) = &prompt.repo_root else {
+            // Still a dialog, not an invisible status line: the operation
+            // cannot run and the user needs to see why.
+            body = body
+                .push(
+                    text(prompt.failure.clone().unwrap_or_else(|| {
+                        "The focused pane is not inside a git repository, so a worktree cannot be created from it.".to_owned()
+                    }))
+                    .size(self.settings.ui_pixels(10.0))
+                    .color(tokens.muted),
+                )
+                .push(
+                    row![
+                        container("").width(Fill),
+                        settings_action_button(
+                            "Close",
+                            Message::CancelWorktree,
+                            SettingsButtonKind::Secondary,
+                            &self.settings,
+                        ),
+                    ]
+                    .align_y(Alignment::Center),
+                );
+            return container(body)
+                .padding(18)
+                .width(460)
+                .style(move |_| modal_surface(tokens))
+                .into();
+        };
+        // Live conflict check so the collision is visible before submitting.
+        // Names were listed when the dialog opened; no filesystem probing
+        // per keystroke (through WSL that would launch wsl.exe every frame).
+        let name = worktree_name(&self.worktree_name_draft);
+        let conflict = !name.is_empty() && prompt.taken_names.contains(&name);
+        let inline_error = prompt
+            .error
+            .clone()
+            .or_else(|| conflict.then(|| format!("{name} already exists for this repository")));
+        let can_create = !prompt.busy && !name.is_empty() && !conflict;
+        let confirm_label = if prompt.busy {
+            "Creating…"
+        } else {
+            "Create worktree"
+        };
+        let mut confirm = button(centered_button_label(
+            confirm_label,
+            self.settings.ui_pixels(9.0),
+        ))
+        .height(30)
+        .padding([0, 11])
+        .style({
+            let settings_tokens = tokens;
+            move |_, status| {
+                settings_button_style(settings_tokens, SettingsButtonKind::Primary, status)
+            }
+        });
+        if can_create {
+            confirm = confirm.on_press(Message::ConfirmWorktree);
+        }
+        body = body
+            .push(
+                text(format!("Branch and worktree from {}", repo_root.display()))
+                    .size(self.settings.ui_pixels(10.0))
+                    .color(tokens.muted),
+            )
+            .push(
+                text(
+                    prompt
+                        .base_directory
+                        .as_deref()
+                        .map_or_else(String::new, |base| {
+                            format!("Created under {}", base.display())
+                        }),
+                )
+                .size(self.settings.ui_pixels(9.0))
+                .color(tokens.faint),
+            )
+            .push(
+                text_input("Worktree name", &self.worktree_name_draft)
+                    .id(iced::widget::Id::new(WORKTREE_INPUT_ID))
+                    .on_input(Message::WorktreeNameChanged)
+                    .on_submit(Message::ConfirmWorktree)
+                    .padding(10)
+                    .size(self.settings.ui_pixels(11.0)),
+            );
+        if let Some(error) = inline_error {
+            body = body.push(
+                text(error)
+                    .size(self.settings.ui_pixels(9.0))
+                    .color(tokens.danger),
+            );
+        }
+        body = body.push(
+            row![
+                text("Enter creates · Esc cancels")
+                    .size(self.settings.ui_pixels(8.0))
+                    .color(tokens.faint),
+                container("").width(Fill),
+                settings_action_button(
+                    "Cancel",
+                    Message::CancelWorktree,
+                    SettingsButtonKind::Secondary,
+                    &self.settings,
+                ),
+                confirm,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        container(body)
+            .padding(18)
+            .width(460)
+            .style(move |_| modal_surface(tokens))
+            .into()
+    }
+
+    /// Full-screen theme browser: every preset rendered as the same live
+    /// terminal preview the settings page shows for the current theme —
+    /// sample output, selection, cursor, and the full ANSI strip — two per
+    /// row, clickable, Esc or Back to return. The catalog is bounded, so
+    /// rendering all cards in the scrollable stays cheap.
+    fn theme_gallery_view(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings_draft.appearance);
+        let count_nudge = iced::Padding {
+            top: (self.settings_draft.ui_pixels(18.0) - self.settings_draft.ui_pixels(9.5)) * 0.6,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        };
+        let header = row![
+            settings_action_button(
+                "← Settings",
+                Message::CloseThemeGallery,
+                SettingsButtonKind::Secondary,
+                &self.settings_draft,
+            ),
+            text("Theme gallery")
+                .size(self.settings_draft.ui_pixels(18.0))
+                .font(Font {
+                    weight: font::Weight::Bold,
+                    ..Font::DEFAULT
+                })
+                .color(tokens.text),
+            container("").width(Fill),
+            container(
+                text(format!(
+                    "Current: {} · {} themes",
+                    self.settings_draft.terminal_theme.preset().name,
+                    TerminalThemeId::ALL.len()
+                ))
+                .size(self.settings_draft.ui_pixels(9.5))
+                .color(tokens.faint),
+            )
+            .padding(count_nudge),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center);
+        // One column keeps the preview truthful when cards would squeeze
+        // below the width the sample line and ANSI strip need.
+        let columns: usize = if self.window_size.width < 980.0 { 1 } else { 2 };
+        let mut grid = column![].spacing(12);
+        let mut cards: Vec<Element<'_, Message>> = Vec::new();
+        fn flush_row<'a>(
+            mut grid: iced::widget::Column<'a, Message>,
+            cards: &mut Vec<Element<'a, Message>>,
+            columns: usize,
+        ) -> iced::widget::Column<'a, Message> {
+            if !cards.is_empty() {
+                while cards.len() < columns {
+                    cards.push(container("").width(Fill).into());
+                }
+                grid =
+                    grid.push(iced::widget::Row::with_children(std::mem::take(cards)).spacing(12));
+            }
+            grid
+        }
+        let mut current_group: Option<bool> = None;
+        // Dark first, then light: grouped so the mode chip on every card
+        // becomes redundant and a named theme is findable by section.
+        let ordered = TerminalThemeId::ALL
+            .into_iter()
+            .filter(|id| !id.preset().is_light)
+            .chain(
+                TerminalThemeId::ALL
+                    .into_iter()
+                    .filter(|id| id.preset().is_light),
+            );
+        for id in ordered {
+            let preset = id.preset();
+            if current_group != Some(preset.is_light) {
+                grid = flush_row(grid, &mut cards, columns);
+                current_group = Some(preset.is_light);
+                grid = grid.push(
+                    container(
+                        text(if preset.is_light { "LIGHT" } else { "DARK" })
+                            .size(self.settings_draft.ui_pixels(8.5))
+                            .font(Font {
+                                weight: font::Weight::Semibold,
+                                ..Font::DEFAULT
+                            })
+                            .color(tokens.faint),
+                    )
+                    .padding(iced::Padding {
+                        top: 8.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                        left: 3.0,
+                    }),
+                );
+            }
+            let selected = id == self.settings_draft.terminal_theme;
+            let card = button(terminal_theme_preview_with_caption(
+                preset,
+                &self.settings_draft,
+                false,
+            ))
+            .on_press(Message::GalleryThemeChosen(id))
+            .padding(3)
+            .width(Fill)
+            .style(move |_, status| iced::widget::button::Style {
+                background: None,
+                border: Border {
+                    color: if selected {
+                        tokens.accent
+                    } else if matches!(status, iced::widget::button::Status::Hovered) {
+                        tokens.line_strong
+                    } else {
+                        Color::TRANSPARENT
+                    },
+                    width: 2.0,
+                    radius: 12.0.into(),
+                },
+                ..iced::widget::button::Style::default()
+            });
+            cards.push(card.into());
+            if cards.len() == columns {
+                grid = grid
+                    .push(iced::widget::Row::with_children(std::mem::take(&mut cards)).spacing(12));
+            }
+        }
+        grid = flush_row(grid, &mut cards, columns);
+        container(
+            column![
+                header,
+                scrollable(container(grid).padding(iced::Padding {
+                    top: 4.0,
+                    right: 14.0,
+                    bottom: 24.0,
+                    left: 0.0,
+                }))
+                .height(Fill),
+            ]
+            .spacing(18),
+        )
+        .padding(28)
+        .width(Fill)
+        .height(Fill)
+        .style(move |_| container::Style::default().background(tokens.app))
+        .into()
+    }
+
+    fn session_picker_dialog(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        let Some(picker) = &self.session_picker else {
+            return container("").into();
+        };
+        let title = if picker.startup {
+            "Resume a session?"
+        } else {
+            "Sessions"
+        };
+        let mut body = column![text(title).size(self.settings.ui_pixels(18.0)).font(Font {
+            weight: font::Weight::Bold,
+            ..Font::DEFAULT
+        })]
+        .spacing(14);
+        if picker.startup {
+            body = body.push(
+                text("Background sessions are still running. Attach to one, or start fresh.")
+                    .size(self.settings.ui_pixels(10.0))
+                    .color(tokens.muted),
+            );
+        }
+        if picker.entries.is_empty() {
+            body = body.push(
+                text(
+                    "No background sessions. Close a window and its running session appears here.",
+                )
+                .size(self.settings.ui_pixels(9.5))
+                .color(tokens.faint),
+            );
+        } else {
+            let mut list = column![].spacing(2);
+            for (index, entry) in picker.entries.iter().enumerate() {
+                let selected = index == picker.selected;
+                let age = age_label(entry.record.created_unix);
+                let status = if entry.alive {
+                    status_pill("Running", tokens.success, &self.settings)
+                } else {
+                    status_pill("Dead", tokens.faint, &self.settings)
+                };
+                // Dead sessions cannot be resumed; offering a primary
+                // button that silently no-ops would be a lie. They get
+                // Remove and nothing else.
+                let resume: Element<'_, Message> = if entry.alive {
+                    button(centered_button_label(
+                        "Resume",
+                        self.settings.ui_pixels(9.0),
+                    ))
+                    .height(28)
+                    .padding([0, 14])
+                    .style({
+                        let settings_tokens = tokens;
+                        move |_, status| {
+                            settings_button_style(
+                                settings_tokens,
+                                SettingsButtonKind::Primary,
+                                status,
+                            )
+                        }
+                    })
+                    .on_press(Message::SessionPickerResume(index))
+                    .into()
+                } else {
+                    container("").width(0).into()
+                };
+                let kill = button(centered_button_label(
+                    if entry.alive { "Kill" } else { "Remove" },
+                    self.settings.ui_pixels(9.0),
+                ))
+                .height(28)
+                .padding([0, 14])
+                .style({
+                    let settings_tokens = tokens;
+                    move |_, status| {
+                        settings_button_style(settings_tokens, SettingsButtonKind::Danger, status)
+                    }
+                })
+                .on_press(Message::SessionPickerKill(index));
+                let details = column![
+                    row![
+                        text(entry.record.name.clone())
+                            .size(self.settings.ui_pixels(11.0))
+                            .font(Font {
+                                weight: self.default_family_weight(FontWeight::Medium),
+                                ..Font::DEFAULT
+                            })
+                            .color(tokens.text)
+                            .wrapping(iced::widget::text::Wrapping::None),
+                        status,
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    text(format!(
+                        "{} pane{} · started {age}{}",
+                        entry.pane_count,
+                        if entry.pane_count == 1 { "" } else { "s" },
+                        // A daemon can outlive app updates; surface skew so
+                        // "kill and start fresh" is an informed choice.
+                        if entry.record.version.is_empty()
+                            || entry.record.version == env!("CARGO_PKG_VERSION")
+                        {
+                            String::new()
+                        } else {
+                            format!(" · daemon v{}", entry.record.version)
+                        }
+                    ))
+                    .font(self.settings.terminal_font.iced())
+                    .size(self.settings.ui_pixels(8.5))
+                    .color(tokens.faint)
+                    .wrapping(iced::widget::text::Wrapping::None),
+                ]
+                .spacing(3)
+                .width(Fill);
+                list = list.push(
+                    container(
+                        row![details, resume, kill]
+                            .spacing(8)
+                            .align_y(Alignment::Center),
+                    )
+                    .padding([9, 12])
+                    .width(Fill)
+                    .style(move |_| iced::widget::container::Style {
+                        // Accent tint like the command palette: the row Enter
+                        // and Del act on must clear non-text contrast, which
+                        // panel_raised (1.07:1 on the modal) never did.
+                        background: selected.then(|| {
+                            Color {
+                                a: 0.16,
+                                ..tokens.accent
+                            }
+                            .into()
+                        }),
+                        border: Border {
+                            color: if selected {
+                                Color {
+                                    a: 0.55,
+                                    ..tokens.accent
+                                }
+                            } else {
+                                Color::TRANSPARENT
+                            },
+                            width: 1.0,
+                            radius: 8.0.into(),
+                        },
+                        ..iced::widget::container::Style::default()
+                    }),
+                );
+            }
+            body = body.push(scrollable(list).height(iced::Length::Shrink));
+        }
+        if let Some(error) = &picker.error {
+            body = body.push(
+                text(error.clone())
+                    .size(self.settings.ui_pixels(9.0))
+                    .color(tokens.danger),
+            );
+        }
+        let mut footer = row![].spacing(8).align_y(Alignment::Center);
+        if !picker.entries.is_empty() {
+            footer = footer.push(
+                text("↑↓ select · Enter resumes · Del kills · Esc closes")
+                    .size(self.settings.ui_pixels(8.0))
+                    .color(tokens.faint),
+            );
+        }
+        if !picker.entries.is_empty() {
+            footer = footer.push(settings_action_button(
+                "Kill all",
+                Message::SessionPickerKillAll,
+                SettingsButtonKind::Danger,
+                &self.settings,
+            ));
+        }
+        footer = footer.push(container("").width(Fill));
+        // The selected row's Resume owns the accent; declining the dialog's
+        // question is never the primary action.
+        footer = footer.push(settings_action_button(
+            if picker.startup {
+                "Start new session"
+            } else {
+                "Close"
+            },
+            Message::CloseSessionPicker,
+            SettingsButtonKind::Secondary,
+            &self.settings,
+        ));
+        body = body.push(footer);
+        container(body)
+            .padding(18)
+            .width(600)
+            .style(move |_| modal_surface(tokens))
+            .into()
+    }
+
+    fn worktree_manager_dialog(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        let Some(manager) = &self.worktree_manager else {
+            return container("").into();
+        };
+        if let Some(entry) = manager
+            .restart_target
+            .and_then(|index| manager.entries.get(index))
+        {
+            let name = entry.branch.as_deref().unwrap_or_else(|| {
+                entry
+                    .path
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or("selected worktree")
+            });
+            let body = column![
+                text("Restart pane?")
+                    .size(self.settings.ui_pixels(18.0))
+                    .font(Font {
+                        weight: font::Weight::Bold,
+                        ..Font::DEFAULT
+                    }),
+                text(format!("Open a fresh terminal in {name}?"))
+                    .size(self.settings.ui_pixels(10.5))
+                    .color(tokens.text),
+                text("The current process and terminal history will close. The pane stays in its present tab and position.")
+                    .size(self.settings.ui_pixels(9.5))
+                    .color(tokens.muted),
+                container(
+                    text(entry.path.display().to_string())
+                        .font(self.settings.terminal_font.iced())
+                        .size(self.settings.ui_pixels(9.0))
+                        .color(tokens.text)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                )
+                .padding([9, 12])
+                .width(Fill)
+                .style(move |_| container::Style::default()
+                    .background(tokens.panel)
+                    .border(Border {
+                        color: tokens.line,
+                        width: 1.0,
+                        radius: 7.0.into(),
+                    })),
+                row![
+                    text("Enter restarts · Esc goes back")
+                        .size(self.settings.ui_pixels(8.0))
+                        .color(tokens.faint),
+                    container("").width(Fill),
+                    settings_action_button(
+                        "Cancel",
+                        Message::CancelWorktreeManagerRestart,
+                        SettingsButtonKind::Secondary,
+                        &self.settings,
+                    ),
+                    settings_action_button(
+                        "Restart pane",
+                        Message::ConfirmWorktreeManagerRestart,
+                        SettingsButtonKind::Danger,
+                        &self.settings,
+                    ),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(14);
+            return container(body)
+                .padding(18)
+                .width(600)
+                .style(move |_| modal_surface(tokens))
+                .into();
+        }
+
+        let restart_mode = matches!(manager.mode, WorktreeManagerMode::RestartPane(_));
+        let unused_count = unused_worktree_paths(&manager.entries).len();
+        let title = text(if restart_mode {
+            "Restart pane in worktree"
+        } else {
+            "Worktrees"
+        })
+        .size(self.settings.ui_pixels(18.0))
+        .font(Font {
+            weight: font::Weight::Bold,
+            ..Font::DEFAULT
+        });
+        let header: Element<'_, Message> = if restart_mode {
+            title.into()
+        } else {
+            let label = if manager.busy {
+                "Removing…".to_owned()
+            } else {
+                format!("Remove unused ({unused_count})")
+            };
+            let mut remove_unused = button(centered_button_content(
+                text(label).size(self.settings.ui_pixels(9.0)),
+            ))
+            .height(30)
+            .padding([0, 11])
+            .style({
+                let settings_tokens = tokens;
+                move |_, status| {
+                    settings_button_style(settings_tokens, SettingsButtonKind::Danger, status)
+                }
+            });
+            if unused_count > 0 && !manager.busy {
+                remove_unused = remove_unused.on_press(Message::WorktreeManagerDeleteUnused);
+            }
+            row![title.width(Fill), remove_unused]
+                .spacing(12)
+                .align_y(Alignment::Center)
+                .into()
+        };
+        let mut body = column![header].spacing(14);
+        if manager.loading {
+            body = body.push(settings_notice(
+                "Loading worktrees",
+                "Reading registered checkouts and local commit status in the background.",
+                "The terminal remains responsive while this finishes.",
+                tokens.accent,
+                &self.settings,
+            ));
+        } else if let Some(failure) = &manager.failure {
+            body = body.push(
+                text(failure.clone())
+                    .size(self.settings.ui_pixels(10.0))
+                    .color(tokens.danger),
+            );
+        } else if let Some(repo_root) = &manager.repo_root {
+            body = body.push(
+                text(if restart_mode {
+                    "Choose another checkout. You’ll confirm before the current terminal closes."
+                        .to_owned()
+                } else {
+                    format!(
+                        "Manage registered checkouts for {}.",
+                        worktree_display_name(repo_root)
+                    )
+                })
+                .size(self.settings.ui_pixels(10.0))
+                .color(tokens.muted),
+            );
+            if manager.entries.is_empty() {
+                body = body.push(
+                    text(if restart_mode {
+                        "No other worktrees are registered for this repository."
+                    } else {
+                        "No worktrees yet. Create one with the New worktree commands."
+                    })
+                    .size(self.settings.ui_pixels(9.5))
+                    .color(tokens.faint),
+                );
+            } else {
+                let mut list = column![].spacing(2);
+                for (index, entry) in manager.entries.iter().enumerate() {
+                    let selected = index == manager.selected;
+                    let name = worktree_display_name(&entry.path);
+                    let branch = entry
+                        .branch
+                        .as_deref()
+                        .map_or_else(|| "Detached HEAD".to_owned(), |branch| branch.to_owned());
+                    let status = if restart_mode {
+                        match &entry.used_by {
+                            Some(pane) => status_pill(
+                                &format!(
+                                    "In use · {}",
+                                    ellipsize(pane, self.settings.ui_char_budget(18))
+                                ),
+                                tokens.warning,
+                                &self.settings,
+                            ),
+                            None => status_pill("Idle", tokens.faint, &self.settings),
+                        }
+                    } else {
+                        match (&entry.deletion_blocker, &entry.used_by) {
+                            (Some(blocker), _) => {
+                                status_pill(blocker, tokens.faint, &self.settings)
+                            }
+                            (None, Some(pane)) => status_pill(
+                                &format!(
+                                    "In use · {}",
+                                    ellipsize(pane, self.settings.ui_char_budget(18))
+                                ),
+                                tokens.warning,
+                                &self.settings,
+                            ),
+                            (None, None) => status_pill("Idle", tokens.faint, &self.settings),
+                        }
+                    };
+                    let action: Element<'_, Message> = if restart_mode {
+                        settings_action_button(
+                            "Restart",
+                            Message::WorktreeManagerRestart(index),
+                            if selected {
+                                SettingsButtonKind::Primary
+                            } else {
+                                SettingsButtonKind::Secondary
+                            },
+                            &self.settings,
+                        )
+                    } else {
+                        let delete_label = if manager.busy && selected {
+                            "Removing…"
+                        } else if entry.deletion_blocker.is_some() {
+                            "Protected"
+                        } else {
+                            "Delete"
+                        };
+                        let mut delete = button(centered_button_label(
+                            delete_label,
+                            self.settings.ui_pixels(9.0),
+                        ))
+                        .height(28)
+                        .padding([0, 14])
+                        .style({
+                            let settings_tokens = tokens;
+                            move |_, status| {
+                                settings_button_style(
+                                    settings_tokens,
+                                    SettingsButtonKind::Danger,
+                                    status,
+                                )
+                            }
+                        });
+                        if entry.deletion_blocker.is_none()
+                            && entry.used_by.is_none()
+                            && !manager.busy
+                        {
+                            delete = delete.on_press(Message::WorktreeManagerDelete(index));
+                        }
+                        delete.into()
+                    };
+                    let push_status: Element<'_, Message> = if entry.unpushed_commits > 0 {
+                        status_pill(
+                            &format!(
+                                "{} unpushed {}",
+                                entry.unpushed_commits,
+                                if entry.unpushed_commits == 1 {
+                                    "commit"
+                                } else {
+                                    "commits"
+                                }
+                            ),
+                            tokens.warning,
+                            &self.settings,
+                        )
+                    } else {
+                        container("").width(0).into()
+                    };
+                    let details = column![
+                        row![
+                            text(ellipsize(&name, self.settings.ui_char_budget(34)))
+                                .size(self.settings.ui_pixels(11.0))
+                                .font(Font {
+                                    weight: self.default_family_weight(FontWeight::Medium),
+                                    ..Font::DEFAULT
+                                })
+                                .color(tokens.text)
+                                .width(Fill)
+                                .wrapping(iced::widget::text::Wrapping::None),
+                            status,
+                        ]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                        row![
+                            text(ellipsize(&branch, self.settings.ui_char_budget(34)))
+                                .font(self.settings.terminal_font.iced())
+                                .size(self.settings.ui_pixels(8.5))
+                                .color(tokens.faint)
+                                .width(Fill)
+                                .wrapping(iced::widget::text::Wrapping::None),
+                            push_status,
+                        ]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                    ]
+                    .spacing(3)
+                    .width(Fill);
+                    list = list.push(
+                        container(
+                            row![
+                                container(details).width(Fill).clip(true),
+                                container(action)
+                                    .width(92)
+                                    .align_x(iced::alignment::Horizontal::Right),
+                            ]
+                            .spacing(10)
+                            .align_y(Alignment::Center),
+                        )
+                        .padding([9, 12])
+                        .width(Fill)
+                        .style(move |_| iced::widget::container::Style {
+                            background: selected.then(|| {
+                                Color {
+                                    a: 0.16,
+                                    ..tokens.accent
+                                }
+                                .into()
+                            }),
+                            border: iced::Border {
+                                color: if selected {
+                                    Color {
+                                        a: 0.55,
+                                        ..tokens.accent
+                                    }
+                                } else {
+                                    Color::TRANSPARENT
+                                },
+                                width: 1.0,
+                                radius: 8.0.into(),
+                            },
+                            ..iced::widget::container::Style::default()
+                        }),
+                    );
+                }
+                body = body.push(scrollable(list).height(iced::Length::Shrink));
+            }
+            if let Some(error) = &manager.error {
+                body = body.push(
+                    text(error.clone())
+                        .size(self.settings.ui_pixels(9.0))
+                        .color(tokens.danger),
+                );
+            }
+        }
+        let hint = if manager.failure.is_none() && !manager.entries.is_empty() {
+            if restart_mode {
+                "↑↓ select · Enter reviews · Esc closes"
+            } else {
+                "↑↓ select · Del deletes eligible worktrees · Enter or Esc closes"
+            }
+        } else {
+            ""
+        };
+        body = body.push(
+            row![
+                text(hint)
+                    .size(self.settings.ui_pixels(8.0))
+                    .color(tokens.faint),
+                container("").width(Fill),
+                settings_action_button(
+                    "Close",
+                    Message::CloseWorktreeManager,
+                    SettingsButtonKind::Secondary,
+                    &self.settings,
+                ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        container(body)
+            .padding(18)
+            .width(600)
+            .style(move |_| modal_surface(tokens))
+            .into()
+    }
+
+    fn close_workspace_dialog(&self, workspace_id: WorkspaceId) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        let workspace_name = self
+            .session
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .map_or("this workspace", |workspace| workspace.name.as_str());
+        let can_close = self.session.workspaces.len() > 1;
+        let actions: Element<'_, Message> = if can_close {
+            row![
+                text("Enter closes · Esc keeps")
+                    .size(self.settings.ui_pixels(8.0))
+                    .color(tokens.faint),
+                container("").width(Fill),
+                settings_action_button(
+                    "Cancel",
+                    Message::CancelCloseWorkspace,
+                    SettingsButtonKind::Secondary,
+                    &self.settings,
+                ),
+                settings_action_button(
+                    "Close workspace",
+                    Message::ConfirmCloseWorkspace(workspace_id),
+                    SettingsButtonKind::Danger,
+                    &self.settings,
+                ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            row![
+                text("Esc dismisses")
+                    .size(self.settings.ui_pixels(8.0))
+                    .color(tokens.faint),
+                container("").width(Fill),
+                settings_action_button(
+                    "Keep workspace",
+                    Message::CancelCloseWorkspace,
+                    SettingsButtonKind::Secondary,
+                    &self.settings,
+                ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into()
+        };
+        container(
+            column![
+                text(if can_close {
+                    "Close workspace?"
+                } else {
+                    "This is the last workspace"
+                })
+                .size(self.settings.ui_pixels(18.0))
+                    .font(Font {
+                        weight: font::Weight::Bold,
+                        ..Font::DEFAULT
+                    }),
+                text(if can_close {
+                    format!(
+                        "That was the last tab in {workspace_name}. Closing it will also close the workspace and its terminal."
+                    )
+                } else {
+                    format!(
+                        "{workspace_name} is the only workspace. Create another workspace before closing its last tab."
+                    )
+                })
+                .size(self.settings.ui_pixels(10.0))
+                .color(tokens.muted),
+                actions,
+            ]
+            .spacing(14),
+        )
+        .padding(18)
+        .width(460)
+        .style(move |_| modal_surface(tokens))
+        .into()
+    }
+
+    fn github_panel_view(&self, tokens: DesignTokens, floating: bool) -> Element<'_, Message> {
+        let panel = self
+            .github_panel
+            .as_ref()
+            .expect("GitHub panel view requires panel state");
+        let repo_label = panel
+            .repository
+            .owner_and_name
+            .as_deref()
+            .unwrap_or(&panel.repository.name);
+        let refresh = app_tooltip(
+            button(icon(IconKind::Refresh, tokens.muted, 14.0))
+                .on_press_maybe((!panel.loading).then_some(Message::RefreshGitHubPanel))
+                .width(30)
+                .height(30)
+                .padding(7)
+                .style(move |_, status| quiet_button_style(tokens, false, status)),
+            "Refresh repository",
+            tooltip::Position::Bottom,
+            tokens,
+            self.settings.ui_pixels(9.0),
+        );
+        let close = app_tooltip(
+            button(icon(IconKind::Close, tokens.muted, 13.0))
+                .on_press(Message::CloseGitHubPanel)
+                .width(30)
+                .height(30)
+                .padding(8)
+                .style(move |_, status| quiet_button_style(tokens, false, status)),
+            "Close GitHub panel",
+            tooltip::Position::Bottom,
+            tokens,
+            self.settings.ui_pixels(9.0),
+        );
+        let header = container(
+            row![
+                icon(IconKind::GitHub, tokens.text, 17.0),
+                column![
+                    text(repo_label)
+                        .size(self.settings.ui_pixels(10.0))
+                        .font(Font {
+                            weight: font::Weight::Semibold,
+                            ..Font::DEFAULT
+                        })
+                        .color(tokens.text)
+                        .width(Fill)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                    row![
+                        icon(IconKind::Branch, tokens.faint, 11.0),
+                        text(&panel.repository.branch)
+                            .size(self.settings.ui_pixels(8.0))
+                            .color(tokens.faint)
+                            .width(Fill)
+                            .wrapping(iced::widget::text::Wrapping::None),
+                    ]
+                    .spacing(5)
+                    .align_y(Alignment::Center),
+                ]
+                .spacing(2)
+                .width(Fill),
+                refresh,
+                close,
+            ]
+            .spacing(9)
+            .align_y(Alignment::Center),
+        )
+        .height(54)
+        .padding([7, 10]);
+
+        let body: Element<'_, Message> = match &self.github_auth {
+            github::AuthStatus::Authenticated { .. } => {
+                if let Some(data) = panel.data.as_ref() {
+                    self.github_data_view(panel, data, tokens)
+                } else if panel.loading {
+                    self.github_centered_state(
+                        IconKind::Refresh,
+                        "Reading repository…",
+                        "Collecting local changes and pull request details.",
+                        None,
+                        tokens,
+                    )
+                } else {
+                    self.github_centered_state(
+                        IconKind::GitHub,
+                        "Repository unavailable",
+                        panel
+                            .error
+                            .as_deref()
+                            .unwrap_or("Refresh to try loading this repository again."),
+                        Some(("Try again", Message::RefreshGitHubPanel)),
+                        tokens,
+                    )
+                }
+            }
+            github::AuthStatus::Checking => self.github_centered_state(
+                IconKind::GitHub,
+                "Checking GitHub…",
+                "Muxtrix is checking for an authenticated GitHub account.",
+                None,
+                tokens,
+            ),
+            github::AuthStatus::NeedsAuthentication => self.github_centered_state(
+                IconKind::GitHub,
+                if self.github_auth_busy {
+                    "Finish in your browser"
+                } else {
+                    "Connect GitHub"
+                },
+                if self.github_auth_busy {
+                    "Complete the GitHub sign-in, then this panel will refresh automatically."
+                } else {
+                    "Authenticate to see pull request details, merge readiness, checks, and merge controls."
+                },
+                (!self.github_auth_busy)
+                    .then_some(("Authenticate with GitHub", Message::BeginGitHubAuth)),
+                tokens,
+            ),
+            github::AuthStatus::Unavailable { reason } => self.github_centered_state(
+                IconKind::GitHub,
+                "GitHub CLI required",
+                reason,
+                (!self.github_auth_busy)
+                    .then_some(("Try connecting again", Message::BeginGitHubAuth)),
+                tokens,
+            ),
+        };
+
+        row![
+            container("")
+                .width(1)
+                .height(Fill)
+                .style(move |_| container::Style::default().background(tokens.line_strong)),
+            container(column![
+                header,
+                container("")
+                    .height(1)
+                    .width(Fill)
+                    .style(move |_| container::Style::default().background(tokens.line)),
+                body,
+            ])
+            .width(GITHUB_PANEL_WIDTH - 1.0)
+            .height(Fill)
+            .style(move |_| container::Style {
+                background: Some(tokens.rail.into()),
+                shadow: if floating {
+                    Shadow {
+                        color: Color::from_rgba8(0, 0, 0, 0.38),
+                        offset: Vector::new(-7.0, 0.0),
+                        blur_radius: 22.0,
+                    }
+                } else {
+                    Shadow::default()
+                },
+                ..container::Style::default()
+            }),
+        ]
+        .width(GITHUB_PANEL_WIDTH)
+        .height(Fill)
+        .into()
+    }
+
+    fn github_centered_state<'a>(
+        &'a self,
+        kind: IconKind,
+        title: &'a str,
+        detail: &'a str,
+        action: Option<(&'static str, Message)>,
+        tokens: DesignTokens,
+    ) -> Element<'a, Message> {
+        let mut content = column![
+            container(icon(kind, tokens.muted, 28.0))
+                .padding(12)
+                .style(move |_| container::Style {
+                    background: Some(tokens.panel_raised.into()),
+                    border: Border {
+                        color: tokens.line_strong,
+                        width: 1.0,
+                        radius: 12.0.into(),
+                    },
+                    ..container::Style::default()
+                }),
+            text(title)
+                .size(self.settings.ui_pixels(13.0))
+                .font(Font {
+                    weight: font::Weight::Semibold,
+                    ..Font::DEFAULT
+                })
+                .color(tokens.text),
+            text(detail)
+                .size(self.settings.ui_pixels(9.0))
+                .color(tokens.muted)
+                .center()
+                .width(280),
+        ]
+        .spacing(10)
+        .align_x(Alignment::Center);
+        if let Some((label, message)) = action {
+            content = content.push(
+                button(centered_button_label(label, self.settings.ui_pixels(9.0)))
+                    .on_press(message)
+                    .height(34)
+                    .padding([0, 14])
+                    .style(move |_, status| {
+                        settings_button_style(tokens, SettingsButtonKind::Primary, status)
+                    }),
+            );
+        }
+        container(content)
+            .width(Fill)
+            .height(Fill)
+            .center_x(Fill)
+            .center_y(Fill)
+            .padding(24)
+            .into()
+    }
+
+    fn github_data_view<'a>(
+        &'a self,
+        panel: &'a GitHubPanelState,
+        data: &'a github::PanelData,
+        tokens: DesignTokens,
+    ) -> Element<'a, Message> {
+        let pull_request = data.pull_request.as_ref().map_or_else(
+            || self.github_no_pull_request(data, tokens),
+            |pull_request| self.github_pull_request(panel, pull_request, tokens),
+        );
+        let data_error = data
+            .pull_request
+            .as_ref()
+            .and(data.pull_request_error.as_ref());
+        let error: Element<'_, Message> = panel.error.as_ref().or(data_error).map_or_else(
+            || container("").height(0).into(),
+            |error| {
+                container(
+                    text(error)
+                        .size(self.settings.ui_pixels(8.5))
+                        .color(tokens.danger),
+                )
+                .padding([8, 12])
+                .width(Fill)
+                .style(move |_| {
+                    container::Style::default().background(Color {
+                        a: 0.07,
+                        ..tokens.danger
+                    })
+                })
+                .into()
+            },
+        );
+        let changes_header = container(
+            row![
+                text("CHANGES")
+                    .size(self.settings.ui_pixels(8.0))
+                    .font(Font {
+                        weight: font::Weight::Bold,
+                        ..Font::DEFAULT
+                    })
+                    .color(tokens.faint),
+                text(data.files.len().to_string())
+                    .size(self.settings.ui_pixels(8.0))
+                    .color(tokens.muted),
+                container("").width(Fill),
+                text(format!("+{}", data.additions))
+                    .size(self.settings.ui_pixels(8.0))
+                    .font(self.settings.terminal_font.iced())
+                    .color(tokens.success),
+                text(format!("−{}", data.deletions))
+                    .size(self.settings.ui_pixels(8.0))
+                    .font(self.settings.terminal_font.iced())
+                    .color(tokens.danger),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+        )
+        .height(38)
+        .padding([8, 12])
+        .style(move |_| container::Style::default().background(tokens.panel));
+        let files = self.github_file_list(data, tokens);
+        column![
+            pull_request,
+            error,
+            container("")
+                .height(1)
+                .width(Fill)
+                .style(move |_| container::Style::default().background(tokens.line)),
+            changes_header,
+            container("")
+                .height(1)
+                .width(Fill)
+                .style(move |_| container::Style::default().background(tokens.line)),
+            files,
+        ]
+        .height(Fill)
+        .into()
+    }
+
+    fn github_no_pull_request<'a>(
+        &'a self,
+        data: &'a github::PanelData,
+        tokens: DesignTokens,
+    ) -> Element<'a, Message> {
+        let detail = data.pull_request_error.as_deref().unwrap_or(
+            "Push this branch and open a pull request to see checks and merge readiness here.",
+        );
+        container(
+            column![
+                row![
+                    signal_dot(tokens.muted, 7.0),
+                    text("No pull request")
+                        .size(self.settings.ui_pixels(10.0))
+                        .font(Font {
+                            weight: font::Weight::Semibold,
+                            ..Font::DEFAULT
+                        })
+                        .color(tokens.text),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                text(detail).size(self.settings.ui_pixels(8.5)).color(
+                    if data.pull_request_error.is_some() {
+                        tokens.warning
+                    } else {
+                        tokens.muted
+                    }
+                ),
+            ]
+            .spacing(7),
+        )
+        .padding(12)
+        .width(Fill)
+        .into()
+    }
+
+    fn github_pull_request<'a>(
+        &'a self,
+        panel: &'a GitHubPanelState,
+        pull_request: &'a github::PullRequest,
+        tokens: DesignTokens,
+    ) -> Element<'a, Message> {
+        let readiness = pull_request.readiness();
+        let (readiness_label, readiness_detail, readiness_color) =
+            github_readiness_copy(readiness.clone(), tokens);
+        let mut merge = button(centered_button_label(
+            if panel.merging { "Merging…" } else { "Merge" },
+            self.settings.ui_pixels(8.5),
+        ))
+        .height(30)
+        .padding([0, 12])
+        .style(move |_, status| github_merge_button_style(tokens, status));
+        if readiness == github::MergeReadiness::Ready && !panel.merging && !panel.merge_confirmation
+        {
+            merge = merge.on_press(Message::RequestGitHubMerge);
+        }
+        let readiness_row = row![
+            signal_dot(readiness_color, 8.0),
+            column![
+                text(readiness_label)
+                    .size(self.settings.ui_pixels(9.0))
+                    .font(Font {
+                        weight: font::Weight::Semibold,
+                        ..Font::DEFAULT
+                    })
+                    .color(readiness_color),
+                text(readiness_detail)
+                    .size(self.settings.ui_pixels(7.5))
+                    .color(tokens.muted),
+            ]
+            .spacing(1)
+            .width(Fill),
+            merge,
+        ]
+        .spacing(9)
+        .align_y(Alignment::Center);
+
+        let title = button(
+            column![
+                text(&pull_request.title)
+                    .size(self.settings.ui_pixels(11.0))
+                    .font(Font {
+                        weight: font::Weight::Semibold,
+                        ..Font::DEFAULT
+                    })
+                    .color(tokens.text)
+                    .width(Fill),
+                text(format!(
+                    "#{} by {}  ·  {} into {}",
+                    pull_request.number, pull_request.author, pull_request.head, pull_request.base
+                ))
+                .size(self.settings.ui_pixels(8.0))
+                .color(tokens.faint)
+                .width(Fill)
+                .wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .spacing(4),
+        )
+        .on_press(Message::OpenGitHubPullRequest(pull_request.url.clone()))
+        .padding(0)
+        .width(Fill)
+        .style(move |_, status| quiet_button_style(tokens, false, status));
+        let checks_color = if pull_request.checks.failed > 0 {
+            tokens.danger
+        } else if pull_request.checks.pending > 0 {
+            tokens.warning
+        } else {
+            tokens.success
+        };
+        let stats = row![
+            text(format!("{} files", pull_request.changed_files))
+                .size(self.settings.ui_pixels(8.0))
+                .color(tokens.muted),
+            text(format!("+{}", pull_request.additions))
+                .size(self.settings.ui_pixels(8.0))
+                .font(self.settings.terminal_font.iced())
+                .color(tokens.success),
+            text(format!("−{}", pull_request.deletions))
+                .size(self.settings.ui_pixels(8.0))
+                .font(self.settings.terminal_font.iced())
+                .color(tokens.danger),
+            container("").width(Fill),
+            signal_dot(checks_color, 6.0),
+            text(format!(
+                "{} passed · {} pending · {} failed",
+                pull_request.checks.passed, pull_request.checks.pending, pull_request.checks.failed
+            ))
+            .size(self.settings.ui_pixels(7.5))
+            .color(tokens.muted),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        let confirmation: Element<'_, Message> = if panel.merge_confirmation {
+            container(
+                column![
+                    text(format!("Merge pull request #{}?", pull_request.number))
+                        .size(self.settings.ui_pixels(9.0))
+                        .font(Font {
+                            weight: font::Weight::Semibold,
+                            ..Font::DEFAULT
+                        })
+                        .color(tokens.text),
+                    text("This creates a merge commit on GitHub. The branch is kept.")
+                        .size(self.settings.ui_pixels(8.0))
+                        .color(tokens.muted),
+                    row![
+                        button(centered_button_label(
+                            "Cancel",
+                            self.settings.ui_pixels(8.5),
+                        ))
+                        .on_press(Message::CancelGitHubMerge)
+                        .height(30)
+                        .padding([0, 12])
+                        .style(move |_, status| {
+                            settings_button_style(tokens, SettingsButtonKind::Secondary, status)
+                        }),
+                        button(centered_button_label(
+                            "Merge pull request",
+                            self.settings.ui_pixels(8.5),
+                        ))
+                        .on_press(Message::ConfirmGitHubMerge)
+                        .height(30)
+                        .padding([0, 12])
+                        .style(move |_, status| github_merge_button_style(tokens, status)),
+                    ]
+                    .spacing(8),
+                ]
+                .spacing(8),
+            )
+            .padding(10)
+            .width(Fill)
+            .style(move |_| {
+                container::Style::default()
+                    .background(Color {
+                        a: 0.07,
+                        ..tokens.success
+                    })
+                    .border(Border {
+                        color: Color {
+                            a: 0.35,
+                            ..tokens.success
+                        },
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    })
+            })
+            .into()
+        } else {
+            container("").height(0).into()
+        };
+
+        container(column![readiness_row, title, stats, confirmation].spacing(10))
+            .padding(12)
+            .width(Fill)
+            .into()
+    }
+
+    fn github_file_list<'a>(
+        &'a self,
+        data: &'a github::PanelData,
+        tokens: DesignTokens,
+    ) -> Element<'a, Message> {
+        if data.files.is_empty() {
+            return container(
+                column![
+                    icon(IconKind::File, tokens.faint, 22.0),
+                    text("Working tree is clean")
+                        .size(self.settings.ui_pixels(10.0))
+                        .color(tokens.text),
+                    text("Local file changes will appear here.")
+                        .size(self.settings.ui_pixels(8.5))
+                        .color(tokens.muted),
+                ]
+                .spacing(8)
+                .align_x(Alignment::Center),
+            )
+            .width(Fill)
+            .height(Fill)
+            .center_x(Fill)
+            .center_y(Fill)
+            .into();
+        }
+        let offset = self
+            .github_panel
+            .as_ref()
+            .map_or(0.0, |panel| panel.file_scroll_offset);
+        let viewport_height = (self.window_size.height - 330.0).max(140.0);
+        let (first, last) = github_file_window(data.files.len(), offset, viewport_height);
+        let mut rows =
+            column![container("").height(first as f32 * GITHUB_FILE_ROW_HEIGHT)].spacing(0);
+        for file in &data.files[first..last] {
+            rows = rows.push(self.github_file_row(file, tokens));
+        }
+        rows = rows
+            .push(container("").height((data.files.len() - last) as f32 * GITHUB_FILE_ROW_HEIGHT));
+        scrollable(rows)
+            .id(iced::widget::Id::new(GITHUB_FILE_SCROLL_ID))
+            .height(Fill)
+            .on_scroll(|viewport| Message::GitHubFileScrolled(viewport.absolute_offset().y))
+            .into()
+    }
+
+    fn github_file_row<'a>(
+        &'a self,
+        file: &'a github::FileChange,
+        tokens: DesignTokens,
+    ) -> Element<'a, Message> {
+        let status_color = if file.status == "Conflict" || file.status == "Deleted" {
+            tokens.danger
+        } else if file.status == "Untracked" || file.status == "Added" {
+            tokens.success
+        } else {
+            tokens.muted
+        };
+        container(
+            row![
+                icon(IconKind::File, tokens.faint, 13.0),
+                column![
+                    text(single_line_ellipsize(
+                        &file.path,
+                        self.settings.ui_char_budget(36),
+                    ))
+                    .size(self.settings.ui_pixels(8.8))
+                    .color(tokens.text)
+                    .width(Fill)
+                    .wrapping(iced::widget::text::Wrapping::None),
+                    text(&file.status)
+                        .size(self.settings.ui_pixels(7.2))
+                        .color(status_color),
+                ]
+                .spacing(1)
+                .width(Fill),
+                text(format!("+{}", file.additions))
+                    .size(self.settings.ui_pixels(7.5))
+                    .font(self.settings.terminal_font.iced())
+                    .color(tokens.success),
+                text(format!("−{}", file.deletions))
+                    .size(self.settings.ui_pixels(7.5))
+                    .font(self.settings.terminal_font.iced())
+                    .color(tokens.danger),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+        )
+        .height(GITHUB_FILE_ROW_HEIGHT)
+        .padding([4, 11])
+        .width(Fill)
+        .style(move |_| {
+            container::Style::default().border(Border {
+                color: tokens.line,
+                width: 0.0,
+                radius: 0.0.into(),
+            })
+        })
+        .into()
+    }
+
+    fn github_status_button(&self, tokens: DesignTokens, compact: bool) -> Element<'_, Message> {
+        let (label, color, tooltip_label) = if self.github_auth_busy {
+            (
+                "Connecting…".to_owned(),
+                tokens.warning,
+                "Finish connecting GitHub in your browser".to_owned(),
+            )
+        } else {
+            match &self.github_auth {
+                github::AuthStatus::Checking => (
+                    "GitHub".into(),
+                    tokens.muted,
+                    "Checking GitHub authentication".into(),
+                ),
+                github::AuthStatus::Authenticated { login } => (
+                    format!("@{login}"),
+                    tokens.success,
+                    "GitHub connected — open repository panel".into(),
+                ),
+                github::AuthStatus::NeedsAuthentication => (
+                    "Connect GitHub".into(),
+                    tokens.warning,
+                    "Authenticate with GitHub".into(),
+                ),
+                github::AuthStatus::Unavailable { reason } => {
+                    ("GitHub unavailable".into(), tokens.danger, reason.clone())
+                }
+            }
+        };
+        let content: Element<'_, Message> = if compact {
+            row![
+                icon(IconKind::GitHub, tokens.muted, GITHUB_STATUS_ICON_SIZE),
+                signal_dot(color, GITHUB_STATUS_DOT_SIZE),
+            ]
+            .spacing(3)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            row![
+                icon(IconKind::GitHub, tokens.muted, GITHUB_STATUS_ICON_SIZE),
+                // The dot belongs to the account, not to the rail's edge, so
+                // the name hugs its own copy and the dot follows it. That
+                // makes the cap the only thing deciding where a long login
+                // ends: it is measured against this lane, never run under the
+                // dot or allowed to shove collapse off the rail.
+                container(
+                    EllipsizedText::owned(
+                        label,
+                        self.settings.ui_pixels(10.0),
+                        self.settings.ui_font(),
+                        tokens.muted,
+                    )
+                    .width(Length::Shrink)
+                )
+                .max_width(GITHUB_STATUS_LABEL_WIDTH),
+                signal_dot(color, GITHUB_STATUS_DOT_SIZE),
+            ]
+            .spacing(GITHUB_STATUS_ROW_SPACING)
+            .align_y(Alignment::Center)
+            .into()
+        };
+        let mut control = button(content)
+            .padding(if compact {
+                Padding::from(8)
+            } else {
+                Padding::from([7, 8])
+            })
+            .style(move |_, status| quiet_button_style(tokens, false, status));
+        if !self.github_auth_busy && !matches!(self.github_auth, github::AuthStatus::Checking) {
+            control = control.on_press(Message::GitHubStatusPressed);
+        }
+        app_tooltip(
+            control,
+            tooltip_label,
+            if compact {
+                tooltip::Position::Right
+            } else {
+                tooltip::Position::Top
+            },
+            tokens,
+            self.settings.ui_pixels(9.0),
+        )
+    }
+
+    fn sidebar(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        if self.sidebar_is_compact() {
+            return self.collapsed_sidebar(tokens);
+        }
+
+        let mut rail = column![].spacing(0);
+        rail = rail.push(
+            container(
+                row![
+                    text("WORKSPACES")
+                        .size(self.settings.ui_pixels(9.0))
+                        .font(Font {
+                            weight: font::Weight::Bold,
+                            ..Font::DEFAULT
+                        })
+                        .color(tokens.faint)
+                        .width(Fill),
+                    app_tooltip(
+                        button(icon(IconKind::Add, tokens.muted, 14.0))
+                            .on_press(Message::NewWorkspace)
+                            .width(28)
+                            .height(28)
+                            .padding(0)
+                            .style(move |_, status| { quiet_button_style(tokens, false, status) }),
+                        "New workspace",
+                        tooltip::Position::Bottom,
+                        tokens,
+                        self.settings.ui_pixels(9.0),
+                    ),
+                ]
+                .align_y(Alignment::Center),
+            )
+            // Same height as the app bar so the two headers' text shares one
+            // baseline across the rail/content seam.
+            .height(44)
+            .align_y(iced::alignment::Vertical::Center)
+            .padding([4, 8]),
+        );
+        for workspace in &self.session.workspaces {
+            rail = rail.push(self.workspace_row(workspace, tokens));
+        }
+        rail = rail.push(container("").height(10));
+        rail = rail.push(
+            container("")
+                .height(1)
+                .width(Fill)
+                .style(move |_| container::Style::default().background(tokens.line)),
+        );
+        rail = rail.push(container("").height(4));
+        rail = rail.push(self.fleet_header(tokens));
+        // One entry order feeds row rendering and the keyboard handler so the
+        // visible order and direct-navigation targets can never disagree.
+        let entry_order = self.fleet_entries();
+        match self.settings.fleet_view {
+            FleetView::Tabs => {
+                if let Ok(workspace) = self.active_workspace() {
+                    for tab in &workspace.tabs {
+                        if workspace.tabs.len() > 1 {
+                            rail = rail.push(fleet_group_label(
+                                tab.name.clone(),
+                                matches!(
+                                    self.tab_signal_kind(tab),
+                                    PaneSignalKind::Warning | PaneSignalKind::Danger
+                                ),
+                                self.rail_nav == Some(RailTarget::FleetTab(workspace.id, tab.id)),
+                                pane_ids_in_layout(&tab.root)
+                                    .first()
+                                    .map(|pane_id| Message::FocusFleetPane(workspace.id, *pane_id)),
+                                &self.settings,
+                                tokens,
+                            ));
+                        }
+                        for pane_id in pane_ids_in_layout(&tab.root) {
+                            rail = rail.push(self.fleet_row(workspace, pane_id, tokens));
+                        }
+                    }
+                }
+            }
+            FleetView::Agents => {
+                if entry_order.is_empty() {
+                    rail = rail.push(
+                        container(
+                            column![
+                                text("No agent panes")
+                                    .size(self.settings.ui_pixels(9.0))
+                                    .color(tokens.muted),
+                                text("Launch Codex or Claude Code from the command palette")
+                                    .size(self.settings.ui_pixels(8.0))
+                                    .color(tokens.faint),
+                            ]
+                            .spacing(3),
+                        )
+                        .padding([8, 8]),
+                    );
+                }
+                if let Ok(workspace) = self.active_workspace() {
+                    for (workspace_id, pane_id) in entry_order.iter().copied() {
+                        if workspace.id == workspace_id {
+                            rail = rail.push(self.fleet_row(workspace, pane_id, tokens));
+                        }
+                    }
+                }
+            }
+            FleetView::Repos => {
+                if let Ok(workspace) = self.active_workspace() {
+                    for group in self.fleet_repository_groups() {
+                        let Some((workspace_id, first_pane)) = group.entries.first().copied()
+                        else {
+                            continue;
+                        };
+                        let warning = group.entries.iter().any(|(_, pane_id)| {
+                            workspace.pane(*pane_id).is_some_and(|pane| {
+                                matches!(
+                                    self.pane_signal_kind(
+                                        *pane_id,
+                                        self.pane_needs_attention(
+                                            *pane_id,
+                                            pane.attention.unread_count,
+                                        ),
+                                    ),
+                                    PaneSignalKind::Warning | PaneSignalKind::Danger
+                                )
+                            })
+                        });
+                        rail = rail.push(fleet_group_label(
+                            group.name,
+                            warning,
+                            self.rail_nav == Some(RailTarget::FleetGroup(workspace_id, first_pane)),
+                            Some(Message::FocusFleetPane(workspace_id, first_pane)),
+                            &self.settings,
+                            tokens,
+                        ));
+                        for (_, pane_id) in group.entries {
+                            rail = rail.push(self.fleet_row(workspace, pane_id, tokens));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Alerts sit after the fleet, not before the workspaces. They arrive and
+        // clear on their own schedule, and from the top they shoved every
+        // workspace and pane row down the rail the moment one appeared — the
+        // row a user was reaching for moved out from under the pointer. At the
+        // end of the rail they cost nothing above them, and the rail's own
+        // scrollbar carries them when they do not fit.
+        if !self.global_alerts.is_empty() {
+            rail = rail.push(container("").height(12));
+            rail = rail.push(
+                container("")
+                    .height(1)
+                    .width(Fill)
+                    .style(move |_| container::Style::default().background(tokens.line)),
+            );
+            rail = rail.push(section_label("ATTENTION", &self.settings, tokens));
+            for (index, alert) in self.global_alerts.iter().enumerate() {
+                rail = rail.push(self.global_alert_row(index, alert, tokens));
+            }
+        }
+
+        let collapse = app_tooltip(
+            button(icon(IconKind::Collapse, tokens.muted, 15.0))
+                .on_press(Message::ToggleSidebar)
+                .padding(8)
+                .style(move |_, status| quiet_button_style(tokens, false, status)),
+            "Collapse fleet",
+            tooltip::Position::Top,
+            tokens,
+            self.settings.ui_pixels(9.0),
+        );
+        let footer = row![
+            self.github_status_button(tokens, false),
+            container("").width(Fill),
+            collapse
+        ]
+        .align_y(Alignment::Center);
+        let surface = container(column![
+            scrollable(container(rail).padding(Padding {
+                top: 0.0,
+                bottom: 12.0,
+                left: 0.0,
+                right: 0.0,
+            }))
+            .height(Fill),
+            container(footer).height(44).padding([4, 8]),
+        ])
+        .width(SIDEBAR_WIDTH - 1.0)
+        .height(Fill)
+        .style(move |_| container::Style::default().background(tokens.rail));
+        // The rail's edge is its own element, so selected-row fills and copy
+        // can never paint over it and no border runs along window edges.
+        row![
+            surface,
+            container("")
+                .width(1)
+                .height(Fill)
+                .style(move |_| container::Style::default().background(tokens.line)),
+        ]
+        .into()
+    }
+
+    fn workspace_row<'a>(
+        &'a self,
+        workspace: &'a Workspace,
+        tokens: DesignTokens,
+    ) -> Element<'a, Message> {
+        let selected = workspace.id == self.session.active_workspace_id;
+        let targeted = self.rail_nav == Some(RailTarget::Workspace(workspace.id));
+        let signal_kind = self.workspace_signal_kind(workspace);
+        let context = self.workspace_context(workspace);
+        let tab_count = workspace.tabs.len();
+        let pane_count = workspace.pane_count();
+        let details = column![
+            row![
+                // The font's visible glyphs sit below the center of its line
+                // box, so lower the geometric dot by one logical pixel to
+                // align it with the workspace name optically.
+                container(signal_dot(signal_kind.color(tokens), 9.0)).padding(Padding {
+                    top: 2.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                    right: 0.0,
+                }),
+                text(ellipsize(&workspace.name, self.settings.ui_char_budget(24)))
+                    .size(self.settings.ui_pixels(11.0))
+                    .font(Font {
+                        weight: font::Weight::Semibold,
+                        ..Font::DEFAULT
+                    })
+                    // One accent headline means one thing everywhere in the
+                    // rail: the keyboard cursor is standing here.
+                    .color(if targeted { tokens.accent } else { tokens.text })
+                    .width(Fill)
+                    .wrapping(iced::widget::text::Wrapping::None),
+                text(self.workspace_state_label(workspace))
+                    // Same size as the fleet row's state label: both report a
+                    // pane's condition, so they belong to one type step.
+                    .size(self.settings.ui_pixels(9.0))
+                    .color(signal_kind.label_color(tokens))
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            text(format!(
+                "{tab_count} tab{} · {pane_count} pane{}",
+                if tab_count == 1 { "" } else { "s" },
+                if pane_count == 1 { "" } else { "s" }
+            ))
+            .size(self.settings.ui_pixels(9.0))
+            .color(tokens.muted),
+            text(if context.is_empty() {
+                "\u{00a0}".to_owned()
+            } else {
+                let budget =
+                    (FLEET_ENTRY_TEXT_WIDTH / (self.settings.ui_pixels(8.5) * 0.62)) as usize;
+                ellipsize_start(&context, budget)
+            })
+            .font(self.settings.terminal_font.iced())
+            .size(self.settings.ui_pixels(8.5))
+            .color(tokens.faint)
+            .wrapping(iced::widget::text::Wrapping::None),
+        ]
+        .spacing(4);
+        let row = row![
+            rail_marker(selected, targeted, tokens),
+            button(details)
+                .on_press(Message::SwitchWorkspace(workspace.id))
+                .padding([9, 13])
+                .width(Fill)
+                .style(move |_, status| rail_row_style(tokens, selected, targeted, status)),
+        ];
+        mouse_area(row)
+            .on_enter(Message::TabDragOver(workspace.id, workspace.tabs.len()))
+            .into()
+    }
+
+    /// The Tabs/Agents/Repos projection toggle above the fleet rows.
+    fn fleet_header(&self, tokens: DesignTokens) -> Element<'_, Message> {
+        let segment = |view: FleetView| -> Element<'_, Message> {
+            let selected = self.settings.fleet_view == view;
+            button(centered_button_content(
+                text(view.to_string())
+                    .size(self.settings.ui_pixels(10.0))
+                    .color(if selected { tokens.text } else { tokens.muted })
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ))
+            .on_press(Message::SetFleetView(view))
+            .height(24)
+            .padding([0, 11])
+            .style(move |_, status| fleet_toggle_style(tokens, selected, status))
+            .into()
+        };
+        container(
+            row![
+                iced::widget::Space::new().width(Fill),
+                // The recessed well the thumb sits in: app-dark fill under
+                // the raised segment gives the toggle its tactile depth.
+                container(
+                    row![
+                        segment(FleetView::Tabs),
+                        segment(FleetView::Agents),
+                        segment(FleetView::Repos)
+                    ]
+                    .spacing(2)
+                )
+                .padding(2)
+                .style(move |_| {
+                    container::Style::default()
+                        .background(tokens.app)
+                        .border(Border {
+                            color: tokens.line,
+                            width: 1.0,
+                            radius: 7.0.into(),
+                        })
+                }),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .height(36)
+        .align_y(iced::alignment::Vertical::Center)
+        .padding([0, 8])
+        .into()
+    }
+
+    /// Applies the fleet projection everywhere it is read and persists it as
+    /// a durable preference without routing through the settings screen.
+    fn set_fleet_view(&mut self, view: FleetView) {
+        self.settings.fleet_view = view;
+        self.settings_draft.fleet_view = view;
+        // Unit tests run without a config-path override and must never touch
+        // the user's real settings file.
+        #[cfg(not(test))]
+        {
+            let _ = self.settings.save();
+        }
+    }
+
+    /// The fleet projection the rail actually renders. The collapsed rail is
+    /// pure navigation with no reachable toggle, so it always lists every
+    /// pane without projection grouping.
+    fn effective_fleet_view(&self) -> FleetView {
+        if self.sidebar_is_compact() {
+            FleetView::Tabs
+        } else {
+            self.settings.fleet_view
+        }
+    }
+
+    /// The launch profile behind a plain terminal pane.
+    fn pane_profile(&self, pane_id: PaneId) -> Option<&LaunchProfile> {
+        self.session
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.pane(pane_id))
+            .and_then(Pane::active_surface)
+            .and_then(|surface| match &surface.kind {
+                muxtrix_domain::SurfaceKind::Terminal(terminal) => self
+                    .session
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == terminal.profile_id),
+                _ => None,
+            })
+    }
+
+    /// The program a plain terminal pane was launched with, as a basename.
+    ///
+    /// `None` when the backend supplies its own shell rather than being handed
+    /// a program: a WSL profile runs the distribution's login shell, so naming
+    /// it in the header would only repeat the profile ("WSL shell") in a place
+    /// that is meant to say what is running.
+    fn pane_program(&self, pane_id: PaneId) -> Option<String> {
+        let profile = self.pane_profile(pane_id)?;
+        let program = profile
+            .program
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default();
+        (!program.is_empty()).then(|| program.to_owned())
+    }
+
+    /// The command a plain terminal pane was launched with — the program's
+    /// basename, or the profile name when the backend has no program. Copy
+    /// with room for it (tooltips) still wants the profile as a last resort.
+    fn pane_command(&self, pane_id: PaneId) -> String {
+        self.pane_program(pane_id)
+            .or_else(|| {
+                self.pane_profile(pane_id)
+                    .map(|profile| profile.name.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    fn collapsed_sidebar(&self, tokens: DesignTokens) -> Element<'_, Message> {
+        let mut items = column![].spacing(0).align_x(Alignment::Center);
+        for (index, workspace) in self.session.workspaces.iter().enumerate() {
+            let selected = workspace.id == self.session.active_workspace_id;
+            let targeted = self.rail_nav == Some(RailTarget::Workspace(workspace.id));
+            let signal_kind = self.workspace_signal_kind(workspace);
+            let hint = format!(
+                "{}\n{} · {} tabs · {} panes",
+                workspace.name,
+                self.workspace_state_label(workspace),
+                workspace.tabs.len(),
+                workspace.pane_count()
+            );
+            items = items.push(app_tooltip(
+                button(
+                    container(
+                        row![
+                            text((index + 1).to_string())
+                                .size(self.settings.ui_pixels(10.0))
+                                .font(Font {
+                                    weight: font::Weight::Semibold,
+                                    ..Font::DEFAULT
+                                })
+                                // The collapsed rail has no room for a rung bar,
+                                // so identity carries the cursor here, the same
+                                // accent the expanded rows put on their headline.
+                                .color(if targeted { tokens.accent } else { tokens.text }),
+                            signal_dot(signal_kind.color(tokens), 7.0),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .width(Fill)
+                    .height(Fill)
+                    .center_x(Fill)
+                    .align_y(iced::alignment::Vertical::Center),
+                )
+                .on_press(Message::SwitchWorkspace(workspace.id))
+                .width(COLLAPSED_SIDEBAR_WIDTH - 2.0)
+                .height(43)
+                .padding(0)
+                .style(move |_, status| rail_row_style(tokens, selected, targeted, status)),
+                hint,
+                tooltip::Position::Right,
+                tokens,
+                self.settings.ui_pixels(9.0),
+            ));
+            items = items.push(
+                container("")
+                    .height(1)
+                    .width(Fill)
+                    .style(move |_| container::Style::default().background(tokens.line)),
+            );
+        }
+        // Workspaces and fleet panes are both numbered from one, so an 8px gap
+        // was the only thing telling a user which "1" they were looking at. A
+        // rule in the strong line colour separates the two ledgers the way the
+        // expanded rail's own divider does.
+        if !self.fleet_entries().is_empty() {
+            items = items.push(container("").height(7));
+            items = items.push(
+                container("")
+                    .height(1)
+                    .width(COLLAPSED_SIDEBAR_WIDTH - 18.0)
+                    .style(move |_| container::Style::default().background(tokens.line_strong)),
+            );
+            items = items.push(container("").height(7));
+        }
+        for (index, (workspace_id, pane_id)) in self.fleet_entries().into_iter().enumerate() {
+            if let Some(workspace) = self
+                .session
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+            {
+                let focused = workspace.id == self.session.active_workspace_id
+                    && workspace
+                        .active_tab()
+                        .is_some_and(|tab| tab.focused_pane_id == pane_id);
+                let targeted = self.rail_nav == Some(RailTarget::FleetPane(workspace_id, pane_id));
+                let Some(pane) = workspace.pane(pane_id) else {
+                    continue;
+                };
+                let attention = self.pane_needs_attention(pane_id, pane.attention.unread_count);
+                let color = self.pane_signal_color(pane_id, attention, tokens);
+                let title = self.pane_title(workspace, pane_id);
+                // Agent tooltips carry lifecycle; terminal tooltips carry the
+                // same truthful command/folder copy as their expanded rows.
+                let hint = if self.agent_statuses.contains_key(&pane_id) {
+                    let state = self.pane_state_label(pane_id);
+                    let activity = single_line_ellipsize(
+                        &self.pane_activity(pane_id, pane.attention.message.as_deref()),
+                        self.settings.ui_char_budget(72),
+                    );
+                    format!("{title}\n{state} · {activity}")
+                } else {
+                    let mut line = self.pane_command(pane_id);
+                    let state = self.pane_state_label(pane_id);
+                    if state != "Shell" {
+                        line = format!("{state} · {line}");
+                    }
+                    let context = self.pane_context(pane_id);
+                    if !context.is_empty() {
+                        line = format!("{line} · {context}");
+                    }
+                    format!(
+                        "{title}\n{}",
+                        single_line_ellipsize(&line, self.settings.ui_char_budget(72))
+                    )
+                };
+                // Attention is carried by colour, not by a tally: how many
+                // notifications an agent emitted while the user was elsewhere
+                // says nothing about what it wants, and the number competes
+                // with the row index for the same few pixels.
+                let identity = (index + 1).to_string();
+                // The keyboard cursor outranks attention: it marks where the
+                // user is looking right now, and it moves away again. Attention
+                // still has the pip, which the cursor does not touch.
+                let identity_color = if targeted {
+                    tokens.accent
+                } else if attention {
+                    tokens.warning
+                } else {
+                    tokens.text
+                };
+                items = items.push(app_tooltip(
+                    button(
+                        container(
+                            row![
+                                text(identity)
+                                    .size(self.settings.ui_pixels(10.0))
+                                    .font(Font {
+                                        weight: font::Weight::Semibold,
+                                        ..Font::DEFAULT
+                                    })
+                                    .color(identity_color),
+                                self.pane_pip(pane_id, color, 7.0),
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        )
+                        .width(Fill)
+                        .height(Fill)
+                        .center_x(Fill)
+                        .align_y(iced::alignment::Vertical::Center),
+                    )
+                    .on_press(Message::FocusFleetPane(workspace_id, pane_id))
+                    .width(COLLAPSED_SIDEBAR_WIDTH - 2.0)
+                    .height(43)
+                    .padding(0)
+                    .style(move |_, status| rail_row_style(tokens, focused, targeted, status)),
+                    hint,
+                    tooltip::Position::Right,
+                    tokens,
+                    self.settings.ui_pixels(9.0),
+                ));
+                items = items.push(
+                    container("")
+                        .height(1)
+                        .width(Fill)
+                        .style(move |_| container::Style::default().background(tokens.line)),
+                );
+            }
+        }
+        let expand = app_tooltip(
+            button(icon(IconKind::Expand, tokens.muted, 15.0))
+                .padding(8)
+                .on_press(Message::ToggleSidebar)
+                .style(move |_, status| quiet_button_style(tokens, false, status)),
+            "Expand fleet",
+            tooltip::Position::Right,
+            tokens,
+            self.settings.ui_pixels(9.0),
+        );
+        let surface = container(column![
+            container(app_tooltip(
+                button(icon(IconKind::Add, tokens.text, 16.0))
+                    .on_press(Message::NewWorkspace)
+                    .padding(8)
+                    .style(move |_, status| quiet_button_style(tokens, false, status)),
+                "New workspace",
+                tooltip::Position::Right,
+                tokens,
+                self.settings.ui_pixels(9.0),
+            ))
+            .height(44)
+            .center_x(Fill)
+            .align_y(iced::alignment::Vertical::Center),
+            scrollable(container(items).padding([0, 0])).height(Fill),
+            container(self.github_status_button(tokens, true))
+                .height(44)
+                .center_x(Fill)
+                .align_y(iced::alignment::Vertical::Center),
+            container(expand)
+                .height(44)
+                .center_x(Fill)
+                .align_y(iced::alignment::Vertical::Center),
+        ])
+        .width(COLLAPSED_SIDEBAR_WIDTH - 1.0)
+        .height(Fill)
+        .style(move |_| container::Style::default().background(tokens.rail));
+        row![
+            surface,
+            container("")
+                .width(1)
+                .height(Fill)
+                .style(move |_| container::Style::default().background(tokens.line)),
+        ]
+        .into()
+    }
+
+    fn global_alert_row<'a>(
+        &'a self,
+        index: usize,
+        alert: &'a GlobalAlert,
+        tokens: DesignTokens,
+    ) -> Element<'a, Message> {
+        column![
+            container(
+                column![
+                    row![
+                        signal_dot(tokens.warning, 8.0),
+                        text(&alert.title)
+                            .size(self.settings.ui_pixels(11.0))
+                            .color(tokens.text)
+                            .width(Fill),
+                        button(icon(IconKind::Close, tokens.faint, 12.0))
+                            .on_press(Message::DismissGlobalAlert(index))
+                            .padding(4)
+                            .style(move |_, status| quiet_button_style(tokens, false, status)),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                    text(&alert.body)
+                        .size(self.settings.ui_pixels(9.0))
+                        .color(tokens.muted),
+                ]
+                .spacing(4)
+            )
+            .padding([10, 6]),
+            container("")
+                .height(1)
+                .width(Fill)
+                .style(move |_| container::Style::default().background(tokens.line)),
+        ]
+        .into()
+    }
+
+    fn fleet_row<'a>(
+        &'a self,
+        workspace: &'a Workspace,
+        pane_id: PaneId,
+        tokens: DesignTokens,
+    ) -> Element<'a, Message> {
+        let Some(pane) = workspace.pane(pane_id) else {
+            return container(text("Missing pane")).into();
+        };
+        let focused = workspace.id == self.session.active_workspace_id
+            && workspace
+                .active_tab()
+                .is_some_and(|tab| tab.focused_pane_id == pane_id);
+        let targeted = self.rail_nav == Some(RailTarget::FleetPane(workspace.id, pane_id));
+        let attention = self.pane_needs_attention(pane_id, pane.attention.unread_count);
+        let signal_kind = self.pane_signal_kind(pane_id, attention);
+        let signal = signal_kind.color(tokens);
+        let location = self.pane_location_label(pane_id);
+        let title = self.pane_title(workspace, pane_id);
+        let is_agent = self.agent_statuses.contains_key(&pane_id);
+        let pane_state = self.pane_state_label(pane_id);
+        // Agents report a real lifecycle, so their rows carry state, activity,
+        // and branch context. Plain terminals have none of that: their rows
+        // show only what is true — name, command, and folder. A text state
+        // still accompanies every non-neutral pip so color never stands alone.
+        let state_label = if attention && pane_state == "Shell" {
+            "Needs input".to_owned()
+        } else {
+            pane_state
+        };
+        let state: Element<'_, Message> = text(state_label.clone())
+            .size(self.settings.ui_pixels(9.0))
+            .color(if is_agent || state_label != "Needs input" {
+                signal_kind.label_color(tokens)
+            } else {
+                tokens.warning
+            })
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into();
+        // The first line answers where the pane belongs; the second answers
+        // which pane it is and what it is doing. Trailing state claims its
+        // natural width before the measured title ellipsis is fitted.
+        let dot = self.pane_pip(pane_id, signal, 7.0);
+        // Weight is the one property here that changes text metrics, so it never
+        // varies with state: a row that thickened under focus or the cursor
+        // re-fitted its own ellipsis and slid every glyph sideways as the
+        // selection moved. Emphasis rides on colour and the leading marker
+        // instead, neither of which costs a single pixel of layout.
+        let location_font = font_with_style(
+            self.settings.ui_font(),
+            self.ui_weight(FontWeight::Medium),
+            font::Style::Normal,
+        );
+        let location_line = row![
+            dot,
+            EllipsizedText::owned(
+                location,
+                self.settings.ui_pixels(10.5),
+                location_font,
+                if targeted { tokens.accent } else { tokens.text },
+            ),
+        ]
+        .spacing(8)
+        .width(Fill)
+        .clip(true)
+        .align_y(Alignment::Center);
+        let title_font = font_with_style(
+            self.settings.ui_font(),
+            self.ui_weight(FontWeight::Normal),
+            font::Style::Normal,
+        );
+        let pane_identity = row![
+            container("").width(15),
+            EllipsizedText::new(
+                title,
+                self.settings.ui_pixels(9.0),
+                title_font,
+                if focused || targeted {
+                    tokens.text
+                } else {
+                    tokens.muted
+                },
+            ),
+        ]
+        .spacing(0)
+        .width(Fill)
+        .clip(true)
+        .align_y(Alignment::Center);
+        // No unread tally. The pip and the state label already say a pane wants
+        // the user; the count only said how many times it said so while they
+        // were elsewhere, which never changes what they do next.
+        let mut pane_line = row![pane_identity].spacing(10).align_y(Alignment::Center);
+        pane_line = pane_line.push(state);
+        let details = column![location_line, pane_line].spacing(3).width(Fill);
+        row![
+            rail_marker(focused, targeted, tokens),
+            button(centered_button_content(details))
+                .on_press(Message::FocusFleetPane(workspace.id, pane_id))
+                .height(52)
+                .padding([5, 8])
+                .width(Fill)
+                .style(move |_, status| rail_row_style(tokens, focused, targeted, status)),
+        ]
+        .into()
+    }
+
+    fn pane_location_label(&self, pane_id: PaneId) -> String {
+        let Some(directory) = self.pane_working_directory(pane_id) else {
+            return "No directory".into();
+        };
+        if let Some(repository) = self
+            .pane_repositories
+            .get(&pane_id)
+            .filter(|repository| repository.directory == directory)
+        {
+            return repository
+                .worktree_name
+                .as_deref()
+                .or(repository.name.as_deref())
+                .map(str::to_owned)
+                .unwrap_or_else(|| directory.display().to_string());
+        }
+        let path = directory.display().to_string();
+        if path.is_empty() {
+            "No directory".into()
+        } else {
+            path
+        }
+    }
+
+    fn pane_title<'a>(&'a self, workspace: &'a Workspace, pane_id: PaneId) -> &'a str {
+        if let Some(name) = workspace
+            .pane(pane_id)
+            .and_then(|pane| pane.custom_name.as_deref())
+        {
+            return name;
+        }
+        self.agent_statuses.get(&pane_id).map_or_else(
+            || {
+                workspace
+                    .pane(pane_id)
+                    .and_then(|pane| pane.active_surface())
+                    .map_or("terminal", |surface| surface.title.as_str())
+            },
+            |status| {
+                status
+                    .display_name
+                    .as_deref()
+                    .unwrap_or_else(|| agent_display_name(&status.agent))
+            },
+        )
+    }
+
+    /// True while this pane is showing Claude Code's Agents view.
+    fn shows_agents_roster(&self, pane_id: PaneId) -> bool {
+        self.agents_view_panes.contains(&pane_id)
+    }
+
+    /// Every surface that stands for one pane draws the same pip, so a pane
+    /// projecting the roster reads identically in the rail, its header, and its
+    /// stacked title sheet.
+    fn pane_pip(&self, pane_id: PaneId, color: Color, size: f32) -> Element<'static, Message> {
+        if self.shows_agents_roster(pane_id) {
+            roster_ring(color, size)
+        } else {
+            signal_dot(color, size)
+        }
+    }
+
+    fn pane_state_label(&self, pane_id: PaneId) -> String {
+        if self.shows_agents_roster(pane_id) {
+            // Until the first read lands the roster is genuinely unknown, so
+            // the row names the surface instead of guessing a count — and says
+            // so plainly when the read is what failed.
+            return self.agents_roster.map_or_else(
+                || {
+                    if self.agents_roster_error.is_some() {
+                        // The same word a pane whose terminal cannot be reached
+                        // uses: the surface is there, the reading of it is not.
+                        "Unavailable".into()
+                    } else {
+                        "Agents".into()
+                    }
+                },
+                agents_roster::AgentsRoster::label,
+            );
+        }
+        if let Some(status) = self.agent_statuses.get(&pane_id) {
+            return agent_state_label(status.state).into();
+        }
+        self.terminals.get(&pane_id).map_or_else(
+            || "Unavailable".into(),
+            |runtime| match runtime.launch_state {
+                TerminalLaunchState::PreparingHost => "Preparing".into(),
+                TerminalLaunchState::Starting { .. } => "Starting".into(),
+                TerminalLaunchState::Running => "Shell".into(),
+                TerminalLaunchState::Failed(_) => "Unavailable".into(),
+                TerminalLaunchState::Suppressed => "Not started".into(),
+                TerminalLaunchState::Exited => "Exited".into(),
+            },
+        )
+    }
+
+    fn pane_activity(&self, pane_id: PaneId, notification: Option<&str>) -> String {
+        if self.shows_agents_roster(pane_id) {
+            return self.agents_roster.map_or_else(
+                || {
+                    self.agents_roster_error.clone().map_or_else(
+                        || "Showing the agent roster".into(),
+                        |error| format!("Agent roster unreadable — {error}"),
+                    )
+                },
+                agents_roster::AgentsRoster::activity,
+            );
+        }
+        if let Some(status) = self.agent_statuses.get(&pane_id) {
+            if let Some(activity) = status.activity.as_deref().filter(|value| !value.is_empty()) {
+                return activity.to_owned();
+            }
+            return match status.state {
+                AgentState::Idle => "Ready for input".into(),
+                AgentState::Running => "Agent working".into(),
+                AgentState::Waiting => "Waiting for you".into(),
+                AgentState::Completed => "Turn complete".into(),
+                AgentState::Failed => "Agent failed".into(),
+                AgentState::Stopped => "Agent stopped".into(),
+            };
+        }
+        if let Some(notification) = notification.filter(|value| !value.is_empty()) {
+            return notification.to_owned();
+        }
+        self.terminals.get(&pane_id).map_or_else(
+            || "Terminal unavailable".into(),
+            |runtime| match runtime.launch_state {
+                TerminalLaunchState::PreparingHost => "Preparing terminal host".into(),
+                TerminalLaunchState::Starting { .. } => "Starting terminal".into(),
+                TerminalLaunchState::Running => "Ready for input".into(),
+                TerminalLaunchState::Failed(_) => "Terminal unavailable".into(),
+                TerminalLaunchState::Suppressed => "Terminal not started".into(),
+                TerminalLaunchState::Exited => "Process exited".into(),
+            },
+        )
+    }
+
+    /// Raw pane context — callers apply their own display budgets, so this
+    /// never pre-truncates (double truncation reads as a two-ended ellipsis).
+    fn pane_context(&self, pane_id: PaneId) -> String {
+        if let Some(status) = self.agent_statuses.get(&pane_id) {
+            return match (status.git_branch.as_deref(), status.cwd.as_deref()) {
+                (Some(branch), Some(cwd)) => format!("{branch} · {cwd}"),
+                (None, Some(cwd)) => cwd.to_owned(),
+                (_, None) => status.session_id.clone().unwrap_or_default(),
+            };
+        }
+        // The live process's directory (via /proc on Linux) beats the static
+        // launch configuration, so shell folder lines follow `cd`.
+        self.pane_working_directory(pane_id)
+            .map_or_else(String::new, |cwd| cwd.display().to_string())
+    }
+
+    fn pane_signal_kind(&self, pane_id: PaneId, attention: bool) -> PaneSignalKind {
+        // A pane projecting the roster reports the roster's worst state: the
+        // conversation behind it is backgrounded and has no visible state of
+        // its own. Blocked and failed come from each session's own reported
+        // state, never from the harness's "awaiting input" tally, which counts
+        // merely-idle sessions as well.
+        if self.shows_agents_roster(pane_id) {
+            return self
+                .agents_roster
+                .and_then(agents_roster::AgentsRoster::signal)
+                .map_or(PaneSignalKind::Neutral, |signal| match signal {
+                    agents_roster::RosterSignal::Failed => PaneSignalKind::Danger,
+                    agents_roster::RosterSignal::Blocked => PaneSignalKind::Warning,
+                    agents_roster::RosterSignal::Working => PaneSignalKind::Active,
+                    // A finished fleet reads exactly like a finished agent, and
+                    // a roster of sessions that never started reads like a
+                    // stopped one.
+                    agents_roster::RosterSignal::Completed => PaneSignalKind::Neutral,
+                    agents_roster::RosterSignal::Idle => PaneSignalKind::Subtle,
+                });
+        }
+        match self.agent_statuses.get(&pane_id).map(|status| status.state) {
+            Some(AgentState::Idle | AgentState::Stopped) => PaneSignalKind::Subtle,
+            Some(AgentState::Running) => PaneSignalKind::Active,
+            Some(AgentState::Waiting) => PaneSignalKind::Warning,
+            Some(AgentState::Completed) => PaneSignalKind::Neutral,
+            Some(AgentState::Failed) => PaneSignalKind::Danger,
+            _ if self.terminals.get(&pane_id).is_some_and(|runtime| {
+                matches!(runtime.launch_state, TerminalLaunchState::Failed(_))
+            }) =>
+            {
+                PaneSignalKind::Danger
+            }
+            _ if self.terminals.get(&pane_id).is_some_and(|runtime| {
+                matches!(
+                    runtime.launch_state,
+                    TerminalLaunchState::PreparingHost | TerminalLaunchState::Starting { .. }
+                )
+            }) =>
+            {
+                PaneSignalKind::Warning
+            }
+            _ if self.terminals.get(&pane_id).is_some_and(|runtime| {
+                matches!(
+                    runtime.launch_state,
+                    TerminalLaunchState::Exited | TerminalLaunchState::Suppressed
+                )
+            }) =>
+            {
+                PaneSignalKind::Subtle
+            }
+            _ if attention => PaneSignalKind::Warning,
+            _ => PaneSignalKind::Neutral,
+        }
+    }
+
+    fn pane_needs_attention(&self, pane_id: PaneId, unread_count: u32) -> bool {
+        unread_count > 0
+            && !self
+                .agent_statuses
+                .get(&pane_id)
+                .is_some_and(|status| status.state == AgentState::Completed)
+    }
+
+    fn pane_signal_color(&self, pane_id: PaneId, attention: bool, tokens: DesignTokens) -> Color {
+        self.pane_signal_kind(pane_id, attention).color(tokens)
+    }
+
+    fn tab_signal_kind(&self, tab: &WorkspaceTab) -> PaneSignalKind {
+        tab.root
+            .pane_ids()
+            .into_iter()
+            .filter_map(|pane_id| {
+                tab.panes.get(&pane_id).map(|pane| {
+                    self.pane_signal_kind(
+                        pane_id,
+                        self.pane_needs_attention(pane_id, pane.attention.unread_count),
+                    )
+                })
+            })
+            .max_by_key(|kind| pane_signal_priority(*kind))
+            .unwrap_or(PaneSignalKind::Neutral)
+    }
+
+    fn workspace_signal_kind(&self, workspace: &Workspace) -> PaneSignalKind {
+        workspace
+            .tabs
+            .iter()
+            .map(|tab| self.tab_signal_kind(tab))
+            .max_by_key(|kind| pane_signal_priority(*kind))
+            .unwrap_or(PaneSignalKind::Neutral)
+    }
+
+    fn workspace_state_label(&self, workspace: &Workspace) -> &'static str {
+        match self.workspace_signal_kind(workspace) {
+            PaneSignalKind::Danger => "Failed",
+            PaneSignalKind::Warning => "Needs input",
+            PaneSignalKind::Active => "Working",
+            PaneSignalKind::Subtle | PaneSignalKind::Neutral => "Ready",
+        }
+    }
+
+    fn workspace_context(&self, workspace: &Workspace) -> String {
+        workspace
+            .active_tab()
+            .into_iter()
+            .flat_map(|tab| {
+                std::iter::once(tab.focused_pane_id).chain(
+                    tab.root
+                        .pane_ids()
+                        .into_iter()
+                        .filter(move |pane_id| *pane_id != tab.focused_pane_id),
+                )
+            })
+            .chain(
+                workspace
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.id != workspace.active_tab_id)
+                    .flat_map(|tab| tab.root.pane_ids()),
+            )
+            .map(|pane_id| self.pane_context(pane_id))
+            .find(|context| !context.is_empty())
+            .unwrap_or_default()
+    }
+
+    fn fleet_entries_in_tab_order(&self) -> Vec<(WorkspaceId, PaneId)> {
+        self.active_workspace()
+            .into_iter()
+            .flat_map(|workspace| {
+                workspace.tabs.iter().flat_map(move |tab| {
+                    pane_ids_in_layout(&tab.root)
+                        .into_iter()
+                        .map(move |pane_id| (workspace.id, pane_id))
+                })
+            })
+            .collect()
+    }
+
+    fn fleet_repository_groups(&self) -> Vec<FleetRepositoryGroup> {
+        let mut groups: Vec<FleetRepositoryGroup> = Vec::new();
+        let mut no_repo = Vec::new();
+        for entry @ (_, pane_id) in self.fleet_entries_in_tab_order() {
+            let current_directory = self.pane_working_directory(pane_id);
+            let repository_name = self
+                .pane_repositories
+                .get(&pane_id)
+                .filter(|repository| current_directory.as_ref() == Some(&repository.directory))
+                .and_then(|repository| repository.name.as_deref());
+            let Some(repository_name) = repository_name else {
+                no_repo.push(entry);
+                continue;
+            };
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.name == repository_name)
+            {
+                group.entries.push(entry);
+            } else {
+                groups.push(FleetRepositoryGroup {
+                    name: repository_name.to_owned(),
+                    entries: vec![entry],
+                });
+            }
+        }
+        if !no_repo.is_empty() {
+            groups.push(FleetRepositoryGroup {
+                name: NO_REPO_GROUP.into(),
+                entries: no_repo,
+            });
+        }
+        groups
+    }
+
+    fn fleet_entries(&self) -> Vec<(WorkspaceId, PaneId)> {
+        let entries = self.fleet_entries_in_tab_order();
+        match self.effective_fleet_view() {
+            FleetView::Tabs => entries,
+            // Agents is a flat filter over the same tab-and-pane order.
+            FleetView::Agents => entries
+                .into_iter()
+                .filter(|(_, pane_id)| self.agent_statuses.contains_key(pane_id))
+                .collect(),
+            FleetView::Repos => self
+                .fleet_repository_groups()
+                .into_iter()
+                .flat_map(|group| group.entries)
+                .collect(),
+        }
+    }
+
+    fn selected_terminal_text(&self, pane_id: PaneId) -> Option<String> {
+        self.terminals.get(&pane_id)?.selection_text()
+    }
+
+    fn terminal_grid_cell_at(&self, pane_id: PaneId, position: Point) -> (u16, u16) {
+        let size = self
+            .terminals
+            .get(&pane_id)
+            .map_or_else(initial_pty_size, |runtime| runtime.size);
+        terminal_grid_cell_at(position, &self.settings, size)
+    }
+
+    fn hovered_terminal_link(&self, pane_id: PaneId) -> Option<TerminalLink> {
+        if self.hovered_terminal != Some(pane_id) {
+            return None;
+        }
+        let snapshot = self.terminals.get(&pane_id)?.snapshot.as_ref()?;
+        let position = self.terminal_pointer_positions.get(&pane_id).copied()?;
+        let cell = terminal_cell_at(position, &self.settings, snapshot.scrollbar.offset);
+        terminal_link_at(snapshot, cell)
+    }
+
+    fn sidebar_is_compact(&self) -> bool {
+        self.sidebar_collapsed
+    }
+
+    fn workspace_view(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        let content = match self.active_workspace() {
+            Ok(workspace) => workspace.active_tab().map_or_else(
+                || {
+                    container(text("Workspace has no tabs"))
+                        .width(Fill)
+                        .height(Fill)
+                        .into()
+                },
+                |tab| {
+                    self.maximized_pane.map_or_else(
+                        || self.view_tree(workspace, tab, &tab.root, Vec::new()),
+                        |pane_id| self.view_pane(workspace, tab, pane_id),
+                    )
+                },
+            ),
+            Err(error) => container(text(error)).width(Fill).height(Fill).into(),
+        };
+        // One 44px bar: tab chips on the left, command and settings actions on
+        // the right. Pane actions stay with their pane headers.
+        let divider = || {
+            container("")
+                .width(1)
+                .height(16)
+                .style(move |_| container::Style::default().background(tokens.line_strong))
+        };
+        let toolbar = row![
+            self.app_bar_tabs(tokens),
+            self.commands_pill(tokens),
+            divider(),
+        ]
+        .push(pane_icon_button(
+            IconKind::Settings,
+            "Settings",
+            Message::OpenSettings,
+            tokens,
+        ))
+        .padding([0, 10])
+        .spacing(8)
+        .align_y(Alignment::Center);
+        let workspace_id = self.active_workspace().map(|workspace| workspace.id).ok();
+        let tab_count = self
+            .active_workspace()
+            .map(|workspace| workspace.tabs.len())
+            .unwrap_or_default();
+        let mut bar = mouse_area(
+            container(toolbar)
+                .height(43)
+                .align_y(iced::alignment::Vertical::Center)
+                .style(move |_| container::Style::default().background(tokens.rail)),
+        );
+        if let Some(workspace_id) = workspace_id {
+            bar = bar.on_enter(Message::TabDragOver(workspace_id, tab_count));
+        }
+        let mut layout = column![
+            bar,
+            container("")
+                .height(1)
+                .width(Fill)
+                .style(move |_| container::Style::default().background(tokens.line)),
+            container(content).padding(8),
+        ]
+        .height(Fill);
+        if self.settings.show_status_bar {
+            let panes = self
+                .active_workspace()
+                .ok()
+                .and_then(Workspace::active_tab)
+                .map_or(0, |tab| tab.panes.len());
+            layout = layout.push(
+                container(
+                    row![
+                        text(&self.status)
+                            .size(self.settings.ui_pixels(9.0))
+                            .color(tokens.muted)
+                            .width(Fill),
+                        text(format!("{panes} pane{}", if panes == 1 { "" } else { "s" }))
+                            .size(self.settings.ui_pixels(9.0))
+                            .color(tokens.faint),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .height(26)
+                .padding([0, 10])
+                .style(move |_| ruled_surface(tokens.rail, tokens.line)),
+            );
+        }
+        container(layout)
+            .width(Fill)
+            .height(Fill)
+            .style(move |_| container::Style::default().background(tokens.app))
+            .into()
+    }
+
+    /// The Commands entry: icon, label, and the real keycap for the palette.
+    fn commands_pill(&self, tokens: DesignTokens) -> Element<'_, Message> {
+        let keycap = container(
+            text(if cfg!(target_os = "macos") {
+                "Cmd+P"
+            } else {
+                "Ctrl+P"
+            })
+            .font(self.settings.terminal_font.iced())
+            .size(self.settings.ui_pixels(7.5))
+            .color(tokens.muted),
+        )
+        .padding([1, 5])
+        .style(move |_| {
+            container::Style::default()
+                .background(Color {
+                    a: 0.05,
+                    ..tokens.text
+                })
+                .border(Border {
+                    color: tokens.line_strong,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                })
+        });
+        button(centered_button_content(
+            row![
+                icon(IconKind::Command, tokens.muted, 13.0),
+                text("Commands")
+                    .size(self.settings.ui_pixels(9.0))
+                    .color(tokens.muted),
+                keycap,
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+        ))
+        .on_press(Message::ToggleCommandPalette)
+        .height(29)
+        .padding([0, 9])
+        .style(move |_, status| {
+            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            button::Style {
+                background: Some(iced::Background::Color(Color {
+                    a: if hovered { 0.07 } else { 0.04 },
+                    ..tokens.text
+                })),
+                text_color: tokens.muted,
+                border: Border {
+                    color: tokens.line_strong,
+                    width: 1.0,
+                    radius: 7.0.into(),
+                },
+                shadow: Shadow::default(),
+                snap: true,
+            }
+        })
+        .into()
+    }
+
+    /// Tab chips inside the app bar: dot, name, and close inside one rounded
+    /// chip, with the trailing add action.
+    fn app_bar_tabs(&self, tokens: DesignTokens) -> Element<'_, Message> {
+        let Ok(workspace) = self.active_workspace() else {
+            return container("").width(Fill).into();
+        };
+        let mut tabs = row![].spacing(3).align_y(Alignment::Center);
+        for (index, tab) in workspace.tabs.iter().enumerate() {
+            let selected = tab.id == workspace.active_tab_id;
+            let drop_target = self.tab_drag.is_some_and(|drag| {
+                drag.target_workspace_id == workspace.id && drag.target_index == index
+            });
+            let signal_kind = self.tab_signal_kind(tab);
+            let label = button(centered_button_content(
+                row![
+                    signal_dot(signal_kind.color(tokens), 6.0),
+                    text(ellipsize(&tab.name, self.settings.ui_char_budget(20)))
+                        .size(self.settings.ui_pixels(9.0))
+                        .color(if selected { tokens.text } else { tokens.muted })
+                        .wrapping(iced::widget::text::Wrapping::None),
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center),
+            ))
+            .on_press(Message::BeginTabDrag(workspace.id, tab.id, index))
+            .height(27)
+            .padding(Padding {
+                top: 0.0,
+                bottom: 0.0,
+                left: 11.0,
+                right: 4.0,
+            })
+            .style(move |_, _| button::Style {
+                background: None,
+                text_color: tokens.text,
+                border: Border::default(),
+                shadow: Shadow::default(),
+                snap: true,
+            });
+            let close = app_tooltip(
+                button(
+                    container(icon(IconKind::Close, tokens.muted, 11.0))
+                        .width(Fill)
+                        .height(Fill)
+                        .center_x(Fill)
+                        .align_y(iced::alignment::Vertical::Center),
+                )
+                .on_press(Message::CloseTab(workspace.id, tab.id))
+                .width(18)
+                .height(18)
+                .padding(0)
+                .style(move |_, status| {
+                    let hovered =
+                        matches!(status, button::Status::Hovered | button::Status::Pressed);
+                    button::Style {
+                        background: hovered.then_some(iced::Background::Color(Color {
+                            a: 0.10,
+                            ..tokens.text
+                        })),
+                        text_color: tokens.text,
+                        border: Border::default().rounded(4.0),
+                        shadow: Shadow::default(),
+                        snap: true,
+                    }
+                }),
+                "Close tab",
+                tooltip::Position::Bottom,
+                tokens,
+                self.settings.ui_pixels(9.0),
+            );
+            // The chip carries fill, border, and radius; label and close are
+            // transparent children so the whole chip reads as one control.
+            let chip = container(
+                row![label, close]
+                    .spacing(0)
+                    .align_y(Alignment::Center)
+                    .padding(Padding {
+                        top: 0.0,
+                        bottom: 0.0,
+                        left: 0.0,
+                        right: 5.0,
+                    }),
+            )
+            .height(29)
+            .align_y(iced::alignment::Vertical::Center)
+            .style(move |_| {
+                let (fill, edge) = if selected {
+                    (0.08, tokens.line_strong)
+                } else {
+                    (0.03, tokens.line)
+                };
+                container::Style::default()
+                    .background(Color {
+                        a: fill,
+                        ..tokens.text
+                    })
+                    .border(Border {
+                        color: if drop_target { tokens.accent } else { edge },
+                        width: 1.0,
+                        radius: 7.0.into(),
+                    })
+            });
+            tabs = tabs.push(
+                mouse_area(chip)
+                    .on_enter(Message::TabDragOver(workspace.id, index))
+                    .interaction(mouse::Interaction::Grab),
+            );
+        }
+        let add_tab = app_tooltip(
+            button(
+                container(icon(IconKind::Add, tokens.muted, 13.0))
+                    .width(Fill)
+                    .height(Fill)
+                    .center_x(Fill)
+                    .align_y(iced::alignment::Vertical::Center),
+            )
+            .on_press(Message::NewTab)
+            .width(26)
+            .height(26)
+            .padding(0)
+            .style(move |_, status| add_tab_button_style(tokens, status)),
+            "New tab",
+            tooltip::Position::Bottom,
+            tokens,
+            self.settings.ui_pixels(9.0),
+        );
+        container(
+            scrollable(
+                row![tabs, add_tab]
+                    .spacing(3)
+                    .align_y(Alignment::Center)
+                    .padding(Padding {
+                        top: 0.0,
+                        bottom: 0.0,
+                        left: 0.0,
+                        right: 8.0,
+                    }),
+            )
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::hidden(),
+            )),
+        )
+        .width(Fill)
+        .align_y(iced::alignment::Vertical::Center)
+        .into()
+    }
+
+    fn settings_view(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings_draft.appearance);
+        let changed = settings_have_changes(&self.settings, &self.settings_draft);
+        let terminal_label = if changed {
+            "Discard changes and return"
+        } else {
+            "Back to terminal"
+        };
+        // Returning to the terminal is navigation, not one of the page's
+        // actions, so it wears the quiet role: no fill competing with Refresh,
+        // Apply, or Remove, and a real surface only under the pointer.
+        let back = button(centered_button_content(
+            row![
+                icon(IconKind::Back, tokens.muted, 12.0),
+                text(terminal_label)
+                    .size(self.settings_draft.ui_pixels(9.5))
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .spacing(7)
+            .align_y(Alignment::Center),
+        ))
+        .on_press(Message::CancelSettings)
+        .height(30)
+        .padding([0, 10])
+        .style(move |_, status| settings_button_style(tokens, SettingsButtonKind::Quiet, status));
+        let nav = container(
+            row![
+                back,
+                container("")
+                    .width(1)
+                    .height(16)
+                    .style(move |_| container::Style::default().background(tokens.line_strong)),
+                // The window's own title while settings owns it. The page name
+                // belongs to the toggle and the page heading, not here.
+                text("Settings")
+                    .size(self.settings_draft.ui_pixels(11.0))
+                    .font(Font {
+                        weight: font::Weight::Semibold,
+                        ..Font::DEFAULT
+                    })
+                    .color(tokens.text),
+                container("").width(Fill),
+                settings_page_toggle(self.settings_page, &self.settings_draft),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        )
+        .height(52)
+        .align_y(iced::alignment::Vertical::Center)
+        // The left inset is short by the back button's own padding so its
+        // glyph, not its hit area, lands on the page's content margin; the
+        // toggle's well has almost none, so the right inset is the margin.
+        .padding(Padding {
+            top: 0.0,
+            bottom: 0.0,
+            left: SETTINGS_PAGE_PADDING_X - 10.0,
+            right: SETTINGS_PAGE_PADDING_X,
+        })
+        .style(move |_| ruled_surface(tokens.rail, tokens.line));
+        let content = match self.settings_page {
+            SettingsPage::Preferences => self.preferences_settings_view(changed),
+            SettingsPage::Worktrees => self.worktree_settings_view(),
+        };
+        container(column![nav, content].height(Fill))
+            .width(Fill)
+            .height(Fill)
+            .style(move |_| {
+                container::Style::default()
+                    .background(tokens.app)
+                    .color(tokens.text)
+            })
+            .into()
+    }
+
+    fn worktree_settings_view(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings_draft.appearance);
+        let compact = self.window_size.width < 900.0;
+        let lanes = WorktreeLanes::for_window(self.window_size.width, compact);
+        let Some(manager) = self.worktree_manager.as_ref() else {
+            return container(settings_notice(
+                "Worktrees are not loaded",
+                "Choose Refresh to inspect the focused terminal's repository.",
+                "Muxtrix only reads local Git metadata and never fetches from a remote.",
+                tokens.muted,
+                &self.settings_draft,
+            ))
+            .padding(28)
+            .width(Fill)
+            .height(Fill)
+            .into();
+        };
+        let unused_count = unused_worktree_paths(&manager.entries).len();
+        let repository = manager
+            .repo_root
+            .as_ref()
+            .map(|root| format!("{} · {}", worktree_display_name(root), root.display()));
+        let heading = row![
+            column![
+                text("Worktrees")
+                    .size(self.settings_draft.ui_pixels(22.0))
+                    .font(Font {
+                        weight: font::Weight::Bold,
+                        ..Font::DEFAULT
+                    }),
+                text(repository.unwrap_or_else(|| {
+                    "Registered checkouts for the focused terminal's repository".to_owned()
+                }))
+                .size(self.settings_draft.ui_pixels(10.0))
+                .color(tokens.muted),
+            ]
+            .spacing(4)
+            .width(Fill),
+            settings_action_button(
+                "Refresh",
+                Message::RefreshWorktreeManager,
+                SettingsButtonKind::Secondary,
+                &self.settings_draft,
+            ),
+            {
+                let label = if manager.busy {
+                    "Removing…".to_owned()
+                } else {
+                    format!("Remove unused ({unused_count})")
+                };
+                let mut button = button(centered_button_content(
+                    text(label).size(self.settings_draft.ui_pixels(9.0)),
+                ))
+                .height(30)
+                .padding([0, 11])
+                .style(move |_, status| {
+                    settings_button_style(tokens, SettingsButtonKind::Danger, status)
+                });
+                if unused_count > 0 && !manager.busy && !manager.loading {
+                    button = button.on_press(Message::WorktreeManagerDeleteUnused);
+                }
+                button
+            },
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let mut page = column![heading].spacing(18);
+        if manager.loading {
+            page = page.push(settings_notice(
+                "Loading repository",
+                "Discovering registered worktrees and checking local-only commits in the background.",
+                "You can return to the terminal immediately; this screen will update when discovery finishes.",
+                tokens.accent,
+                &self.settings_draft,
+            ));
+        } else if let Some(failure) = &manager.failure {
+            page = page.push(settings_notice(
+                "Worktrees unavailable",
+                failure,
+                "Focus a terminal inside a Git repository, then choose Refresh.",
+                tokens.warning,
+                &self.settings_draft,
+            ));
+        } else {
+            if let Some(error) = &manager.error {
+                page = page.push(settings_notice(
+                    "Worktree action failed",
+                    error,
+                    "Nothing else was changed. Resolve the Git issue and choose Refresh to try again.",
+                    tokens.danger,
+                    &self.settings_draft,
+                ));
+            }
+            if manager.entries.is_empty() {
+                page = page.push(settings_notice(
+                    "No registered worktrees",
+                    "This repository only has its current checkout, or Git returned an empty worktree list.",
+                    "Create a checkout from the command palette with New worktree pane or New worktree tab.",
+                    tokens.muted,
+                    &self.settings_draft,
+                ));
+            } else {
+                let mut rows = column![];
+                if !compact {
+                    rows = rows.push(worktree_table_header(&self.settings_draft, lanes));
+                }
+                for (index, entry) in manager.entries.iter().enumerate() {
+                    if index > 0 || !compact {
+                        rows = rows.push(settings_divider(tokens));
+                    }
+                    rows = rows.push(self.worktree_settings_row(index, entry, compact, lanes));
+                }
+                page = page.push(
+                    column![
+                        row![
+                            text(format!(
+                                "{} registered {}",
+                                manager.entries.len(),
+                                if manager.entries.len() == 1 {
+                                    "checkout"
+                                } else {
+                                    "checkouts"
+                                }
+                            ))
+                            .size(self.settings_draft.ui_pixels(11.0))
+                            .font(Font {
+                                weight: font::Weight::Semibold,
+                                ..Font::DEFAULT
+                            }),
+                            container("").width(Fill),
+                            text("Local status only · no network fetch")
+                                .size(self.settings_draft.ui_pixels(8.5))
+                                .color(tokens.faint),
+                        ]
+                        .align_y(Alignment::Center),
+                        container(rows).width(Fill).style(move |_| {
+                            container::Style::default()
+                                .background(tokens.panel)
+                                .border(Border {
+                                    color: tokens.line,
+                                    width: 1.0,
+                                    radius: 6.0.into(),
+                                })
+                        }),
+                    ]
+                    .spacing(8),
+                );
+            }
+        }
+        let hint = |keys: &'static str, label: &'static str| {
+            worktree_footer_hint(keys, label, &self.settings_draft)
+        };
+        // A key is only advertised while it can act. With nothing listed —
+        // still loading, unavailable, or genuinely empty — the selection and
+        // removal chords would be claims the page cannot honour.
+        let navigable =
+            !manager.loading && manager.failure.is_none() && !manager.entries.is_empty();
+        let mut hints = row![]
+            .spacing(if compact { 16 } else { 20 })
+            .align_y(Alignment::Center);
+        if navigable {
+            hints = hints.push(hint("↑↓", "Select")).push(hint(
+                "Del",
+                if compact { "Remove" } else { "Remove checkout" },
+            ));
+        }
+        hints = hints.push(hint(
+            "Esc",
+            if compact {
+                "Terminal"
+            } else {
+                "Back to terminal"
+            },
+        ));
+        let footer_content: Element<'_, Message> = if compact || !navigable {
+            hints.into()
+        } else {
+            row![
+                hints,
+                container("").width(Fill),
+                text("Protected and in-use worktrees cannot be removed")
+                    .size(self.settings_draft.ui_pixels(9.0))
+                    .color(tokens.faint)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ]
+            .spacing(20)
+            .align_y(Alignment::Center)
+            .into()
+        };
+        let footer = container(footer_content)
+            .width(Fill)
+            .height(44)
+            .align_y(iced::alignment::Vertical::Center)
+            .padding([0.0, SETTINGS_PAGE_PADDING_X])
+            .style(move |_| ruled_surface(tokens.rail, tokens.line));
+        column![
+            scrollable(
+                container(page.max_width(WORKTREE_PAGE_MAX_WIDTH))
+                    .padding([24.0, SETTINGS_PAGE_PADDING_X])
+                    .center_x(Fill)
+            )
+            .height(Fill),
+            footer,
+        ]
+        .height(Fill)
+        .into()
+    }
+
+    fn worktree_settings_row(
+        &self,
+        index: usize,
+        entry: &WorktreeManagerEntry,
+        compact: bool,
+        lanes: WorktreeLanes,
+    ) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings_draft.appearance);
+        let selected = self
+            .worktree_manager
+            .as_ref()
+            .is_some_and(|manager| manager.selected == index);
+        let name = worktree_display_name(&entry.path);
+        let branch = entry
+            .branch
+            .as_deref()
+            .unwrap_or("Detached HEAD")
+            .to_owned();
+        let status = if let Some(blocker) = &entry.deletion_blocker {
+            worktree_status_tag(blocker, tokens.faint, &self.settings_draft)
+        } else if entry.used_by.is_some() {
+            worktree_status_tag("In use", tokens.warning, &self.settings_draft)
+        } else {
+            worktree_status_tag("Available", tokens.muted, &self.settings_draft)
+        };
+        let status_detail = entry
+            .used_by
+            .as_deref()
+            .unwrap_or(if entry.deletion_blocker.is_some() {
+                "Removal disabled"
+            } else {
+                "Not used by an open pane"
+            })
+            .to_owned();
+        let commit_color = if entry.unpushed_commits > 0 {
+            tokens.warning
+        } else {
+            tokens.faint
+        };
+        let commit_copy = if entry.unpushed_commits == 0 {
+            "None".to_owned()
+        } else {
+            format!(
+                "{} local-only {}",
+                entry.unpushed_commits,
+                if entry.unpushed_commits == 1 {
+                    "commit"
+                } else {
+                    "commits"
+                }
+            )
+        };
+        // A lane headed ACTION names one action. The reason a row cannot act
+        // is state, and state already has its own lane immediately to the
+        // left — relabelling the button with it printed "In use" twice in one
+        // row and made the lane's shape change from row to row. The button
+        // keeps its label and goes disabled instead, with the reason repeated
+        // in a tooltip so hovering the dead control still explains itself.
+        let blocked_reason = entry
+            .deletion_blocker
+            .as_deref()
+            .map(|blocker| format!("Protected: {blocker} cannot be removed"))
+            .or_else(|| {
+                entry
+                    .used_by
+                    .as_deref()
+                    .map(|pane| format!("In use by {pane}; close that pane first"))
+            });
+        let removing = self
+            .worktree_manager
+            .as_ref()
+            .is_some_and(|manager| manager.busy && selected);
+        let delete_label = if removing { "Removing…" } else { "Remove" };
+        let mut delete = button(centered_button_label(
+            delete_label,
+            self.settings_draft.ui_pixels(9.0),
+        ))
+        .height(28)
+        .padding([0, 12])
+        .style(move |_, button_status| {
+            settings_button_style(tokens, SettingsButtonKind::Danger, button_status)
+        });
+        if blocked_reason.is_none()
+            && self
+                .worktree_manager
+                .as_ref()
+                .is_some_and(|manager| !manager.busy)
+        {
+            delete = delete.on_press(Message::WorktreeManagerDelete(index));
+        }
+        let delete: Element<'_, Message> = match blocked_reason {
+            Some(reason) => app_tooltip(
+                delete,
+                reason,
+                tooltip::Position::Left,
+                tokens,
+                self.settings_draft.ui_pixels(9.0),
+            ),
+            None => delete.into(),
+        };
+        // Every string on the row is budgeted against the lane that holds it,
+        // so copy ends in an ellipsis inside its own lane instead of sliding
+        // under the next one and being cut mid-glyph.
+        let location = entry.path.parent().map_or_else(
+            || entry.path.display().to_string(),
+            |parent| parent.display().to_string(),
+        );
+        let name_size = self.settings_draft.ui_pixels(11.0);
+        let path_size = self.settings_draft.ui_pixels(8.0);
+        let branch_size = self.settings_draft.ui_pixels(9.0);
+        let detail_size = self.settings_draft.ui_pixels(8.0);
+        let identity = column![
+            text(ellipsize(
+                &name,
+                worktree_ui_budget(lanes.identity, name_size)
+            ))
+            .size(name_size)
+            .font(Font {
+                weight: font::Weight::Semibold,
+                ..Font::DEFAULT
+            })
+            .color(tokens.text)
+            .wrapping(iced::widget::text::Wrapping::None),
+            // The name above is already this path's last segment, so the
+            // secondary line carries the directory that holds it — together
+            // they still spell the full path, without printing the leaf
+            // twice. Checkout locations share a long common prefix, so the
+            // front is what can be spent.
+            text(ellipsize_start(
+                &location,
+                worktree_mono_budget(lanes.identity, path_size, &self.settings_draft),
+            ))
+            .font(self.settings_draft.terminal_font.iced())
+            .size(path_size)
+            .color(tokens.faint)
+            .wrapping(iced::widget::text::Wrapping::None),
+        ]
+        .spacing(3);
+        let status_column = column![
+            status,
+            text(single_line_ellipsize(
+                &status_detail,
+                worktree_ui_budget(lanes.status, detail_size)
+            ))
+            .size(detail_size)
+            .color(tokens.faint)
+            .wrapping(iced::widget::text::Wrapping::None),
+        ]
+        .spacing(4);
+        let commit_column = column![
+            text(commit_copy)
+                .size(branch_size)
+                .color(commit_color)
+                .wrapping(iced::widget::text::Wrapping::None),
+            text(if entry.unpushed_commits > 0 {
+                "Not on any remote ref"
+            } else {
+                "Safe from local-only loss"
+            })
+            .size(detail_size)
+            .color(tokens.faint)
+            .wrapping(iced::widget::text::Wrapping::None),
+        ]
+        .spacing(3);
+        let branch_text = |width: f32| {
+            text(ellipsize(
+                &branch,
+                worktree_mono_budget(width, branch_size, &self.settings_draft),
+            ))
+            .font(self.settings_draft.terminal_font.iced())
+            .size(branch_size)
+            .wrapping(iced::widget::text::Wrapping::None)
+        };
+        let row_content: Element<'_, Message> = if compact {
+            column![
+                identity,
+                row![
+                    // The label leads its value here: with the lanes stacked,
+                    // a bare slug has no column header to name it.
+                    column![
+                        text("Branch")
+                            .size(detail_size)
+                            .color(tokens.faint)
+                            .wrapping(iced::widget::text::Wrapping::None),
+                        branch_text(lanes.branch),
+                    ]
+                    .spacing(3)
+                    .width(Length::FillPortion(1)),
+                    status_column.width(Length::FillPortion(1)),
+                ]
+                .spacing(WorktreeLanes::STACKED_GAP),
+                row![
+                    column![
+                        text("Local commits")
+                            .size(detail_size)
+                            .color(tokens.faint)
+                            .wrapping(iced::widget::text::Wrapping::None),
+                        commit_column,
+                    ]
+                    .spacing(3)
+                    .width(Fill),
+                    delete,
+                ]
+                .spacing(WorktreeLanes::STACKED_GAP)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(10)
+            .into()
+        } else {
+            row![
+                container(identity).width(lanes.identity).clip(true),
+                container(branch_text(lanes.branch))
+                    .width(lanes.branch)
+                    .clip(true),
+                container(status_column).width(lanes.status).clip(true),
+                container(commit_column).width(lanes.commits).clip(true),
+                container(delete)
+                    .width(lanes.action)
+                    .align_x(iced::alignment::Horizontal::Right),
+            ]
+            .spacing(WORKTREE_LANE_SPACING)
+            .align_y(Alignment::Center)
+            .into()
+        };
+        container(row![
+            selection_bar(selected, tokens),
+            container(row_content)
+                .padding([12.0, WORKTREE_ROW_PADDING_X])
+                .width(Fill)
+        ])
+        .width(Fill)
+        .style(move |_| {
+            container::Style::default().background(if selected {
+                Color {
+                    a: 0.10,
+                    ..tokens.accent
+                }
+            } else {
+                Color::TRANSPARENT
+            })
+        })
+        .into()
+    }
+
+    fn preferences_settings_view(&self, changed: bool) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings_draft.appearance);
+        let title = column![
+            text("Preferences")
+                .size(self.settings_draft.ui_pixels(22.0))
+                .font(Font {
+                    weight: font::Weight::Bold,
+                    ..Font::DEFAULT
+                }),
+            text("Tune the interface, terminal, and agent integrations.")
+                .size(self.settings_draft.ui_pixels(11.0))
+                .color(tokens.muted),
+        ]
+        .spacing(4);
+
+        let ui_scale = row![
+            slider(
+                12.0..=20.0,
+                self.settings_draft.ui_font_size,
+                Message::SettingsUiFontSize,
+            )
+            .step(1.0_f32)
+            .width(220),
+            text(format!("{:.0} pt", self.settings_draft.ui_font_size))
+                .size(self.settings_draft.ui_pixels(10.0))
+                .color(tokens.muted)
+                .width(52),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
+        let interface = settings_section(
+            "Appearance",
+            "Theme and interface chrome",
+            column![
+                settings_row(
+                    "Theme",
+                    "Color scheme for the application",
+                    pick_list(
+                        Appearance::ALL,
+                        Some(self.settings_draft.appearance),
+                        Message::SettingsAppearance,
+                    )
+                    .width(220),
+                    &self.settings_draft
+                ),
+                settings_divider(tokens),
+                settings_row(
+                    "Interface font",
+                    "Installed font used by application chrome",
+                    pick_list(
+                        self.available_ui_fonts.clone(),
+                        Some(self.settings_draft.ui_font.clone()),
+                        Message::SettingsUiFont,
+                    )
+                    .menu_height(Length::Fixed(FONT_FAMILY_MENU_MAX_HEIGHT))
+                    .width(280),
+                    &self.settings_draft,
+                ),
+                settings_divider(tokens),
+                settings_row(
+                    "Interface font weight",
+                    "Weights installed for the selected family",
+                    pick_list(
+                        self.available_ui_font_weights.clone(),
+                        Some(self.settings_draft.ui_font_weight),
+                        Message::SettingsUiFontWeight,
+                    )
+                    .width(220),
+                    &self.settings_draft,
+                ),
+                settings_divider(tokens),
+                settings_row(
+                    "Interface text size",
+                    "Scales labels, controls, and workspace chrome",
+                    ui_scale,
+                    &self.settings_draft
+                ),
+                settings_divider(tokens),
+                settings_row(
+                    "Workspace status bar",
+                    "Show process messages and pane count at the bottom",
+                    toggler(self.settings_draft.show_status_bar)
+                        .on_toggle(Message::SettingsShowStatusBar)
+                        .size(18),
+                    &self.settings_draft
+                ),
+            ],
+            &self.settings_draft,
+        );
+
+        let font_size = row![
+            slider(
+                10.0..=28.0,
+                self.settings_draft.terminal_font_size,
+                Message::SettingsTerminalFontSize,
+            )
+            .step(1.0_f32)
+            .width(220),
+            text(format!("{:.0} pt", self.settings_draft.terminal_font_size))
+                .size(self.settings_draft.ui_pixels(10.0))
+                .color(tokens.muted)
+                .width(52),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
+        let line_height = row![
+            slider(
+                1.0..=1.6,
+                self.settings_draft.terminal_line_height,
+                Message::SettingsLineHeight,
+            )
+            .step(0.05_f32)
+            .width(220),
+            text(format!("{:.2}", self.settings_draft.terminal_line_height))
+                .size(self.settings_draft.ui_pixels(10.0))
+                .color(tokens.muted)
+                .width(52),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
+        let typography_preview = container(
+            text("$ cargo test --workspace\n✓ all checks passed")
+                .font(font_with_style(
+                    self.settings_draft.terminal_font.iced(),
+                    self.settings_draft.terminal_font_weight.iced(),
+                    font::Style::Normal,
+                ))
+                .size(self.settings_draft.terminal_font_pixels())
+                .line_height(Pixels(self.settings_draft.terminal_cell_height())),
+        )
+        .padding([10, 12])
+        .width(Fill)
+        .style(move |_| {
+            container::Style::default()
+                .background(tokens.app)
+                .border(Border {
+                    color: tokens.line,
+                    width: 1.0,
+                    radius: 5.0.into(),
+                })
+        });
+        let terminal_appearance = settings_section(
+            "Terminal appearance",
+            "Ghostty-compatible color presets and ANSI palette",
+            column![
+                settings_row(
+                    "Color theme",
+                    "Sets terminal defaults while applications keep explicit colors",
+                    pick_list(
+                        TerminalThemeId::ALL,
+                        Some(self.settings_draft.terminal_theme),
+                        Message::SettingsTerminalTheme,
+                    )
+                    .width(280),
+                    &self.settings_draft,
+                ),
+                settings_divider(tokens),
+                settings_row(
+                    "Theme gallery",
+                    "Browse every preset with live terminal previews",
+                    settings_action_button(
+                        "Browse gallery",
+                        Message::OpenThemeGallery,
+                        SettingsButtonKind::Secondary,
+                        &self.settings_draft,
+                    ),
+                    &self.settings_draft,
+                ),
+                settings_divider(tokens),
+                container(terminal_theme_preview(
+                    self.settings_draft.terminal_theme.preset(),
+                    &self.settings_draft,
+                ))
+                .padding(14),
+            ],
+            &self.settings_draft,
+        );
+        let terminal = settings_section(
+            "Terminal typography",
+            "Installed monospace fonts and terminal grid metrics",
+            column![
+                settings_row(
+                    "Font family",
+                    "Only installed monospaced families are listed",
+                    pick_list(
+                        self.available_terminal_fonts.clone(),
+                        Some(self.settings_draft.terminal_font.clone()),
+                        Message::SettingsTerminalFont,
+                    )
+                    .menu_height(Length::Fixed(FONT_FAMILY_MENU_MAX_HEIGHT))
+                    .width(340),
+                    &self.settings_draft,
+                ),
+                settings_divider(tokens),
+                settings_row(
+                    "Font weight",
+                    "Weights installed for the selected family",
+                    pick_list(
+                        self.available_terminal_font_weights.clone(),
+                        Some(self.settings_draft.terminal_font_weight),
+                        Message::SettingsTerminalFontWeight,
+                    )
+                    .width(220),
+                    &self.settings_draft,
+                ),
+                settings_divider(tokens),
+                settings_row(
+                    "Font size",
+                    "Point size used for terminal glyphs",
+                    font_size,
+                    &self.settings_draft
+                ),
+                settings_divider(tokens),
+                settings_row(
+                    "Line height",
+                    "Vertical spacing between terminal rows",
+                    line_height,
+                    &self.settings_draft
+                ),
+                settings_divider(tokens),
+                settings_row(
+                    "Preview",
+                    "Updates before changes are applied",
+                    typography_preview,
+                    &self.settings_draft
+                ),
+            ],
+            &self.settings_draft,
+        );
+
+        let integrations = settings_section(
+            "Agent lifecycle hooks",
+            "Reversible Codex and Claude Code integration",
+            column![
+                self.agent_hook_row(Agent::Codex),
+                settings_divider(tokens),
+                self.agent_hook_row(Agent::Claude),
+                settings_divider(tokens),
+                row![
+                    text("Muxtrix only changes its tagged entries; project-level controls remain available in muxtrixctl.")
+                        .size(self.settings_draft.ui_pixels(10.0))
+                        .color(tokens.muted)
+                        .width(Fill),
+                    settings_action_button(
+                        "Refresh",
+                        Message::RefreshHookStatus,
+                        SettingsButtonKind::Secondary,
+                        &self.settings_draft,
+                    ),
+                ]
+                .padding(14)
+                .align_y(Alignment::Center),
+            ],
+            &self.settings_draft,
+        );
+
+        let content = column![title, interface, terminal_appearance, terminal];
+        #[cfg(target_os = "windows")]
+        let content = content.push(settings_section(
+            "Default terminal shell",
+            "Choose where new Windows terminal panes run",
+            column![
+                settings_row(
+                    "Shell backend",
+                    "Existing panes keep running until restarted",
+                    pick_list(
+                        WindowsShellBackend::ALL,
+                        Some(self.settings_draft.windows_shell_backend),
+                        Message::SettingsWindowsShellBackend,
+                    )
+                    .width(220),
+                    &self.settings_draft,
+                ),
+                settings_divider(tokens),
+                settings_row(
+                    "WSL distribution",
+                    "Distributions are discovered from wsl.exe",
+                    row![
+                        pick_list(
+                            self.available_wsl_distributions.clone(),
+                            Some(WslDistributionChoice(
+                                (!self.settings_draft.wsl_distribution.is_empty())
+                                    .then(|| self.settings_draft.wsl_distribution.clone())
+                            )),
+                            Message::SettingsWslDistribution,
+                        )
+                        .width(220),
+                        settings_action_button(
+                            "Refresh",
+                            Message::RefreshWslDistributions,
+                            SettingsButtonKind::Secondary,
+                            &self.settings_draft,
+                        ),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                    &self.settings_draft,
+                ),
+            ],
+            &self.settings_draft,
+        ));
+        let content = content.push(integrations).spacing(22).max_width(860);
+        let font_restart = if self.settings_draft.ui_font != self.settings.ui_font
+            || self.settings_draft.ui_font_weight != self.settings.ui_font_weight
+        {
+            "Interface typography changes after restarting Muxtrix. "
+        } else {
+            ""
+        };
+        let footer = container(
+            row![
+                text(format!(
+                    "{font_restart}Terminal appearance applies now; shell changes affect new panes"
+                ))
+                .size(self.settings_draft.ui_pixels(9.0))
+                .color(tokens.faint)
+                .width(Fill),
+                settings_action_button(
+                    "Cancel",
+                    Message::CancelSettings,
+                    SettingsButtonKind::Secondary,
+                    &self.settings_draft,
+                ),
+                settings_action_button_maybe(
+                    "Apply changes",
+                    changed.then_some(Message::SaveSettings),
+                    SettingsButtonKind::Primary,
+                    &self.settings_draft,
+                ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .height(58)
+        .padding([10.0, SETTINGS_PAGE_PADDING_X])
+        .style(move |_| ruled_surface(tokens.rail, tokens.line));
+        container(
+            column![
+                scrollable(
+                    container(content)
+                        .padding([24.0, SETTINGS_PAGE_PADDING_X])
+                        .center_x(Fill)
+                )
+                .height(Fill),
+                footer,
+            ]
+            .height(Fill),
+        )
+        .width(Fill)
+        .height(Fill)
+        .style(move |_| {
+            container::Style::default()
+                .background(tokens.app)
+                .color(tokens.text)
+        })
+        .into()
+    }
+
+    fn agent_hook_row(&self, agent: Agent) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings_draft.appearance);
+        let status = self
+            .hook_statuses
+            .iter()
+            .find(|status| status.agent == agent && status.scope == HookScope::User);
+        let installed = status.is_some_and(|status| status.installed);
+        let repair_needed =
+            status.is_some_and(|status| !status.installed && status.managed_entries > 0);
+        let detail = status.map_or_else(
+            || {
+                if self.integration_refreshing {
+                    "Checking…".into()
+                } else {
+                    "Not installed".into()
+                }
+            },
+            |status| {
+                if installed {
+                    format!("Installed · {} managed entries", status.managed_entries)
+                } else if status.unreachable_entries > 0 {
+                    // The distinct failure: the hooks read as installed by
+                    // their own text, but the binary they call is gone, so the
+                    // agent has been reporting nothing at all.
+                    format!(
+                        "Needs repair · {} hooks call a muxtrixctl that is missing",
+                        status.unreachable_entries
+                    )
+                } else if repair_needed {
+                    format!(
+                        "Needs repair · {} hooks target another Muxtrix binary",
+                        status.managed_entries
+                    )
+                } else {
+                    "Not installed".into()
+                }
+            },
+        );
+        let command_input = match agent {
+            Agent::Codex => text_input("codex", &self.settings_draft.codex_command)
+                .on_input(Message::SettingsCodexCommand),
+            Agent::Claude => text_input("claude", &self.settings_draft.claude_command)
+                .on_input(Message::SettingsClaudeCommand),
+        }
+        .line_height(Pixels(30.0))
+        .padding([0, 9])
+        .size(self.settings_draft.ui_pixels(11.0));
+        container(
+            column![
+                row![
+                    column![
+                        text(match agent {
+                            Agent::Codex => "Codex",
+                            Agent::Claude => "Claude Code",
+                        })
+                        .size(self.settings_draft.ui_pixels(13.0))
+                        .font(Font {
+                            weight: font::Weight::Bold,
+                            ..Font::DEFAULT
+                        }),
+                        text(detail)
+                            .size(self.settings_draft.ui_pixels(10.0))
+                            .color(if installed {
+                                tokens.success
+                            } else if repair_needed {
+                                tokens.warning
+                            } else {
+                                tokens.muted
+                            }),
+                    ]
+                    .spacing(2)
+                    .width(Fill),
+                    settings_action_button(
+                        "Launch",
+                        Message::RunCommand(CommandAction::LaunchAgent(agent)),
+                        SettingsButtonKind::Secondary,
+                        &self.settings_draft,
+                    ),
+                    settings_hook_button(
+                        if repair_needed { "Repair" } else { "Add" },
+                        agent,
+                        if repair_needed {
+                            HookAction::ReAdd
+                        } else {
+                            HookAction::Add
+                        },
+                        SettingsButtonKind::Secondary,
+                        &self.settings_draft,
+                    ),
+                    settings_hook_button(
+                        "Remove",
+                        agent,
+                        HookAction::Remove,
+                        SettingsButtonKind::Danger,
+                        &self.settings_draft
+                    ),
+                    settings_hook_button(
+                        "Re-add",
+                        agent,
+                        HookAction::ReAdd,
+                        SettingsButtonKind::Secondary,
+                        &self.settings_draft
+                    ),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                command_input,
+            ]
+            .spacing(8),
+        )
+        .padding(14)
+        .into()
+    }
+
+    fn command_palette(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        let commands = commands::filtered(&self.palette.query);
+        let results =
+            commands
+                .iter()
+                .enumerate()
+                .fold(column![].spacing(2), |list, (index, command)| {
+                    let enabled = self.command_enabled(command.action);
+                    let selected = enabled && index == self.palette.selected;
+                    let shortcut: Element<'_, Message> = if command.shortcut.is_empty() {
+                        container("").width(0).into()
+                    } else {
+                        text(command.shortcut)
+                            .font(self.settings.terminal_font.iced())
+                            .size(self.settings.ui_pixels(7.5))
+                            .color(tokens.faint)
+                            .into()
+                    };
+                    let title_color = if enabled { tokens.text } else { tokens.faint };
+                    let subtitle = if enabled {
+                        command.subtitle
+                    } else {
+                        "Restore panes to use this command"
+                    };
+                    let mut command_button = button(
+                        row![
+                            column![
+                                text(command.title)
+                                    .size(self.settings.ui_pixels(11.0))
+                                    .font(Font {
+                                        weight: self.default_family_weight(FontWeight::Medium),
+                                        ..Font::DEFAULT
+                                    })
+                                    .color(title_color),
+                                text(subtitle)
+                                    .size(self.settings.ui_pixels(9.0))
+                                    .color(if enabled { tokens.muted } else { tokens.faint }),
+                            ]
+                            .spacing(2)
+                            .width(Fill),
+                            shortcut,
+                        ]
+                        .align_y(Alignment::Center),
+                    )
+                    // Extra right inset keeps the chord hints clear
+                    // of the overlay scrollbar.
+                    .padding(Padding {
+                        top: 7.0,
+                        bottom: 7.0,
+                        left: 12.0,
+                        right: 24.0,
+                    })
+                    .width(Fill)
+                    .style(move |_, status| {
+                        palette_button_style(tokens, selected, enabled, status)
+                    });
+                    if enabled {
+                        command_button = command_button.on_press(Message::CommandSelected(index));
+                    }
+                    list.push(
+                        row![selection_bar(selected, tokens), command_button,]
+                            .align_y(Alignment::Center),
+                    )
+                });
+        let results: Element<'_, Message> = if commands.is_empty() {
+            container(
+                column![
+                    text("No matching commands").size(self.settings.ui_pixels(11.0)),
+                    text("Try searching for split, terminal, or settings.")
+                        .size(self.settings.ui_pixels(9.0))
+                        .color(tokens.muted),
+                ]
+                .spacing(4),
+            )
+            .padding(18)
+            .into()
+        } else {
+            // Bounded so the keyboard-hint footer below always renders.
+            container(scrollable(results).id(iced::widget::Id::new(PALETTE_SCROLL_ID)))
+                .max_height(400)
+                .into()
+        };
+
+        container(
+            column![
+                container(
+                    text_input("Search commands…", &self.palette.query)
+                        .id(iced::widget::Id::new(PALETTE_INPUT_ID))
+                        .on_input(Message::CommandQueryChanged)
+                        .padding(11)
+                        .size(self.settings.ui_pixels(12.0))
+                        .style(move |_, _| text_input::Style {
+                            background: iced::Background::Color(tokens.app),
+                            border: Border {
+                                color: tokens.line_strong,
+                                width: 1.0,
+                                radius: 7.0.into(),
+                            },
+                            icon: tokens.muted,
+                            placeholder: tokens.faint,
+                            value: tokens.text,
+                            selection: Color {
+                                a: 0.35,
+                                ..tokens.accent
+                            },
+                        }),
+                )
+                .padding(Padding {
+                    top: 0.0,
+                    bottom: 0.0,
+                    left: 12.0,
+                    right: 12.0,
+                }),
+                results,
+                container(
+                    row![
+                        text("↑/↓ or Tab Navigate  ·  Enter Run  ·  Esc Close")
+                            .size(self.settings.ui_pixels(8.5))
+                            .color(tokens.muted)
+                            .width(Fill),
+                        text(if cfg!(target_os = "macos") {
+                            "Cmd+P"
+                        } else {
+                            "Ctrl+P"
+                        })
+                        .font(self.settings.terminal_font.iced())
+                        .size(self.settings.ui_pixels(8.0))
+                        .color(tokens.accent),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                )
+                .padding(Padding {
+                    top: 0.0,
+                    bottom: 0.0,
+                    left: 12.0,
+                    right: 12.0,
+                }),
+            ]
+            .spacing(8),
+        )
+        .padding(Padding {
+            top: 12.0,
+            bottom: 10.0,
+            left: 0.0,
+            right: 0.0,
+        })
+        .width(620)
+        .max_height(520)
+        .style(move |_| {
+            container::Style::default()
+                .background(tokens.overlay)
+                .border(Border {
+                    color: tokens.line_strong,
+                    width: 1.0,
+                    radius: 10.0.into(),
+                })
+                .shadow(Shadow {
+                    color: Color::from_rgba8(0, 0, 0, 0.45),
+                    offset: Vector::new(0.0, 12.0),
+                    blur_radius: 32.0,
+                })
+        })
+        .into()
+    }
+
+    fn view_tree<'a>(
+        &'a self,
+        workspace: &'a Workspace,
+        tab: &'a WorkspaceTab,
+        tree: &'a PaneTree,
+        path: Vec<SplitBranch>,
+    ) -> Element<'a, Message> {
+        match tree {
+            PaneTree::Leaf { pane_id } => self.view_pane(workspace, tab, *pane_id),
+            PaneTree::Stack { pane_ids } => self.view_pane_stack(workspace, tab, pane_ids),
+            PaneTree::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let key = SplitKey {
+                    workspace_id: workspace.id,
+                    tab_id: tab.id,
+                    path: path.clone(),
+                };
+                let mut first_path = path.clone();
+                first_path.push(SplitBranch::First);
+                let mut second_path = path;
+                second_path.push(SplitBranch::Second);
+                let first = container(self.view_tree(workspace, tab, first, first_path));
+                let second_ratio = 1_000 - ratio.permille();
+                let second = container(self.view_tree(workspace, tab, second, second_path));
+                let dragging = self.split_drag.as_ref().is_some_and(|drag| drag.key == key);
+                let handle_color = if dragging {
+                    DesignTokens::for_appearance(self.settings.appearance).accent
+                } else {
+                    Color::TRANSPARENT
+                };
+                let content: Element<'_, Message> = match axis {
+                    SplitAxis::Horizontal => {
+                        let handle = mouse_area(
+                            container(
+                                container("")
+                                    .width(if dragging { 2.0 } else { 1.0 })
+                                    .height(Fill)
+                                    .style(move |_| {
+                                        container::Style::default().background(handle_color)
+                                    }),
+                            )
+                            .width(SPLIT_HANDLE_SIZE)
+                            .height(Fill)
+                            .align_x(iced::alignment::Horizontal::Center),
+                        )
+                        .on_press(Message::BeginSplitDrag(key.clone(), *axis))
+                        .interaction(mouse::Interaction::ResizingHorizontally);
+                        row![
+                            first.width(Length::FillPortion(ratio.permille())),
+                            handle,
+                            second.width(Length::FillPortion(second_ratio)),
+                        ]
+                        .into()
+                    }
+                    SplitAxis::Vertical => {
+                        let handle = mouse_area(
+                            container(
+                                container("")
+                                    .width(Fill)
+                                    .height(if dragging { 2.0 } else { 1.0 })
+                                    .style(move |_| {
+                                        container::Style::default().background(handle_color)
+                                    }),
+                            )
+                            .width(Fill)
+                            .height(SPLIT_HANDLE_SIZE)
+                            .align_y(iced::alignment::Vertical::Center),
+                        )
+                        .on_press(Message::BeginSplitDrag(key.clone(), *axis))
+                        .interaction(mouse::Interaction::ResizingVertically);
+                        column![
+                            first.height(Length::FillPortion(ratio.permille())),
+                            handle,
+                            second.height(Length::FillPortion(second_ratio)),
+                        ]
+                        .into()
+                    }
+                };
+                sensor(content)
+                    .key(key.clone())
+                    .on_resize(move |size| Message::ResizeSplit(key.clone(), size))
+                    .into()
+            }
+        }
+    }
+
+    fn view_pane_stack<'a>(
+        &'a self,
+        workspace: &'a Workspace,
+        tab: &'a WorkspaceTab,
+        pane_ids: &'a [PaneId],
+    ) -> Element<'a, Message> {
+        let mut sheets = column![].spacing(3).height(Fill);
+        let expanded_pane_id = expanded_stack_pane(pane_ids, tab.focused_pane_id);
+        for (index, pane_id) in pane_ids.iter().copied().enumerate() {
+            if Some(pane_id) == expanded_pane_id {
+                sheets = sheets.push(self.view_pane(workspace, tab, pane_id));
+            } else {
+                sheets = sheets.push(self.view_stacked_pane_header(workspace, tab, pane_id, index));
+            }
+        }
+        sheets.into()
+    }
+
+    fn view_stacked_pane_header<'a>(
+        &'a self,
+        workspace: &'a Workspace,
+        tab: &'a WorkspaceTab,
+        pane_id: PaneId,
+        index: usize,
+    ) -> Element<'a, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        let Some(pane) = tab.panes.get(&pane_id) else {
+            return container(text("Missing pane")).height(31).into();
+        };
+        let needs_attention = self.pane_needs_attention(pane_id, pane.attention.unread_count);
+        let signal_kind = self.pane_signal_kind(pane_id, needs_attention);
+        let title = self.pane_title(workspace, pane_id);
+        let state = self.pane_state_label(pane_id);
+        // A three-step inset keeps large stacks from tapering indefinitely,
+        // while making the exposed title sheets read as physical layers.
+        let inset = (index % 3) as f32 * 2.0;
+        container(
+            button(
+                row![
+                    self.pane_pip(pane_id, signal_kind.color(tokens), 6.0),
+                    text(ellipsize(title, self.settings.ui_char_budget(32)))
+                        .size(self.settings.ui_pixels(9.0))
+                        .font(Font {
+                            weight: self.default_family_weight(FontWeight::Medium),
+                            ..Font::DEFAULT
+                        })
+                        .color(tokens.muted)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                    container("").width(Fill),
+                    text(state)
+                        .size(self.settings.ui_pixels(8.5))
+                        .color(signal_kind.label_color(tokens))
+                        .wrapping(iced::widget::text::Wrapping::None),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .height(Fill),
+            )
+            .on_press(Message::Focus(pane_id))
+            .height(31)
+            .padding(Padding {
+                top: 0.0,
+                bottom: 0.0,
+                left: 11.0,
+                right: 11.0,
+            })
+            .width(Fill)
+            .style(move |_, status| {
+                let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                button::Style {
+                    background: Some(iced::Background::Color(if hovered {
+                        Color {
+                            a: 0.08,
+                            ..tokens.text
+                        }
+                    } else {
+                        tokens.panel_raised
+                    })),
+                    text_color: tokens.text,
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 7.0.into(),
+                    },
+                    shadow: Shadow {
+                        color: Color::from_rgba8(0, 0, 0, 0.32),
+                        offset: Vector::new(0.0, 4.0),
+                        blur_radius: 10.0,
+                    },
+                    snap: true,
+                }
+            }),
+        )
+        .padding(Padding {
+            top: 0.0,
+            bottom: 0.0,
+            left: inset,
+            right: 4.0 - inset.min(4.0),
+        })
+        .height(31)
+        .width(Fill)
+        .into()
+    }
+
+    fn view_pane<'a>(
+        &'a self,
+        workspace: &'a Workspace,
+        tab: &'a WorkspaceTab,
+        pane_id: PaneId,
+    ) -> Element<'a, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        let Some(pane) = tab.panes.get(&pane_id) else {
+            return container(text("Missing pane"))
+                .width(Fill)
+                .height(Fill)
+                .into();
+        };
+        let focused = workspace.id == self.session.active_workspace_id
+            && workspace.active_tab_id == tab.id
+            && tab.focused_pane_id == pane_id;
+        let needs_attention = self.pane_needs_attention(pane_id, pane.attention.unread_count);
+        let runtime = self.terminals.get(&pane_id);
+        let process_exited = runtime
+            .is_some_and(|runtime| matches!(runtime.launch_state, TerminalLaunchState::Exited));
+        let launch_failed = runtime
+            .is_some_and(|runtime| matches!(runtime.launch_state, TerminalLaunchState::Failed(_)));
+        let launch_pending = runtime.is_some_and(|runtime| {
+            matches!(
+                runtime.launch_state,
+                TerminalLaunchState::PreparingHost | TerminalLaunchState::Starting { .. }
+            )
+        });
+        let launch_suppressed = runtime
+            .is_some_and(|runtime| matches!(runtime.launch_state, TerminalLaunchState::Suppressed));
+        let title = self.pane_title(workspace, pane_id);
+        let state = self.pane_state_label(pane_id);
+        let compact_header = pane_header_is_compact(self.window_size.width, tab.panes.len());
+        let signal_kind = self.pane_signal_kind(pane_id, needs_attention);
+        let signal = signal_kind.color(tokens);
+        let hovered_link = terminal_link_modifiers(self.keyboard_modifiers)
+            .then(|| self.hovered_terminal_link(pane_id))
+            .flatten();
+        let snapshot = runtime.and_then(|runtime| runtime.snapshot.as_ref());
+        let terminal_content: Element<'_, Message> = match snapshot {
+            Some(snapshot) => styled_terminal(
+                snapshot,
+                focused,
+                self.cursor_phase_visible,
+                hovered_link.as_ref(),
+                &self.settings,
+            ),
+            None => terminal_empty_state_copy(runtime).map_or_else(
+                || container(row![]).into(),
+                |copy| {
+                    text(copy)
+                        .font(font_with_style(
+                            self.settings.terminal_font.iced(),
+                            self.settings.terminal_font_weight.iced(),
+                            font::Style::Normal,
+                        ))
+                        .size(self.settings.terminal_font_pixels())
+                        .into()
+                },
+            ),
+        };
+        let terminal_background = rgb(terminal_surface_background(
+            snapshot,
+            self.settings.terminal_theme.preset(),
+        ));
+        let terminal_canvas: Element<'_, Message> = container(terminal_content)
+            .padding(8)
+            .width(Fill)
+            .height(Fill)
+            .clip(true)
+            .style(move |_| {
+                iced::widget::container::Style::default()
+                    .background(terminal_background)
+                    .border(Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: iced::border::Radius {
+                            top_left: 0.0,
+                            top_right: 0.0,
+                            bottom_right: 9.0,
+                            bottom_left: 9.0,
+                        },
+                    })
+            })
+            .into();
+        let scrollbar: Element<'_, Message> = runtime
+            .and_then(|runtime| runtime.snapshot.as_ref())
+            .filter(|snapshot| {
+                self.hovered_terminal == Some(pane_id) && snapshot.scrollbar.is_scrollable()
+            })
+            .map_or_else(
+                || container("").width(0).into(),
+                |snapshot| {
+                    terminal_scrollbar(
+                        pane_id,
+                        snapshot.scrollbar,
+                        runtime.and_then(|runtime| runtime.viewport).map_or(
+                            f32::from(runtime.map_or(24, |runtime| runtime.size.rows))
+                                * self.settings.terminal_cell_height()
+                                + 16.0,
+                            |viewport| viewport.height,
+                        ),
+                        tokens,
+                    )
+                },
+            );
+        let terminal_view = mouse_area(stack([terminal_canvas, scrollbar]))
+            .on_enter(Message::EnterTerminal(pane_id))
+            .on_exit(Message::LeaveTerminal(pane_id))
+            .on_move(move |position| Message::TerminalPointerMoved(pane_id, position))
+            .on_press(Message::BeginTerminalSelection(pane_id))
+            .on_release(Message::EndTerminalSelection(pane_id))
+            .on_right_press(Message::OpenPaneContextMenu(pane_id))
+            .on_scroll(move |delta| Message::ScrollTerminal(pane_id, delta))
+            .interaction(terminal_mouse_interaction(hovered_link.is_some()));
+        let terminal_view = sensor(terminal_view)
+            .key(pane_id)
+            .on_resize(move |size| Message::ResizePane(pane_id, size));
+        let header_button = |kind: IconKind,
+                             label: &'static str,
+                             message: Message,
+                             danger: bool|
+         -> Element<'static, Message> {
+            app_tooltip(
+                button(
+                    container(icon(kind, tokens.muted, 12.0))
+                        .width(Fill)
+                        .height(Fill)
+                        .center_x(Fill)
+                        .align_y(iced::alignment::Vertical::Center),
+                )
+                .on_press(message)
+                .width(24)
+                .height(24)
+                .padding(0)
+                .style(move |_, status| {
+                    let hovered =
+                        matches!(status, button::Status::Hovered | button::Status::Pressed);
+                    let background = if !hovered {
+                        None
+                    } else if danger {
+                        Some(Color {
+                            a: 0.14,
+                            ..tokens.danger
+                        })
+                    } else {
+                        Some(Color {
+                            a: 0.07,
+                            ..tokens.text
+                        })
+                    };
+                    button::Style {
+                        background: background.map(iced::Background::Color),
+                        text_color: tokens.text,
+                        border: Border::default().rounded(5.0),
+                        shadow: Shadow::default(),
+                        snap: true,
+                    }
+                }),
+                label,
+                tooltip::Position::Bottom,
+                tokens,
+                12.0,
+            )
+        };
+        // The header row never clips, so every element right of the title has
+        // to be paid for out of the title's width budget below.
+        let (command_chip, command_chip_width): (Element<'_, Message>, f32) = {
+            match self.pane_program(pane_id).filter(|_| !compact_header) {
+                None => (container("").width(0).into(), 0.0),
+                Some(command) => {
+                    let chip_size = self.settings.ui_pixels(7.5);
+                    let width = command.chars().count() as f32
+                        * chip_size
+                        * self.settings.terminal_advance_ratio()
+                        + PANE_HEADER_CHIP_PADDING;
+                    let chip = container(
+                        text(command)
+                            .font(self.settings.terminal_font.iced())
+                            .size(chip_size)
+                            .color(tokens.muted),
+                    )
+                    .padding([1, 6])
+                    .style(move |_| {
+                        container::Style::default()
+                            .background(Color {
+                                a: 0.05,
+                                ..tokens.text
+                            })
+                            .border(Border::default().rounded(4.0))
+                    })
+                    .into();
+                    (chip, width)
+                }
+            }
+        };
+        let (state_label, state_label_width): (Element<'_, Message>, f32) = if compact_header
+            || state == "Shell"
+        {
+            (container("").width(0).into(), 0.0)
+        } else {
+            let width =
+                state.chars().count() as f32 * self.settings.ui_pixels(9.0) * UI_TEXT_ADVANCE_RATIO;
+            (
+                text(state)
+                    .size(self.settings.ui_pixels(9.0))
+                    .color(signal_kind.label_color(tokens))
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
+                width,
+            )
+        };
+        // Every control is a fixed-size icon button or a labelled button whose
+        // width follows its copy; tally them as they are pushed so the title
+        // budget cannot drift from what the row actually renders.
+        let mut controls_width = 0.0_f32;
+        let mut push_control_width = |width: f32| {
+            controls_width += width + PANE_HEADER_CONTROL_SPACING;
+        };
+        let labelled_control_width = |label: &str| {
+            label.chars().count() as f32 * self.settings.ui_pixels(9.0) * UI_TEXT_ADVANCE_RATIO
+                + PANE_HEADER_LABEL_PADDING
+        };
+        let mut controls = row![].spacing(2).align_y(Alignment::Center);
+        if !compact_header {
+            if self.maximized_pane.is_none() {
+                for _ in 0..2 {
+                    push_control_width(PANE_HEADER_ICON_BUTTON);
+                }
+                controls = controls
+                    .push(header_button(
+                        IconKind::SplitRight,
+                        "Split right",
+                        Message::SplitFrom(pane_id, SplitAxis::Horizontal),
+                        false,
+                    ))
+                    .push(header_button(
+                        IconKind::SplitDown,
+                        "Split down",
+                        Message::SplitFrom(pane_id, SplitAxis::Vertical),
+                        false,
+                    ));
+            }
+            push_control_width(PANE_HEADER_ICON_BUTTON);
+            controls = controls.push(header_button(
+                if self.maximized_pane == Some(pane_id) {
+                    IconKind::Restore
+                } else {
+                    IconKind::Maximize
+                },
+                if self.maximized_pane == Some(pane_id) {
+                    "Restore panes"
+                } else {
+                    "Maximize pane"
+                },
+                Message::ToggleMaximize(pane_id),
+                false,
+            ));
+        }
+        if (process_exited || launch_failed) && !compact_header {
+            push_control_width(labelled_control_width("Restart"));
+            controls = controls.push(
+                button(centered_button_label(
+                    "Restart",
+                    self.settings.ui_pixels(9.0),
+                ))
+                .on_press(Message::RestartPane(pane_id))
+                .height(24)
+                .padding([0, 8])
+                .style(move |_, status| quiet_button_style(tokens, false, status)),
+            );
+        }
+        if launch_pending && !compact_header {
+            push_control_width(labelled_control_width("Cancel"));
+            controls = controls.push(
+                button(centered_button_label(
+                    "Cancel",
+                    self.settings.ui_pixels(9.0),
+                ))
+                .on_press(Message::CancelTerminalLaunch(pane_id))
+                .height(24)
+                .padding([0, 8])
+                .style(move |_, status| quiet_button_style(tokens, false, status)),
+            );
+        }
+        if launch_suppressed && !compact_header {
+            push_control_width(labelled_control_width("Start terminal"));
+            controls = controls.push(
+                button(centered_button_label(
+                    "Start terminal",
+                    self.settings.ui_pixels(9.0),
+                ))
+                .on_press(Message::StartTerminal(pane_id))
+                .height(24)
+                .padding([0, 8])
+                .style(move |_, status| quiet_button_style(tokens, false, status)),
+            );
+        }
+        if !compact_header {
+            push_control_width(PANE_HEADER_DIVIDER);
+            controls = controls.push(
+                container("")
+                    .width(1)
+                    .height(14)
+                    .style(move |_| container::Style::default().background(tokens.line_strong)),
+            );
+        }
+        push_control_width(PANE_HEADER_ICON_BUTTON);
+        push_control_width(PANE_HEADER_ICON_BUTTON);
+        controls = controls
+            .push(header_button(
+                IconKind::Overflow,
+                "More pane actions",
+                Message::TogglePaneMenu(pane_id),
+                false,
+            ))
+            .push(header_button(
+                IconKind::Close,
+                if tab.panes.len() == 1 {
+                    "Close pane and tab"
+                } else {
+                    "Close pane"
+                },
+                Message::ClosePane(pane_id),
+                true,
+            ));
+        // A fixed character budget cannot know how much room the trailing
+        // chrome actually left, so it has to assume the worst and truncate the
+        // title far sooner than the card requires. The measured card width
+        // knows better: spend everything the chrome does not claim. Panes that
+        // have not reported a size yet keep the conservative budget.
+        let title_space = runtime
+            .and_then(|runtime| runtime.viewport)
+            .map(|viewport| {
+                (viewport.width
+                    - PANE_HEADER_FIXED_WIDTH
+                    - command_chip_width
+                    - state_label_width
+                    - controls_width)
+                    .max(PANE_TITLE_MIN_WIDTH)
+            });
+        let title_budget = title_space.map_or_else(
+            || self.settings.ui_char_budget(24),
+            |space| {
+                pane_title_char_budget(space, self.settings.ui_pixels(9.0) * UI_TEXT_ADVANCE_RATIO)
+            },
+        );
+        // The card's header: rounded top corners carry the card radius, and
+        // the whole band shares one fill so it can never render two-toned.
+        let pane_bar = column![
+            container(
+                row![
+                    self.pane_pip(pane_id, signal, 6.0),
+                    // The ellipsis is placed from an averaged advance, so a
+                    // title of unusually wide glyphs can still outrun its
+                    // budget. Bounding the title to the same space it was
+                    // budgeted keeps that error inside the title instead of
+                    // shoving the state label and controls off the card.
+                    container(
+                        text(ellipsize(title, title_budget))
+                            .size(self.settings.ui_pixels(9.0))
+                            .font(Font {
+                                weight: self.default_family_weight(FontWeight::Medium),
+                                ..Font::DEFAULT
+                            })
+                            .color(if focused { tokens.text } else { tokens.muted })
+                            .wrapping(iced::widget::text::Wrapping::None)
+                    )
+                    .max_width(title_space.unwrap_or(PANE_TITLE_UNMEASURED_WIDTH))
+                    .clip(true),
+                    command_chip,
+                    container("").width(Fill),
+                    state_label,
+                    controls,
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .height(34)
+            .align_y(iced::alignment::Vertical::Center)
+            .padding(Padding {
+                top: 0.0,
+                bottom: 0.0,
+                left: 12.0,
+                right: 6.0,
+            })
+            .style(move |_| {
+                let style = container::Style::default().border(Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: iced::border::Radius {
+                        top_left: 9.0,
+                        top_right: 9.0,
+                        bottom_right: 0.0,
+                        bottom_left: 0.0,
+                    },
+                });
+                if focused {
+                    style.background(tokens.panel_raised)
+                } else {
+                    style.background(Color {
+                        a: 0.03,
+                        ..tokens.text
+                    })
+                }
+            }),
+            container("")
+                .height(1)
+                .width(Fill)
+                .style(move |_| container::Style::default().background(tokens.line)),
+        ]
+        .height(35);
+        let pane_menu: Option<Element<'_, Message>> = if self.pane_menu == Some(pane_id) {
+            // Copy and Paste stay present but disabled when they cannot act,
+            // so every row keeps a fixed position regardless of invisible
+            // selection or process state.
+            // Asking the emulator for the text would mean a round trip to the
+            // session thread on every frame the menu is open; the flag tracks
+            // the same answer from this side of the channel.
+            let can_copy = runtime.is_some_and(|runtime| runtime.has_selection);
+            let can_paste = runtime.is_some_and(|runtime| runtime.session.is_some());
+            let mut entries = column![
+                pane_menu_entry(
+                    "Copy",
+                    commands::COPY_SHORTCUT,
+                    can_copy.then_some(Message::CopyTerminalSelection(pane_id)),
+                    false,
+                    tokens,
+                    &self.settings,
+                ),
+                pane_menu_entry(
+                    "Paste",
+                    commands::PASTE_SHORTCUT,
+                    can_paste.then_some(Message::PastePane(pane_id)),
+                    false,
+                    tokens,
+                    &self.settings,
+                ),
+                pane_menu_divider(tokens),
+            ]
+            .spacing(2);
+            if self.maximized_pane.is_none() {
+                entries = entries
+                    .push(pane_menu_entry(
+                        "Split right",
+                        "Ctrl+Shift+E",
+                        Some(Message::SplitFrom(pane_id, SplitAxis::Horizontal)),
+                        false,
+                        tokens,
+                        &self.settings,
+                    ))
+                    .push(pane_menu_entry(
+                        "Split down",
+                        "Ctrl+Shift+O",
+                        Some(Message::SplitFrom(pane_id, SplitAxis::Vertical)),
+                        false,
+                        tokens,
+                        &self.settings,
+                    ));
+            }
+            entries = entries
+                .push(pane_menu_entry(
+                    if self.maximized_pane == Some(pane_id) {
+                        "Restore panes"
+                    } else {
+                        "Maximize pane"
+                    },
+                    "Ctrl+Shift+M",
+                    Some(Message::ToggleMaximizeFromPaneMenu(pane_id)),
+                    false,
+                    tokens,
+                    &self.settings,
+                ))
+                .push(pane_menu_divider(tokens))
+                .push(pane_menu_entry(
+                    "Restart in worktree…",
+                    "",
+                    Some(Message::OpenPaneWorktreePrompt(pane_id)),
+                    false,
+                    tokens,
+                    &self.settings,
+                ))
+                .push(pane_menu_entry(
+                    "Restart terminal",
+                    "",
+                    Some(Message::RestartPane(pane_id)),
+                    false,
+                    tokens,
+                    &self.settings,
+                ))
+                .push(pane_menu_entry(
+                    if tab.panes.len() == 1 {
+                        "Close pane and tab"
+                    } else {
+                        "Close pane"
+                    },
+                    "",
+                    Some(Message::ClosePane(pane_id)),
+                    true,
+                    tokens,
+                    &self.settings,
+                ));
+            Some(
+                container(entries)
+                    .width(236)
+                    .padding(5)
+                    .style(move |_| {
+                        container::Style::default()
+                            .background(tokens.overlay)
+                            .border(Border {
+                                color: tokens.line_strong,
+                                width: 1.0,
+                                radius: 10.0.into(),
+                            })
+                            .shadow(Shadow {
+                                color: Color::from_rgba8(0, 0, 0, 0.5),
+                                offset: Vector::new(0.0, 16.0),
+                                blur_radius: 40.0,
+                            })
+                    })
+                    .into(),
+            )
+        } else {
+            None
+        };
+        let terminal: Element<'_, Message> = Popover::new(
+            column![pane_bar, terminal_view].height(Fill),
+            pane_menu,
+            Message::DismissPaneMenu,
+        )
+        .into();
+
+        // Any pane that requires the user — an agent waiting on input or a
+        // terminal with unread attention — gets the full amber ring so it is
+        // findable at a glance even while visible on screen.
+        let awaiting_input = self
+            .agent_statuses
+            .get(&pane_id)
+            .is_some_and(|status| status.state == AgentState::Waiting)
+            || needs_attention;
+        // Panes are rounded cards. A pane that needs a person carries a full
+        // amber border and glow — the whole card, not just an edge — with
+        // focus as the accent-blue equivalent beneath it in priority.
+        let (edge, glow) = if awaiting_input {
+            (
+                Color {
+                    a: 0.75,
+                    ..tokens.warning
+                },
+                Shadow {
+                    color: Color {
+                        a: 0.22,
+                        ..tokens.warning
+                    },
+                    offset: Vector::new(0.0, 0.0),
+                    blur_radius: 18.0,
+                },
+            )
+        } else if focused {
+            (
+                Color {
+                    a: 0.62,
+                    ..tokens.accent
+                },
+                Shadow {
+                    color: Color {
+                        a: 0.14,
+                        ..tokens.accent
+                    },
+                    offset: Vector::new(0.0, 5.0),
+                    blur_radius: 16.0,
+                },
+            )
+        } else {
+            (tokens.line, Shadow::default())
+        };
+        mouse_area(
+            container(terminal)
+                .width(Fill)
+                .height(Fill)
+                .padding(1)
+                .clip(true)
+                .style(move |_| {
+                    container::Style::default()
+                        .background(tokens.panel)
+                        .border(Border {
+                            color: edge,
+                            width: 1.0,
+                            radius: 10.0.into(),
+                        })
+                        .shadow(glow)
+                }),
+        )
+        .on_press(Message::Focus(pane_id))
+        .on_right_press(Message::OpenPaneContextMenu(pane_id))
+        .into()
+    }
+
+    fn active_workspace(&self) -> Result<&Workspace, String> {
+        self.session
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == self.session.active_workspace_id)
+            .ok_or_else(|| "active workspace is missing".into())
+    }
+
+    fn active_workspace_mut(&mut self) -> Result<&mut Workspace, String> {
+        self.session
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == self.session.active_workspace_id)
+            .ok_or_else(|| "active workspace is missing".into())
+    }
+}
+
+fn github_file_window(file_count: usize, offset: f32, viewport_height: f32) -> (usize, usize) {
+    let visible = (viewport_height / GITHUB_FILE_ROW_HEIGHT).ceil() as usize;
+    let raw_first = (offset.max(0.0) / GITHUB_FILE_ROW_HEIGHT).floor() as usize;
+    let first = raw_first
+        .saturating_sub(GITHUB_FILE_OVERSCAN)
+        .min(file_count);
+    let last = (first + visible + GITHUB_FILE_OVERSCAN * 2).min(file_count);
+    (first, last)
+}
+
+fn character_key_is(key: Key<&str>, expected: &str) -> bool {
+    matches!(key, Key::Character(character) if character.eq_ignore_ascii_case(expected))
+}
+
+fn clipboard_shortcut(key: Key<&str>, modifiers: Modifiers) -> Option<ClipboardAction> {
+    clipboard_shortcut_for(key, modifiers, cfg!(target_os = "macos"))
+}
+
+/// Ghostty's default clipboard bindings: Super+C/Super+V on macOS and
+/// Ctrl+Shift+C/Ctrl+Shift+V everywhere else. Everything else — including
+/// bare Ctrl+C and Ctrl+V — still belongs to the terminal.
+fn clipboard_shortcut_for(
+    key: Key<&str>,
+    modifiers: Modifiers,
+    macos: bool,
+) -> Option<ClipboardAction> {
+    let chord = if macos {
+        modifiers.logo() && !modifiers.control() && !modifiers.shift() && !modifiers.alt()
+    } else {
+        modifiers.control() && modifiers.shift() && !modifiers.logo() && !modifiers.alt()
+    };
+    if !chord {
+        return None;
+    }
+    if character_key_is(key.clone(), "c") {
+        Some(ClipboardAction::Copy)
+    } else if character_key_is(key, "v") {
+        Some(ClipboardAction::Paste)
+    } else {
+        None
+    }
+}
+
+fn palette_selection(current: usize, count: usize, direction: PaletteMove) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    match direction {
+        PaletteMove::Next => (current + 1) % count,
+        PaletteMove::Previous => (current + count - 1) % count,
+    }
+}
+
+fn first_enabled_palette_command(enabled: &[bool]) -> usize {
+    enabled
+        .iter()
+        .position(|command_enabled| *command_enabled)
+        .unwrap_or(0)
+}
+
+fn enabled_palette_selection(current: usize, enabled: &[bool], direction: PaletteMove) -> usize {
+    let enabled_indices: Vec<_> = enabled
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command_enabled)| command_enabled.then_some(index))
+        .collect();
+    if enabled_indices.is_empty() {
+        return 0;
+    }
+    let current_enabled_index = enabled_indices.iter().position(|index| *index == current);
+    let next_enabled_index = current_enabled_index.map_or_else(
+        || match direction {
+            PaletteMove::Next => 0,
+            PaletteMove::Previous => enabled_indices.len() - 1,
+        },
+        |position| palette_selection(position, enabled_indices.len(), direction),
+    );
+    enabled_indices[next_enabled_index]
+}
+
+fn pane_ids_in_layout(tree: &PaneTree) -> Vec<PaneId> {
+    tree.pane_ids()
+}
+
+/// Keeps the tree's spatial order while recovering panes that are still owned
+/// by the tab but missing from a stale layout projection.
+fn pane_ids_for_layout(tab: &WorkspaceTab) -> Vec<PaneId> {
+    let mut seen = BTreeSet::new();
+    let mut pane_ids = tab
+        .root
+        .pane_ids()
+        .into_iter()
+        .filter(|pane_id| tab.panes.contains_key(pane_id) && seen.insert(*pane_id))
+        .collect::<Vec<_>>();
+    pane_ids.extend(
+        tab.panes
+            .keys()
+            .copied()
+            .filter(|pane_id| seen.insert(*pane_id)),
+    );
+    pane_ids
+}
+
+fn same_panes(first: &[PaneId], second: &[PaneId]) -> bool {
+    if first.len() != second.len() {
+        return false;
+    }
+    let mut first = first.to_vec();
+    let mut second = second.to_vec();
+    first.sort_unstable();
+    second.sort_unstable();
+    first == second
+}
+
+/// A stack always needs one live body. In a half-stacked layout the global
+/// focus may be in the sibling leaf, so the stack falls back to its first pane
+/// instead of rendering only collapsed headers above an empty field.
+fn expanded_stack_pane(pane_ids: &[PaneId], focused_pane_id: PaneId) -> Option<PaneId> {
+    pane_ids
+        .contains(&focused_pane_id)
+        .then_some(focused_pane_id)
+        .or_else(|| pane_ids.first().copied())
+}
+
+fn pane_layout_tree(layout: PaneLayout, pane_ids: &[PaneId]) -> PaneTree {
+    match layout {
+        PaneLayout::Base | PaneLayout::Vertical => {
+            grid_pane_layout(pane_ids, SplitAxis::Horizontal, SplitAxis::Vertical)
+        }
+        PaneLayout::Horizontal => {
+            grid_pane_layout(pane_ids, SplitAxis::Vertical, SplitAxis::Horizontal)
+        }
+        PaneLayout::Stacked => PaneTree::stack(pane_ids.to_vec())
+            .expect("a pane layout is only built from non-empty pane lists"),
+        PaneLayout::HalfStacked => {
+            let Some((first, rest)) = pane_ids.split_first() else {
+                unreachable!("a pane layout is only built from non-empty pane lists");
+            };
+            if rest.is_empty() {
+                return PaneTree::leaf(*first);
+            }
+            PaneTree::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: SplitRatio::EQUAL,
+                first: Box::new(PaneTree::leaf(*first)),
+                second: Box::new(
+                    PaneTree::stack(rest.to_vec())
+                        .expect("half-stacked layouts always have a right-hand stack"),
+                ),
+            }
+        }
+    }
+}
+
+/// Mirrors Zellij's default tiled layouts: a leading remainder group followed
+/// by groups of four, laid out as columns for Vertical and rows for Horizontal.
+fn grid_pane_layout(
+    pane_ids: &[PaneId],
+    group_axis: SplitAxis,
+    within_group_axis: SplitAxis,
+) -> PaneTree {
+    if pane_ids.len() == 1 {
+        return PaneTree::leaf(pane_ids[0]);
+    }
+    // Zellij's first Vertical constraint is a full-height leading pane with
+    // the remaining panes sharing the second column.
+    if group_axis == SplitAxis::Horizontal && pane_ids.len() <= 5 {
+        return PaneTree::Split {
+            axis: group_axis,
+            ratio: SplitRatio::EQUAL,
+            first: Box::new(PaneTree::leaf(pane_ids[0])),
+            second: Box::new(balanced_pane_layout(&pane_ids[1..], within_group_axis)),
+        };
+    }
+    // The first Horizontal constraint is a simple sequence of rows.
+    if group_axis == SplitAxis::Vertical && pane_ids.len() <= 4 {
+        return balanced_pane_layout(pane_ids, group_axis);
+    }
+    let group_count = pane_ids.len().div_ceil(4);
+    let leading = pane_ids.len() - (group_count - 1) * 4;
+    let mut groups = Vec::with_capacity(group_count);
+    groups.push(balanced_pane_layout(
+        &pane_ids[..leading],
+        within_group_axis,
+    ));
+    for group in pane_ids[leading..].chunks(4) {
+        groups.push(balanced_pane_layout(group, within_group_axis));
+    }
+    balanced_tree_layout(groups, group_axis)
+}
+
+fn balanced_pane_layout(pane_ids: &[PaneId], axis: SplitAxis) -> PaneTree {
+    match pane_ids {
+        [] => unreachable!("pane layouts require at least one pane"),
+        [pane_id] => PaneTree::leaf(*pane_id),
+        _ => {
+            let split = pane_ids.len().div_ceil(2);
+            let ratio = SplitRatio::new(((split * 1_000) / pane_ids.len()) as u16)
+                .expect("balanced pane groups stay inside split ratio bounds");
+            PaneTree::Split {
+                axis,
+                ratio,
+                first: Box::new(balanced_pane_layout(&pane_ids[..split], axis)),
+                second: Box::new(balanced_pane_layout(&pane_ids[split..], axis)),
+            }
+        }
+    }
+}
+
+fn balanced_tree_layout(mut trees: Vec<PaneTree>, axis: SplitAxis) -> PaneTree {
+    match trees.len() {
+        0 => unreachable!("pane layouts require at least one pane group"),
+        1 => trees.pop().expect("the only pane group remains"),
+        len => {
+            let split = len.div_ceil(2);
+            let second = trees.split_off(split);
+            let ratio = SplitRatio::new(((split * 1_000) / len) as u16)
+                .expect("balanced pane groups stay inside split ratio bounds");
+            PaneTree::Split {
+                axis,
+                ratio,
+                first: Box::new(balanced_tree_layout(trees, axis)),
+                second: Box::new(balanced_tree_layout(second, axis)),
+            }
+        }
+    }
+}
+
+/// Grow the deepest split containing `target` by about 30% of its footprint.
+/// Once that would consume its sibling, both sides become a title-sheet stack.
+fn enlarge_focused_tree(tree: &mut PaneTree, target: PaneId) -> bool {
+    let PaneTree::Split {
+        ratio,
+        first,
+        second,
+        ..
+    } = tree
+    else {
+        return false;
+    };
+    let in_first = first.contains(target);
+    let branch = if in_first { first } else { second };
+    if enlarge_focused_tree(branch, target) {
+        return true;
+    }
+
+    let current = ratio.permille();
+    let next = if in_first {
+        current
+            .checked_add(300)
+            .filter(|next| *next <= SplitRatio::MAX)
+    } else {
+        current
+            .checked_sub(300)
+            .filter(|next| *next >= SplitRatio::MIN)
+    };
+    if let Some(next) = next {
+        *ratio = SplitRatio::new(next).expect("bounded resize ratios remain valid");
+        return true;
+    }
+
+    let pane_ids = tree.pane_ids();
+    *tree = PaneTree::stack(pane_ids).expect("a split always contains at least two panes");
+    true
+}
+
+/// Grow `target` across the nearest split on one side of it. The direction is
+/// chosen from rendered pane geometry, while this tree walk keeps the mutation
+/// attached to the exact split that owns that boundary.
+fn enlarge_focused_tree_toward(
+    tree: &mut PaneTree,
+    target: PaneId,
+    direction: NavDirection,
+) -> bool {
+    let PaneTree::Split {
+        axis,
+        ratio,
+        first,
+        second,
+    } = tree
+    else {
+        return false;
+    };
+    let in_first = first.contains(target);
+    let branch = if in_first {
+        &mut **first
+    } else {
+        &mut **second
+    };
+    if enlarge_focused_tree_toward(branch, target, direction) {
+        return true;
+    }
+
+    let owns_boundary = matches!(
+        (axis, in_first, direction),
+        (SplitAxis::Vertical, false, NavDirection::Up)
+            | (SplitAxis::Vertical, true, NavDirection::Down)
+            | (SplitAxis::Horizontal, false, NavDirection::Left)
+            | (SplitAxis::Horizontal, true, NavDirection::Right)
+    );
+    if !owns_boundary {
+        return false;
+    }
+
+    let current = ratio.permille();
+    let next = if in_first {
+        current
+            .checked_add(300)
+            .filter(|next| *next <= SplitRatio::MAX)
+    } else {
+        current
+            .checked_sub(300)
+            .filter(|next| *next >= SplitRatio::MIN)
+    };
+    if let Some(next) = next {
+        *ratio = SplitRatio::new(next).expect("bounded resize ratios remain valid");
+    } else {
+        let pane_ids = tree.pane_ids();
+        *tree = PaneTree::stack(pane_ids).expect("a split always contains at least two panes");
+    }
+    true
+}
+
+fn pane_rects(tree: &PaneTree) -> Vec<PaneRect> {
+    fn visit(tree: &PaneTree, x: f32, y: f32, width: f32, height: f32, rects: &mut Vec<PaneRect>) {
+        match tree {
+            PaneTree::Leaf { pane_id } => rects.push(PaneRect {
+                pane_id: *pane_id,
+                x,
+                y,
+                width,
+                height,
+            }),
+            PaneTree::Stack { pane_ids } => rects.extend(pane_ids.iter().map(|pane_id| PaneRect {
+                pane_id: *pane_id,
+                x,
+                y,
+                width,
+                height,
+            })),
+            PaneTree::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let fraction = ratio.fraction();
+                match axis {
+                    SplitAxis::Horizontal => {
+                        let first_width = width * fraction;
+                        visit(first, x, y, first_width, height, rects);
+                        visit(
+                            second,
+                            x + first_width,
+                            y,
+                            width - first_width,
+                            height,
+                            rects,
+                        );
+                    }
+                    SplitAxis::Vertical => {
+                        let first_height = height * fraction;
+                        visit(first, x, y, width, first_height, rects);
+                        visit(
+                            second,
+                            x,
+                            y + first_height,
+                            width,
+                            height - first_height,
+                            rects,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let mut rects = Vec::new();
+    visit(tree, 0.0, 0.0, 1.0, 1.0, &mut rects);
+    rects
+}
+
+/// Zellij's undirected grow heuristic prefers a fully aligned neighbor above,
+/// then below, left, and right. A pane merely touching part of an edge does not
+/// claim that direction; the original deepest-split behavior remains the
+/// fallback for irregular layouts.
+fn zellij_resize_direction(rects: &[PaneRect], current: PaneId) -> Option<NavDirection> {
+    [
+        NavDirection::Up,
+        NavDirection::Down,
+        NavDirection::Left,
+        NavDirection::Right,
+    ]
+    .into_iter()
+    .find(|direction| has_aligned_direct_neighbors(rects, current, *direction))
+}
+
+fn has_aligned_direct_neighbors(
+    rects: &[PaneRect],
+    current: PaneId,
+    direction: NavDirection,
+) -> bool {
+    const EPSILON: f32 = 1e-3;
+    let Some(origin) = rects.iter().find(|rect| rect.pane_id == current) else {
+        return false;
+    };
+    let (origin_start, origin_end) = match direction {
+        NavDirection::Left | NavDirection::Right => (origin.y, origin.y + origin.height),
+        NavDirection::Up | NavDirection::Down => (origin.x, origin.x + origin.width),
+    };
+    let mut spans: Vec<_> = rects
+        .iter()
+        .filter(|rect| rect.pane_id != current)
+        .filter(|rect| match direction {
+            NavDirection::Left => (rect.x + rect.width - origin.x).abs() <= EPSILON,
+            NavDirection::Right => (rect.x - (origin.x + origin.width)).abs() <= EPSILON,
+            NavDirection::Up => (rect.y + rect.height - origin.y).abs() <= EPSILON,
+            NavDirection::Down => (rect.y - (origin.y + origin.height)).abs() <= EPSILON,
+        })
+        .filter_map(|rect| {
+            let (start, end) = match direction {
+                NavDirection::Left | NavDirection::Right => (rect.y, rect.y + rect.height),
+                NavDirection::Up | NavDirection::Down => (rect.x, rect.x + rect.width),
+            };
+            (start >= origin_start - EPSILON && end <= origin_end + EPSILON).then_some((start, end))
+        })
+        .collect();
+    spans.sort_by(|first, second| {
+        first
+            .0
+            .partial_cmp(&second.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut covered_until = origin_start;
+    for (start, end) in spans {
+        if start > covered_until + EPSILON {
+            return false;
+        }
+        covered_until = covered_until.max(end);
+        if covered_until >= origin_end - EPSILON {
+            return true;
+        }
+    }
+    false
+}
+
+fn stacked_neighbor(tree: &PaneTree, current: PaneId, direction: NavDirection) -> Option<PaneId> {
+    match tree {
+        PaneTree::Leaf { .. } => None,
+        PaneTree::Stack { pane_ids } => {
+            let index = pane_ids.iter().position(|pane_id| *pane_id == current)?;
+            match direction {
+                NavDirection::Up if index > 0 => pane_ids.get(index - 1).copied(),
+                NavDirection::Down => pane_ids.get(index + 1).copied(),
+                NavDirection::Left | NavDirection::Right | NavDirection::Up => None,
+            }
+        }
+        PaneTree::Split { first, second, .. } => stacked_neighbor(first, current, direction)
+            .or_else(|| stacked_neighbor(second, current, direction)),
+    }
+}
+
+/// The nearest pane strictly in `direction` from `current`, requiring overlap
+/// on the orthogonal axis so diagonal panes are not surprising jumps.
+fn neighbor_pane(rects: &[PaneRect], current: PaneId, direction: NavDirection) -> Option<PaneId> {
+    const EPSILON: f32 = 1e-3;
+    let origin = rects.iter().find(|rect| rect.pane_id == current)?;
+    let candidates = rects.iter().filter(|rect| {
+        let ahead = match direction {
+            NavDirection::Right => rect.x >= origin.x + origin.width - EPSILON,
+            NavDirection::Left => rect.x + rect.width <= origin.x + EPSILON,
+            NavDirection::Down => rect.y >= origin.y + origin.height - EPSILON,
+            NavDirection::Up => rect.y + rect.height <= origin.y + EPSILON,
+        };
+        let overlaps = match direction {
+            NavDirection::Left | NavDirection::Right => {
+                rect.y < origin.y + origin.height - EPSILON
+                    && rect.y + rect.height > origin.y + EPSILON
+            }
+            NavDirection::Up | NavDirection::Down => {
+                rect.x < origin.x + origin.width - EPSILON
+                    && rect.x + rect.width > origin.x + EPSILON
+            }
+        };
+        rect.pane_id != current && ahead && overlaps
+    });
+    candidates
+        .min_by(|first, second| {
+            let distance = |rect: &PaneRect| match direction {
+                NavDirection::Right => rect.x - (origin.x + origin.width),
+                NavDirection::Left => origin.x - (rect.x + rect.width),
+                NavDirection::Down => rect.y - (origin.y + origin.height),
+                NavDirection::Up => origin.y - (rect.y + rect.height),
+            };
+            let drift = |rect: &PaneRect| match direction {
+                NavDirection::Left | NavDirection::Right => {
+                    ((rect.y + rect.height / 2.0) - (origin.y + origin.height / 2.0)).abs()
+                }
+                NavDirection::Up | NavDirection::Down => {
+                    ((rect.x + rect.width / 2.0) - (origin.x + origin.width / 2.0)).abs()
+                }
+            };
+            (distance(first), drift(first))
+                .partial_cmp(&(distance(second), drift(second)))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|rect| rect.pane_id)
+}
+
+fn home_directory() -> Option<std::path::PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(std::path::PathBuf::from)
+}
+
+/// Walks up from `directory` to the closest directory containing `.git`.
+/// Whether a path is a real observed location rather than a launch
+/// placeholder like `~`. On Windows a Linux-side path never counts as
+/// absolute, so the leading-slash check carries that case.
+fn reported_path_is_concrete(path: &std::path::Path) -> bool {
+    path.is_absolute() || path.to_string_lossy().starts_with('/')
+}
+
+/// True when this process can only reach `path` through WSL: a Windows
+/// build handed a Linux-side absolute path (as WSL panes report via OSC 7).
+fn path_is_wsl_side(path: &std::path::Path) -> bool {
+    cfg!(target_os = "windows") && path.to_string_lossy().starts_with('/')
+}
+
+/// Writes `content` to `$HOME/<relative_dir>/<file_name>` inside the WSL
+/// distribution, returning the absolute directory it landed in.
+#[cfg(target_os = "windows")]
+fn wsl_stage_file(
+    distribution: &str,
+    relative_dir: &str,
+    file_name: &str,
+    content: &str,
+) -> Option<String> {
+    use std::io::Write as _;
+    let mut child = wsl_command(distribution)
+        .args([
+            "--exec",
+            "sh",
+            "-c",
+            &format!(
+                "dir=\"$HOME/{relative_dir}\" && mkdir -p \"$dir\" && cat > \"$dir/{file_name}\" && printf %s \"$dir\""
+            ),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(content.as_bytes()).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!dir.is_empty()).then_some(dir)
+}
+
+/// Explains why worktree creation is impossible, probing the actual failure
+/// point instead of shrugging. Runs once, from the dialog-open path, and
+/// only after repository detection has already failed.
+fn worktree_failure_message(probed: Option<&std::path::Path>, wsl_distribution: &str) -> String {
+    let Some(directory) = probed else {
+        return "This pane's shell has not reported its working directory (OSC 7). Bash, \
+                zsh, and fish panes report automatically when Muxtrix opens them: try a \
+                freshly opened pane. Other shells need an OSC 7 prompt hook."
+            .into();
+    };
+    #[cfg(target_os = "windows")]
+    if path_is_wsl_side(directory) {
+        let probe = |args: &[&str]| {
+            wsl_command(wsl_distribution)
+                .args(args)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if !probe(&["--exec", "test", "-d", "/"]) {
+            let distribution = wsl_distribution.trim();
+            return if distribution.is_empty() {
+                "The default WSL distribution could not be reached, so the repository \
+                 cannot be inspected. Check that WSL is installed and running."
+                    .into()
+            } else {
+                format!(
+                    "WSL distribution \"{distribution}\" could not be reached — check the \
+                     distribution selected in Settings."
+                )
+            };
+        }
+        let directory_str = directory.to_string_lossy();
+        if !probe(&["--exec", "test", "-d", &directory_str]) {
+            return format!(
+                "{directory_str} does not exist inside WSL. The shell may have reported a \
+                 stale directory, or a different distribution is selected in Settings."
+            );
+        }
+        if !probe(&["--exec", "sh", "-c", "command -v git >/dev/null"]) {
+            return "git is not installed inside the WSL distribution, so worktrees cannot \
+                    be created there."
+                .into();
+        }
+        return format!(
+            "{directory_str} is not inside a git repository, so a worktree cannot be \
+             created from it."
+        );
+    }
+    let _ = wsl_distribution;
+    if !directory.is_dir() {
+        return format!(
+            "{} no longer exists, so a worktree cannot be created from it.",
+            directory.display()
+        );
+    }
+    format!(
+        "{} is not inside a git repository, so a worktree cannot be created from it.",
+        directory.display()
+    )
+}
+
+/// A hidden wsl.exe invocation targeting the configured distribution, or
+/// the default distribution when the setting is empty.
+#[cfg(target_os = "windows")]
+fn wsl_command(wsl_distribution: &str) -> Command {
+    let mut command = console_command("wsl.exe");
+    let distribution = wsl_distribution.trim();
+    if !distribution.is_empty() {
+        command.args(["--distribution", distribution]);
+    }
+    command
+}
+
+/// The Linux-side home directory, asked of the distribution itself.
+#[cfg(target_os = "windows")]
+fn wsl_home_directory(wsl_distribution: &str) -> Option<String> {
+    let output = wsl_command(wsl_distribution)
+        .args(["--exec", "sh", "-c", "printf %s \"$HOME\""])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let home = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!home.is_empty()).then_some(home)
+}
+
+/// Decodes a shell-reported working directory. OSC 7 carries a
+/// `file://[host]/path` URI with percent-encoding; OSC 9/1337 carry a bare
+/// path. libghostty stores the raw value; decoding is the embedder's job.
+fn decode_reported_pwd(raw: &str) -> Option<std::path::PathBuf> {
+    let raw = raw.trim();
+    let path = if let Some(rest) = raw.strip_prefix("file://") {
+        let path_start = rest.find('/')?;
+        percent_decode_path(&rest[path_start..])
+    } else {
+        raw.to_owned()
+    };
+    if path.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(path))
+}
+
+fn percent_decode_path(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Some(high) = (bytes[index + 1] as char).to_digit(16)
+            && let Some(low) = (bytes[index + 2] as char).to_digit(16)
+        {
+            decoded.push((high * 16 + low) as u8);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// The repository root that owns `directory`. git itself answers (it also
+/// understands worktrees, and runs inside WSL when the directory lives
+/// there); walking for `.git` remains as a fallback when git is missing.
+fn git_repository_root(
+    directory: &std::path::Path,
+    wsl_distribution: &str,
+) -> Option<std::path::PathBuf> {
+    match git_in(
+        directory,
+        wsl_distribution,
+        &["rev-parse", "--show-toplevel"],
+    ) {
+        Ok(output) if output.status.success() => {
+            let root = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            return (!root.is_empty()).then(|| std::path::PathBuf::from(root));
+        }
+        // Git ran and authoritatively said this is not a repository. Walking
+        // upward here can mistake an unrelated or unreadable `.git` entry in
+        // an ancestor for the pane's repository.
+        Ok(_) => return None,
+        Err(_) => {}
+    }
+    let mut directory = directory.to_path_buf();
+    if !directory.is_dir() {
+        return None;
+    }
+    loop {
+        if directory.join(".git").exists() {
+            return Some(directory);
+        }
+        if !directory.pop() {
+            return None;
+        }
+    }
+}
+
+/// The primary checkout's leaf name for the repository containing
+/// `directory`. Linked worktrees have their own top-level directory names, so
+/// grouping from `--show-toplevel` would split one repository into many fake
+/// repos. Git's common directory points every linked worktree back to the
+/// primary checkout's `.git` directory.
+fn git_repository_name(directory: &std::path::Path, wsl_distribution: &str) -> Option<String> {
+    let root = git_repository_root(directory, wsl_distribution)?;
+    let common = git_in(
+        directory,
+        wsl_distribution,
+        &["rev-parse", "--git-common-dir"],
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .and_then(|output| {
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!value.is_empty()).then(|| std::path::PathBuf::from(value))
+    });
+    common
+        .map(|common| {
+            if reported_path_is_concrete(&common) {
+                common
+            } else {
+                root.join(common)
+            }
+        })
+        .and_then(|common| common.parent().and_then(path_leaf_name))
+        .or_else(|| path_leaf_name(&root))
+}
+
+/// The leaf name of a linked worktree, excluding the repository's primary
+/// checkout. A linked checkout has a `.git` pointer file where the primary
+/// checkout has a directory. This stays process-free on the UI path; the
+/// convention fallback covers Linux-side paths a native Windows build cannot
+/// inspect directly.
+fn linked_worktree_name(directory: &std::path::Path) -> Option<String> {
+    let mut root = directory.to_path_buf();
+    while !root.as_os_str().is_empty() {
+        let metadata = root.join(".git");
+        if metadata.is_file() {
+            return path_leaf_name(&root);
+        }
+        if metadata.is_dir() {
+            return None;
+        }
+        if !root.pop() {
+            break;
+        }
+    }
+    linked_worktree_name_from_convention(directory)
+}
+
+fn path_leaf_name(path: &std::path::Path) -> Option<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn linked_worktree_name_from_convention(directory: &std::path::Path) -> Option<String> {
+    let components: Vec<_> = directory
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect();
+    for (index, component) in components.iter().enumerate() {
+        if !component.eq_ignore_ascii_case("worktrees") {
+            continue;
+        }
+        let parent = index.checked_sub(1).and_then(|index| components.get(index));
+        let name_index = if parent.is_some_and(|parent| {
+            parent.eq_ignore_ascii_case(".claude") || parent.eq_ignore_ascii_case(".codex")
+        }) {
+            index + 1
+        } else if parent.is_some_and(|parent| {
+            parent.eq_ignore_ascii_case(".muxtrix") || parent.eq_ignore_ascii_case("codex-fleet")
+        }) {
+            index + 2
+        } else {
+            continue;
+        };
+        if let Some(name) = components.get(name_index).map(|name| name.trim())
+            && !name.is_empty()
+        {
+            return Some(name.to_owned());
+        }
+    }
+    None
+}
+
+/// Where a repository's worktrees live: `<home>/.muxtrix/worktrees/<repo>`,
+/// with `<home>` on whichever side of the WSL boundary the repository is.
+fn worktree_base_directory(
+    repo_root: &std::path::Path,
+    wsl_distribution: &str,
+) -> Option<std::path::PathBuf> {
+    let repo_name = repo_root.file_name()?.to_string_lossy().into_owned();
+    #[cfg(target_os = "windows")]
+    if path_is_wsl_side(repo_root) {
+        let home = wsl_home_directory(wsl_distribution)?;
+        return Some(std::path::PathBuf::from(format!(
+            "{home}/{WORKTREE_HOME_FOLDER}/{repo_name}"
+        )));
+    }
+    let _ = wsl_distribution;
+    Some(home_directory()?.join(WORKTREE_HOME_FOLDER).join(repo_name))
+}
+
+/// Joins the worktree name onto the base without introducing backslashes —
+/// the base may be a Linux-side path a Windows build reaches through WSL.
+fn worktree_destination(base: &std::path::Path, name: &str) -> std::path::PathBuf {
+    if path_is_wsl_side(base) {
+        std::path::PathBuf::from(format!("{}/{name}", base.to_string_lossy()))
+    } else {
+        base.join(name)
+    }
+}
+
+/// Directory names already present under the worktree base.
+fn worktree_taken_names(base: &std::path::Path, wsl_distribution: &str) -> BTreeSet<String> {
+    #[cfg(target_os = "windows")]
+    if path_is_wsl_side(base) {
+        return wsl_command(wsl_distribution)
+            .args(["--exec", "ls", "-1"])
+            .arg(base)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(|line| line.trim().to_owned())
+                    .filter(|line| !line.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    let _ = wsl_distribution;
+    std::fs::read_dir(base)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parses `git worktree list --porcelain` output into (path, branch) pairs.
+/// The first entry is the main worktree — callers filter it out by path.
+fn parse_worktree_list(output: &str) -> Vec<(std::path::PathBuf, Option<String>)> {
+    let mut entries = Vec::new();
+    let mut current: Option<(std::path::PathBuf, Option<String>)> = None;
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some((std::path::PathBuf::from(path), None));
+        } else if let Some(branch) = line.strip_prefix("branch ")
+            && let Some((_, slot)) = current.as_mut()
+        {
+            *slot = Some(
+                branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch)
+                    .to_owned(),
+            );
+        }
+    }
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+    entries
+}
+
+/// All worktrees in git's stable porcelain order. Git documents the primary
+/// worktree first, followed by linked worktrees.
+fn git_worktrees(
+    repo_root: &std::path::Path,
+    wsl_distribution: &str,
+) -> Option<Vec<(std::path::PathBuf, Option<String>)>> {
+    let output = git_in(
+        repo_root,
+        wsl_distribution,
+        &["worktree", "list", "--porcelain"],
+    )
+    .ok()?;
+    output
+        .status
+        .success()
+        .then(|| parse_worktree_list(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Performs every Git subprocess needed by the worktree screens away from the
+/// Iced update thread. The screen is already visible with a loading state while
+/// this runs, so repositories with many checkouts never stall navigation.
+fn discover_worktree_manager(
+    mode: WorktreeManagerMode,
+    probed_directory: Option<std::path::PathBuf>,
+    wsl_distribution: &str,
+) -> Result<WorktreeManagerDiscovery, String> {
+    let repo_root = probed_directory
+        .as_deref()
+        .and_then(|directory| git_repository_root(directory, wsl_distribution));
+    let Some(repo_root) = repo_root else {
+        return Ok(WorktreeManagerDiscovery {
+            repo_root: None,
+            failure: Some(worktree_failure_message(
+                probed_directory.as_deref(),
+                wsl_distribution,
+            )),
+            entries: Vec::new(),
+        });
+    };
+    let worktrees = git_worktrees(&repo_root, wsl_distribution)
+        .ok_or_else(|| format!("Git could not list worktrees for {}", repo_root.display()))?;
+    let default_branch = github_default_branch(&repo_root, wsl_distribution);
+    let entries = worktrees
+        .iter()
+        .enumerate()
+        .filter(|(_, (path, _))| match mode {
+            WorktreeManagerMode::Manage => true,
+            WorktreeManagerMode::RestartPane(_) => probed_directory
+                .as_deref()
+                .is_none_or(|directory| !directory.starts_with(path)),
+        })
+        .map(|(index, (path, branch))| WorktreeManagerEntry {
+            used_by: None,
+            deletion_blocker: worktree_deletion_blocker(
+                index == 0,
+                branch.as_deref(),
+                default_branch.as_deref(),
+            ),
+            unpushed_commits: unpushed_commit_count(path, wsl_distribution),
+            path: path.clone(),
+            branch: branch.clone(),
+        })
+        .collect();
+    Ok(WorktreeManagerDiscovery {
+        repo_root: Some(repo_root),
+        failure: None,
+        entries,
+    })
+}
+
+/// Counts commits in a checkout that are not reachable from any configured
+/// remote ref. This catches both ahead-of-upstream work and branches that have
+/// never been published without requiring a network fetch.
+fn unpushed_commit_count(worktree: &std::path::Path, wsl_distribution: &str) -> usize {
+    let Ok(output) = git_in(
+        worktree,
+        wsl_distribution,
+        &["rev-list", "--count", "HEAD", "--not", "--remotes"],
+    ) else {
+        return 0;
+    };
+    if !output.status.success() {
+        return 0;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+fn worktree_display_name(path: &std::path::Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+fn unused_worktree_paths(entries: &[WorktreeManagerEntry]) -> Vec<std::path::PathBuf> {
+    entries
+        .iter()
+        .filter(|entry| entry.deletion_blocker.is_none() && entry.used_by.is_none())
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+fn remove_git_worktrees(
+    repo_root: &std::path::Path,
+    paths: Vec<std::path::PathBuf>,
+    wsl_distribution: &str,
+) -> (Vec<std::path::PathBuf>, Result<(), String>) {
+    let mut removed = Vec::new();
+    let mut failures = Vec::new();
+    for path in paths {
+        let path_str = path.to_string_lossy().into_owned();
+        match git_in(
+            repo_root,
+            wsl_distribution,
+            &["worktree", "remove", &path_str],
+        ) {
+            Ok(output) if output.status.success() => removed.push(path),
+            Ok(output) => failures.push(format!(
+                "{}: {}",
+                worktree_display_name(&path),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => failures.push(format!("{}: {error}", worktree_display_name(&path))),
+        }
+    }
+    let result = if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("Could not remove {}", failures.join("; ")))
+    };
+    (removed, result)
+}
+
+/// The default branch advertised by a configured GitHub remote. A normal
+/// GitHub clone records this as refs/remotes/<remote>/HEAD, so this stays
+/// local and responsive while still following repository metadata instead of
+/// assuming a branch name.
+fn github_default_branch(repo_root: &std::path::Path, wsl_distribution: &str) -> Option<String> {
+    let output = git_in(repo_root, wsl_distribution, &["remote"]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut remotes: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .map(str::to_owned)
+        .collect();
+    remotes.sort_by_key(|remote| remote != "origin");
+    for remote in remotes {
+        let Ok(url) = git_in(repo_root, wsl_distribution, &["remote", "get-url", &remote]) else {
+            continue;
+        };
+        if !url.status.success()
+            || !String::from_utf8_lossy(&url.stdout)
+                .to_ascii_lowercase()
+                .contains("github.com")
+        {
+            continue;
+        }
+        let reference = format!("refs/remotes/{remote}/HEAD");
+        let Ok(head) = git_in(
+            repo_root,
+            wsl_distribution,
+            &["symbolic-ref", "--quiet", "--short", &reference],
+        ) else {
+            continue;
+        };
+        if !head.status.success() {
+            continue;
+        }
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+        let prefix = format!("{remote}/");
+        if let Some(branch) = head
+            .strip_prefix(&prefix)
+            .filter(|branch| !branch.is_empty())
+        {
+            return Some(branch.to_owned());
+        }
+    }
+    None
+}
+
+/// Picks the worktree for the GitHub default branch. If remote HEAD metadata
+/// is missing, main/master are conservative fallbacks; the primary worktree
+/// remains the final safe destination.
+fn preferred_default_worktree(
+    worktrees: &[(std::path::PathBuf, Option<String>)],
+    github_default_branch: Option<&str>,
+) -> std::path::PathBuf {
+    let branch = github_default_branch.and_then(|default_branch| {
+        worktrees
+            .iter()
+            .find(|(_, branch)| branch.as_deref() == Some(default_branch))
+    });
+    let fallback = github_default_branch.is_none().then(|| {
+        ["main", "master"].into_iter().find_map(|fallback_branch| {
+            worktrees
+                .iter()
+                .find(|(_, branch)| branch.as_deref() == Some(fallback_branch))
+        })
+    });
+    branch
+        .or_else(|| fallback.flatten())
+        .or_else(|| worktrees.first())
+        .map_or_else(std::path::PathBuf::new, |(path, _)| path.clone())
+}
+
+fn regular_creation_directory_from_worktrees(
+    focused_directory: &std::path::Path,
+    focused_repo_root: &std::path::Path,
+    worktrees: &[(std::path::PathBuf, Option<String>)],
+    github_default_branch: Option<&str>,
+) -> std::path::PathBuf {
+    if worktrees
+        .first()
+        .is_none_or(|(primary_path, _)| primary_path == focused_repo_root)
+    {
+        return focused_directory.to_path_buf();
+    }
+    preferred_default_worktree(worktrees, github_default_branch)
+}
+
+/// Resolves the launch directory for an ordinary pane, tab, or workspace.
+/// Any subprocess work happens on the terminal-launch worker. Failures are
+/// intentionally conservative: outside a linked worktree, or when Git cannot
+/// answer, preserve the exact focused directory.
+fn resolve_regular_creation_directory(
+    focused_directory: &std::path::Path,
+    wsl_distribution: &str,
+) -> std::path::PathBuf {
+    let Some(repo_root) = git_repository_root(focused_directory, wsl_distribution) else {
+        return focused_directory.to_path_buf();
+    };
+    let Some(worktrees) = git_worktrees(&repo_root, wsl_distribution) else {
+        return focused_directory.to_path_buf();
+    };
+    let default_branch = github_default_branch(&repo_root, wsl_distribution);
+    regular_creation_directory_from_worktrees(
+        focused_directory,
+        &repo_root,
+        &worktrees,
+        default_branch.as_deref(),
+    )
+}
+
+fn worktree_deletion_blocker(
+    is_primary: bool,
+    branch: Option<&str>,
+    github_default_branch: Option<&str>,
+) -> Option<String> {
+    if is_primary {
+        return Some("Primary worktree".into());
+    }
+    if github_default_branch.is_some_and(|default| branch == Some(default)) {
+        return Some("GitHub default branch".into());
+    }
+    if github_default_branch.is_none() && matches!(branch, Some("main" | "master")) {
+        return Some("Fallback default branch".into());
+    }
+    None
+}
+
+/// The first `worktree-N` not already taken.
+fn default_worktree_name(taken: &BTreeSet<String>) -> String {
+    (1..1000)
+        .map(|index| format!("worktree-{index}"))
+        .find(|candidate| !taken.contains(candidate))
+        .unwrap_or_else(|| "worktree".into())
+}
+
+/// A worktree name usable as both a directory name and a branch name.
+fn worktree_name(raw: &str) -> String {
+    let mut name: String = raw
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while name.starts_with(['-', '.', '/']) {
+        name.remove(0);
+    }
+    while name.ends_with(['/', '.']) {
+        name.pop();
+    }
+    name.replace('/', "-")
+}
+
+/// Runs git where the repository actually lives: natively, or inside WSL
+/// when a Windows build is pointed at a Linux-side path.
+fn git_in(
+    repo_root: &std::path::Path,
+    wsl_distribution: &str,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
+    #[cfg(target_os = "windows")]
+    let mut command = if path_is_wsl_side(repo_root) {
+        let mut command = wsl_command(wsl_distribution);
+        command.args(["--exec", "git"]);
+        command
+    } else {
+        console_command("git")
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut command = console_command("git");
+    let _ = wsl_distribution;
+    command
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+        .map_err(|error| format!("could not run git: {error}"))
+}
+
+fn create_git_worktree(
+    repo_root: &std::path::Path,
+    destination: &std::path::Path,
+    branch: &str,
+    wsl_distribution: &str,
+) -> Result<std::path::PathBuf, String> {
+    if path_is_wsl_side(destination) {
+        // The destination is on the Linux side, unreachable via std::fs.
+        #[cfg(target_os = "windows")]
+        if let Some(parent) = destination.parent() {
+            let _ = wsl_command(wsl_distribution)
+                .args(["--exec", "mkdir", "-p"])
+                .arg(parent)
+                .output();
+        }
+    } else if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        // Dot-prefixed names are not hidden on Windows by themselves; the
+        // attribute is what Explorer respects.
+        #[cfg(target_os = "windows")]
+        if let Some(app_folder) = home_directory().map(|home| home.join(".muxtrix"))
+            && app_folder.is_dir()
+        {
+            let _ = console_command("attrib")
+                .arg("+h")
+                .arg(&app_folder)
+                .output();
+        }
+    }
+    // A hand-deleted worktree folder leaves a stale registration behind that
+    // blocks every later attempt; prune is cheap and makes retries work.
+    let _ = git_in(repo_root, wsl_distribution, &["worktree", "prune"]);
+    // A branch left over from an earlier worktree is reused rather than
+    // treated as a fatal conflict — unless a live worktree still holds it,
+    // which git reports clearly below.
+    let branch_exists = git_in(
+        repo_root,
+        wsl_distribution,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_ok_and(|output| output.status.success());
+    let output = if branch_exists {
+        let mut args = vec!["worktree", "add"];
+        let destination_str = destination.to_string_lossy();
+        args.push(&destination_str);
+        args.push(branch);
+        git_in(repo_root, wsl_distribution, &args)?
+    } else {
+        let destination_str = destination.to_string_lossy();
+        git_in(
+            repo_root,
+            wsl_distribution,
+            &["worktree", "add", "-b", branch, &destination_str],
+        )?
+    };
+    if output.status.success() {
+        Ok(destination.to_path_buf())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(stderr.trim().to_owned())
+    }
+}
+
+/// Coarse "3h ago"-style label from a unix timestamp.
+fn age_label(created_unix: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let elapsed = now.saturating_sub(created_unix);
+    if created_unix == 0 {
+        return "unknown age".into();
+    }
+    match elapsed {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", elapsed / 60),
+        3600..=86_399 => format!("{}h ago", elapsed / 3600),
+        86_400..=31_535_999 => format!("{}d ago", elapsed / 86_400),
+        _ => "a long time ago".into(),
+    }
+}
+
+fn split_ratio_at(tree: &PaneTree, path: &[SplitBranch]) -> Option<SplitRatio> {
+    if path.is_empty() {
+        return match tree {
+            PaneTree::Split { ratio, .. } => Some(*ratio),
+            PaneTree::Leaf { .. } | PaneTree::Stack { .. } => None,
+        };
+    }
+    let PaneTree::Split { first, second, .. } = tree else {
+        return None;
+    };
+    match path[0] {
+        SplitBranch::First => split_ratio_at(first, &path[1..]),
+        SplitBranch::Second => split_ratio_at(second, &path[1..]),
+    }
+}
+
+fn set_split_ratio_at(tree: &mut PaneTree, path: &[SplitBranch], next: SplitRatio) -> bool {
+    if path.is_empty() {
+        if let PaneTree::Split { ratio, .. } = tree {
+            *ratio = next;
+            return true;
+        }
+        return false;
+    }
+    let PaneTree::Split { first, second, .. } = tree else {
+        return false;
+    };
+    match path[0] {
+        SplitBranch::First => set_split_ratio_at(first, &path[1..], next),
+        SplitBranch::Second => set_split_ratio_at(second, &path[1..], next),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IconKind {
+    Back,
+    Add,
+    Collapse,
+    Expand,
+    SplitRight,
+    SplitDown,
+    Maximize,
+    Restore,
+    Settings,
+    Command,
+    GitHub,
+    Refresh,
+    Branch,
+    File,
+    Close,
+    Overflow,
+}
+
+fn icon<'a>(kind: IconKind, color: Color, size: f32) -> svg::Svg<'a> {
+    let bytes: &'static [u8] = match kind {
+        IconKind::Back => include_bytes!("../assets/icons/back.svg"),
+        IconKind::Add => include_bytes!("../assets/icons/add.svg"),
+        IconKind::Collapse => include_bytes!("../assets/icons/collapse.svg"),
+        IconKind::Expand => include_bytes!("../assets/icons/expand.svg"),
+        IconKind::SplitRight => include_bytes!("../assets/icons/split-right.svg"),
+        IconKind::SplitDown => include_bytes!("../assets/icons/split-down.svg"),
+        IconKind::Maximize => include_bytes!("../assets/icons/maximize.svg"),
+        IconKind::Restore => include_bytes!("../assets/icons/restore.svg"),
+        IconKind::Settings => include_bytes!("../assets/icons/settings.svg"),
+        IconKind::Command => include_bytes!("../assets/icons/command.svg"),
+        IconKind::GitHub => include_bytes!("../assets/icons/github.svg"),
+        IconKind::Refresh => include_bytes!("../assets/icons/refresh.svg"),
+        IconKind::Branch => include_bytes!("../assets/icons/branch.svg"),
+        IconKind::File => include_bytes!("../assets/icons/file.svg"),
+        IconKind::Close => include_bytes!("../assets/icons/close.svg"),
+        IconKind::Overflow => include_bytes!("../assets/icons/overflow.svg"),
+    };
+    svg(svg::Handle::from_memory(bytes))
+        .width(size)
+        .height(size)
+        .style(move |_, _| svg::Style { color: Some(color) })
+}
+
+/// The 2px accent bar that marks the selected row in a ruled list — always
+/// present so selection never shifts layout, transparent when inactive.
+/// Small tinted state pill sitting beside an identity line in list rows —
+/// keeps state out of the meta column's lane so long meta never collides
+/// with it.
+fn status_pill(label: &str, hue: Color, settings: &AppSettings) -> Element<'static, Message> {
+    container(
+        text(label.to_owned())
+            .size(settings.ui_pixels(7.5))
+            .font(Font {
+                weight: font::Weight::Semibold,
+                ..Font::DEFAULT
+            })
+            .color(hue)
+            .wrapping(iced::widget::text::Wrapping::None),
+    )
+    .padding([2, 8])
+    .style(move |_| {
+        container::Style::default()
+            .background(Color { a: 0.12, ..hue })
+            .border(Border {
+                color: Color { a: 0.3, ..hue },
+                width: 1.0,
+                radius: 999.0.into(),
+            })
+    })
+    .into()
+}
+
+fn selection_bar(selected: bool, tokens: DesignTokens) -> Element<'static, Message> {
+    container("")
+        .width(3)
+        .height(Length::Fill)
+        .style(move |_| {
+            container::Style::default().background(if selected {
+                tokens.accent
+            } else {
+                Color::TRANSPARENT
+            })
+        })
+        .into()
+}
+
+/// Rungs in the keyboard cursor's leading bar. Odd, so the ladder opens and
+/// closes on a filled rung and reads as a broken bar rather than a fade.
+const RAIL_CURSOR_RUNGS: usize = 7;
+
+/// The leading mark in a rail row's gutter. Where you already are is one
+/// unbroken accent bar; where the keyboard cursor would land is that same bar
+/// cut into rungs. Solid reads as committed and broken reads as proposed, and
+/// the pair stays legible in a 3px gutter where two shades of one accent would
+/// collapse into each other. The cursor wins the gutter when it sits on the
+/// focused row, matching the row fill, which resolves the overlap the same way.
+fn rail_marker(selected: bool, targeted: bool, tokens: DesignTokens) -> Element<'static, Message> {
+    if !targeted {
+        return selection_bar(selected, tokens);
+    }
+    let mut ladder = column![].width(3).height(Length::Fill);
+    for rung in 0..RAIL_CURSOR_RUNGS {
+        let filled = rung % 2 == 0;
+        ladder = ladder.push(container("").width(3).height(Length::Fill).style(move |_| {
+            container::Style::default().background(if filled {
+                tokens.accent
+            } else {
+                Color::TRANSPARENT
+            })
+        }));
+    }
+    ladder.into()
+}
+
+fn signal_dot(color: Color, size: f32) -> Element<'static, Message> {
+    container("")
+        .width(size)
+        .height(size)
+        .style(move |_| {
+            container::Style::default()
+                .background(color)
+                .border(Border::default().rounded(size / 2.0))
+        })
+        .into()
+}
+
+/// The pip for a pane projecting Claude Code's roster: the same footprint and
+/// the same rolled-up signal colour as a lifecycle dot, drawn as a core inside
+/// a ring so the row reads as a container of agents rather than as one agent's
+/// own state. It keeps the shared left edge every fleet row aligns to.
+///
+/// The ring alone was not enough. At the quiet end of the palette a hairline
+/// outline of `faint` or `muted` on the rail's own background reads as no pip
+/// at all — which is the state a healthy fleet spends most of its time in — so
+/// the mark keeps a solid centre at every signal.
+fn roster_ring(color: Color, size: f32) -> Element<'static, Message> {
+    container(signal_dot(color, (size * 0.45).round().max(3.0)))
+        .width(size)
+        .height(size)
+        .align_x(iced::alignment::Horizontal::Center)
+        .align_y(iced::alignment::Vertical::Center)
+        .style(move |_| {
+            container::Style::default().border(Border {
+                color: Color {
+                    a: color.a * 0.7,
+                    ..color
+                },
+                width: 1.0,
+                radius: (size / 2.0).into(),
+            })
+        })
+        .into()
+}
+
+fn section_label(
+    label: &'static str,
+    settings: &AppSettings,
+    tokens: DesignTokens,
+) -> Element<'static, Message> {
+    container(
+        text(label)
+            .size(settings.ui_pixels(9.0))
+            .color(tokens.faint)
+            .font(Font {
+                weight: font::Weight::Semibold,
+                ..Font::DEFAULT
+            }),
+    )
+    .padding([6, 6])
+    .into()
+}
+
+/// A recessed group band in the fleet: uppercase label on the app-dark fill,
+/// with an amber rollup dot when any pane in the group needs a person.
+/// Clicking a band focuses the group's first pane.
+fn fleet_group_label(
+    label: String,
+    warning: bool,
+    targeted: bool,
+    on_press: Option<Message>,
+    settings: &AppSettings,
+    tokens: DesignTokens,
+) -> Element<'static, Message> {
+    let content = row![
+        text(ellipsize(
+            &label.to_uppercase(),
+            settings.ui_char_budget(26)
+        ))
+        .size(settings.ui_pixels(8.0))
+        .font(Font {
+            weight: font::Weight::Semibold,
+            ..Font::DEFAULT
+        })
+        .color(if targeted {
+            tokens.accent
+        } else {
+            tokens.faint
+        })
+        .width(Fill)
+        .wrapping(iced::widget::text::Wrapping::None),
+        if warning {
+            signal_dot(tokens.warning, 6.0)
+        } else {
+            signal_dot(Color::TRANSPARENT, 6.0)
+        },
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let mut band = button(centered_button_content(content))
+        .height(30)
+        .padding([0, 16])
+        .width(Fill)
+        .style(move |_, status| {
+            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            button::Style {
+                background: Some(iced::Background::Color(if targeted {
+                    Color {
+                        a: 0.12,
+                        ..tokens.accent
+                    }
+                } else if hovered {
+                    Color {
+                        a: 0.04,
+                        ..tokens.text
+                    }
+                } else {
+                    tokens.app
+                })),
+                text_color: if targeted { tokens.text } else { tokens.faint },
+                border: Border {
+                    color: if targeted {
+                        tokens.accent
+                    } else {
+                        Color::TRANSPARENT
+                    },
+                    width: if targeted { 1.0 } else { 0.0 },
+                    radius: 0.0.into(),
+                },
+                shadow: Shadow::default(),
+                snap: true,
+            }
+        });
+    if let Some(message) = on_press {
+        band = band.on_press(message);
+    }
+    band.into()
+}
+
+const fn pane_signal_priority(kind: PaneSignalKind) -> u8 {
+    match kind {
+        PaneSignalKind::Danger => 4,
+        PaneSignalKind::Warning => 3,
+        PaneSignalKind::Active => 2,
+        PaneSignalKind::Neutral => 1,
+        PaneSignalKind::Subtle => 0,
+    }
+}
+
+fn ellipsize(value: &str, max_characters: usize) -> String {
+    if value.chars().count() <= max_characters {
+        return value.to_owned();
+    }
+    let mut truncated: String = value
+        .chars()
+        .take(max_characters.saturating_sub(1))
+        .collect();
+    truncated.push('…');
+    truncated
+}
+
+/// Truncates from the front, keeping the tail — for paths, the leaf is the
+/// informative end.
+fn ellipsize_start(value: &str, max_characters: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_characters {
+        return value.to_owned();
+    }
+    let keep = max_characters.saturating_sub(1).max(1);
+    let mut truncated = String::from("\u{2026}");
+    truncated.extend(value.chars().skip(count - keep));
+    truncated
+}
+
+fn single_line_ellipsize(value: &str, max_characters: usize) -> String {
+    let single_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    ellipsize(&single_line, max_characters)
+}
+
+fn git_branch_for_directory(cwd: Option<&str>) -> Option<String> {
+    let mut directory = std::path::PathBuf::from(cwd?.trim());
+    if !directory.is_dir() {
+        return None;
+    }
+    loop {
+        let metadata = directory.join(".git");
+        let head = if metadata.is_dir() {
+            std::fs::read_to_string(metadata.join("HEAD")).ok()
+        } else if metadata.is_file() {
+            let pointer = std::fs::read_to_string(&metadata).ok()?;
+            let git_dir = pointer.trim().strip_prefix("gitdir:")?.trim();
+            let git_dir = std::path::Path::new(git_dir);
+            let git_dir = if git_dir.is_absolute() {
+                git_dir.to_owned()
+            } else {
+                directory.join(git_dir)
+            };
+            std::fs::read_to_string(git_dir.join("HEAD")).ok()
+        } else {
+            None
+        };
+        if let Some(head) = head
+            && let Some(branch) = head.trim().strip_prefix("ref: refs/heads/")
+            && !branch.is_empty()
+        {
+            return Some(branch.to_owned());
+        }
+        if !directory.pop() {
+            return None;
+        }
+    }
+}
+
+/// Rail rows are square and full-bleed. Real selection keeps the familiar
+/// neutral fill plus its solid 3px leading bar; the keyboard cursor takes an
+/// accent tint, a complete accent perimeter, accent headline text, and a rung
+/// bar, so current location and proposed destination remain unmistakably
+/// different, even when they overlap. The cursor is transient and answers a
+/// question the eye is actively asking, so it is allowed to shout where
+/// selection stays quiet.
+fn rail_row_style(
+    tokens: DesignTokens,
+    selected: bool,
+    targeted: bool,
+    status: button::Status,
+) -> button::Style {
+    if targeted {
+        return button::Style {
+            background: Some(
+                Color {
+                    a: 0.18,
+                    ..tokens.accent
+                }
+                .into(),
+            ),
+            text_color: tokens.text,
+            border: Border {
+                color: tokens.accent,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            shadow: Shadow::default(),
+            snap: true,
+        };
+    }
+
+    button::Style {
+        border: Border::default(),
+        ..quiet_button_style(tokens, selected, status)
+    }
+}
+
+fn quiet_button_style(
+    tokens: DesignTokens,
+    selected: bool,
+    status: button::Status,
+) -> button::Style {
+    // Text-derived translucent fills read correctly on every surface in both
+    // appearances: light overlay on dark text-on-dark, dark overlay on light.
+    let background = if selected {
+        Some(Color {
+            a: 0.07,
+            ..tokens.text
+        })
+    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        Some(Color {
+            a: 0.04,
+            ..tokens.text
+        })
+    } else {
+        None
+    };
+    button::Style {
+        background: background.map(iced::Background::Color),
+        text_color: tokens.text,
+        border: Border::default().rounded(6.0),
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+/// A fleet-view segment inside the recessed toggle track. The selected thumb
+/// is a raised, bordered chip with its own shadow so the control reads as a
+/// physical toggle: dark well, light thumb.
+fn fleet_toggle_style(
+    tokens: DesignTokens,
+    selected: bool,
+    status: button::Status,
+) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    let background = if selected {
+        Some(tokens.panel_raised)
+    } else if hovered {
+        Some(Color {
+            a: 0.05,
+            ..tokens.text
+        })
+    } else {
+        None
+    };
+    button::Style {
+        background: background.map(iced::Background::Color),
+        text_color: if selected { tokens.text } else { tokens.muted },
+        border: Border {
+            color: if selected {
+                tokens.line_strong
+            } else {
+                Color::TRANSPARENT
+            },
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        shadow: if selected {
+            Shadow {
+                color: Color::from_rgba8(0, 0, 0, 0.35),
+                offset: Vector::new(0.0, 1.0),
+                blur_radius: 3.0,
+            }
+        } else {
+            Shadow::default()
+        },
+        snap: true,
+    }
+}
+
+fn add_tab_button_style(tokens: DesignTokens, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: hovered.then_some(iced::Background::Color(tokens.panel_raised)),
+        text_color: tokens.text,
+        border: Border {
+            color: if hovered {
+                tokens.line_strong
+            } else {
+                Color::TRANSPARENT
+            },
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+fn palette_button_style(
+    tokens: DesignTokens,
+    selected: bool,
+    enabled: bool,
+    status: button::Status,
+) -> button::Style {
+    let hovered = enabled && matches!(status, button::Status::Hovered | button::Status::Pressed);
+    let background = if selected && enabled {
+        Color {
+            a: 0.14,
+            ..tokens.accent
+        }
+    } else if hovered {
+        tokens.panel
+    } else {
+        Color::TRANSPARENT
+    };
+    button::Style {
+        background: Some(iced::Background::Color(background)),
+        text_color: if enabled { tokens.text } else { tokens.faint },
+        border: Border::default().rounded(5.0),
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+fn ruled_surface(background: Color, line: Color) -> container::Style {
+    container::Style::default()
+        .background(background)
+        .border(Border {
+            color: line,
+            width: 1.0,
+            radius: 0.0.into(),
+        })
+}
+
+fn modal_surface(tokens: DesignTokens) -> container::Style {
+    container::Style::default()
+        .background(tokens.overlay)
+        .border(Border {
+            color: tokens.line_strong,
+            width: 1.0,
+            radius: 8.0.into(),
+        })
+        .shadow(Shadow {
+            color: Color::from_rgba8(0, 0, 0, 0.45),
+            offset: Vector::new(0.0, 10.0),
+            blur_radius: 28.0,
+        })
+}
+
+fn centered_button_content<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .height(Fill)
+        .align_y(iced::alignment::Vertical::Center)
+        .into()
+}
+
+fn centered_button_label(label: &'static str, size: f32) -> Element<'static, Message> {
+    centered_button_content(text(label).size(size))
+}
+
+fn app_tooltip<'a>(
+    content: impl Into<Element<'a, Message>>,
+    label: impl Into<String>,
+    position: tooltip::Position,
+    tokens: DesignTokens,
+    font_size: f32,
+) -> Element<'a, Message> {
+    tooltip(
+        content,
+        text(label.into()).size(font_size).color(tokens.text),
+        position,
+    )
+    .gap(6)
+    .padding(8)
+    .style(move |_| ruled_surface(tokens.overlay, tokens.line_strong))
+    .into()
+}
+
+fn pane_icon_button(
+    kind: IconKind,
+    label: &'static str,
+    message: Message,
+    tokens: DesignTokens,
+) -> Element<'static, Message> {
+    app_tooltip(
+        button(
+            container(icon(kind, tokens.muted, 14.0))
+                .width(Fill)
+                .height(Fill)
+                .center_x(Fill)
+                .align_y(iced::alignment::Vertical::Center),
+        )
+        .on_press(message)
+        .width(30)
+        .height(28)
+        .padding(0)
+        .style(move |_, status| quiet_button_style(tokens, false, status)),
+        label,
+        tooltip::Position::Bottom,
+        tokens,
+        12.0,
+    )
+}
+
+/// A context-menu row: label, optional trailing shortcut hint, and an
+/// optional message — `None` renders the row disabled in place so menu
+/// positions never shift with selection or process state.
+fn pane_menu_entry(
+    label: &'static str,
+    hint: &'static str,
+    message: Option<Message>,
+    danger: bool,
+    tokens: DesignTokens,
+    settings: &AppSettings,
+) -> Element<'static, Message> {
+    let label_color = if message.is_none() {
+        tokens.faint
+    } else if danger {
+        tokens.danger
+    } else {
+        tokens.text
+    };
+    let mut entry = button(centered_button_content(
+        row![
+            text(label)
+                .size(settings.ui_pixels(9.0))
+                .color(label_color)
+                .width(Fill)
+                .wrapping(iced::widget::text::Wrapping::None),
+            text(hint)
+                .font(settings.terminal_font.iced())
+                .size(settings.ui_pixels(7.5))
+                .color(tokens.faint)
+                .wrapping(iced::widget::text::Wrapping::None),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    ))
+    .width(Fill)
+    .height(30)
+    .padding([0, 9])
+    .style(move |_, status| pane_menu_entry_style(tokens, danger, status));
+    if let Some(message) = message {
+        entry = entry.on_press(message);
+    }
+    entry.into()
+}
+
+/// Menu rows sit on the raised panel, so the hover fill must come from a
+/// different token than the panel itself or hovering is invisible.
+fn pane_menu_entry_style(
+    tokens: DesignTokens,
+    danger: bool,
+    status: button::Status,
+) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    let background = if !hovered {
+        None
+    } else if danger {
+        Some(Color {
+            a: 0.14,
+            ..tokens.danger
+        })
+    } else {
+        // A text-derived tint stays visible on the overlay surface, where
+        // the line token would disappear into the fill.
+        Some(Color {
+            a: 0.08,
+            ..tokens.text
+        })
+    };
+    button::Style {
+        background: background.map(iced::Background::Color),
+        text_color: tokens.text,
+        border: Border::default().rounded(4.0),
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+fn pane_menu_divider(tokens: DesignTokens) -> Element<'static, Message> {
+    container(
+        container("")
+            .height(1)
+            .width(Fill)
+            .style(move |_| container::Style::default().background(tokens.line)),
+    )
+    .padding([3, 4])
+    .into()
+}
+
+#[derive(Clone, Copy)]
+enum SettingsButtonKind {
+    Primary,
+    Secondary,
+    Danger,
+    /// Navigation that happens to be a button. It carries no fill or border at
+    /// rest so it cannot compete with the page's real actions, and gains a
+    /// surface only under the pointer.
+    Quiet,
+}
+
+fn github_readiness_copy(
+    readiness: github::MergeReadiness,
+    tokens: DesignTokens,
+) -> (&'static str, &'static str, Color) {
+    match readiness {
+        github::MergeReadiness::Ready => (
+            "Ready to merge",
+            "Checks and review requirements are satisfied",
+            tokens.success,
+        ),
+        github::MergeReadiness::Draft => (
+            "Draft pull request",
+            "Mark it ready for review on GitHub first",
+            tokens.muted,
+        ),
+        github::MergeReadiness::Conflicts => (
+            "Merge conflicts",
+            "Resolve conflicts before merging",
+            tokens.danger,
+        ),
+        github::MergeReadiness::Behind => (
+            "Branch is behind",
+            "Update the branch before merging",
+            tokens.warning,
+        ),
+        github::MergeReadiness::ChecksPending => (
+            "Checks are running",
+            "Wait for required checks to finish",
+            tokens.warning,
+        ),
+        github::MergeReadiness::ChecksFailed => (
+            "Checks failed",
+            "Fix the failing checks before merging",
+            tokens.danger,
+        ),
+        github::MergeReadiness::ReviewRequired => (
+            "Review required",
+            "Approval is still required",
+            tokens.warning,
+        ),
+        github::MergeReadiness::Blocked => (
+            "Merge blocked",
+            "GitHub reports an unmet branch rule",
+            tokens.warning,
+        ),
+        github::MergeReadiness::Unknown => (
+            "Readiness unknown",
+            "Refresh after GitHub finishes calculating mergeability",
+            tokens.muted,
+        ),
+    }
+}
+
+fn github_merge_button_style(tokens: DesignTokens, status: button::Status) -> button::Style {
+    if matches!(status, button::Status::Disabled) {
+        return button::Style {
+            background: Some(tokens.panel.into()),
+            text_color: tokens.faint,
+            border: Border {
+                color: tokens.line,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..button::Style::default()
+        };
+    }
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: Some(
+            Color {
+                a: if hovered { 0.88 } else { 1.0 },
+                ..tokens.success
+            }
+            .into(),
+        ),
+        text_color: tokens.app,
+        border: Border {
+            color: tokens.success,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+fn settings_button_style(
+    tokens: DesignTokens,
+    kind: SettingsButtonKind,
+    status: button::Status,
+) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    // An un-pressable button must not impersonate a live one.
+    if matches!(status, button::Status::Disabled) {
+        return button::Style {
+            background: Some(tokens.panel.into()),
+            text_color: tokens.faint,
+            border: Border {
+                color: tokens.line,
+                width: 1.0,
+                radius: 7.0.into(),
+            },
+            ..button::Style::default()
+        };
+    }
+    let (background, text_color, border_color) = match kind {
+        SettingsButtonKind::Primary => (
+            if hovered {
+                Color {
+                    a: 0.86,
+                    ..tokens.accent
+                }
+            } else {
+                tokens.accent
+            },
+            tokens.app,
+            tokens.accent,
+        ),
+        SettingsButtonKind::Secondary => (
+            if hovered {
+                tokens.panel_raised
+            } else {
+                tokens.panel
+            },
+            tokens.text,
+            tokens.line_strong,
+        ),
+        SettingsButtonKind::Danger => (
+            if hovered {
+                Color {
+                    a: 0.12,
+                    ..tokens.danger
+                }
+            } else {
+                Color {
+                    a: 0.05,
+                    ..tokens.danger
+                }
+            },
+            tokens.danger,
+            // tokens.line (6% white) rendered these borders invisible.
+            if hovered {
+                tokens.danger
+            } else {
+                Color {
+                    a: 0.45,
+                    ..tokens.danger
+                }
+            },
+        ),
+        SettingsButtonKind::Quiet => (
+            if hovered {
+                tokens.panel_raised
+            } else {
+                Color::TRANSPARENT
+            },
+            if hovered { tokens.text } else { tokens.muted },
+            if hovered {
+                tokens.line_strong
+            } else {
+                Color::TRANSPARENT
+            },
+        ),
+    };
+    button::Style {
+        background: Some(iced::Background::Color(background)),
+        text_color,
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: 5.0.into(),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+fn settings_action_button(
+    label: &'static str,
+    message: Message,
+    kind: SettingsButtonKind,
+    settings: &AppSettings,
+) -> Element<'static, Message> {
+    settings_action_button_maybe(label, Some(message), kind, settings)
+}
+
+fn settings_have_changes(saved: &AppSettings, draft: &AppSettings) -> bool {
+    draft != saved
+}
+
+fn settings_action_button_maybe(
+    label: &'static str,
+    message: Option<Message>,
+    kind: SettingsButtonKind,
+    settings: &AppSettings,
+) -> Element<'static, Message> {
+    let tokens = DesignTokens::for_appearance(settings.appearance);
+    button(centered_button_label(label, settings.ui_pixels(9.0)))
+        .on_press_maybe(message)
+        .height(30)
+        .padding([0, 11])
+        .style(move |_, status| settings_button_style(tokens, kind, status))
+        .into()
+}
+
+/// The Preferences/Worktrees page switcher, built on the same recessed-well
+/// toggle the fleet heading uses: a dark track with one raised thumb, so the
+/// current page is unambiguous without inventing a second selection idiom.
+fn settings_page_toggle(
+    current: SettingsPage,
+    settings: &AppSettings,
+) -> Element<'static, Message> {
+    let tokens = DesignTokens::for_appearance(settings.appearance);
+    let segment = |label: &'static str, page: SettingsPage| {
+        let selected = current == page;
+        button(centered_button_content(
+            text(label)
+                .size(settings.ui_pixels(9.5))
+                .wrapping(iced::widget::text::Wrapping::None),
+        ))
+        .on_press(Message::OpenSettingsPage(page))
+        .height(26)
+        .padding([0, 13])
+        .style(move |_, status| fleet_toggle_style(tokens, selected, status))
+    };
+    container(
+        row![
+            segment("Preferences", SettingsPage::Preferences),
+            segment("Worktrees", SettingsPage::Worktrees),
+        ]
+        .spacing(2),
+    )
+    .padding(2)
+    .style(move |_| {
+        container::Style::default()
+            .background(tokens.app)
+            .border(Border {
+                color: tokens.line,
+                width: 1.0,
+                radius: 7.0.into(),
+            })
+    })
+    .into()
+}
+
+fn settings_notice<'a>(
+    title: impl Into<String>,
+    body: impl Into<String>,
+    recovery: impl Into<String>,
+    hue: Color,
+    settings: &AppSettings,
+) -> Element<'a, Message> {
+    let tokens = DesignTokens::for_appearance(settings.appearance);
+    let title_size = settings.ui_pixels(11.0);
+    container(
+        row![
+            // Centred against the title's line box rather than the row's top
+            // edge: aligned to Start the dot floated above the cap height of
+            // the words it belongs to.
+            container(signal_dot(hue, 7.0))
+                .height(title_size * 1.3)
+                .align_y(iced::alignment::Vertical::Center),
+            column![
+                text(title.into())
+                    .size(title_size)
+                    .font(Font {
+                        weight: font::Weight::Semibold,
+                        ..Font::DEFAULT
+                    })
+                    .color(tokens.text),
+                text(body.into())
+                    .size(settings.ui_pixels(9.5))
+                    .color(tokens.muted),
+                text(recovery.into())
+                    .size(settings.ui_pixels(8.5))
+                    .color(hue),
+            ]
+            .spacing(3)
+            .width(Fill),
+        ]
+        .spacing(11)
+        .align_y(Alignment::Start),
+    )
+    .padding([12, 14])
+    .width(Fill)
+    .style(move |_| {
+        container::Style::default()
+            .background(Color { a: 0.06, ..hue })
+            .border(Border {
+                color: Color { a: 0.35, ..hue },
+                width: 1.0,
+                radius: 6.0.into(),
+            })
+    })
+    .into()
+}
+
+fn worktree_status_tag(
+    label: &str,
+    hue: Color,
+    settings: &AppSettings,
+) -> Element<'static, Message> {
+    container(
+        row![
+            signal_dot(hue, 5.0),
+            text(label.to_owned())
+                .size(settings.ui_pixels(8.0))
+                .font(Font {
+                    weight: font::Weight::Semibold,
+                    ..Font::DEFAULT
+                })
+                .color(hue),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .padding([3, 7])
+    .style(move |_| {
+        container::Style::default()
+            .background(Color { a: 0.08, ..hue })
+            .border(Border {
+                color: Color { a: 0.28, ..hue },
+                width: 1.0,
+                radius: 4.0.into(),
+            })
+    })
+    .into()
+}
+
+/// Horizontal inset held clear inside every ellipsized lane, so truncated copy
+/// stops short of the next lane instead of touching it.
+const WORKTREE_LANE_INSET: f32 = 10.0;
+const WORKTREE_LANE_SPACING: f32 = 16.0;
+const WORKTREE_ROW_PADDING_X: f32 = 14.0;
+/// The one horizontal margin the settings window keeps: its top bar, both page
+/// bodies, and both footers share it, so every leading and trailing edge in
+/// the surface lines up on the same two rules.
+const SETTINGS_PAGE_PADDING_X: f32 = 28.0;
+/// The inventory reads as a table, so it takes the window's width rather than
+/// a column measure. The cap only stops the action lane from drifting a whole
+/// screen away from the identity it acts on.
+const WORKTREE_PAGE_MAX_WIDTH: f32 = 1480.0;
+/// Reserve for the scrollable's overlay scrollbar, which draws over the
+/// content's right edge rather than displacing it.
+const WORKTREE_SCROLLBAR_RESERVE: f32 = 12.0;
+
+/// Lane widths for the worktree inventory, derived once from the table's real
+/// width so the header, every row, and the ellipsis budgets cannot drift apart.
+///
+/// The three trailing lanes hold bounded copy — a tag, a count, one button —
+/// so they stay fixed. Identity and branch are the two unbounded strings, and
+/// they split whatever the window leaves rather than living in fixed boxes
+/// that force a long branch to wrap while the window has room to spare.
+#[derive(Clone, Copy)]
+struct WorktreeLanes {
+    identity: f32,
+    branch: f32,
+    status: f32,
+    commits: f32,
+    action: f32,
+}
+
+impl WorktreeLanes {
+    const STATUS: f32 = 200.0;
+    const COMMITS: f32 = 176.0;
+    const ACTION: f32 = 104.0;
+    /// Gap between the two lanes that share a line in the compact layout.
+    const STACKED_GAP: f32 = 14.0;
+
+    /// Width a row's content actually gets, once the page margins, the table
+    /// border, the selection-bar gutter, the row padding, and the overlay
+    /// scrollbar are all taken out.
+    fn content_width(window_width: f32) -> f32 {
+        let table =
+            (window_width - 2.0 * SETTINGS_PAGE_PADDING_X).clamp(320.0, WORKTREE_PAGE_MAX_WIDTH);
+        (table
+            - 2.0 // the table's own 1px border
+            - 3.0 // the row's leading selection bar
+            - 2.0 * WORKTREE_ROW_PADDING_X
+            - WORKTREE_SCROLLBAR_RESERVE)
+            .max(240.0)
+    }
+
+    fn for_window(window_width: f32, compact: bool) -> Self {
+        let content = Self::content_width(window_width);
+        if compact {
+            // Stacked layout: identity and the commit block each own a full
+            // line, while branch and status share one.
+            let half = ((content - Self::STACKED_GAP) / 2.0).max(120.0);
+            return Self {
+                identity: content,
+                branch: half,
+                status: half,
+                commits: content,
+                action: Self::ACTION,
+            };
+        }
+        let flexible =
+            (content - 4.0 * WORKTREE_LANE_SPACING - (Self::STATUS + Self::COMMITS + Self::ACTION))
+                .max(240.0);
+        // The path under the name is the longer of the two strings, so
+        // identity keeps the larger share of the slack.
+        let branch = (flexible * 0.4).floor();
+        Self {
+            identity: flexible - branch,
+            branch,
+            status: Self::STATUS,
+            commits: Self::COMMITS,
+            action: Self::ACTION,
+        }
+    }
+}
+
+/// Characters that fit in `width` of proportional UI copy at `size` pixels.
+fn worktree_ui_budget(width: f32, size: f32) -> usize {
+    pane_title_char_budget(width - WORKTREE_LANE_INSET, size * UI_TEXT_ADVANCE_RATIO)
+}
+
+/// Characters that fit in `width` of the configured monospace face.
+fn worktree_mono_budget(width: f32, size: f32, settings: &AppSettings) -> usize {
+    pane_title_char_budget(
+        width - WORKTREE_LANE_INSET,
+        size * settings.terminal_advance_ratio(),
+    )
+}
+
+/// One keyboard affordance in the inventory footer: the real key drawn as a
+/// keycap in the terminal face, then what it does. Same grammar as the command
+/// palette's keycap, so the two teach the same thing the same way.
+fn worktree_footer_hint(
+    keys: &'static str,
+    label: &'static str,
+    settings: &AppSettings,
+) -> Element<'static, Message> {
+    let tokens = DesignTokens::for_appearance(settings.appearance);
+    row![
+        container(
+            text(keys)
+                .font(settings.terminal_font.iced())
+                .size(settings.ui_pixels(8.5))
+                .color(tokens.text)
+                .wrapping(iced::widget::text::Wrapping::None),
+        )
+        .padding([1.0, 5.0])
+        .style(move |_| {
+            container::Style::default()
+                .background(tokens.panel_raised)
+                .border(Border {
+                    color: tokens.line_strong,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                })
+        }),
+        text(label)
+            .size(settings.ui_pixels(9.0))
+            .color(tokens.muted)
+            .wrapping(iced::widget::text::Wrapping::None),
+    ]
+    .spacing(7)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn worktree_table_header(
+    settings: &AppSettings,
+    lanes: WorktreeLanes,
+) -> Element<'static, Message> {
+    let tokens = DesignTokens::for_appearance(settings.appearance);
+    let label = |copy: &'static str| {
+        text(copy)
+            .size(settings.ui_pixels(8.0))
+            .font(Font {
+                weight: font::Weight::Semibold,
+                ..Font::DEFAULT
+            })
+            .color(tokens.faint)
+            .wrapping(iced::widget::text::Wrapping::None)
+    };
+    container(
+        row![
+            label("WORKTREE").width(lanes.identity),
+            label("BRANCH").width(lanes.branch),
+            label("STATUS").width(lanes.status),
+            label("LOCAL COMMITS").width(lanes.commits),
+            label("ACTION").width(lanes.action),
+        ]
+        .spacing(WORKTREE_LANE_SPACING),
+    )
+    // The extra 3px on the left absorbs the selection-bar gutter every row
+    // reserves, so each label sits exactly over the copy it names.
+    .padding(Padding {
+        top: 9.0,
+        bottom: 9.0,
+        left: WORKTREE_ROW_PADDING_X + 3.0,
+        right: WORKTREE_ROW_PADDING_X,
+    })
+    .into()
+}
+
+fn terminal_theme_preview(
+    preset: TerminalThemePreset,
+    settings: &AppSettings,
+) -> Element<'static, Message> {
+    terminal_theme_preview_with_caption(preset, settings, true)
+}
+
+fn terminal_theme_preview_with_caption(
+    preset: TerminalThemePreset,
+    settings: &AppSettings,
+    caption: bool,
+) -> Element<'static, Message> {
+    let tokens = DesignTokens::for_appearance(settings.appearance);
+    let terminal_font = settings.terminal_font.iced();
+    let preview_size = settings.terminal_font_pixels().clamp(13.0, 18.0);
+    let mode = if preset.is_light { "Light" } else { "Dark" };
+    let sample_spans: Vec<iced::widget::text::Span<'static, (), Font>> = vec![
+        span("❯ ").color(rgb(preset.ansi[10])),
+        span("cargo test ").color(rgb(preset.foreground)),
+        span("--workspace\n").color(rgb(preset.ansi[12])),
+        span("   Compiling ").color(rgb(preset.ansi[3])),
+        span("muxtrix\n").color(rgb(preset.foreground)),
+        span("   Finished ").color(rgb(preset.ansi[2])),
+        span("95 tests passed  ").color(rgb(preset.foreground)),
+        span(" selected ")
+            .color(rgb(preset.selection_foreground))
+            .background(rgb(preset.selection_background)),
+        span("  ").color(rgb(preset.foreground)),
+        span(" C ")
+            .color(rgb(preset.cursor_text))
+            .background(rgb(preset.cursor)),
+    ];
+    let sample = rich_text(sample_spans)
+        .font(terminal_font)
+        .size(preview_size)
+        .line_height(Pixels(preview_size * 1.35));
+
+    let mut normal = row![].spacing(5);
+    let mut bright = row![].spacing(5);
+    for (index, color) in preset.ansi.into_iter().enumerate() {
+        let swatch = container("")
+            .width(Fill)
+            .max_width(24)
+            .height(12)
+            .style(move |_| {
+                container::Style::default()
+                    .background(rgb(color))
+                    .border(Border::default().rounded(2.0))
+            });
+        if index < 8 {
+            normal = normal.push(swatch);
+        } else {
+            bright = bright.push(swatch);
+        }
+    }
+
+    container(
+        column![
+            row![
+                text(preset.name)
+                    .size(settings.ui_pixels(11.0))
+                    .font(Font {
+                        weight: font::Weight::Semibold,
+                        ..Font::DEFAULT
+                    })
+                    .color(rgb(preset.foreground))
+                    .width(Fill)
+                    .wrapping(iced::widget::text::Wrapping::None),
+                if caption {
+                    // In the gallery, section headings already say the mode;
+                    // repeating a pill on every card is noise, and long
+                    // names were clipping it against the card edge.
+                    Element::from(
+                        container(
+                            text(mode)
+                                .size(settings.ui_pixels(8.0))
+                                .color(rgb(preset.background)),
+                        )
+                        .padding([2, 7])
+                        .style(move |_| {
+                            container::Style::default()
+                                .background(rgb(preset.foreground))
+                                .border(Border::default().rounded(4.0))
+                        }),
+                    )
+                } else {
+                    container("").width(0).into()
+                },
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            sample,
+            column![normal, bright].spacing(5),
+            if caption {
+                Element::from(
+                    text("Theme colors set defaults · direct RGB and application OSC colors stay intact")
+                        .size(settings.ui_pixels(8.0))
+                        .color(rgb(preset.ansi[8])),
+                )
+            } else {
+                container("").width(0).height(0).into()
+            },
+        ]
+        .spacing(12),
+    )
+    .padding([14, 16])
+    .width(Fill)
+    .style(move |_| {
+        container::Style::default()
+            .background(rgb(preset.background))
+            .border(Border {
+                color: tokens.line_strong,
+                width: 1.0,
+                radius: 6.0.into(),
+            })
+    })
+    .into()
+}
+
+fn settings_hook_button(
+    label: &'static str,
+    agent: Agent,
+    action: HookAction,
+    kind: SettingsButtonKind,
+    settings: &AppSettings,
+) -> Element<'static, Message> {
+    settings_action_button(label, Message::ManageHooks(agent, action), kind, settings)
+}
+
+fn settings_divider(tokens: DesignTokens) -> Element<'static, Message> {
+    container("")
+        .width(Fill)
+        .height(1)
+        .style(move |_| container::Style::default().background(tokens.line))
+        .into()
+}
+
+fn settings_row<'a>(
+    label: &'static str,
+    description: &'static str,
+    control: impl Into<Element<'a, Message>>,
+    settings: &AppSettings,
+) -> Element<'a, Message> {
+    let tokens = DesignTokens::for_appearance(settings.appearance);
+    container(
+        row![
+            column![
+                text(label)
+                    .size(settings.ui_pixels(11.0))
+                    .font(Font {
+                        weight: font::Weight::Semibold,
+                        ..Font::DEFAULT
+                    })
+                    .color(tokens.text),
+                text(description)
+                    .size(settings.ui_pixels(9.0))
+                    .color(tokens.muted),
+            ]
+            .spacing(2)
+            .width(Fill),
+            container(control).align_y(iced::alignment::Vertical::Center),
+        ]
+        .spacing(18)
+        .align_y(Alignment::Center),
+    )
+    .padding([12, 14])
+    .width(Fill)
+    .into()
+}
+
+fn settings_section<'a>(
+    title: &'static str,
+    description: &'static str,
+    content: iced::widget::Column<'a, Message>,
+    settings: &AppSettings,
+) -> Element<'a, Message> {
+    let tokens = DesignTokens::for_appearance(settings.appearance);
+    column![
+        column![
+            text(title)
+                .size(settings.ui_pixels(13.0))
+                .font(Font {
+                    weight: font::Weight::Semibold,
+                    ..Font::DEFAULT
+                })
+                .color(tokens.text),
+            text(description)
+                .size(settings.ui_pixels(9.0))
+                .color(tokens.muted),
+        ]
+        .spacing(2),
+        container(content).width(Fill).style(move |_| {
+            container::Style::default()
+                .background(tokens.panel)
+                .border(Border {
+                    color: tokens.line,
+                    width: 1.0,
+                    radius: 10.0.into(),
+                })
+        }),
+    ]
+    .spacing(8)
+    .into()
+}
+
+#[derive(Default)]
+struct RuntimePoll {
+    status: Option<String>,
+    notifications: Vec<TerminalNotification>,
+    title: Option<String>,
+    exited: bool,
+    exited_clean: bool,
+}
+
+impl TerminalRuntime {
+    fn preparing_host(fallback_title: &str) -> Self {
+        Self {
+            preview: "Preparing terminal host…\n\nThe workspace remains usable while this runs."
+                .into(),
+            snapshot: None,
+            snapshot_revision: 0,
+            session: None,
+            fallback_title: fallback_title.into(),
+            display_title: fallback_title.into(),
+            size: initial_pty_size(),
+            viewport: None,
+            launch_state: TerminalLaunchState::PreparingHost,
+            has_selection: false,
+        }
+    }
+
+    fn suppressed(fallback_title: &str) -> Self {
+        Self {
+            preview: "No terminal was started.\n\nYou can browse the workspace and start a terminal when the host is healthy."
+                .into(),
+            snapshot: None,
+            snapshot_revision: 0,
+            session: None,
+            fallback_title: fallback_title.into(),
+            display_title: fallback_title.into(),
+            size: initial_pty_size(),
+            viewport: None,
+            launch_state: TerminalLaunchState::Suppressed,
+            has_selection: false,
+        }
+    }
+
+    fn starting(fallback_title: &str, attempt_id: u64, viewport: Option<Size>) -> Self {
+        Self {
+            preview:
+                "Starting terminal…\n\nThis pane can be cancelled without blocking the workspace."
+                    .into(),
+            snapshot: None,
+            snapshot_revision: 0,
+            session: None,
+            fallback_title: fallback_title.into(),
+            display_title: fallback_title.into(),
+            size: initial_pty_size(),
+            viewport,
+            launch_state: TerminalLaunchState::Starting { attempt_id },
+            has_selection: false,
+        }
+    }
+
+    fn launch(
+        profile: &LaunchProfile,
+        pane_id: PaneId,
+        fallback_title: &str,
+        theme: TerminalTheme,
+        notifier: EventNotifier,
+        control_endpoint: Option<&str>,
+    ) -> (Self, String) {
+        match start_live_session(profile, pane_id, theme, notifier, control_endpoint) {
+            Ok(session) => (
+                Self {
+                    preview: "Starting local terminal…".into(),
+                    snapshot: None,
+                    snapshot_revision: 0,
+                    session: Some(session),
+                    fallback_title: fallback_title.into(),
+                    display_title: fallback_title.into(),
+                    size: initial_pty_size(),
+                    viewport: None,
+                    launch_state: TerminalLaunchState::Running,
+                    has_selection: false,
+                },
+                "Live terminal — GPU compositor: Iced/wgpu".into(),
+            ),
+            Err(error) => (
+                Self {
+                    preview: ghostty_preview().unwrap_or_else(|preview_error| {
+                        format!(
+                            "Live terminal failed: {error}\nGhostty preview failed: {preview_error}"
+                        )
+                    }),
+                    snapshot: None,
+                    snapshot_revision: 0,
+                    session: None,
+                    fallback_title: fallback_title.into(),
+                    display_title: fallback_title.into(),
+                    size: initial_pty_size(),
+                    viewport: None,
+                    launch_state: TerminalLaunchState::Failed(error.clone()),
+                    has_selection: false,
+                },
+                format!("Terminal launch failed: {error}"),
+            ),
+        }
+    }
+
+    /// Attaches to a pane whose PTY already lives in a session daemon:
+    /// no spawn request, just the byte stream (backlog first) into a
+    /// fresh VT.
+    fn attach(
+        pane_id: PaneId,
+        title: &str,
+        theme: TerminalTheme,
+        notifier: EventNotifier,
+        client: Arc<muxtrix_sessions::SessionClient>,
+        output: std::sync::mpsc::Receiver<Vec<u8>>,
+    ) -> Self {
+        let size = initial_pty_size();
+        // Knock the PTY one row off before attaching: the first real layout
+        // resize is then a guaranteed change, and the SIGWINCH it raises
+        // makes full-screen applications repaint — clearing any artifacts
+        // the backlog replay left behind.
+        let _ = client.send(&muxtrix_sessions::Request::Resize {
+            pane: pane_id.as_uuid(),
+            rows: size.rows.saturating_sub(1),
+            cols: size.cols,
+        });
+        let session = LiveSession::spawn_remote(
+            Box::new(RemotePaneBackend {
+                pane: pane_id.as_uuid(),
+                client,
+                output: Some(output),
+            }),
+            size,
+            TerminalOptions {
+                cols: size.cols,
+                rows: size.rows,
+                max_scrollback: 10_000,
+            },
+            theme,
+            Some(notifier),
+        )
+        .ok();
+        let attached = session.is_some();
+        Self {
+            preview: "Reattaching…".into(),
+            snapshot: None,
+            snapshot_revision: 0,
+            session,
+            fallback_title: title.into(),
+            display_title: title.into(),
+            size,
+            viewport: None,
+            launch_state: if attached {
+                TerminalLaunchState::Running
+            } else {
+                TerminalLaunchState::Failed("Could not attach to the terminal session".into())
+            },
+            has_selection: false,
+        }
+    }
+
+    fn poll(&mut self) -> RuntimePoll {
+        let mut poll = RuntimePoll::default();
+        loop {
+            let event = self
+                .session
+                .as_ref()
+                .and_then(|session| session.try_recv().ok());
+            match event {
+                Some(LiveSessionEvent::Frame(snapshot)) => {
+                    if !snapshot_matches_grid(&snapshot, self.size) {
+                        continue;
+                    }
+                    let title = snapshot
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| self.fallback_title.clone());
+                    if title != self.display_title {
+                        self.display_title.clone_from(&title);
+                        poll.title = Some(title);
+                    }
+                    self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
+                    self.snapshot = Some(snapshot);
+                }
+                Some(LiveSessionEvent::Notification(notification)) => {
+                    poll.notifications.push(notification);
+                }
+                Some(LiveSessionEvent::Exited { clean }) => {
+                    poll.status = Some("Terminal process exited".into());
+                    poll.exited = true;
+                    poll.exited_clean = clean;
+                    self.session.take();
+                    self.launch_state = TerminalLaunchState::Exited;
+                    break;
+                }
+                Some(LiveSessionEvent::Error(error)) => {
+                    poll.status = Some(format!("Terminal error: {error}"));
+                }
+                None => break,
+            }
+        }
+        poll
+    }
+
+    /// Anchors a selection at a grid cell. The emulator owns and tracks it
+    /// from here, so nothing on this side records where it sits.
+    fn selection_start(&mut self, cell: (u16, u16)) -> Result<(), String> {
+        self.has_selection = false;
+        self.session
+            .as_ref()
+            .ok_or_else(|| "terminal process has exited".to_owned())?
+            .selection_start(cell.0, cell.1)
+            .map_err(|error| error.to_string())
+    }
+
+    fn selection_extend(&mut self, cell: (u16, u16)) -> Result<(), String> {
+        self.has_selection = true;
+        self.session
+            .as_ref()
+            .ok_or_else(|| "terminal process has exited".to_owned())?
+            .selection_extend(cell.0, cell.1)
+            .map_err(|error| error.to_string())
+    }
+
+    fn selection_clear(&mut self) -> Result<(), String> {
+        self.has_selection = false;
+        let Some(session) = self.session.as_ref() else {
+            return Ok(());
+        };
+        session.selection_clear().map_err(|error| error.to_string())
+    }
+
+    fn selection_text(&self) -> Option<String> {
+        self.session
+            .as_ref()?
+            .selection_text()
+            .ok()
+            .flatten()
+            .filter(|text| !text.is_empty())
+    }
+
+    fn wheel(&self, lines: isize, cell: Option<(u16, u16)>) -> Result<(), String> {
+        self.session
+            .as_ref()
+            .ok_or_else(|| "terminal process has exited".to_owned())?
+            .wheel(lines, cell)
+            .map_err(|error| error.to_string())
+    }
+
+    fn scroll_to(&self, row: usize) -> Result<(), String> {
+        self.session
+            .as_ref()
+            .ok_or_else(|| "terminal process has exited".to_owned())?
+            .scroll_viewport_to(row)
+            .map_err(|error| error.to_string())
+    }
+
+    fn resize(&mut self, pane_size: Size, settings: &AppSettings) -> Result<(), String> {
+        self.viewport = Some(pane_size);
+        let size = pty_size_for_pane(pane_size, settings);
+        if !terminal_grid_changed(self.size, size) {
+            self.size = size;
+            return Ok(());
+        }
+        let Some(session) = self.session.as_ref() else {
+            self.size = size;
+            return Ok(());
+        };
+        session
+            .resize(
+                size,
+                settings.terminal_cell_width().round() as u32,
+                settings.terminal_cell_height().round() as u32,
+            )
+            .map_err(|error| error.to_string())?;
+        self.size = size;
+        Ok(())
+    }
+}
+
+fn snapshot_matches_grid(snapshot: &GridSnapshot, size: PtySize) -> bool {
+    snapshot.cells.len() == usize::from(size.rows)
+        && snapshot
+            .cells
+            .iter()
+            .all(|row| row.len() == usize::from(size.cols))
+}
+
+fn terminal_grid_changed(previous: PtySize, next: PtySize) -> bool {
+    previous.rows != next.rows || previous.cols != next.cols
+}
+
+fn terminal_scroll_lines(delta: ScrollDelta, cell_height: f32) -> isize {
+    let lines = match delta {
+        ScrollDelta::Lines { y, .. } => y * 3.0,
+        ScrollDelta::Pixels { y, .. } => y / cell_height.max(1.0),
+    };
+    if lines > 0.0 {
+        -lines.ceil() as isize
+    } else if lines < 0.0 {
+        (-lines).ceil() as isize
+    } else {
+        0
+    }
+}
+
+fn terminal_cell_at(
+    position: Point,
+    settings: &AppSettings,
+    scroll_offset: u64,
+) -> TerminalCellPosition {
+    TerminalCellPosition {
+        row: scroll_offset.saturating_add(
+            ((position.y - 8.0).max(0.0) / settings.terminal_cell_height()).floor() as u64,
+        ),
+        column: ((position.x - 8.0).max(0.0) / settings.terminal_cell_width()).floor() as usize,
+    }
+}
+
+/// The visible grid cell under a pointer, clamped to the grid. Selection is
+/// expressed to the emulator in viewport coordinates, which is the only space
+/// a pointer position can speak to.
+fn terminal_grid_cell_at(position: Point, settings: &AppSettings, size: PtySize) -> (u16, u16) {
+    let column = ((position.x - TERMINAL_PADDING / 2.0).max(0.0) / settings.terminal_cell_width())
+        .floor()
+        .clamp(0.0, f32::from(size.cols.saturating_sub(1))) as u16;
+    let row = ((position.y - TERMINAL_PADDING / 2.0).max(0.0) / settings.terminal_cell_height())
+        .floor()
+        .clamp(0.0, f32::from(size.rows.saturating_sub(1))) as u16;
+    (column, row)
+}
+
+fn terminal_selection_drag_started(origin: Point, current: Point) -> bool {
+    let x = current.x - origin.x;
+    let y = current.y - origin.y;
+    x * x + y * y >= TERMINAL_SELECTION_DRAG_THRESHOLD * TERMINAL_SELECTION_DRAG_THRESHOLD
+}
+
+fn terminal_link_modifiers(modifiers: Modifiers) -> bool {
+    modifiers.control() && modifiers.shift() && !modifiers.alt() && !modifiers.logo()
+}
+
+fn terminal_mouse_interaction(link_hovered: bool) -> mouse::Interaction {
+    if link_hovered {
+        mouse::Interaction::Pointer
+    } else {
+        mouse::Interaction::Idle
+    }
+}
+
+fn terminal_link_at(
+    snapshot: &GridSnapshot,
+    position: TerminalCellPosition,
+) -> Option<TerminalLink> {
+    let viewport_row =
+        usize::try_from(position.row.checked_sub(snapshot.scrollbar.offset)?).ok()?;
+    let cells = snapshot.cells.get(viewport_row)?;
+    let cell = cells.get(position.column)?;
+
+    if let Some(uri) = cell.hyperlink.as_deref().and_then(valid_web_url) {
+        let mut start_column = position.column;
+        while start_column > 0 && cells[start_column - 1].hyperlink.as_deref() == Some(uri.as_str())
+        {
+            start_column -= 1;
+        }
+        let mut end_column = position.column + 1;
+        while end_column < cells.len()
+            && cells[end_column].hyperlink.as_deref() == Some(uri.as_str())
+        {
+            end_column += 1;
+        }
+        return Some(TerminalLink {
+            uri,
+            row: position.row,
+            start_column,
+            end_column,
+        });
+    }
+
+    let ascii_row = cells
+        .iter()
+        .map(|cell| {
+            let bytes = cell.text.as_bytes();
+            if cell.columns == 1 && bytes.len() == 1 && bytes[0].is_ascii() {
+                bytes[0]
+            } else {
+                b' '
+            }
+        })
+        .collect::<Vec<_>>();
+    detected_web_links(&ascii_row)
+        .into_iter()
+        .find(|(_, start, end)| position.column >= *start && position.column < *end)
+        .map(|(uri, start_column, end_column)| TerminalLink {
+            uri,
+            row: position.row,
+            start_column,
+            end_column,
+        })
+}
+
+fn detected_web_links(row: &[u8]) -> Vec<(String, usize, usize)> {
+    detected_web_link_ranges(row)
+        .into_iter()
+        .filter_map(|(start, end)| {
+            std::str::from_utf8(&row[start..end])
+                .ok()
+                .map(|uri| (uri.to_owned(), start, end))
+        })
+        .collect()
+}
+
+fn detected_web_link_ranges(row: &[u8]) -> Vec<(usize, usize)> {
+    let mut links = Vec::new();
+    let mut index = 0;
+    while index < row.len() {
+        let scheme_length = if row[index..].starts_with(b"https://") {
+            8
+        } else if row[index..].starts_with(b"http://") {
+            7
+        } else {
+            index += 1;
+            continue;
+        };
+        if index > 0 && row[index - 1].is_ascii_alphanumeric() {
+            index += scheme_length;
+            continue;
+        }
+        let mut end = index + scheme_length;
+        while end < row.len() && !is_url_boundary(row[end]) {
+            end += 1;
+        }
+        end = trim_url_end(row, index, end);
+        if end > index + scheme_length
+            && let Ok(candidate) = std::str::from_utf8(&row[index..end])
+            && is_valid_web_url(candidate)
+        {
+            links.push((index, end));
+        }
+        index = end.max(index + scheme_length);
+    }
+    links
+}
+
+fn is_url_boundary(byte: u8) -> bool {
+    byte.is_ascii_whitespace() || matches!(byte, b'<' | b'>' | b'"' | b'\'' | b'`')
+}
+
+fn trim_url_end(row: &[u8], start: usize, mut end: usize) -> usize {
+    while end > start && matches!(row[end - 1], b'.' | b',' | b';' | b':' | b'!' | b'?') {
+        end -= 1;
+    }
+    for (open, close) in [(b'(', b')'), (b'[', b']'), (b'{', b'}')] {
+        while end > start
+            && row[end - 1] == close
+            && row[start..end]
+                .iter()
+                .filter(|byte| **byte == close)
+                .count()
+                > row[start..end].iter().filter(|byte| **byte == open).count()
+        {
+            end -= 1;
+        }
+    }
+    end
+}
+
+fn valid_web_url(candidate: &str) -> Option<String> {
+    is_valid_web_url(candidate).then(|| candidate.to_owned())
+}
+
+fn is_valid_web_url(candidate: &str) -> bool {
+    let Some(rest) = candidate
+        .strip_prefix("https://")
+        .or_else(|| candidate.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty()
+        && authority.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && candidate
+            .bytes()
+            .all(|byte| !byte.is_ascii_control() && !byte.is_ascii_whitespace())
+}
+
+fn open_web_url(uri: &str) -> std::io::Result<()> {
+    if valid_web_url(uri).is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "only http and https URLs can be opened",
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("rundll32.exe");
+        command.args(["url.dll,FileProtocolHandler", uri]);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(uri);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(uri);
+        command
+    };
+
+    command.spawn().map(|_| ())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TerminalScrollbarGeometry {
+    track_top: f32,
+    track_height: f32,
+    thumb_top: f32,
+    thumb_height: f32,
+    max_offset: u64,
+}
+
+impl TerminalScrollbarGeometry {
+    fn offset_for_thumb_top(self, thumb_top: f32) -> u64 {
+        let travel = (self.track_height - self.thumb_height).max(0.0);
+        if self.max_offset == 0 || travel == 0.0 {
+            return 0;
+        }
+        ((thumb_top.clamp(0.0, travel) / travel) * self.max_offset as f32).round() as u64
+    }
+}
+
+fn terminal_scrollbar_geometry(
+    scrollbar: ScrollbarSnapshot,
+    viewport_height: f32,
+) -> TerminalScrollbarGeometry {
+    const TRACK_INSET: f32 = 5.0;
+    const MIN_THUMB_HEIGHT: f32 = 24.0;
+
+    let total = scrollbar.total.max(1);
+    let visible = scrollbar.visible.min(total);
+    let track_height = (viewport_height - TRACK_INSET * 2.0).max(1.0);
+    let thumb_height = ((visible as f32 / total as f32) * track_height)
+        .clamp(MIN_THUMB_HEIGHT.min(track_height), track_height);
+    let travel = (track_height - thumb_height).max(0.0);
+    let max_offset = total.saturating_sub(visible);
+    let thumb_top = if max_offset == 0 {
+        0.0
+    } else {
+        (scrollbar.offset.min(max_offset) as f32 / max_offset as f32) * travel
+    };
+    TerminalScrollbarGeometry {
+        track_top: TRACK_INSET,
+        track_height,
+        thumb_top,
+        thumb_height,
+        max_offset,
+    }
+}
+
+fn terminal_scrollbar(
+    pane_id: PaneId,
+    scrollbar: ScrollbarSnapshot,
+    viewport_height: f32,
+    tokens: DesignTokens,
+) -> Element<'static, Message> {
+    let geometry = terminal_scrollbar_geometry(scrollbar, viewport_height);
+    let track = column![
+        container("").height(Length::Fixed(geometry.thumb_top)),
+        container("")
+            .height(Length::Fixed(geometry.thumb_height))
+            .width(3)
+            .style(move |_| {
+                container::Style::default()
+                    .background(tokens.line_strong)
+                    .border(Border::default().rounded(2.0))
+            }),
+        container("").height(Fill),
+    ]
+    .height(Fill)
+    .align_x(Alignment::End);
+    let hit_target = mouse_area(
+        container(track)
+            .width(12)
+            .height(Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .padding(Padding {
+                top: geometry.track_top,
+                right: 3.0,
+                bottom: geometry.track_top,
+                left: 0.0,
+            }),
+    )
+    .on_move(move |position| Message::TerminalScrollbarMoved(pane_id, position))
+    .on_press(Message::BeginTerminalScroll(pane_id))
+    // A scrollbar is not a draggable object: the grab interaction renders as
+    // the four-direction move cross on some platforms. Plain arrow.
+    .interaction(mouse::Interaction::Idle);
+    container(hit_target)
+        .width(Fill)
+        .height(Fill)
+        .align_x(iced::alignment::Horizontal::Right)
+        .into()
+}
+
+fn pane_header_is_compact(window_width: f32, pane_count: usize) -> bool {
+    window_width < 1_080.0 || pane_count > 2
+}
+
+/// Header chrome the title can never have: the band's 12/6 padding, the signal
+/// dot, the five 8px gaps in the row, and a reserve so proportional copy stops
+/// short of the state label instead of crowding it.
+const PANE_HEADER_FIXED_WIDTH: f32 = 12.0 + 6.0 + 6.0 + 8.0 * 5.0 + 12.0;
+const PANE_HEADER_ICON_BUTTON: f32 = 24.0;
+const PANE_HEADER_DIVIDER: f32 = 1.0;
+const PANE_HEADER_CONTROL_SPACING: f32 = 2.0;
+/// Horizontal padding of the command chip and of a labelled header button.
+const PANE_HEADER_CHIP_PADDING: f32 = 12.0;
+const PANE_HEADER_LABEL_PADDING: f32 = 16.0;
+/// Even a pane too narrow to hold its own chrome shows some title; a header
+/// that tight is already compact and has shed its chip and state label.
+const PANE_TITLE_MIN_WIDTH: f32 = 48.0;
+/// Budget for the frames before a pane has reported its size — wide enough not
+/// to bind, since the character budget still truncates.
+const PANE_TITLE_UNMEASURED_WIDTH: f32 = 4_096.0;
+
+/// Characters the pane header title may render in `available` pixels.
+///
+/// The row lays every element out at its natural width, so a title measured
+/// too generously does not truncate — it pushes the state label and controls
+/// toward and past the card's right edge.
+fn pane_title_char_budget(available: f32, character_width: f32) -> usize {
+    ((available.max(0.0) / character_width.max(1.0)).floor() as usize).max(1)
+}
+
+fn event_subscription(
+    subscription: &EventSubscription,
+) -> impl iced::futures::Stream<Item = Message> + use<> {
+    subscription.0.clone().map(|()| Message::PollTerminal)
+}
+
+fn app_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    window: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Keyboard(event) => Some(Message::Keyboard(event)),
+        iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
+            Some(Message::PointerMoved(position))
+        }
+        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+            Some(Message::EndPointerInteraction)
+        }
+        iced::Event::Mouse(mouse::Event::WheelScrolled { delta })
+            if status == iced::event::Status::Ignored =>
+        {
+            Some(Message::ScrollHoveredTerminal(delta))
+        }
+        iced::Event::Window(iced::window::Event::Opened { size, .. }) => {
+            Some(Message::WindowOpened(window, size))
+        }
+        iced::Event::Window(iced::window::Event::Resized(size)) => {
+            Some(Message::WindowResized(size))
+        }
+        _ => None,
+    }
+}
+
+fn terminal_empty_state_copy(runtime: Option<&TerminalRuntime>) -> Option<&str> {
+    runtime.and_then(|runtime| {
+        matches!(
+            runtime.launch_state,
+            TerminalLaunchState::Failed(_) | TerminalLaunchState::Suppressed
+        )
+        .then_some(runtime.preview.as_str())
+    })
+}
+
+fn terminal_surface_background(
+    snapshot: Option<&GridSnapshot>,
+    theme: TerminalThemePreset,
+) -> muxtrix_terminal::Rgb {
+    snapshot.map_or(theme.background, |snapshot| snapshot.default_background)
+}
+
+fn styled_terminal(
+    snapshot: &GridSnapshot,
+    focused: bool,
+    cursor_phase_visible: bool,
+    hovered_link: Option<&TerminalLink>,
+    settings: &AppSettings,
+) -> Element<'static, Message> {
+    let theme = settings.terminal_theme.preset();
+    let cell_width = settings.terminal_cell_width();
+    let cell_height = settings.terminal_cell_height();
+    let font_size = settings.terminal_font_pixels();
+    let terminal_font = settings.terminal_font.iced();
+    let family = settings.terminal_font.family_name();
+    let cell_ratio = settings.terminal_advance_ratio();
+    // A bold face may be wider than the regular one it shares a grid with. The
+    // grid stays uniform, so shrink bold text instead of letting it overrun.
+    let bold_scale = bold_size_scale(settings, cell_ratio);
+    let mut grid = column![].spacing(0);
+    for runs in
+        terminal_row_style_runs(snapshot, focused, cursor_phase_visible, hovered_link, theme)
+    {
+        let mut line = row![].spacing(0).height(Length::Fixed(cell_height));
+        for run in runs.into_iter().filter(|run| run.columns > 0) {
+            let alpha = if run.style.faint { 0.6 } else { 1.0 };
+            let foreground = if run.style.selected {
+                theme.selection_foreground
+            } else {
+                run.style.foreground
+            };
+            let foreground_color =
+                Color::from_rgba8(foreground.red, foreground.green, foreground.blue, alpha);
+            let background = if run.style.selected {
+                Some(theme.selection_background)
+            } else {
+                run.style.background
+            };
+            let run_width = cell_width * run.columns as f32;
+            if run.kind == TerminalRunKind::BoxDrawing {
+                let content = canvas(box_drawing::BoxDrawingRun::new(
+                    run.text,
+                    cell_width,
+                    cell_height,
+                    foreground_color,
+                ))
+                .width(Length::Fixed(run_width))
+                .height(Length::Fixed(cell_height));
+                line = line.push(
+                    container(content)
+                        .width(Length::Fixed(run_width))
+                        .height(Length::Fixed(cell_height))
+                        .clip(true)
+                        .style(move |_| {
+                            background.map_or_else(container::Style::default, |background| {
+                                container::Style::default().background(rgb(background))
+                            })
+                        }),
+                );
+                continue;
+            }
+            let weight = if run.style.bold {
+                settings.terminal_font_weight.bold_variant()
+            } else {
+                settings.terminal_font_weight.iced()
+            };
+            // Only Unicode runs can miss the configured face; ASCII runs are
+            // guaranteed present and skip the lookup entirely.
+            let fallback = run.kind.needs_fallback().then_some(()).and_then(|()| {
+                metrics::glyph_fallback(
+                    family,
+                    settings::weight_numeric(weight),
+                    &run.text,
+                    cell_ratio,
+                    settings.terminal_line_height,
+                )
+            });
+            // A substitute is requested at the weight and style its own face
+            // ships. Shaping drops the family rather than relaxing either, so a
+            // single-weight face silently falls through to another family.
+            let (base_font, run_weight, run_style) = match fallback {
+                Some(fallback) => (
+                    Font::with_name(fallback.family),
+                    settings::weight_from_numeric(fallback.weight),
+                    font::Style::Normal,
+                ),
+                None => (
+                    terminal_font,
+                    weight,
+                    if run.style.italic {
+                        font::Style::Italic
+                    } else {
+                        font::Style::Normal
+                    },
+                ),
+            };
+            let size_scale = fallback.map_or_else(
+                || if run.style.bold { bold_scale } else { 1.0 },
+                |fallback| fallback.size_scale,
+            );
+            // A substituted glyph is placed by its run's line height, which only
+            // moves it while the paragraph is top-aligned; centering it in the
+            // cell cancels the term out.
+            let line_height =
+                fallback.map_or(cell_height, |fallback| font_size * fallback.line_height_em);
+            let geometry = terminal_run_geometry(&run);
+            let underline_decoration = terminal_underline_decoration(run.style);
+            let run_span: iced::widget::text::Span<'static, (), Font> = span(run.text)
+                .color(foreground_color)
+                .size(font_size * size_scale)
+                .font(font_with_style(base_font, run_weight, run_style))
+                .underline(underline_decoration == TerminalUnderlineDecoration::Solid)
+                .strikethrough(run.style.strikethrough);
+            let mut content = rich_text(vec![run_span])
+                .size(font_size)
+                .line_height(Pixels(line_height))
+                .font(terminal_font)
+                .wrapping(iced::widget::text::Wrapping::None);
+            if fallback.is_some_and(|fallback| fallback.color) {
+                // A colour glyph is drawn wider than its cell, and a container
+                // cannot offset content it does not fit. Centring at shaping
+                // time is what produces the negative offset it needs.
+                content = content
+                    .width(Length::Fixed(cell_width * run.columns as f32))
+                    .align_x(iced::alignment::Horizontal::Center);
+            }
+            let vertical = if fallback.is_some() {
+                iced::alignment::Vertical::Top
+            } else {
+                iced::alignment::Vertical::Center
+            };
+            let horizontal = if fallback.is_some() {
+                iced::alignment::Horizontal::Center
+            } else {
+                iced::alignment::Horizontal::Left
+            };
+            let content: Element<'static, Message> = match geometry {
+                Some(TerminalRunGeometry::FullBlock) => {
+                    // U+2588 means the whole terminal cell, while many fonts
+                    // leave a fractional side bearing around its outline.
+                    // Drawing that semantic cell area directly keeps progress
+                    // bars solid across fractional GPU clip boundaries.
+                    container("")
+                        .width(Length::Fixed(run_width))
+                        .height(Length::Fixed(cell_height))
+                        .style(move |_| container::Style::default().background(foreground_color))
+                        .into()
+                }
+                None if underline_decoration == TerminalUnderlineDecoration::Dotted => {
+                    const LINK_DOT_SIZE: f32 = 5.0;
+                    let dot_advance = (cell_ratio * LINK_DOT_SIZE).max(1.0);
+                    let dot_count = (run_width / dot_advance).ceil() as usize;
+                    let dots = container(
+                        text(".".repeat(dot_count))
+                            .font(terminal_font)
+                            .size(LINK_DOT_SIZE)
+                            .line_height(Pixels(LINK_DOT_SIZE))
+                            .color(Color::from_rgba8(
+                                foreground.red,
+                                foreground.green,
+                                foreground.blue,
+                                alpha,
+                            ))
+                            .wrapping(iced::widget::text::Wrapping::None),
+                    )
+                    .width(Length::Fixed(run_width))
+                    .height(Length::Fixed(cell_height))
+                    .align_x(iced::alignment::Horizontal::Left)
+                    .align_y(iced::alignment::Vertical::Bottom)
+                    .clip(true);
+                    stack([content.into(), dots.into()]).into()
+                }
+                _ => content.into(),
+            };
+            line = line.push(
+                container(content)
+                    .width(Length::Fixed(run_width))
+                    .height(Length::Fixed(cell_height))
+                    .align_x(horizontal)
+                    .align_y(vertical)
+                    // A colour glyph is sized to match the text beside it, which
+                    // needs marginally more than one cell on a square canvas.
+                    .clip(!fallback.is_some_and(|fallback| fallback.color))
+                    .style(move |_| {
+                        background.map_or_else(container::Style::default, |background| {
+                            container::Style::default().background(rgb(background))
+                        })
+                    }),
+            );
+        }
+        grid = grid.push(line);
+    }
+    grid.into()
+}
+
+/// Shrinks bold text when the bold face is wider than one grid cell.
+///
+/// The grid is one uniform advance wide, taken from the regular face. Most
+/// monospace families keep bold at the same advance, so this is usually `1.0`.
+fn bold_size_scale(settings: &AppSettings, cell_ratio: f32) -> f32 {
+    let bold_ratio = metrics::advance_ratio(
+        settings.terminal_font.family_name(),
+        settings::weight_numeric(settings.terminal_font_weight.bold_variant()),
+    );
+    match bold_ratio {
+        Some(bold) if bold > cell_ratio && cell_ratio > 0.0 => cell_ratio / bold,
+        _ => 1.0,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalRunStyle {
+    foreground: muxtrix_terminal::Rgb,
+    background: Option<muxtrix_terminal::Rgb>,
+    bold: bool,
+    italic: bool,
+    faint: bool,
+    underline: bool,
+    strikethrough: bool,
+    selected: bool,
+    link: bool,
+    link_hovered: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalUnderlineDecoration {
+    None,
+    Dotted,
+    Solid,
+}
+
+/// Recognized links own their underline affordance. Terminal applications such
+/// as Claude and Codex may already underline a printed URL, but that styling
+/// must not make the link look clickable until Ctrl+Shift is held over it.
+fn terminal_underline_decoration(style: TerminalRunStyle) -> TerminalUnderlineDecoration {
+    if style.link {
+        if style.link_hovered {
+            TerminalUnderlineDecoration::Solid
+        } else {
+            TerminalUnderlineDecoration::Dotted
+        }
+    } else if style.underline {
+        TerminalUnderlineDecoration::Solid
+    } else {
+        TerminalUnderlineDecoration::None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalStyleRun {
+    text: String,
+    style: TerminalRunStyle,
+    columns: usize,
+    kind: TerminalRunKind,
+}
+
+/// How a cell may be grouped before Iced lays it out and clips it.
+///
+/// Variable-width Unicode remains isolated so it cannot move later grid cells.
+/// Box-drawing and block-element glyphs are the exception: those characters
+/// are explicitly designed to join across fixed terminal cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalRunKind {
+    Ascii,
+    /// Adjacent box-drawing characters share one geometry canvas even when
+    /// their code points differ. Their arms terminate at the same cell edges.
+    BoxDrawing,
+    JoinedCellGlyph(char),
+    IsolatedUnicode,
+}
+
+impl TerminalRunKind {
+    const fn needs_fallback(self) -> bool {
+        matches!(self, Self::JoinedCellGlyph(_) | Self::IsolatedUnicode)
+    }
+
+    fn can_join(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Ascii, Self::Ascii)
+                | (Self::BoxDrawing, Self::BoxDrawing)
+                | (Self::JoinedCellGlyph(_), Self::JoinedCellGlyph(_))
+        ) && self == next
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TerminalRunGeometry {
+    FullBlock,
+}
+
+/// Block elements with whole-cell semantics use geometry instead of outlines.
+/// Box-drawing runs take the dedicated sprite path before font shaping.
+fn terminal_run_geometry(run: &TerminalStyleRun) -> Option<TerminalRunGeometry> {
+    match run.kind {
+        TerminalRunKind::JoinedCellGlyph('█') => Some(TerminalRunGeometry::FullBlock),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn terminal_style_runs(
+    snapshot: &GridSnapshot,
+    focused: bool,
+    cursor_phase_visible: bool,
+    theme: TerminalThemePreset,
+) -> Vec<TerminalStyleRun> {
+    terminal_row_style_runs(snapshot, focused, cursor_phase_visible, None, theme)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn terminal_row_style_runs(
+    snapshot: &GridSnapshot,
+    focused: bool,
+    cursor_phase_visible: bool,
+    hovered_link: Option<&TerminalLink>,
+    theme: TerminalThemePreset,
+) -> Vec<Vec<TerminalStyleRun>> {
+    let mut rows = Vec::with_capacity(snapshot.cells.len());
+    for (row_index, cells) in snapshot.cells.iter().enumerate() {
+        let ascii_row = cells
+            .iter()
+            .map(|cell| {
+                let bytes = cell.text.as_bytes();
+                if cell.columns == 1 && bytes.len() == 1 && bytes[0].is_ascii() {
+                    bytes[0]
+                } else {
+                    b' '
+                }
+            })
+            .collect::<Vec<_>>();
+        let detected_links = detected_web_link_ranges(&ascii_row);
+        let mut runs = Vec::new();
+        // The emulator resolved this row's selected columns for this frame,
+        // having already moved the selection with whatever it scrolled.
+        let selected_columns = snapshot.selection.get(row_index).copied().flatten();
+        for (column_index, cell) in cells.iter().enumerate() {
+            let selected = selected_columns.is_some_and(|range| range.contains(column_index));
+            let cursor_here = focused
+                && snapshot.cursor.is_some_and(|cursor| {
+                    cursor.visible
+                        && (!cursor.blinking || cursor_phase_visible)
+                        && usize::from(cursor.row) == row_index
+                        && usize::from(cursor.column) == column_index
+                });
+            let link_hovered = hovered_link.is_some_and(|link| {
+                link.row == snapshot.scrollbar.offset.saturating_add(row_index as u64)
+                    && column_index >= link.start_column
+                    && column_index < link.end_column
+            });
+            let link = cell.hyperlink.as_deref().is_some_and(is_valid_web_url)
+                || detected_links
+                    .iter()
+                    .any(|(start, end)| column_index >= *start && column_index < *end);
+            let (foreground, background) = if cursor_here {
+                (
+                    theme.cursor_text,
+                    snapshot.cursor_color.unwrap_or(theme.cursor),
+                )
+            } else {
+                (cell.foreground, cell.background)
+            };
+            push_terminal_run(
+                &mut runs,
+                &cell.text,
+                usize::from(cell.columns),
+                TerminalRunStyle {
+                    foreground,
+                    background: (cursor_here || cell.background != snapshot.default_background)
+                        .then_some(background),
+                    bold: cell.bold,
+                    italic: cell.italic,
+                    faint: cell.faint,
+                    underline: cell.underline,
+                    strikethrough: cell.strikethrough,
+                    selected,
+                    link,
+                    link_hovered,
+                },
+            );
+        }
+        rows.push(runs);
+    }
+    rows
+}
+
+fn push_terminal_run(
+    runs: &mut Vec<TerminalStyleRun>,
+    text: &str,
+    columns: usize,
+    style: TerminalRunStyle,
+) {
+    let kind = terminal_run_kind(text, columns);
+    if let Some(run) = runs
+        .last_mut()
+        .filter(|run| run.style == style && run.kind.can_join(kind))
+    {
+        run.text.push_str(text);
+        run.columns += columns;
+    } else {
+        runs.push(TerminalStyleRun {
+            text: text.to_owned(),
+            style,
+            columns,
+            kind,
+        });
+    }
+}
+
+fn terminal_run_kind(text: &str, columns: usize) -> TerminalRunKind {
+    if text.is_ascii() {
+        return TerminalRunKind::Ascii;
+    }
+    if columns == 1
+        && let mut characters = text.chars()
+    {
+        match (characters.next(), characters.next()) {
+            (Some('\u{2500}'..='\u{257f}'), None) => return TerminalRunKind::BoxDrawing,
+            (Some(character @ '\u{2580}'..='\u{259f}'), None) => {
+                return TerminalRunKind::JoinedCellGlyph(character);
+            }
+            _ => {}
+        }
+    }
+    TerminalRunKind::IsolatedUnicode
+}
+
+fn rgb(color: muxtrix_terminal::Rgb) -> Color {
+    Color::from_rgb8(color.red, color.green, color.blue)
+}
+
+fn pty_size_for_pane(size: Size, settings: &AppSettings) -> PtySize {
+    let cell_width = settings.terminal_cell_width();
+    let cell_height = settings.terminal_cell_height();
+    let width = (size.width - TERMINAL_PADDING).max(cell_width * 2.0);
+    let height = (size.height - TERMINAL_PADDING).max(cell_height * 2.0);
+    PtySize {
+        rows: (height / cell_height)
+            .floor()
+            .clamp(2.0, f32::from(u16::MAX)) as u16,
+        cols: (width / cell_width).floor().clamp(2.0, f32::from(u16::MAX)) as u16,
+        pixel_width: width.round().clamp(0.0, f32::from(u16::MAX)) as u16,
+        pixel_height: height.round().clamp(0.0, f32::from(u16::MAX)) as u16,
+    }
+}
+
+fn wsl_wayland_resize_increments(
+    is_wsl: bool,
+    wayland_is_available: bool,
+    x11_is_forced: bool,
+    settings: &AppSettings,
+) -> Option<Size> {
+    if !is_wsl || !wayland_is_available || x11_is_forced {
+        return None;
+    }
+
+    Some(Size::new(
+        settings.terminal_cell_width().round().clamp(4.0, 32.0),
+        settings.terminal_cell_height().round().clamp(4.0, 32.0),
+    ))
+}
+
+fn initial_pty_size() -> PtySize {
+    PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 800,
+        pixel_height: 480,
+    }
+}
+
+fn encode_terminal_key(
+    key: Key<&str>,
+    modifiers: Modifiers,
+    text: Option<&str>,
+) -> Option<Vec<u8>> {
+    if modifiers.logo() {
+        return None;
+    }
+
+    // Ctrl+Alt commonly represents AltGr. Prefer the composed text when the
+    // platform supplies it instead of turning it into a control sequence.
+    if modifiers.control()
+        && modifiers.alt()
+        && let Some(text) = text.filter(|text| !text.is_empty())
+    {
+        return Some(text.as_bytes().to_vec());
+    }
+
+    let mut bytes = match key {
+        Key::Character(character) if modifiers.control() => {
+            vec![control_byte(character)?]
+        }
+        Key::Character(character) => text
+            .filter(|text| !text.is_empty())
+            .unwrap_or(character)
+            .as_bytes()
+            .to_vec(),
+        // Agent prompts treat a line feed as "insert newline" (Ctrl+J), so
+        // Ctrl+Enter extends the prompt instead of submitting it.
+        Key::Named(Named::Enter) if modifiers.control() => vec![b'\n'],
+        Key::Named(Named::Enter) => vec![b'\r'],
+        Key::Named(Named::Space) if modifiers.control() => vec![0x00],
+        Key::Named(Named::Space) => text
+            .filter(|text| !text.is_empty())
+            .unwrap_or(" ")
+            .as_bytes()
+            .to_vec(),
+        Key::Named(Named::Tab) if modifiers.shift() => b"\x1b[Z".to_vec(),
+        Key::Named(Named::Tab) => vec![b'\t'],
+        Key::Named(Named::Backspace) if modifiers.control() => vec![0x08],
+        Key::Named(Named::Backspace) => vec![0x7f],
+        Key::Named(Named::Escape) => vec![0x1b],
+        Key::Named(Named::ArrowUp) => modified_csi('A', modifiers),
+        Key::Named(Named::ArrowDown) => modified_csi('B', modifiers),
+        Key::Named(Named::ArrowRight) => modified_csi('C', modifiers),
+        Key::Named(Named::ArrowLeft) => modified_csi('D', modifiers),
+        Key::Named(Named::Home) => modified_csi('H', modifiers),
+        Key::Named(Named::End) => modified_csi('F', modifiers),
+        Key::Named(Named::Insert) => b"\x1b[2~".to_vec(),
+        Key::Named(Named::Delete) => b"\x1b[3~".to_vec(),
+        Key::Named(Named::PageUp) => b"\x1b[5~".to_vec(),
+        Key::Named(Named::PageDown) => b"\x1b[6~".to_vec(),
+        Key::Named(Named::F1) => b"\x1bOP".to_vec(),
+        Key::Named(Named::F2) => b"\x1bOQ".to_vec(),
+        Key::Named(Named::F3) => b"\x1bOR".to_vec(),
+        Key::Named(Named::F4) => b"\x1bOS".to_vec(),
+        Key::Named(Named::F5) => b"\x1b[15~".to_vec(),
+        Key::Named(Named::F6) => b"\x1b[17~".to_vec(),
+        Key::Named(Named::F7) => b"\x1b[18~".to_vec(),
+        Key::Named(Named::F8) => b"\x1b[19~".to_vec(),
+        Key::Named(Named::F9) => b"\x1b[20~".to_vec(),
+        Key::Named(Named::F10) => b"\x1b[21~".to_vec(),
+        Key::Named(Named::F11) => b"\x1b[23~".to_vec(),
+        Key::Named(Named::F12) => b"\x1b[24~".to_vec(),
+        _ => return None,
+    };
+
+    if modifiers.alt() {
+        bytes.insert(0, 0x1b);
+    }
+    Some(bytes)
+}
+
+fn control_byte(character: &str) -> Option<u8> {
+    let character = character.chars().next()?;
+    match character.to_ascii_lowercase() {
+        '@' | ' ' => Some(0x00),
+        'a'..='z' => Some((character.to_ascii_lowercase() as u8) - b'a' + 1),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        '?' => Some(0x7f),
+        _ => None,
+    }
+}
+
+fn modified_csi(final_byte: char, modifiers: Modifiers) -> Vec<u8> {
+    let modifier = 1
+        + u8::from(modifiers.shift())
+        + 2 * u8::from(modifiers.alt())
+        + 4 * u8::from(modifiers.control());
+    if modifier == 1 {
+        format!("\x1b[{final_byte}").into_bytes()
+    } else {
+        format!("\x1b[1;{modifier}{final_byte}").into_bytes()
+    }
+}
+
+fn agent_state_label(state: AgentState) -> &'static str {
+    match state {
+        // A finished turn and a never-started one are the same thing to the
+        // person reading the row — an agent sitting at its composer waiting for
+        // them. The two stay distinct internally, where the difference decides
+        // attention, signal colour, and which evidence may transition the pane.
+        AgentState::Idle | AgentState::Completed => "Idle",
+        AgentState::Running => "Running",
+        AgentState::Waiting => "Needs input",
+        AgentState::Failed => "Failed",
+        AgentState::Stopped => "Stopped",
+    }
+}
+
+fn screen_state(state: agent_screen::ScreenState) -> AgentState {
+    match state {
+        agent_screen::ScreenState::Waiting => AgentState::Waiting,
+        agent_screen::ScreenState::Running => AgentState::Running,
+        agent_screen::ScreenState::Idle => AgentState::Idle,
+    }
+}
+
+/// What a screen-classified pane is doing. Only the live states have an answer
+/// here: completion, failure, and stopping are lifecycle-owned and arrive with
+/// the hook's own body.
+fn agent_state_activity(state: agent_screen::ScreenState) -> &'static str {
+    match state {
+        agent_screen::ScreenState::Waiting => "Visible approval or answer required",
+        agent_screen::ScreenState::Running => "Agent is working",
+        agent_screen::ScreenState::Idle => "Ready for input",
+    }
+}
+
+fn pane_agent(agent: &str) -> Option<PaneAgent> {
+    match agent.to_ascii_lowercase().as_str() {
+        "codex" => Some(PaneAgent::Codex),
+        "claude" | "claude-code" => Some(PaneAgent::ClaudeCode),
+        _ => None,
+    }
+}
+
+fn pane_agent_name(agent: PaneAgent) -> &'static str {
+    match agent {
+        PaneAgent::Codex => "codex",
+        PaneAgent::ClaudeCode => "claude",
+    }
+}
+
+fn session_with_agent_identities(
+    session: &SessionState,
+    statuses: &BTreeMap<PaneId, AgentPaneStatus>,
+) -> SessionState {
+    let mut persisted = session.clone();
+    for workspace in &mut persisted.workspaces {
+        for tab in &mut workspace.tabs {
+            for pane in tab.panes.values_mut() {
+                pane.agent = statuses
+                    .get(&pane.id)
+                    .and_then(|status| pane_agent(&status.agent));
+            }
+        }
+    }
+    persisted
+}
+
+fn agent_statuses_from_session(session: &SessionState) -> BTreeMap<PaneId, AgentPaneStatus> {
+    session
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .flat_map(|tab| tab.panes.values())
+        .filter_map(|pane| {
+            let agent = pane_agent_name(pane.agent?).to_owned();
+            let display_name = pane
+                .active_surface()
+                .and_then(|surface| harness_terminal_title(&surface.title, &agent));
+            Some((
+                pane.id,
+                AgentPaneStatus {
+                    agent,
+                    display_name,
+                    state: AgentState::Idle,
+                    activity: Some(agent_state_activity(agent_screen::ScreenState::Idle).into()),
+                    session_id: None,
+                    cwd: None,
+                    git_branch: None,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn agent_display_name(agent: &str) -> &str {
+    match agent {
+        "codex" => "Codex",
+        "claude" | "claude-code" => "Claude Code",
+        _ => agent,
+    }
+}
+
+/// Harnesses publish their own session/thread names through OSC terminal-title
+/// metadata. Exact brand-only titles add no identity, so retain the worktree
+/// fallback until the harness emits something more useful.
+fn harness_terminal_title(title: &str, agent: &str) -> Option<String> {
+    // Titles that name the harness's current view rather than its work. The
+    // roster and the `current session` label it leaves behind on the way out
+    // would otherwise rename a fleet row on every toggle and strand it there.
+    if agent_screen::is_view_chrome_title(agent, title) {
+        return None;
+    }
+    let title = agent_screen::stable_title(agent, title);
+    if title.is_empty()
+        || title.eq_ignore_ascii_case(agent)
+        || title.eq_ignore_ascii_case(agent_display_name(agent))
+        || (agent == "codex" && title.eq_ignore_ascii_case("Codex CLI"))
+        || ((agent == "claude" || agent == "claude-code") && title.eq_ignore_ascii_case("Claude"))
+    {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn agent_command(command: &str, settings: &AppSettings) -> Option<Agent> {
+    let executable = command_executable(command)?;
+    let codex = command_executable(&settings.codex_command).unwrap_or("codex");
+    let claude = command_executable(&settings.claude_command).unwrap_or("claude");
+    if executable.eq_ignore_ascii_case(codex) || executable.eq_ignore_ascii_case("codex") {
+        Some(Agent::Codex)
+    } else if executable.eq_ignore_ascii_case(claude) || executable.eq_ignore_ascii_case("claude") {
+        Some(Agent::Claude)
+    } else {
+        None
+    }
+}
+
+fn command_executable(command: &str) -> Option<&str> {
+    let mut words = command.split_whitespace();
+    let mut executable = words.next()?;
+    if executable.eq_ignore_ascii_case("env") || executable.eq_ignore_ascii_case("sudo") {
+        executable = words.find(|word| !word.contains('='))?;
+    } else if executable.contains('=') {
+        executable = words.find(|word| !word.contains('='))?;
+    }
+    executable = executable.trim_matches(['\'', '"']);
+    let executable = executable.rsplit(['/', '\\']).next()?;
+    Some(executable.strip_suffix(".exe").unwrap_or(executable))
+}
+
+#[cfg(not(test))]
+fn start_control_server(notifier: EventNotifier) -> (Option<ControlServer>, Option<String>) {
+    match ControlServer::discover_and_bind_with_notifier(notifier) {
+        Ok(server) => (Some(server), None),
+        Err(error) => (
+            None,
+            Some(format!("Local control service unavailable: {error}")),
+        ),
+    }
+}
+
+#[cfg(test)]
+fn start_control_server(_notifier: EventNotifier) -> (Option<ControlServer>, Option<String>) {
+    (None, None)
+}
+
+fn muxtrixctl_path() -> Result<std::path::PathBuf, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let file_name = if cfg!(windows) {
+        "muxtrixctl.exe"
+    } else {
+        "muxtrixctl"
+    };
+    Ok(executable.with_file_name(file_name))
+}
+
+fn perform_blocking<T>(
+    work: impl FnOnce() -> T + Send + 'static,
+    map: impl FnOnce(Result<T, String>) -> Message + Send + 'static,
+) -> Task<Message>
+where
+    T: Send + 'static,
+{
+    let (sender, receiver) = async_channel::bounded(1);
+    let spawn = std::thread::Builder::new()
+        .name("muxtrix-integration-discovery".into())
+        .spawn(move || {
+            let _ = sender.send_blocking(work());
+        });
+    if let Err(error) = spawn {
+        return Task::done(map(Err(format!(
+            "could not start background discovery: {error}"
+        ))));
+    }
+    Task::perform(
+        async move {
+            receiver
+                .recv()
+                .await
+                .map_err(|_| "background discovery stopped before returning a result".into())
+        },
+        map,
+    )
+}
+
+fn hook_manager(settings: &AppSettings) -> Result<HookManager, String> {
+    #[cfg(target_os = "windows")]
+    if settings.windows_shell_backend == WindowsShellBackend::Wsl {
+        return wsl_hook_manager(settings);
+    }
+    let _ = settings;
+    HookManager::discover(muxtrixctl_path()?).map_err(|error| error.to_string())
+}
+
+fn hook_discovery_may_migrate_paths(
+    no_session_daemon: bool,
+    e2e_instance: bool,
+    custom_control_endpoint: bool,
+) -> bool {
+    !no_session_daemon && !e2e_instance && !custom_control_endpoint
+}
+
+#[cfg(not(test))]
+fn load_hook_statuses(settings: &AppSettings) -> Result<Vec<HookStatus>, String> {
+    let manager = hook_manager(settings)?;
+    // An isolated/headless instance must never claim the user's real hooks for
+    // its temporary executable. Explicit Add/Repair actions still write; only
+    // background discovery becomes read-only in these environments.
+    let migrate_paths = hook_discovery_may_migrate_paths(
+        std::env::var_os("MUXTRIX_NO_SESSIOND").is_some(),
+        std::env::var_os("MUXTRIX_E2E_REPORT").is_some(),
+        std::env::var_os("MUXTRIX_CONTROL_ENDPOINT").is_some(),
+    );
+    Agent::ALL
+        .into_iter()
+        .map(|agent| {
+            let status = if migrate_paths {
+                // A normal installed instance may transparently re-point hooks
+                // after its executable moves. Semantic changes still require
+                // the explicit Repair action.
+                manager.synced_status(agent, HookScope::User)
+            } else {
+                manager.status(agent, HookScope::User)
+            };
+            status.map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn load_hook_statuses(_settings: &AppSettings) -> Result<Vec<HookStatus>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(target_os = "windows")]
+fn wsl_hook_manager(settings: &AppSettings) -> Result<HookManager, String> {
+    let cache_key = settings.wsl_distribution.trim().to_ascii_lowercase();
+    static CONTEXTS: OnceLock<Mutex<HashMap<String, WslHookContext>>> = OnceLock::new();
+    let contexts = CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(context) = contexts
+        .lock()
+        .map_err(|_| "WSL hook context cache is unavailable".to_owned())?
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(context.manager());
+    }
+
+    let windows_executable = muxtrixctl_path()?;
+    let mut identity = console_command("wsl.exe");
+    if !settings.wsl_distribution.trim().is_empty() {
+        identity.args(["--distribution", settings.wsl_distribution.trim()]);
+    }
+    let identity = identity
+        .args([
+            "--exec",
+            "sh",
+            "-lc",
+            "printf '%s\\n%s\\n' \"$WSL_DISTRO_NAME\" \"$HOME\"; wslpath -u \"$1\"",
+            "muxtrix-hook-context",
+        ])
+        .arg(&windows_executable)
+        .output()
+        .map_err(|error| {
+            format!("could not query the selected WSL integration context: {error}")
+        })?;
+    if !identity.status.success() {
+        return Err(format!(
+            "could not query the selected WSL integration context: {}",
+            String::from_utf8_lossy(&identity.stderr).trim()
+        ));
+    }
+    let identity = String::from_utf8(identity.stdout)
+        .map_err(|_| "the selected WSL distribution returned invalid UTF-8".to_owned())?;
+    let mut lines = identity.lines();
+    let distribution = lines
+        .next()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "the selected WSL distribution did not report its name".to_owned())?;
+    let linux_home = lines
+        .next()
+        .filter(|value| value.starts_with('/'))
+        .ok_or_else(|| "the selected WSL distribution did not report its home".to_owned())?;
+    let linux_executable = lines
+        .next()
+        .ok_or_else(|| "the selected WSL distribution did not translate muxtrixctl.exe".to_owned())?
+        .trim()
+        .to_owned();
+    if !linux_executable.starts_with('/') {
+        return Err("the selected WSL distribution returned an invalid muxtrixctl path".into());
+    }
+
+    let unc_home = PathBuf::from(format!(
+        r"\\wsl.localhost\{}\{}",
+        distribution,
+        linux_home.trim_start_matches('/').replace('/', "\\")
+    ));
+    let state_root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .ok_or_else(|| "Windows application data directory is unavailable".to_owned())?;
+    let state_name: String = distribution
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let context = WslHookContext {
+        home: unc_home,
+        state_dir: state_root
+            .join("Muxtrix")
+            .join("hooks")
+            .join(format!("wsl-{state_name}")),
+        executable: PathBuf::from(linux_executable),
+    };
+    contexts
+        .lock()
+        .map_err(|_| "WSL hook context cache is unavailable".to_owned())?
+        .insert(cache_key, context.clone());
+    Ok(context.manager())
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone)]
+struct WslHookContext {
+    home: PathBuf,
+    state_dir: PathBuf,
+    executable: PathBuf,
+}
+
+#[cfg(target_os = "windows")]
+impl WslHookContext {
+    fn manager(&self) -> HookManager {
+        // The executable is the distribution's own translation of
+        // muxtrixctl.exe, so it only resolves inside WSL — this Windows
+        // process cannot stat it, and `wslpath` has already vouched for it.
+        HookManager::with_paths(&self.home, &self.home, &self.state_dir, &self.executable)
+            .with_named_executable()
+    }
+}
+
+fn default_profile(settings: &AppSettings) -> LaunchProfile {
+    default_profile_with_id(settings, ProfileId::new())
+}
+
+fn default_profile_with_id(settings: &AppSettings, id: ProfileId) -> LaunchProfile {
+    #[cfg(target_os = "windows")]
+    {
+        windows_profile(settings, id)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = settings;
+        let (name, program, arguments) = (
+            "Local shell",
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            vec!["-l".to_owned()],
+        );
+
+        LaunchProfile {
+            id,
+            name: name.into(),
+            backend: ProcessBackend::Local,
+            program,
+            arguments,
+            working_directory: None,
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_profile(settings: &AppSettings, id: ProfileId) -> LaunchProfile {
+    match settings.windows_shell_backend {
+        WindowsShellBackend::Native => LaunchProfile {
+            id,
+            name: "PowerShell".into(),
+            backend: ProcessBackend::Local,
+            program: "powershell.exe".into(),
+            arguments: vec!["-NoLogo".into()],
+            working_directory: None,
+        },
+        WindowsShellBackend::Wsl => LaunchProfile {
+            id,
+            name: "WSL shell".into(),
+            backend: ProcessBackend::Wsl {
+                distribution: (!settings.wsl_distribution.trim().is_empty())
+                    .then(|| settings.wsl_distribution.trim().to_owned()),
+            },
+            program: String::new(),
+            arguments: Vec::new(),
+            working_directory: Some("~".into()),
+        },
+    }
+}
+
+fn terminal_surface(profile_id: ProfileId, title: &str) -> Surface {
+    Surface::terminal(
+        title,
+        TerminalSurface {
+            profile_id,
+            working_directory: None,
+        },
+    )
+}
+
+fn ghostty_preview() -> Result<String, String> {
+    let actor = TerminalActor::spawn(TerminalOptions {
+        cols: 80,
+        rows: 24,
+        max_scrollback: 10_000,
+    })
+    .map_err(|error| error.to_string())?;
+    actor
+        .feed(
+            b"\x1b[1;36mMuxtrix\x1b[0m terminal surface\r\n\r\nGhostty VT is parsing this grid.\r\nIced/wgpu will render terminal snapshots on the GPU.\r\n\r\n$ ".to_vec(),
+        )
+        .map_err(|error| error.to_string())?;
+    let snapshot = actor.snapshot().map_err(|error| error.to_string())?;
+    actor.shutdown().map_err(|error| error.to_string())?;
+    Ok(snapshot.text())
+}
+
+/// The GUI's connection to the session daemon that owns its PTYs. Absent
+/// in tests and when the daemon fails to start, in which case panes fall
+/// back to in-process PTYs (no persistence). Mutable so resuming another
+/// session can swap the connection.
+struct SessionHost {
+    id: uuid::Uuid,
+    client: Arc<muxtrix_sessions::SessionClient>,
+}
+
+static SESSION_HOST: std::sync::Mutex<Option<SessionHost>> = std::sync::Mutex::new(None);
+
+fn session_host() -> Option<(uuid::Uuid, Arc<muxtrix_sessions::SessionClient>)> {
+    SESSION_HOST
+        .lock()
+        .ok()?
+        .as_ref()
+        .map(|host| (host.id, Arc::clone(&host.client)))
+}
+
+/// Spawns and connects this instance's own session daemon. Every GUI
+/// instance gets a fresh session; resume replaces panes at the user's ask.
+fn start_session_host() -> Option<SessionHost> {
+    if std::env::var_os("MUXTRIX_NO_SESSIOND").is_some()
+        || std::env::var_os("MUXTRIX_E2E_REPORT").is_some()
+    {
+        return None;
+    }
+    let id = uuid::Uuid::new_v4();
+    let endpoint = muxtrix_sessions::session_endpoint(id);
+    muxtrix_sessions::daemon::spawn_detached(id, "Workspace", &endpoint).ok()?;
+    if !muxtrix_sessions::daemon::wait_until_ready(&endpoint) {
+        return None;
+    }
+    let (client, _, _) = muxtrix_sessions::SessionClient::connect_endpoint(&endpoint).ok()?;
+    Some(SessionHost {
+        id,
+        client: Arc::new(client),
+    })
+}
+
+/// Blocking reader over a pane's daemon-fed byte channel; channel close is
+/// EOF, exactly like a PTY reader hitting the end of stream.
+struct ReceiverReader(std::sync::mpsc::Receiver<Vec<u8>>, Vec<u8>);
+
+impl std::io::Read for ReceiverReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.1.is_empty() {
+            match self.0.recv() {
+                Ok(bytes) => self.1 = bytes,
+                Err(_) => return Ok(0),
+            }
+        }
+        let count = self.1.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&self.1[..count]);
+        self.1.drain(..count);
+        Ok(count)
+    }
+}
+
+struct RemotePaneBackend {
+    pane: uuid::Uuid,
+    client: Arc<muxtrix_sessions::SessionClient>,
+    output: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+}
+
+impl muxtrix_terminal::SessionBackend for RemotePaneBackend {
+    fn take_reader(&mut self) -> Result<Box<dyn std::io::Read + Send>, String> {
+        self.output
+            .take()
+            .map(|receiver| {
+                Box::new(ReceiverReader(receiver, Vec::new())) as Box<dyn std::io::Read + Send>
+            })
+            .ok_or_else(|| "pane reader already taken".to_owned())
+    }
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.client
+            .send(&muxtrix_sessions::Request::Input {
+                pane: self.pane,
+                data: muxtrix_sessions::encode_bytes(bytes),
+            })
+            .map_err(|error| error.to_string())
+    }
+    fn resize(&self, size: PtySize) -> Result<(), String> {
+        self.client
+            .send(&muxtrix_sessions::Request::Resize {
+                pane: self.pane,
+                rows: size.rows,
+                cols: size.cols,
+            })
+            .map_err(|error| error.to_string())
+    }
+    fn kill(&mut self) -> Result<(), String> {
+        let result = self
+            .client
+            .send(&muxtrix_sessions::Request::Kill { pane: self.pane })
+            .map_err(|error| error.to_string());
+        // A killed pane reports no exit, so nothing else will ever close its
+        // byte channel — and its reader thread blocks until something does.
+        self.client.unregister_pane(self.pane);
+        result
+    }
+    fn process_id(&self) -> Option<u32> {
+        self.client.pane_process_id(self.pane)
+    }
+    fn poll_exit(&mut self) -> Result<Option<bool>, String> {
+        Ok(self.client.pane_exit(self.pane))
+    }
+    fn exit_clean(&mut self) -> bool {
+        self.client.pane_exit(self.pane).unwrap_or(false)
+    }
+    fn kill_on_detach(&self) -> bool {
+        false
+    }
+    fn discard_pty_responses(&self) -> bool {
+        self.client.pane_replaying(self.pane)
+    }
+}
+
+fn start_live_session(
+    profile: &LaunchProfile,
+    pane_id: PaneId,
+    theme: TerminalTheme,
+    notifier: EventNotifier,
+    control_endpoint: Option<&str>,
+) -> Result<LiveSession, String> {
+    start_live_session_with_client(
+        profile,
+        pane_id,
+        theme,
+        notifier,
+        control_endpoint,
+        session_host().map(|(_, client)| client),
+    )
+}
+
+fn start_live_session_with_client(
+    profile: &LaunchProfile,
+    pane_id: PaneId,
+    theme: TerminalTheme,
+    notifier: EventNotifier,
+    control_endpoint: Option<&str>,
+    session_client: Option<Arc<muxtrix_sessions::SessionClient>>,
+) -> Result<LiveSession, String> {
+    let mut plan = LaunchPlan::from_profile(profile).map_err(|error| error.to_string())?;
+    let wslenv = std::env::var("WSLENV").ok();
+    let inherited_endpoint = std::env::var("MUXTRIX_CONTROL_ENDPOINT").ok();
+    let endpoint = control_endpoint.or(inherited_endpoint.as_deref());
+    let integration_zdotdir = shell_integration_zdotdir(&profile.backend);
+    add_muxtrix_environment(
+        &mut plan,
+        &profile.backend,
+        pane_id,
+        wslenv.as_deref(),
+        endpoint,
+        integration_zdotdir.as_deref(),
+    );
+    let size = initial_pty_size();
+    let options = TerminalOptions {
+        cols: size.cols,
+        rows: size.rows,
+        max_scrollback: 10_000,
+    };
+    // Daemon-owned PTYs survive this GUI closing. Production never silently
+    // falls back to an in-process PTY: doing so can repeat the same blocked
+    // host operation on the UI's behalf and hides which backend failed.
+    if let Some(client) = session_client {
+        let pane = pane_id.as_uuid();
+        // Pane ids are durable, so this spawn may be reclaiming the id of a
+        // pane that is being replaced. Releasing it explicitly — rather than
+        // relying on the outgoing session's thread having done so — is what
+        // keeps the host from serving two incarnations of one id, where the
+        // outgoing one's reader and exit report land on this one and leave a
+        // live-looking terminal that never receives a byte.
+        let _ = client.send(&muxtrix_sessions::Request::Kill { pane });
+        let output = client.register_pane(pane);
+        let spawned = client.send(&muxtrix_sessions::Request::Spawn {
+            pane,
+            executable: plan.executable.clone(),
+            arguments: plan.arguments.clone(),
+            working_directory: plan.working_directory.clone(),
+            environment: plan.environment.clone(),
+            rows: size.rows,
+            cols: size.cols,
+        });
+        spawned.map_err(|error| format!("Terminal host rejected the launch: {error}"))?;
+        return LiveSession::spawn_remote(
+            Box::new(RemotePaneBackend {
+                pane,
+                client,
+                output: Some(output),
+            }),
+            size,
+            options,
+            theme,
+            Some(notifier),
+        )
+        .map_err(|error| error.to_string());
+    }
+    if local_pty_allowed() {
+        return LiveSession::spawn_with_notifier_and_theme(
+            plan,
+            size,
+            options,
+            theme,
+            Some(notifier),
+        )
+        .map_err(|error| error.to_string());
+    }
+    Err("Terminal session host is unavailable; local fallback was not attempted".into())
+}
+
+fn local_pty_allowed() -> bool {
+    should_allow_local_pty(
+        cfg!(test),
+        std::env::var_os("MUXTRIX_NO_SESSIOND").is_some(),
+        std::env::var_os("MUXTRIX_E2E_REPORT").is_some(),
+    )
+}
+
+const fn should_allow_local_pty(testing: bool, no_sessiond: bool, e2e: bool) -> bool {
+    testing || no_sessiond || e2e
+}
+
+fn dispose_live_session(session: LiveSession) {
+    let _ = std::thread::Builder::new()
+        .name("muxtrix-stale-terminal-disposal".into())
+        .spawn(move || drop(session));
+}
+
+/// Ends a session no pane can reach any more. Dropping alone would only
+/// detach it — daemon-owned panes are built to survive that — so this kills
+/// the process outright, off the UI thread because it waits on the daemon
+/// round trip and the session thread's join.
+fn terminate_live_session(session: LiveSession, pane_id: PaneId) {
+    let _ = std::thread::Builder::new()
+        .name("muxtrix-stale-terminal-disposal".into())
+        .spawn(move || {
+            session.terminate();
+            // Joining the session thread is what guarantees the kill reached
+            // the daemon before the pane is forgotten.
+            drop(session);
+            forget_host_pane(pane_id);
+        });
+}
+
+/// Drops the session host's half of a closed pane. `LiveSession::terminate`
+/// covers a pane whose session thread is still running, but a pane whose
+/// process already exited has no thread left to carry the message — without
+/// this its PTY, backlog and reader linger in the daemon, and the client
+/// keeps a byte channel open that nothing will ever close.
+fn forget_host_pane(pane_id: PaneId) {
+    let Some((_, client)) = session_host() else {
+        return;
+    };
+    let pane = pane_id.as_uuid();
+    let _ = client.send(&muxtrix_sessions::Request::Kill { pane });
+    client.unregister_pane(pane);
+}
+
+fn add_muxtrix_environment(
+    plan: &mut LaunchPlan,
+    backend: &ProcessBackend,
+    pane_id: PaneId,
+    inherited_wslenv: Option<&str>,
+    endpoint: Option<&str>,
+    shell_integration_zdotdir: Option<&str>,
+) {
+    plan.environment
+        .push(("MUXTRIX_PANE_ID".into(), pane_id.as_uuid().to_string()));
+    if let Some(endpoint) = endpoint {
+        plan.environment
+            .push(("MUXTRIX_CONTROL_ENDPOINT".into(), endpoint.into()));
+    }
+    // OSC 7 working-directory reporting for shells that do not emit it
+    // themselves: bash reads PROMPT_COMMAND straight from the environment,
+    // zsh picks up a precmd hook through the redirected ZDOTDIR (whose
+    // .zshenv restores the user's real dotfiles). Fish needs neither.
+    plan.environment.push((
+        "PROMPT_COMMAND".into(),
+        muxtrix_platform::shell_integration::BASH_PROMPT_COMMAND.into(),
+    ));
+    if let Some(zdotdir) = shell_integration_zdotdir {
+        if let Ok(original) = std::env::var("ZDOTDIR")
+            && !original.is_empty()
+        {
+            plan.environment
+                .push(("MUXTRIX_ORIG_ZDOTDIR".into(), original));
+        }
+        plan.environment.push(("ZDOTDIR".into(), zdotdir.into()));
+    }
+    if matches!(backend, ProcessBackend::Wsl { .. }) {
+        let mut shared: Vec<String> = inherited_wslenv
+            .map(|value| {
+                value
+                    .split(':')
+                    .filter(|entry| !entry.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut names = vec![
+            "MUXTRIX_PANE_ID",
+            "MUXTRIX_CONTROL_ENDPOINT",
+            "PROMPT_COMMAND",
+        ];
+        if shell_integration_zdotdir.is_some() {
+            names.push("ZDOTDIR");
+        }
+        for name in names {
+            if !shared
+                .iter()
+                .any(|entry| entry.split('/').next() == Some(name))
+            {
+                shared.push(name.into());
+            }
+        }
+        plan.environment.push(("WSLENV".into(), shared.join(":")));
+    }
+}
+
+/// Where the zsh integration bridge for `backend` lives, staging it on
+/// first use — one filesystem write (or wsl.exe round trip) per backend
+/// per app run, cached after that.
+fn shell_integration_zdotdir(backend: &ProcessBackend) -> Option<String> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    > = std::sync::OnceLock::new();
+    let key = match backend {
+        ProcessBackend::Local => "local".to_owned(),
+        ProcessBackend::Wsl { distribution } => {
+            format!("wsl:{}", distribution.as_deref().unwrap_or(""))
+        }
+    };
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(cached) = cache.lock().expect("shell integration cache").get(&key) {
+        return cached.clone();
+    }
+    let prepared = stage_shell_integration(backend);
+    cache
+        .lock()
+        .expect("shell integration cache")
+        .insert(key, prepared.clone());
+    prepared
+}
+
+const SHELL_INTEGRATION_ZSH_DIR: &str = ".local/share/muxtrix/shell-integration/zsh";
+
+fn stage_shell_integration(backend: &ProcessBackend) -> Option<String> {
+    match backend {
+        ProcessBackend::Local => {
+            #[cfg(target_os = "windows")]
+            {
+                // Native Windows shells are not zsh; nothing to stage.
+                None
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let config_home = std::env::var("XDG_CONFIG_HOME")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| Some(home_directory()?.join(".config")))?;
+                let fish_dir = config_home.join("fish/conf.d");
+                if std::fs::create_dir_all(&fish_dir).is_ok() {
+                    let _ = std::fs::write(
+                        fish_dir.join("muxtrix.fish"),
+                        muxtrix_platform::shell_integration::FISH_CONF_D,
+                    );
+                }
+                let dir = home_directory()?.join(SHELL_INTEGRATION_ZSH_DIR);
+                std::fs::create_dir_all(&dir).ok()?;
+                std::fs::write(
+                    dir.join(".zshenv"),
+                    muxtrix_platform::shell_integration::ZSH_ZSHENV,
+                )
+                .ok()?;
+                Some(dir.to_string_lossy().into_owned())
+            }
+        }
+        ProcessBackend::Wsl { distribution } => {
+            // The bridge files must live on the Linux side; content travels
+            // on stdin because command lines and newlines do not mix well
+            // across the boundary.
+            #[cfg(target_os = "windows")]
+            {
+                let distribution = distribution.as_deref().unwrap_or("");
+                // fish stays silent under plain TERMs unless taught; a
+                // failure here must not cost zsh its bridge.
+                let _ = wsl_stage_file(
+                    distribution,
+                    ".config/fish/conf.d",
+                    "muxtrix.fish",
+                    muxtrix_platform::shell_integration::FISH_CONF_D,
+                );
+                wsl_stage_file(
+                    distribution,
+                    SHELL_INTEGRATION_ZSH_DIR,
+                    ".zshenv",
+                    muxtrix_platform::shell_integration::ZSH_ZSHENV,
+                )
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = distribution;
+                None
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn discover_wsl_distributions() -> Vec<WslDistributionChoice> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+
+    let mut choices = vec![WslDistributionChoice::default_distribution()];
+    let Ok(root) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Lxss")
+    else {
+        return choices;
+    };
+    let names = root.enum_keys().filter_map(Result::ok).filter_map(|id| {
+        let distribution = root.open_subkey(id).ok()?;
+        let modern = distribution.get_value::<u32, _>("Modern").unwrap_or(0);
+        if modern == 1 {
+            return None;
+        }
+        distribution.get_value::<String, _>("DistributionName").ok()
+    });
+    for distribution in visible_wsl_distribution_names(names) {
+        choices.push(WslDistributionChoice(Some(distribution)));
+    }
+    choices
+}
+
+#[cfg(not(target_os = "windows"))]
+fn discover_wsl_distributions() -> Vec<WslDistributionChoice> {
+    vec![WslDistributionChoice::default_distribution()]
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn visible_wsl_distribution_names(candidates: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut names = Vec::new();
+    for name in candidates {
+        let name = name.trim();
+        let lower = name.to_ascii_lowercase();
+        if name.is_empty()
+            || lower.starts_with("docker-desktop")
+            || lower.starts_with("rancher-desktop")
+        {
+            continue;
+        }
+        if !names
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+        {
+            names.push(name.to_owned());
+        }
+    }
+    names.sort_by_key(|name| name.to_ascii_lowercase());
+    names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_change_detection_tracks_edits_and_reverts() {
+        let saved = AppSettings::default();
+        let mut draft = saved.clone();
+
+        assert!(!settings_have_changes(&saved, &draft));
+        draft.show_status_bar = !draft.show_status_bar;
+        assert!(settings_have_changes(&saved, &draft));
+        draft.show_status_bar = saved.show_status_bar;
+        assert!(!settings_have_changes(&saved, &draft));
+    }
+
+    #[test]
+    fn github_file_window_bounds_long_lists_with_overscan() {
+        assert_eq!(github_file_window(74, 0.0, 300.0), (0, 18));
+        let (first, last) = github_file_window(74, 1_680.0, 300.0);
+        assert_eq!((first, last), (35, 53));
+        assert!(last - first < 74);
+        assert_eq!(github_file_window(3, 9_999.0, 300.0), (3, 3));
+    }
+
+    struct BlockingLauncher {
+        entered: std::sync::mpsc::SyncSender<CreationDirectoryPolicy>,
+        finished: std::sync::mpsc::SyncSender<()>,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    type BlockingLauncherControl = (
+        std::sync::mpsc::Receiver<CreationDirectoryPolicy>,
+        std::sync::mpsc::Receiver<()>,
+        Arc<(Mutex<bool>, std::sync::Condvar)>,
+    );
+    type TerminalCreationAction = fn(&mut Muxtrix) -> Result<(), String>;
+
+    impl TerminalLauncher for BlockingLauncher {
+        fn launch(&self, request: TerminalLaunchRequest) -> Result<LaunchedTerminal, String> {
+            let _ = self.entered.send(request.directory_policy);
+            let (lock, ready) = &*self.gate;
+            let mut released = lock.lock().expect("launch gate");
+            while !*released {
+                released = ready.wait(released).expect("launch gate wait");
+            }
+            let _ = self.finished.send(());
+            Err("simulated terminal host stall".into())
+        }
+    }
+
+    fn install_blocking_launcher(app: &mut Muxtrix) -> BlockingLauncherControl {
+        let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
+        let (finished_sender, finished_receiver) = std::sync::mpsc::sync_channel(1);
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        app.terminal_launcher = Arc::new(BlockingLauncher {
+            entered: entered_sender,
+            finished: finished_sender,
+            gate: Arc::clone(&gate),
+        });
+        app.launch_in_background = true;
+        (entered_receiver, finished_receiver, gate)
+    }
+
+    /// A PTY stand-in: it records every size the live session forwards, and
+    /// its reader parks instead of reporting the process as exited.
+    struct RecordingBackend {
+        reader: Option<ParkedReader>,
+        sizes: Arc<Mutex<Vec<PtySize>>>,
+    }
+
+    struct ParkedReader {
+        bytes: std::sync::mpsc::Receiver<Vec<u8>>,
+    }
+
+    impl std::io::Read for ParkedReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let Ok(bytes) = self.bytes.recv() else {
+                return Ok(0);
+            };
+            let count = bytes.len().min(out.len());
+            out[..count].copy_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+    }
+
+    impl muxtrix_terminal::SessionBackend for RecordingBackend {
+        fn take_reader(&mut self) -> Result<Box<dyn std::io::Read + Send>, String> {
+            self.reader
+                .take()
+                .map(|reader| Box::new(reader) as Box<dyn std::io::Read + Send>)
+                .ok_or_else(|| "the recording reader was already taken".to_owned())
+        }
+        fn write_all(&mut self, _bytes: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn resize(&self, size: PtySize) -> Result<(), String> {
+            self.sizes.lock().expect("recorded sizes").push(size);
+            Ok(())
+        }
+        fn kill(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+        fn poll_exit(&mut self) -> Result<Option<bool>, String> {
+            Ok(None)
+        }
+        fn exit_clean(&mut self) -> bool {
+            true
+        }
+    }
+
+    /// Launches a session over [`RecordingBackend`], mirroring how the system
+    /// launcher sizes a freshly spawned PTY.
+    struct RecordingLauncher {
+        sizes: Arc<Mutex<Vec<PtySize>>>,
+        idle: Mutex<Vec<std::sync::mpsc::Sender<Vec<u8>>>>,
+    }
+
+    impl TerminalLauncher for RecordingLauncher {
+        fn launch(&self, request: TerminalLaunchRequest) -> Result<LaunchedTerminal, String> {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            self.idle.lock().expect("idle readers").push(sender);
+            let backend = RecordingBackend {
+                reader: Some(ParkedReader { bytes: receiver }),
+                sizes: Arc::clone(&self.sizes),
+            };
+            let session = LiveSession::spawn_remote(
+                Box::new(backend),
+                initial_pty_size(),
+                TerminalOptions {
+                    cols: initial_pty_size().cols,
+                    rows: initial_pty_size().rows,
+                    max_scrollback: 10_000,
+                },
+                request.theme,
+                Some(request.notifier),
+            )
+            .map_err(|error| error.to_string())?;
+            if terminal_grid_changed(initial_pty_size(), request.target_size) {
+                session
+                    .resize(
+                        request.target_size,
+                        request.cell_width_px,
+                        request.cell_height_px,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            let snapshot = session.snapshot().map_err(|error| error.to_string())?;
+            Ok(LaunchedTerminal {
+                session,
+                snapshot,
+                size: request.target_size,
+                working_directory: request.profile.working_directory,
+            })
+        }
+    }
+
+    /// A daemon-owned pane stand-in: dropping one only detaches it, so a
+    /// recorded kill means the session was deliberately ended.
+    struct KillTrackingBackend {
+        reader: Option<ParkedReader>,
+        killed: Arc<AtomicBool>,
+    }
+
+    impl muxtrix_terminal::SessionBackend for KillTrackingBackend {
+        fn take_reader(&mut self) -> Result<Box<dyn std::io::Read + Send>, String> {
+            self.reader
+                .take()
+                .map(|reader| Box::new(reader) as Box<dyn std::io::Read + Send>)
+                .ok_or_else(|| "the kill-tracking reader was already taken".to_owned())
+        }
+        fn write_all(&mut self, _bytes: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+        fn resize(&self, _size: PtySize) -> Result<(), String> {
+            Ok(())
+        }
+        fn kill(&mut self) -> Result<(), String> {
+            self.killed.store(true, Ordering::Release);
+            Ok(())
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+        fn poll_exit(&mut self) -> Result<Option<bool>, String> {
+            Ok(None)
+        }
+        fn exit_clean(&mut self) -> bool {
+            false
+        }
+        fn kill_on_detach(&self) -> bool {
+            false
+        }
+    }
+
+    /// A launch result that arrives too late to be wanted. The returned
+    /// sender holds the session's reader open; dropping it would end the
+    /// session on its own and hide which disposal path ran.
+    fn late_launched_terminal(
+        app: &Muxtrix,
+        killed: &Arc<AtomicBool>,
+    ) -> (LaunchedTerminal, std::sync::mpsc::Sender<Vec<u8>>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let session = LiveSession::spawn_remote(
+            Box::new(KillTrackingBackend {
+                reader: Some(ParkedReader { bytes: receiver }),
+                killed: Arc::clone(killed),
+            }),
+            initial_pty_size(),
+            TerminalOptions {
+                cols: initial_pty_size().cols,
+                rows: initial_pty_size().rows,
+                max_scrollback: 10_000,
+            },
+            app.settings.terminal_theme.preset().terminal_theme(),
+            None,
+        )
+        .expect("the stand-in session should start");
+        let snapshot = session.snapshot().expect("snapshot");
+        (
+            LaunchedTerminal {
+                session,
+                snapshot,
+                size: initial_pty_size(),
+                working_directory: None,
+            },
+            sender,
+        )
+    }
+
+    fn wait_for_kill(killed: &Arc<AtomicBool>, within: std::time::Duration) -> bool {
+        // Disposal runs off the UI thread.
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if killed.load(Ordering::Acquire) {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        false
+    }
+
+    fn install_recording_launcher(app: &mut Muxtrix) -> Arc<Mutex<Vec<PtySize>>> {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        app.terminal_launcher = Arc::new(RecordingLauncher {
+            sizes: Arc::clone(&sizes),
+            idle: Mutex::new(Vec::new()),
+        });
+        app.launch_in_background = true;
+        sizes
+    }
+
+    fn release_launcher(gate: &Arc<(Mutex<bool>, std::sync::Condvar)>) {
+        let (lock, ready) = &**gate;
+        *lock.lock().expect("launch gate") = true;
+        ready.notify_all();
+    }
+
+    fn active_tab(app: &Muxtrix) -> &WorkspaceTab {
+        app.active_workspace()
+            .expect("workspace should exist")
+            .active_tab()
+            .expect("active tab should exist")
+    }
+
+    fn active_tab_mut(app: &mut Muxtrix) -> &mut WorkspaceTab {
+        app.active_workspace_mut()
+            .expect("workspace should exist")
+            .active_tab_mut()
+            .expect("active tab should exist")
+    }
+
+    fn active_pane_id(app: &Muxtrix) -> PaneId {
+        active_tab(app).focused_pane_id
+    }
+
+    fn create_test_workspace(app: &mut Muxtrix) {
+        app.workspace_name_draft = format!("Workspace {}", app.session.workspaces.len() + 1);
+        app.create_workspace().expect("workspace should be created");
+    }
+
+    fn key_press(modified_key: Key, modifiers: Modifiers) -> keyboard::Event {
+        keyboard::Event::KeyPressed {
+            key: modified_key.clone(),
+            modified_key,
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyG),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn embedded_window_icon_has_the_expected_rgba_shape() {
+        assert_eq!(
+            include_bytes!("../assets/muxtrix-icon.rgba").len(),
+            256 * 256 * 4
+        );
+        assert!(muxtrix_window_icon().is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_application_id_matches_the_desktop_file() {
+        assert_eq!(
+            muxtrix_window_settings().platform_specific.application_id,
+            "muxtrix"
+        );
+    }
+
+    #[test]
+    fn no_terminal_flag_is_explicit() {
+        assert!(no_terminal_requested(&[
+            "muxtrix".into(),
+            "--no-terminal".into()
+        ]));
+        assert!(!no_terminal_requested(&["muxtrix".into()]));
+    }
+
+    #[test]
+    fn terminal_startup_surface_is_empty_and_uses_the_selected_theme() {
+        let preparing = TerminalRuntime::preparing_host("shell");
+        let starting = TerminalRuntime::starting("shell", 1, None);
+        assert_eq!(terminal_empty_state_copy(Some(&preparing)), None);
+        assert_eq!(terminal_empty_state_copy(Some(&starting)), None);
+
+        let theme = TerminalThemeId::TokyoNight.preset();
+        assert_eq!(terminal_surface_background(None, theme), theme.background);
+    }
+
+    #[test]
+    fn terminal_empty_state_keeps_actionable_failure_and_suppression_copy() {
+        let suppressed = TerminalRuntime::suppressed("shell");
+        assert_eq!(
+            terminal_empty_state_copy(Some(&suppressed)),
+            Some(suppressed.preview.as_str())
+        );
+
+        let mut failed = TerminalRuntime::starting("shell", 1, None);
+        failed.preview = "Terminal unavailable".into();
+        failed.launch_state = TerminalLaunchState::Failed("launch failed".into());
+        assert_eq!(
+            terminal_empty_state_copy(Some(&failed)),
+            Some("Terminal unavailable")
+        );
+    }
+
+    #[test]
+    fn production_does_not_use_an_implicit_local_pty_fallback() {
+        assert!(!should_allow_local_pty(false, false, false));
+        assert!(should_allow_local_pty(false, true, false));
+        assert!(should_allow_local_pty(false, false, true));
+        assert!(should_allow_local_pty(true, false, false));
+    }
+
+    #[test]
+    fn every_terminal_creation_handler_returns_while_the_launcher_is_hung() {
+        fn split(app: &mut Muxtrix) -> Result<(), String> {
+            app.split_terminal(SplitAxis::Horizontal)
+        }
+        fn new_tab(app: &mut Muxtrix) -> Result<(), String> {
+            app.new_tab()
+        }
+        fn new_workspace(app: &mut Muxtrix) -> Result<(), String> {
+            app.workspace_name_draft = "Recovery workspace".into();
+            app.create_workspace()
+        }
+        fn restart(app: &mut Muxtrix) -> Result<(), String> {
+            app.restart_pane(active_pane_id(app))
+        }
+        let actions: [(&str, TerminalCreationAction, CreationDirectoryPolicy); 4] = [
+            ("split", split, CreationDirectoryPolicy::Regular),
+            ("new tab", new_tab, CreationDirectoryPolicy::Regular),
+            (
+                "new workspace",
+                new_workspace,
+                CreationDirectoryPolicy::Regular,
+            ),
+            ("restart", restart, CreationDirectoryPolicy::Exact),
+        ];
+
+        for (name, action, expected_policy) in actions {
+            let mut app = Muxtrix::new();
+            let (entered, finished, gate) = install_blocking_launcher(&mut app);
+            let previous_sidebar = app.sidebar_collapsed;
+            let started = std::time::Instant::now();
+
+            action(&mut app).unwrap_or_else(|error| panic!("{name} failed: {error}"));
+            let pane_id = active_pane_id(&app);
+
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "{name} waited for the terminal launcher"
+            );
+            let policy = entered
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap_or_else(|_| panic!("{name} launch did not enter the injected stall"));
+            assert_eq!(
+                policy, expected_policy,
+                "{name} used the wrong working-directory policy"
+            );
+            assert!(matches!(
+                app.terminals[&pane_id].launch_state,
+                TerminalLaunchState::Starting { .. }
+            ));
+            let _ = app.update(Message::ToggleSidebar);
+            assert_ne!(app.sidebar_collapsed, previous_sidebar);
+
+            release_launcher(&gate);
+            finished
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap_or_else(|_| panic!("{name} launch did not return after release"));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while std::time::Instant::now() < deadline {
+                app.poll_terminal();
+                if matches!(
+                    app.terminals[&pane_id].launch_state,
+                    TerminalLaunchState::Failed(_)
+                ) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert!(matches!(
+                app.terminals[&pane_id].launch_state,
+                TerminalLaunchState::Failed(ref error)
+                    if error == "simulated terminal host stall"
+            ));
+        }
+    }
+
+    #[test]
+    fn restarting_a_fresh_tab_waits_for_its_in_flight_launch() {
+        let mut app = Muxtrix::new();
+        let (entered, finished, gate) = install_blocking_launcher(&mut app);
+        app.new_tab().expect("fresh tab should be created");
+        let pane_id = active_pane_id(&app);
+        let first_attempt = app.next_terminal_launch_attempt;
+        let first_policy = entered
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the fresh tab launch should enter the worker");
+        assert_eq!(first_policy, CreationDirectoryPolicy::Regular);
+
+        let target = std::env::temp_dir().join("muxtrix-queued-restart-target");
+        app.restart_pane_in_directory(pane_id, target.clone())
+            .expect("restart should queue behind the fresh tab launch");
+
+        assert_eq!(
+            app.next_terminal_launch_attempt, first_attempt,
+            "the replacement must not overlap a launch using the same pane ID"
+        );
+        assert!(app.queued_terminal_restarts.contains(&pane_id));
+        let terminal = app
+            .active_workspace()
+            .expect("workspace")
+            .pane(pane_id)
+            .and_then(Pane::active_surface)
+            .and_then(|surface| match &surface.kind {
+                muxtrix_domain::SurfaceKind::Terminal(terminal) => Some(terminal),
+                _ => None,
+            })
+            .expect("terminal surface");
+        assert_eq!(terminal.working_directory.as_ref(), Some(&target));
+
+        release_launcher(&gate);
+        finished
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the original launch should finish after release");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while app.next_terminal_launch_attempt == first_attempt
+            && std::time::Instant::now() < deadline
+        {
+            app.drain_terminal_launches();
+            std::thread::yield_now();
+        }
+
+        assert_eq!(app.next_terminal_launch_attempt, first_attempt + 1);
+        assert!(!app.queued_terminal_restarts.contains(&pane_id));
+        let replacement_policy = entered
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the queued replacement should enter the worker");
+        assert_eq!(replacement_policy, CreationDirectoryPolicy::Exact);
+        finished
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the queued replacement should launch after the original completes");
+        app.drain_terminal_launches();
+    }
+
+    #[test]
+    fn cancelling_a_hung_launch_ignores_its_late_completion() {
+        let mut app = Muxtrix::new();
+        let (entered, finished, gate) = install_blocking_launcher(&mut app);
+        app.split_terminal(SplitAxis::Vertical)
+            .expect("pane creation should enqueue a launch");
+        let pane_id = active_pane_id(&app);
+        let _ = entered
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("launch worker should enter the injected stall");
+
+        let _ = app.update(Message::CancelTerminalLaunch(pane_id));
+        release_launcher(&gate);
+        finished
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("launch worker should return after release");
+        let completion_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < completion_deadline
+            && app
+                .terminal_launch_completions
+                .lock()
+                .is_ok_and(|queue| queue.is_empty())
+        {
+            std::thread::yield_now();
+        }
+        app.poll_terminal();
+        assert!(
+            app.terminal_launch_completions
+                .lock()
+                .expect("completion queue")
+                .is_empty()
+        );
+        assert!(matches!(
+            app.terminals[&pane_id].launch_state,
+            TerminalLaunchState::Suppressed
+        ));
+    }
+
+    #[test]
+    fn a_launch_landing_after_its_pane_closed_ends_the_session_it_produced() {
+        let mut app = Muxtrix::new();
+        let killed = Arc::new(AtomicBool::new(false));
+        let (launched, reader) = late_launched_terminal(&app, &killed);
+        let pane_id = active_pane_id(&app);
+        // The close happened while this launch was still in flight, so it
+        // found no session to end.
+        app.terminals.remove(&pane_id);
+
+        app.finish_terminal_launch(TerminalLaunchCompletion {
+            pane_id,
+            attempt_id: app.next_terminal_launch_attempt.wrapping_add(1),
+            result: Ok(launched),
+        });
+
+        assert!(
+            wait_for_kill(&killed, std::time::Duration::from_secs(5)),
+            "a session no pane can reach must be killed, not merely detached"
+        );
+        drop(reader);
+    }
+
+    #[test]
+    fn a_superseded_launch_detaches_without_killing_the_pane_that_replaced_it() {
+        let mut app = Muxtrix::new();
+        let killed = Arc::new(AtomicBool::new(false));
+        let (launched, reader) = late_launched_terminal(&app, &killed);
+        let pane_id = active_pane_id(&app);
+        assert!(
+            app.terminals.contains_key(&pane_id),
+            "the pane must still be open for this test to mean anything"
+        );
+
+        app.finish_terminal_launch(TerminalLaunchCompletion {
+            pane_id,
+            attempt_id: app.next_terminal_launch_attempt.wrapping_add(1),
+            result: Ok(launched),
+        });
+
+        // A newer attempt shares this pane's identity with the daemon, so a
+        // kill here would take down the session that replaced this one.
+        assert!(
+            !wait_for_kill(&killed, std::time::Duration::from_millis(500)),
+            "a superseded launch must detach, not kill the pane it lost to"
+        );
+        drop(reader);
+    }
+
+    #[test]
+    fn a_pane_measured_during_its_launch_keeps_that_size_once_the_session_arrives() {
+        let mut app = Muxtrix::new();
+        let sizes = install_recording_launcher(&mut app);
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("pane creation should enqueue a launch");
+        let pane_id = active_pane_id(&app);
+
+        // Layout measures the new pane while its launch is still in flight,
+        // so there is no session yet to forward the size to.
+        let pane_size = Size::new(420.0, 260.0);
+        let _ = app.update(Message::ResizePane(pane_id, pane_size));
+        let expected = pty_size_for_pane(pane_size, &app.settings);
+        assert!(
+            terminal_grid_changed(initial_pty_size(), expected),
+            "the pane must differ from the launch default for this test to mean anything"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && app
+                .terminal_launch_completions
+                .lock()
+                .is_ok_and(|queue| queue.is_empty())
+        {
+            std::thread::yield_now();
+        }
+        app.poll_terminal();
+
+        let runtime = &app.terminals[&pane_id];
+        assert!(runtime.session.is_some(), "the launch should have landed");
+        assert_eq!(
+            runtime.size, expected,
+            "the launch must not restore the size it was requested with"
+        );
+
+        // The live session forwards resizes on its own thread.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && sizes
+                .lock()
+                .expect("recorded sizes")
+                .last()
+                .is_none_or(|size| terminal_grid_changed(*size, expected))
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            sizes.lock().expect("recorded sizes").last().copied(),
+            Some(expected),
+            "the PTY should end up sized to the pane it is drawn into"
+        );
+    }
+
+    #[test]
+    fn update_splits_without_a_window() {
+        let mut app = Muxtrix::new();
+        let original_pane = active_pane_id(&app);
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+        let workspace = app.active_workspace().expect("workspace should exist");
+        let tab = workspace.active_tab().expect("active tab should exist");
+        assert_eq!(tab.panes.len(), 2);
+        assert_ne!(tab.focused_pane_id, original_pane);
+        assert_eq!(app.terminals.len(), 2);
+        assert!(
+            app.terminals
+                .values()
+                .all(|runtime| runtime.session.is_some())
+        );
+        workspace.validate().expect("workspace should stay valid");
+    }
+
+    #[test]
+    fn closing_a_pane_drops_only_its_terminal_runtime() {
+        let mut app = Muxtrix::new();
+        let original_pane = active_pane_id(&app);
+        let _ = app.update(Message::Split(SplitAxis::Vertical));
+        let closed_pane = active_pane_id(&app);
+
+        let _ = app.update(Message::ClosePane(closed_pane));
+
+        assert_eq!(app.terminals.len(), 1);
+        assert!(app.terminals.contains_key(&original_pane));
+        assert!(!app.terminals.contains_key(&closed_pane));
+    }
+
+    /// A pane can be closed while the pointer still rests over it, so the
+    /// hover must die with the pane — a stale one aims the next wheel event
+    /// at a pane that no longer exists.
+    #[test]
+    fn closing_the_hovered_pane_clears_the_hover() {
+        let mut app = Muxtrix::new();
+        let _ = app.update(Message::Split(SplitAxis::Vertical));
+        let closed_pane = active_pane_id(&app);
+        app.hovered_terminal = Some(closed_pane);
+
+        let _ = app.update(Message::ClosePane(closed_pane));
+        assert_eq!(app.hovered_terminal, None);
+
+        let _ = app.update(Message::ScrollHoveredTerminal(ScrollDelta::Lines {
+            x: 0.0,
+            y: -1.0,
+        }));
+        assert!(
+            !app.status.contains("Terminal scroll failed"),
+            "scrolling after the hovered pane closed must not report a missing pane: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn shell_exit_detaches_the_dead_session_and_restart_replaces_it() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+
+        // A live PTY is ready before its shell has necessarily initialized its
+        // line editor. Waiting for the first non-empty frame makes the test
+        // exercise a user-issued `exit` instead of racing process startup when
+        // the Windows suite launches several ConPTY sessions concurrently,
+        // and loaded CI runners have been seen to blow well past 10s.
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < ready_deadline {
+            app.poll_terminal();
+            if app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.text().trim().is_empty())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.text().trim().is_empty()),
+            "shell did not render a prompt before the readiness deadline"
+        );
+        app.send_terminal_input(b"exit\r".to_vec())
+            .expect("shell should accept exit");
+
+        let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < exit_deadline {
+            app.poll_terminal();
+            if app.terminals[&pane_id].session.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            app.terminals[&pane_id].session.is_none(),
+            "shell remained attached ten seconds after receiving exit"
+        );
+        app.terminals
+            .get_mut(&pane_id)
+            .expect("runtime should remain visible")
+            .resize(Size::new(800.0, 500.0), &app.settings)
+            .expect("an exited pane should still resize without targeting a dead channel");
+
+        app.restart_pane(pane_id)
+            .expect("the exited terminal should restart");
+        assert!(app.terminals[&pane_id].session.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_terminal_exit_closes_its_pane_and_cascades() {
+        let mut app = Muxtrix::new();
+        let original = active_pane_id(&app);
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+        let split = active_pane_id(&app);
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < ready_deadline {
+            app.poll_terminal();
+            if app.terminals[&split]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.text().trim().is_empty())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.send_terminal_input(b"exit\r".to_vec())
+            .expect("shell should accept exit");
+
+        let close_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < close_deadline {
+            app.poll_terminal();
+            if !app.terminals.contains_key(&split) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !app.terminals.contains_key(&split),
+            "a cleanly exited pane should close itself"
+        );
+        assert!(app.terminals.contains_key(&original));
+        // With other panes present, no workspace confirmation appears.
+        assert!(app.close_workspace_prompt.is_none());
+        let workspace = app.active_workspace().expect("workspace should remain");
+        assert_eq!(workspace.pane_count(), 1);
+        workspace.validate().expect("workspace should stay valid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn focused_split_receives_output_independently() {
+        let mut app = Muxtrix::new();
+        let original_pane = active_pane_id(&app);
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+        let focused_pane = active_pane_id(&app);
+
+        app.send_terminal_input(b"printf 'focused-pane-marker\\n'\r".to_vec())
+            .expect("focused terminal should accept input");
+
+        let mut focused_text = String::new();
+        for _ in 0..200 {
+            app.poll_terminal();
+            focused_text = app
+                .terminals
+                .get(&focused_pane)
+                .and_then(|runtime| runtime.snapshot.as_ref())
+                .map(GridSnapshot::text)
+                .unwrap_or_default();
+            if focused_text.contains("focused-pane-marker") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let original_text = app
+            .terminals
+            .get(&original_pane)
+            .and_then(|runtime| runtime.snapshot.as_ref())
+            .map(GridSnapshot::text)
+            .unwrap_or_default();
+        assert!(focused_text.contains("focused-pane-marker"));
+        assert!(!original_text.contains("focused-pane-marker"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn osc_title_updates_the_pane_and_native_window_title() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let profile = app
+            .session
+            .profiles
+            .first_mut()
+            .expect("terminal profile should exist");
+        profile.program = "/bin/sh".into();
+        profile.arguments = vec![
+            "-c".into(),
+            "printf '\\033]2;cargo test\\007'; sleep 5".into(),
+        ];
+        app.restart_pane(pane_id)
+            .expect("title-emitting terminal should start");
+
+        for _ in 0..200 {
+            app.poll_terminal();
+            if app.pane_title(
+                app.active_workspace().expect("workspace should exist"),
+                pane_id,
+            ) == "cargo test"
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let workspace = app.active_workspace().expect("workspace should exist");
+        assert_eq!(app.pane_title(workspace, pane_id), "cargo test");
+        assert_eq!(app.title(), "cargo test — Tab 1 — Muxtrix");
+    }
+
+    #[test]
+    fn terminal_style_runs_coalesce_uniform_cells_before_gpu_projection() {
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .expect("terminal actor should start");
+        actor
+            .feed(b"plain \x1b[31mred\x1b[0m text".to_vec())
+            .expect("terminal should accept styled text");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        let cell_fragments = snapshot.cells.iter().map(|row| row.len()).sum::<usize>()
+            + snapshot.cells.len().saturating_sub(1);
+        let runs = terminal_style_runs(&snapshot, false, true, TerminalThemeId::Ghostty.preset());
+
+        assert!(
+            runs.len() * 20 < cell_fragments,
+            "expected style runs to replace most cell spans: {} runs for {cell_fragments} cells",
+            runs.len()
+        );
+        actor.shutdown().expect("terminal actor should stop");
+    }
+
+    #[test]
+    fn unicode_activity_frames_keep_following_text_on_fixed_grid_columns() {
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 24,
+            rows: 2,
+            max_scrollback: 10,
+        })
+        .expect("terminal actor should start");
+        actor
+            .feed("⠋ Working".as_bytes().to_vec())
+            .expect("terminal should accept a unicode activity frame");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        let rows = terminal_row_style_runs(
+            &snapshot,
+            false,
+            true,
+            None,
+            TerminalThemeId::Ghostty.preset(),
+        );
+        let first_row = &rows[0];
+
+        assert!(first_row.iter().any(|run| {
+            run.text == "⠋" && run.columns == 1 && run.kind == TerminalRunKind::IsolatedUnicode
+        }));
+        assert!(first_row.iter().any(|run| run.text.starts_with(" Working")));
+        assert_eq!(
+            first_row.iter().map(|run| run.columns).sum::<usize>(),
+            snapshot.cells[0].len(),
+        );
+        actor.shutdown().expect("terminal actor should stop");
+    }
+
+    #[test]
+    fn repeated_box_and_block_glyphs_use_continuous_geometry_runs() {
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 32,
+            rows: 2,
+            max_scrollback: 10,
+        })
+        .expect("terminal actor should start");
+        actor
+            .feed("──────── █████░░░".as_bytes().to_vec())
+            .expect("terminal should accept terminal drawing glyphs");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        let rows = terminal_row_style_runs(
+            &snapshot,
+            false,
+            true,
+            None,
+            TerminalThemeId::Ghostty.preset(),
+        );
+        let first_row = &rows[0];
+
+        assert!(first_row.iter().any(|run| {
+            run.text == "────────"
+                && run.columns == 8
+                && run.kind == TerminalRunKind::BoxDrawing
+                && !run.kind.needs_fallback()
+        }));
+        assert!(first_row.iter().any(|run| {
+            run.text == "█████"
+                && run.columns == 5
+                && run.kind == TerminalRunKind::JoinedCellGlyph('█')
+        }));
+        assert!(first_row.iter().any(|run| {
+            run.text == "░░░"
+                && run.columns == 3
+                && run.kind == TerminalRunKind::JoinedCellGlyph('░')
+        }));
+        assert_eq!(
+            first_row.iter().map(|run| run.columns).sum::<usize>(),
+            snapshot.cells[0].len(),
+        );
+        actor.shutdown().expect("terminal actor should stop");
+    }
+
+    #[test]
+    fn rounded_box_borders_group_corners_and_horizontal_arms_together() {
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 16,
+            rows: 3,
+            max_scrollback: 10,
+        })
+        .expect("terminal actor should start");
+        actor
+            .feed("╭──────╮\r\n│ Codex│\r\n╰──────╯".as_bytes().to_vec())
+            .expect("terminal should accept a rounded box");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        let rows = terminal_row_style_runs(
+            &snapshot,
+            false,
+            true,
+            None,
+            TerminalThemeId::Ghostty.preset(),
+        );
+
+        for (row, expected) in [(0, "╭──────╮"), (2, "╰──────╯")] {
+            let border = rows[row]
+                .iter()
+                .find(|run| run.text == expected)
+                .expect("rounded border should be one geometry run");
+            assert_eq!(border.columns, 8);
+            assert_eq!(border.kind, TerminalRunKind::BoxDrawing);
+            assert!(!border.kind.needs_fallback());
+        }
+        assert!(rows[1].iter().any(|run| {
+            run.text == "│" && run.columns == 1 && run.kind == TerminalRunKind::BoxDrawing
+        }));
+        actor.shutdown().expect("terminal actor should stop");
+    }
+
+    #[test]
+    fn wide_unicode_cells_own_their_spacer_column_in_fixed_grid_projection() {
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 12,
+            rows: 2,
+            max_scrollback: 10,
+        })
+        .expect("terminal actor should start");
+        actor
+            .feed("界 ok".as_bytes().to_vec())
+            .expect("terminal should accept a wide glyph");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        let rows = terminal_row_style_runs(
+            &snapshot,
+            false,
+            true,
+            None,
+            TerminalThemeId::Ghostty.preset(),
+        );
+
+        assert!(
+            rows[0]
+                .iter()
+                .any(|run| run.text == "界" && run.columns == 2)
+        );
+        assert_eq!(
+            rows[0].iter().map(|run| run.columns).sum::<usize>(),
+            snapshot.cells[0].len(),
+        );
+        actor.shutdown().expect("terminal actor should stop");
+    }
+
+    #[test]
+    fn terminal_selection_maps_pointer_cells_and_marks_only_the_selected_range() {
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 8,
+            rows: 2,
+            max_scrollback: 10,
+        })
+        .expect("terminal actor should start");
+        actor
+            .feed(b"abcdef".to_vec())
+            .expect("terminal should accept text");
+        actor
+            .selection_start(1, 0)
+            .expect("selection should anchor");
+        actor
+            .selection_extend(3, 0)
+            .expect("selection should extend");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        let runs = terminal_style_runs(&snapshot, false, true, TerminalThemeId::Ghostty.preset());
+        assert!(
+            runs.iter()
+                .any(|run| run.style.selected && run.text == "bcd")
+        );
+        assert_eq!(
+            actor.selection_text().expect("selection text").as_deref(),
+            Some("bcd"),
+            "copy should come from the emulator that owns the selection"
+        );
+
+        let settings = AppSettings::default();
+        assert_eq!(
+            terminal_cell_at(
+                Point::new(
+                    8.0 + settings.terminal_cell_width() * 2.2,
+                    8.0 + settings.terminal_cell_height() * 1.2,
+                ),
+                &settings,
+                0,
+            ),
+            TerminalCellPosition { row: 1, column: 2 }
+        );
+        actor.shutdown().expect("terminal actor should stop");
+    }
+
+    #[test]
+    fn a_pointer_maps_to_the_grid_cell_it_is_over() {
+        // Selection speaks to the emulator in viewport cells, so this mapping
+        // is the whole of what this side contributes to it.
+        let settings = AppSettings::default();
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 480,
+        };
+        assert_eq!(
+            terminal_grid_cell_at(
+                Point::new(
+                    TERMINAL_PADDING / 2.0 + settings.terminal_cell_width() * 2.2,
+                    TERMINAL_PADDING / 2.0 + settings.terminal_cell_height() * 1.2,
+                ),
+                &settings,
+                size,
+            ),
+            (2, 1)
+        );
+        assert_eq!(
+            terminal_grid_cell_at(Point::new(-40.0, -40.0), &settings, size),
+            (0, 0),
+            "a pointer above and left of the grid still lands on its first cell"
+        );
+        assert_eq!(
+            terminal_grid_cell_at(Point::new(100_000.0, 100_000.0), &settings, size),
+            (size.cols - 1, size.rows - 1),
+            "and one beyond it lands on the last, never off the grid"
+        );
+    }
+
+    #[test]
+    fn terminal_click_clears_selection_while_a_real_drag_starts_one() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let origin = Point::new(120.0, 80.0);
+        app.terminals
+            .get_mut(&pane_id)
+            .expect("the initial pane should have a runtime")
+            .has_selection = true;
+
+        let _ = app.update(Message::TerminalPointerMoved(pane_id, origin));
+        let _ = app.update(Message::BeginTerminalSelection(pane_id));
+        assert!(
+            !app.terminals[&pane_id].has_selection,
+            "mouse-down should dismiss the previous selection immediately"
+        );
+        assert!(
+            app.terminal_selection_drag
+                .is_some_and(|drag| drag.pane_id == pane_id && !drag.active)
+        );
+
+        let click_jitter = Point::new(origin.x + 1.0, origin.y + 1.0);
+        let _ = app.update(Message::TerminalPointerMoved(pane_id, click_jitter));
+        let _ = app.update(Message::EndTerminalSelection(pane_id));
+        assert!(app.terminal_selection_drag.is_none());
+        assert!(
+            !app.terminals[&pane_id].has_selection,
+            "sub-threshold click jitter must not create a one-cell selection"
+        );
+
+        let _ = app.update(Message::TerminalPointerMoved(pane_id, origin));
+        let _ = app.update(Message::BeginTerminalSelection(pane_id));
+        let _ = app.update(Message::TerminalPointerMoved(
+            pane_id,
+            Point::new(origin.x + TERMINAL_SELECTION_DRAG_THRESHOLD + 1.0, origin.y),
+        ));
+        assert!(
+            app.terminal_selection_drag
+                .is_some_and(|drag| drag.pane_id == pane_id && drag.active)
+        );
+        assert!(
+            app.terminals[&pane_id].has_selection,
+            "crossing the drag threshold should still select terminal text"
+        );
+    }
+
+    /// A snapshot rendered by a terminal in the given screen mode.
+    fn snapshot_in_mode(sequence: &[u8]) -> GridSnapshot {
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 24,
+            rows: 4,
+            max_scrollback: 100,
+        })
+        .expect("terminal actor should start");
+        let mut bytes = sequence.to_vec();
+        bytes.extend_from_slice(b"selected text");
+        actor.feed(bytes).expect("terminal should accept bytes");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        actor.shutdown().expect("terminal actor should stop");
+        snapshot
+    }
+
+    #[test]
+    fn scrolling_never_clears_selection_at_the_application_layer() {
+        // Selection movement belongs to the terminal session for every screen
+        // mode. The app must not discard it before the emulator sees the
+        // application's response to the wheel.
+        for (sequence, application_scroll) in [
+            (b"\x1b[?1049h".as_slice(), true),
+            (b"\x1b[?1000h".as_slice(), true),
+            (b"".as_slice(), false),
+        ] {
+            let mut app = Muxtrix::new();
+            let pane_id = active_pane_id(&app);
+            let snapshot = snapshot_in_mode(sequence);
+            assert_eq!(snapshot.application_scroll, application_scroll);
+            let runtime = app
+                .terminals
+                .get_mut(&pane_id)
+                .expect("the initial pane should have a runtime");
+            runtime.snapshot = Some(snapshot);
+            runtime.has_selection = true;
+
+            // The wheel itself fails without a live session; whether the app
+            // discarded the selection before trying it is what matters here.
+            let _ = app.scroll_terminal(pane_id, ScrollDelta::Lines { x: 0.0, y: -3.0 });
+
+            assert!(
+                app.terminals[&pane_id].has_selection,
+                "screen mode {application_scroll} must not make the app clear \
+                 emulator-owned selection state"
+            );
+        }
+    }
+
+    #[test]
+    fn web_urls_are_dotted_by_default_and_solid_when_clickable() {
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 64,
+            rows: 2,
+            max_scrollback: 10,
+        })
+        .expect("terminal actor should start");
+        actor
+            .feed(b"See (https://example.com/docs?q=1).".to_vec())
+            .expect("terminal should accept a URL");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        let link = terminal_link_at(&snapshot, TerminalCellPosition { row: 0, column: 12 })
+            .expect("URL should be detected under the pointer");
+
+        assert_eq!(link.uri, "https://example.com/docs?q=1");
+        assert_eq!(link.start_column, 5);
+        assert_eq!(link.end_column, 33);
+        assert!(terminal_link_modifiers(Modifiers::CTRL | Modifiers::SHIFT));
+        assert!(!terminal_link_modifiers(Modifiers::CTRL));
+        assert!(!terminal_link_modifiers(
+            Modifiers::CTRL | Modifiers::SHIFT | Modifiers::ALT
+        ));
+        assert_eq!(terminal_mouse_interaction(false), mouse::Interaction::Idle);
+        assert_eq!(
+            terminal_mouse_interaction(true),
+            mouse::Interaction::Pointer
+        );
+
+        let default_runs = terminal_row_style_runs(
+            &snapshot,
+            false,
+            true,
+            None,
+            TerminalThemeId::Ghostty.preset(),
+        );
+        assert_eq!(
+            default_runs[0]
+                .iter()
+                .filter(|run| run.style.link && !run.style.link_hovered)
+                .map(|run| run.columns)
+                .sum::<usize>(),
+            link.end_column - link.start_column
+        );
+
+        let runs = terminal_row_style_runs(
+            &snapshot,
+            false,
+            true,
+            Some(&link),
+            TerminalThemeId::Ghostty.preset(),
+        );
+        assert_eq!(
+            runs[0]
+                .iter()
+                .filter(|run| run.style.link && run.style.link_hovered)
+                .map(|run| run.columns)
+                .sum::<usize>(),
+            link.end_column - link.start_column
+        );
+        actor.shutdown().expect("terminal actor should stop");
+    }
+
+    #[test]
+    fn inferred_urls_override_application_underlines_until_clickable() {
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 64,
+            rows: 2,
+            max_scrollback: 10,
+        })
+        .expect("terminal actor should start");
+        actor
+            .feed(b"\x1b[4mnote https://example.com\x1b[24m".to_vec())
+            .expect("terminal should accept an underlined URL");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        let link = terminal_link_at(&snapshot, TerminalCellPosition { row: 0, column: 10 })
+            .expect("underlined URL should be inferred under the pointer");
+
+        let default_runs = terminal_row_style_runs(
+            &snapshot,
+            false,
+            true,
+            None,
+            TerminalThemeId::Ghostty.preset(),
+        );
+        let underlined_text = default_runs[0]
+            .iter()
+            .find(|run| run.text.contains("note"))
+            .expect("ordinary underlined text should remain present");
+        let inferred_url = default_runs[0]
+            .iter()
+            .find(|run| run.style.link)
+            .expect("the inferred URL should have a link run");
+        assert!(inferred_url.style.underline);
+        assert_eq!(
+            terminal_underline_decoration(underlined_text.style),
+            TerminalUnderlineDecoration::Solid
+        );
+        assert_eq!(
+            terminal_underline_decoration(inferred_url.style),
+            TerminalUnderlineDecoration::Dotted
+        );
+
+        let hovered_runs = terminal_row_style_runs(
+            &snapshot,
+            false,
+            true,
+            Some(&link),
+            TerminalThemeId::Ghostty.preset(),
+        );
+        assert!(
+            hovered_runs[0]
+                .iter()
+                .filter(|run| run.style.link)
+                .all(|run| terminal_underline_decoration(run.style)
+                    == TerminalUnderlineDecoration::Solid)
+        );
+        actor.shutdown().expect("terminal actor should stop");
+    }
+
+    #[test]
+    fn osc8_link_uses_its_destination_instead_of_visible_label() {
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 32,
+            rows: 2,
+            max_scrollback: 10,
+        })
+        .expect("terminal actor should start");
+        actor
+            .feed(b"\x1b]8;;https://example.com/target\x1b\\open docs\x1b]8;;\x1b\\".to_vec())
+            .expect("terminal should accept an OSC 8 link");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        let link = terminal_link_at(&snapshot, TerminalCellPosition { row: 0, column: 4 })
+            .expect("OSC 8 link should be detected under its label");
+
+        assert_eq!(link.uri, "https://example.com/target");
+        assert_eq!((link.start_column, link.end_column), (0, 9));
+        let runs = terminal_row_style_runs(
+            &snapshot,
+            false,
+            true,
+            None,
+            TerminalThemeId::Ghostty.preset(),
+        );
+        assert_eq!(
+            runs[0]
+                .iter()
+                .filter(|run| run.style.link && !run.style.link_hovered)
+                .map(|run| run.columns)
+                .sum::<usize>(),
+            9
+        );
+        actor.shutdown().expect("terminal actor should stop");
+    }
+
+    #[test]
+    fn terminal_scrollbar_geometry_maps_track_extremes_to_scrollback() {
+        let scrollbar = ScrollbarSnapshot {
+            total: 240,
+            visible: 40,
+            offset: 100,
+        };
+        let geometry = terminal_scrollbar_geometry(scrollbar, 410.0);
+
+        assert_eq!(geometry.max_offset, 200);
+        assert!(geometry.thumb_height >= 24.0);
+        assert_eq!(geometry.offset_for_thumb_top(-100.0), 0);
+        assert_eq!(
+            geometry.offset_for_thumb_top(geometry.track_height),
+            geometry.max_offset
+        );
+    }
+
+    #[test]
+    fn palette_selection_wraps_and_handles_empty_results() {
+        assert_eq!(palette_selection(0, 7, PaletteMove::Next), 1);
+        assert_eq!(palette_selection(6, 7, PaletteMove::Next), 0);
+        assert_eq!(palette_selection(0, 7, PaletteMove::Previous), 6);
+        assert_eq!(palette_selection(4, 0, PaletteMove::Previous), 0);
+    }
+
+    #[test]
+    fn palette_selection_skips_disabled_commands() {
+        let enabled = [false, false, true, false, true];
+        assert_eq!(first_enabled_palette_command(&enabled), 2);
+        assert_eq!(enabled_palette_selection(2, &enabled, PaletteMove::Next), 4);
+        assert_eq!(enabled_palette_selection(4, &enabled, PaletteMove::Next), 2);
+        assert_eq!(
+            enabled_palette_selection(2, &enabled, PaletteMove::Previous),
+            4
+        );
+        assert_eq!(enabled_palette_selection(0, &enabled, PaletteMove::Next), 2);
+        assert_eq!(
+            enabled_palette_selection(0, &enabled, PaletteMove::Previous),
+            4
+        );
+        assert_eq!(first_enabled_palette_command(&[false, false]), 0);
+        assert_eq!(
+            enabled_palette_selection(1, &[false, false], PaletteMove::Next),
+            0
+        );
+    }
+
+    #[test]
+    fn terminal_keys_encode_text_navigation_and_control() {
+        assert_eq!(
+            encode_terminal_key(Key::Character("é"), Modifiers::empty(), Some("é")),
+            Some("é".as_bytes().to_vec())
+        );
+        assert_eq!(
+            encode_terminal_key(Key::Character("c"), Modifiers::CTRL, None),
+            Some(vec![0x03])
+        );
+        assert_eq!(
+            encode_terminal_key(Key::Named(Named::Enter), Modifiers::empty(), None),
+            Some(vec![b'\r'])
+        );
+        assert_eq!(
+            encode_terminal_key(Key::Named(Named::Space), Modifiers::empty(), None),
+            Some(vec![b' '])
+        );
+        assert_eq!(
+            encode_terminal_key(Key::Named(Named::Space), Modifiers::CTRL, None),
+            Some(vec![0x00])
+        );
+        assert_eq!(
+            encode_terminal_key(Key::Named(Named::ArrowLeft), Modifiers::CTRL, None),
+            Some(b"\x1b[1;5D".to_vec())
+        );
+    }
+
+    #[test]
+    fn terminal_keys_support_meta_and_ignore_window_shortcuts() {
+        assert_eq!(
+            encode_terminal_key(Key::Character("x"), Modifiers::ALT, Some("x")),
+            Some(b"\x1bx".to_vec())
+        );
+        assert_eq!(
+            encode_terminal_key(Key::Character("x"), Modifiers::LOGO, Some("x")),
+            None
+        );
+    }
+
+    #[test]
+    fn rename_prompt_keystrokes_never_reach_the_terminal() {
+        let mut app = Muxtrix::new();
+        app.rename_prompt = Some(RenameTarget::Workspace(app.session.active_workspace_id));
+        let _ = app.handle_keyboard(keyboard::Event::KeyPressed {
+            key: Key::Character("x".into()),
+            modified_key: Key::Character("x".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyX),
+            location: keyboard::Location::Standard,
+            modifiers: Modifiers::empty(),
+            text: Some("x".into()),
+            repeat: false,
+        });
+        assert!(app.terminal_command_buffers.is_empty());
+    }
+
+    #[test]
+    fn palette_rename_updates_workspaces_tabs_and_panes() {
+        let mut app = Muxtrix::new();
+        let workspace_id = app.session.active_workspace_id;
+        let _ = app.run_command(CommandAction::RenameWorkspace);
+        assert_eq!(
+            app.rename_prompt,
+            Some(RenameTarget::Workspace(workspace_id))
+        );
+        app.rename_draft = "gateway".into();
+        app.apply_rename().expect("workspace rename should apply");
+        assert_eq!(app.active_workspace().expect("workspace").name, "gateway");
+
+        let tab_id = app.active_workspace().expect("workspace").active_tab_id;
+        let _ = app.run_command(CommandAction::RenameTab);
+        assert_eq!(
+            app.rename_prompt,
+            Some(RenameTarget::Tab(workspace_id, tab_id))
+        );
+        app.rename_draft = "review".into();
+        app.apply_rename().expect("tab rename should apply");
+        assert_eq!(
+            app.active_workspace()
+                .expect("workspace")
+                .active_tab()
+                .expect("tab")
+                .name,
+            "review"
+        );
+
+        let pane_id = active_pane_id(&app);
+        let _ = app.run_command(CommandAction::RenamePane);
+        assert_eq!(app.rename_prompt, Some(RenameTarget::Pane(pane_id)));
+        app.rename_draft = "build watcher".into();
+        app.apply_rename().expect("pane rename should apply");
+        let workspace = app.active_workspace().expect("workspace");
+        assert_eq!(app.pane_title(workspace, pane_id), "build watcher");
+
+        // An empty pane name clears the override back to the automatic title.
+        app.rename_prompt = Some(RenameTarget::Pane(pane_id));
+        app.rename_draft = "  ".into();
+        app.apply_rename().expect("pane rename should clear");
+        let workspace = app.active_workspace().expect("workspace");
+        assert_eq!(app.pane_title(workspace, pane_id), "shell 1");
+    }
+
+    #[test]
+    fn agent_titles_prefer_harness_or_worktree_identity_over_the_brand() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "codex".into(),
+                display_name: Some("agent-title-hardening".into()),
+                state: AgentState::Running,
+                activity: None,
+                session_id: None,
+                cwd: None,
+                git_branch: None,
+            },
+        );
+        let workspace = app.active_workspace().expect("workspace");
+        assert_eq!(app.pane_title(workspace, pane_id), "agent-title-hardening");
+
+        app.agent_statuses
+            .get_mut(&pane_id)
+            .expect("agent status")
+            .display_name = None;
+        let workspace = app.active_workspace().expect("workspace");
+        assert_eq!(app.pane_title(workspace, pane_id), "Codex");
+    }
+
+    #[test]
+    fn session_layout_persists_agent_identity_for_reattach() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "claude".into(),
+                display_name: Some("resume-status".into()),
+                state: AgentState::Running,
+                activity: None,
+                session_id: Some("session-1".into()),
+                cwd: None,
+                git_branch: None,
+            },
+        );
+
+        let persisted = session_with_agent_identities(&app.session, &app.agent_statuses);
+        assert_eq!(
+            persisted.workspaces[0].tabs[0].panes[&pane_id].agent,
+            Some(PaneAgent::ClaudeCode)
+        );
+        let restored = agent_statuses_from_session(&persisted);
+        assert_eq!(restored[&pane_id].agent, "claude");
+        assert_eq!(restored[&pane_id].state, AgentState::Idle);
+
+        // Removing the live status must clear a previously persisted identity
+        // on the next layout sync instead of preserving a stale agent forever.
+        let cleared = session_with_agent_identities(&persisted, &BTreeMap::new());
+        assert_eq!(cleared.workspaces[0].tabs[0].panes[&pane_id].agent, None);
+    }
+
+    #[test]
+    fn replayed_claude_screen_recovers_status_without_a_hook() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .expect("terminal actor should start");
+        actor
+            .feed(
+                "\u{1b}]0;current session\u{7}\u{1b}[2J\u{1b}[H────────────────────────\n❯ continue\n────────────────────────\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents"
+                    .as_bytes()
+                    .to_vec(),
+            )
+            .expect("terminal should accept Claude chrome");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        actor.shutdown().expect("terminal actor should stop");
+
+        let runtime = app.terminals.get_mut(&pane_id).expect("terminal runtime");
+        runtime.session = None;
+        runtime.snapshot = Some(snapshot);
+        app.agent_statuses.clear();
+        app.poll_terminal();
+
+        let status = app
+            .agent_statuses
+            .get(&pane_id)
+            .expect("replayed Claude chrome should restore agent status");
+        assert_eq!(status.agent, "claude");
+        assert_eq!(status.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn harness_terminal_titles_ignore_brand_only_values_and_normalize_copy() {
+        assert_eq!(harness_terminal_title("Codex", "codex"), None);
+        assert_eq!(harness_terminal_title("Claude Code", "claude"), None);
+        assert_eq!(harness_terminal_title("⠋ Codex", "codex"), None);
+        assert_eq!(harness_terminal_title("◐ Claude Code", "claude"), None);
+        assert_eq!(
+            harness_terminal_title("  Fix   agent names  ", "codex"),
+            Some("Fix agent names".into())
+        );
+        assert_eq!(
+            harness_terminal_title("⠋ Fix window titles", "codex"),
+            harness_terminal_title("⠙ Fix window titles", "codex")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_paste_reaches_the_focused_terminal() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < ready_deadline {
+            app.poll_terminal();
+            if app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.text().trim().is_empty())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let _ = app.update(Message::ClipboardPasted(
+            pane_id,
+            Some("paste-marker".into()),
+        ));
+
+        let paste_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut text = String::new();
+        while std::time::Instant::now() < paste_deadline {
+            app.poll_terminal();
+            text = app
+                .terminals
+                .get(&pane_id)
+                .and_then(|runtime| runtime.snapshot.as_ref())
+                .map(GridSnapshot::text)
+                .unwrap_or_default();
+            if text.contains("paste-marker") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            text.contains("paste-marker"),
+            "pasted clipboard text did not reach the terminal grid"
+        );
+    }
+
+    #[test]
+    fn clipboard_shortcuts_match_ghostty_defaults() {
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        assert_eq!(
+            clipboard_shortcut_for(Key::Character("C"), ctrl_shift, false),
+            Some(ClipboardAction::Copy)
+        );
+        assert_eq!(
+            clipboard_shortcut_for(Key::Character("V"), ctrl_shift, false),
+            Some(ClipboardAction::Paste)
+        );
+        assert_eq!(
+            clipboard_shortcut_for(Key::Character("c"), Modifiers::LOGO, true),
+            Some(ClipboardAction::Copy)
+        );
+        assert_eq!(
+            clipboard_shortcut_for(Key::Character("v"), Modifiers::LOGO, true),
+            Some(ClipboardAction::Paste)
+        );
+
+        // Bare Ctrl+C/Ctrl+V and unrelated chords stay terminal input.
+        assert_eq!(
+            clipboard_shortcut_for(Key::Character("c"), Modifiers::CTRL, false),
+            None
+        );
+        assert_eq!(
+            clipboard_shortcut_for(Key::Character("v"), Modifiers::CTRL, false),
+            None
+        );
+        assert_eq!(
+            clipboard_shortcut_for(Key::Character("x"), ctrl_shift, false),
+            None
+        );
+        assert_eq!(
+            clipboard_shortcut_for(
+                Key::Character("v"),
+                Modifiers::LOGO | Modifiers::SHIFT,
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ctrl_enter_extends_an_agent_prompt_instead_of_submitting() {
+        assert_eq!(
+            encode_terminal_key(Key::Named(Named::Enter), Modifiers::CTRL, None),
+            Some(vec![b'\n'])
+        );
+        assert_eq!(
+            encode_terminal_key(Key::Named(Named::Enter), Modifiers::empty(), None),
+            Some(vec![b'\r'])
+        );
+    }
+
+    #[test]
+    fn alt_arrows_walk_split_geometry_before_wrapping() {
+        let profile_id = ProfileId::new();
+        let mut tab = WorkspaceTab::new("Tab 1", terminal_surface(profile_id, "left"));
+        let left = tab.focused_pane_id;
+        let right = tab
+            .split_focused(
+                SplitAxis::Horizontal,
+                SplitRatio::EQUAL,
+                terminal_surface(profile_id, "right"),
+            )
+            .expect("split should succeed");
+        let bottom_right = tab
+            .split_focused(
+                SplitAxis::Vertical,
+                SplitRatio::EQUAL,
+                terminal_surface(profile_id, "bottom right"),
+            )
+            .expect("split should succeed");
+
+        let rects = pane_rects(&tab.root);
+        assert_eq!(
+            neighbor_pane(&rects, left, NavDirection::Right),
+            Some(right)
+        );
+        assert_eq!(neighbor_pane(&rects, right, NavDirection::Left), Some(left));
+        assert_eq!(
+            neighbor_pane(&rects, right, NavDirection::Down),
+            Some(bottom_right)
+        );
+        assert_eq!(
+            neighbor_pane(&rects, bottom_right, NavDirection::Up),
+            Some(right)
+        );
+        // The layout edge has no neighbor; tab wrapping takes over from here.
+        assert_eq!(neighbor_pane(&rects, right, NavDirection::Right), None);
+        assert_eq!(neighbor_pane(&rects, left, NavDirection::Left), None);
+        assert_eq!(neighbor_pane(&rects, left, NavDirection::Up), None);
+    }
+
+    #[test]
+    fn zellij_default_tiled_layouts_preserve_pane_order() {
+        let pane_ids: Vec<_> = (0..6).map(|_| PaneId::new()).collect();
+        let vertical = pane_layout_tree(PaneLayout::Vertical, &pane_ids);
+        let horizontal = pane_layout_tree(PaneLayout::Horizontal, &pane_ids);
+        let stacked = pane_layout_tree(PaneLayout::Stacked, &pane_ids);
+        let half_stacked = pane_layout_tree(PaneLayout::HalfStacked, &pane_ids);
+
+        assert!(matches!(
+            &vertical,
+            PaneTree::Split {
+                axis: SplitAxis::Horizontal,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &horizontal,
+            PaneTree::Split {
+                axis: SplitAxis::Vertical,
+                ..
+            }
+        ));
+        assert!(matches!(&stacked, PaneTree::Stack { .. }));
+        assert!(matches!(
+            &half_stacked,
+            PaneTree::Split {
+                axis: SplitAxis::Horizontal,
+                second,
+                ..
+            } if matches!(second.as_ref(), PaneTree::Stack { .. })
+        ));
+        for layout in [vertical, horizontal, stacked, half_stacked] {
+            assert_eq!(layout.pane_ids(), pane_ids);
+        }
+
+        let three = pane_layout_tree(PaneLayout::Vertical, &pane_ids[..3]);
+        assert!(matches!(
+            three,
+            PaneTree::Split {
+                axis: SplitAxis::Horizontal,
+                second,
+                ..
+            } if matches!(
+                second.as_ref(),
+                PaneTree::Split {
+                    axis: SplitAxis::Vertical,
+                    ..
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn stacked_resize_grows_then_collects_blocked_neighbors() {
+        let focused = PaneId::new();
+        let neighbor = PaneId::new();
+        let mut tree = PaneTree::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: SplitRatio::EQUAL,
+            first: Box::new(PaneTree::leaf(focused)),
+            second: Box::new(PaneTree::leaf(neighbor)),
+        };
+
+        assert!(enlarge_focused_tree(&mut tree, focused));
+        assert_eq!(
+            split_ratio_at(&tree, &[])
+                .expect("split remains")
+                .permille(),
+            800
+        );
+        assert!(enlarge_focused_tree(&mut tree, focused));
+        assert!(matches!(tree, PaneTree::Stack { .. }));
+        assert_eq!(tree.pane_ids(), vec![focused, neighbor]);
+    }
+
+    #[test]
+    fn zellij_resize_prefers_the_aligned_pane_above_bottom_left() {
+        let top_left = PaneId::new();
+        let top_right = PaneId::new();
+        let bottom_left = PaneId::new();
+        let bottom_right = PaneId::new();
+        let row = |first, second| PaneTree::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: SplitRatio::EQUAL,
+            first: Box::new(PaneTree::leaf(first)),
+            second: Box::new(PaneTree::leaf(second)),
+        };
+        let mut tree = PaneTree::Split {
+            axis: SplitAxis::Vertical,
+            ratio: SplitRatio::EQUAL,
+            first: Box::new(row(top_left, top_right)),
+            second: Box::new(row(bottom_left, bottom_right)),
+        };
+
+        let direction = zellij_resize_direction(&pane_rects(&tree), bottom_left);
+        assert_eq!(direction, Some(NavDirection::Up));
+        assert!(enlarge_focused_tree_toward(
+            &mut tree,
+            bottom_left,
+            direction.expect("the aligned pane above determines the direction")
+        ));
+        assert_eq!(
+            split_ratio_at(&tree, &[])
+                .expect("root split remains")
+                .permille(),
+            200,
+            "the shared horizontal boundary should move up past halfway"
+        );
+    }
+
+    #[test]
+    fn zellij_resize_ignores_an_above_pane_that_does_not_line_up() {
+        let above = PaneId::new();
+        let bottom_left = PaneId::new();
+        let bottom_right = PaneId::new();
+        let tree = PaneTree::Split {
+            axis: SplitAxis::Vertical,
+            ratio: SplitRatio::EQUAL,
+            first: Box::new(PaneTree::leaf(above)),
+            second: Box::new(PaneTree::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: SplitRatio::EQUAL,
+                first: Box::new(PaneTree::leaf(bottom_left)),
+                second: Box::new(PaneTree::leaf(bottom_right)),
+            }),
+        };
+
+        assert_eq!(
+            zellij_resize_direction(&pane_rects(&tree), bottom_left),
+            Some(NavDirection::Right),
+            "a wider pane above must not override the original local split"
+        );
+    }
+
+    #[test]
+    fn stacked_headers_are_keyboard_navigable_in_order() {
+        let pane_ids: Vec<_> = (0..3).map(|_| PaneId::new()).collect();
+        let tree = PaneTree::stack(pane_ids.clone()).expect("three panes form a stack");
+        assert_eq!(
+            stacked_neighbor(&tree, pane_ids[1], NavDirection::Up),
+            Some(pane_ids[0])
+        );
+        assert_eq!(
+            stacked_neighbor(&tree, pane_ids[1], NavDirection::Down),
+            Some(pane_ids[2])
+        );
+        assert_eq!(stacked_neighbor(&tree, pane_ids[0], NavDirection::Up), None);
+    }
+
+    #[test]
+    fn half_stacked_layout_keeps_a_body_open_when_focus_is_in_the_sibling() {
+        let pane_ids: Vec<_> = (0..3).map(|_| PaneId::new()).collect();
+        let tree = pane_layout_tree(PaneLayout::HalfStacked, &pane_ids);
+        let PaneTree::Split { second, .. } = tree else {
+            panic!("half-stacked layout should have two branches");
+        };
+        let PaneTree::Stack { pane_ids: stack } = second.as_ref() else {
+            panic!("half-stacked layout should stack the right branch");
+        };
+
+        assert_eq!(expanded_stack_pane(stack, pane_ids[0]), Some(pane_ids[1]));
+        assert_eq!(expanded_stack_pane(stack, pane_ids[2]), Some(pane_ids[2]));
+    }
+
+    #[test]
+    fn layout_cycle_returns_to_the_exact_base_tree() {
+        let mut app = Muxtrix::new();
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("second pane should open");
+        app.split_terminal(SplitAxis::Vertical)
+            .expect("third pane should open");
+        let base = active_tab(&app).root.clone();
+        let left = base.pane_ids()[0];
+        app.focus_pane(left).expect("left pane should focus");
+
+        for expected in ["Vertical", "Horizontal", "Stacked", "Half-stacked", "Base"] {
+            assert_eq!(
+                app.cycle_pane_layout(LayoutCycle::Next)
+                    .expect("layout should cycle"),
+                expected
+            );
+            assert_eq!(active_tab(&app).root.pane_ids().len(), 3);
+        }
+        assert_eq!(active_tab(&app).root, base);
+    }
+
+    #[test]
+    fn layout_cycle_recovers_a_pane_missing_from_the_projection() {
+        let mut app = Muxtrix::new();
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("second pane should open");
+        app.split_terminal(SplitAxis::Vertical)
+            .expect("third pane should open");
+        let all_panes = active_tab(&app).root.pane_ids();
+        active_tab_mut(&mut app).root = PaneTree::Split {
+            axis: SplitAxis::Horizontal,
+            ratio: SplitRatio::EQUAL,
+            first: Box::new(PaneTree::leaf(all_panes[0])),
+            second: Box::new(PaneTree::leaf(all_panes[1])),
+        };
+
+        assert_eq!(active_tab(&app).panes.len(), 3);
+        assert_eq!(active_tab(&app).root.pane_ids().len(), 2);
+        let recovered_order = pane_ids_for_layout(active_tab(&app));
+
+        for expected in ["Vertical", "Horizontal", "Stacked", "Half-stacked", "Base"] {
+            assert_eq!(
+                app.cycle_pane_layout(LayoutCycle::Next)
+                    .expect("layout should cycle"),
+                expected
+            );
+            assert_eq!(active_tab(&app).root.pane_ids(), recovered_order);
+        }
+        assert_eq!(
+            active_tab(&app).root,
+            pane_layout_tree(PaneLayout::Vertical, &recovered_order)
+        );
+    }
+
+    #[test]
+    fn pane_resize_decrease_walks_the_undo_chain() {
+        let mut app = Muxtrix::new();
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("second pane should open");
+        let base = active_tab(&app).root.clone();
+
+        app.resize_focused_pane(true)
+            .expect("first resize should adjust the split");
+        app.resize_focused_pane(true)
+            .expect("second resize should stack blocked panes");
+        assert!(matches!(active_tab(&app).root, PaneTree::Stack { .. }));
+        app.resize_focused_pane(false)
+            .expect("first decrease should restore the split");
+        app.resize_focused_pane(false)
+            .expect("second decrease should restore the base");
+        assert_eq!(active_tab(&app).root, base);
+    }
+
+    #[test]
+    fn pane_resize_decrease_moves_the_chosen_boundary_back_after_crossing_halfway() {
+        let mut app = Muxtrix::new();
+        let top_left = active_pane_id(&app);
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("top-right pane should open");
+        let top_right = active_pane_id(&app);
+        app.focus_pane(top_left)
+            .expect("top-left pane should focus");
+        app.split_terminal(SplitAxis::Vertical)
+            .expect("bottom-left pane should open");
+        let bottom_left = active_pane_id(&app);
+        app.focus_pane(top_right)
+            .expect("top-right pane should focus");
+        app.split_terminal(SplitAxis::Vertical)
+            .expect("bottom-right pane should open");
+        let bottom_right = active_pane_id(&app);
+        active_tab_mut(&mut app).root = PaneTree::Split {
+            axis: SplitAxis::Vertical,
+            ratio: SplitRatio::EQUAL,
+            first: Box::new(PaneTree::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: SplitRatio::EQUAL,
+                first: Box::new(PaneTree::leaf(top_left)),
+                second: Box::new(PaneTree::leaf(top_right)),
+            }),
+            second: Box::new(PaneTree::Split {
+                axis: SplitAxis::Horizontal,
+                ratio: SplitRatio::EQUAL,
+                first: Box::new(PaneTree::leaf(bottom_left)),
+                second: Box::new(PaneTree::leaf(bottom_right)),
+            }),
+        };
+        app.focus_pane(bottom_left)
+            .expect("bottom-left pane should focus");
+        let base = active_tab(&app).root.clone();
+
+        app.resize_focused_pane(true)
+            .expect("grow should move the aligned boundary up");
+        assert_eq!(
+            split_ratio_at(&active_tab(&app).root, &[])
+                .expect("root split remains")
+                .permille(),
+            200
+        );
+        app.resize_focused_pane(false)
+            .expect("decrease should move that boundary back down");
+        assert_eq!(active_tab(&app).root, base);
+    }
+
+    #[test]
+    fn edge_navigation_wraps_to_the_neighboring_tab() {
+        let mut app = Muxtrix::new();
+        let first_pane = active_pane_id(&app);
+        app.new_tab().expect("second tab should open");
+        let second_pane = active_pane_id(&app);
+        assert_ne!(first_pane, second_pane);
+
+        app.focus_neighbor_pane(NavDirection::Right)
+            .expect("navigation should wrap forward");
+        assert_eq!(active_pane_id(&app), first_pane);
+        app.focus_neighbor_pane(NavDirection::Left)
+            .expect("navigation should wrap backward");
+        assert_eq!(active_pane_id(&app), second_pane);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_agent_processes_are_detected_without_hooks() {
+        let mut app = Muxtrix::new();
+        // Any process whose comm matches the configured agent executable
+        // counts; `sleep` stands in for the codex binary here.
+        app.settings.codex_command = "sleep 30".into();
+        let pane_id = active_pane_id(&app);
+
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < ready_deadline {
+            app.poll_terminal();
+            if app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.text().trim().is_empty())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Launched indirectly (as via shell history in the real report), so
+        // the typed-command detector cannot see it — only process detection.
+        app.send_terminal_input(b"sh -c 'exec sleep 30'\r".to_vec())
+            .expect("shell should accept the command");
+
+        let detect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < detect_deadline {
+            app.detect_agent_processes();
+            if app.agent_statuses.contains_key(&pane_id) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let status = app
+            .agent_statuses
+            .get(&pane_id)
+            .expect("a running agent process should be detected without hooks");
+        assert_eq!(status.agent, "codex");
+        assert_eq!(status.state, AgentState::Idle);
+        assert!(app.detected_agents.contains_key(&pane_id));
+
+        // A hook event takes ownership: the detection record clears so the
+        // status is no longer subject to process-scan removal.
+        app.detected_agents.insert(
+            pane_id,
+            std::time::Instant::now() - std::time::Duration::from_secs(3),
+        );
+        app.send_terminal_input(vec![0x03]).expect("ctrl+c");
+        let gone_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < gone_deadline {
+            app.detect_agent_processes();
+            if !app.agent_statuses.contains_key(&pane_id) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !app.agent_statuses.contains_key(&pane_id),
+            "a detected status must self-clean when its process exits"
+        );
+    }
+
+    #[test]
+    fn worktree_names_are_safe_for_branches_and_directories() {
+        assert_eq!(worktree_name("  fix login bug  "), "fix-login-bug");
+        assert_eq!(worktree_name("feature/palette"), "feature-palette");
+        assert_eq!(worktree_name("../escape"), "escape");
+        assert_eq!(worktree_name("   "), "");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clean_exit_cascades_in_daemon_mode() {
+        // The regression class this pins: local-PTY panes cascaded on clean
+        // exit, daemon-owned panes silently stopped.
+        let id = uuid::Uuid::new_v4();
+        let endpoint = muxtrix_sessions::session_endpoint(id);
+        let daemon_endpoint = endpoint.clone();
+        std::thread::spawn(move || {
+            let _ = muxtrix_sessions::daemon::run(id, "cascade-test".into(), daemon_endpoint);
+        });
+        assert!(muxtrix_sessions::daemon::wait_until_ready(&endpoint));
+        let (client, _, _) =
+            muxtrix_sessions::SessionClient::connect_endpoint(&endpoint).expect("attach");
+        let client = Arc::new(client);
+        let mut app = Muxtrix::new();
+        app.terminal_launcher = Arc::new(SystemTerminalLauncher {
+            client: Some(Arc::clone(&client)),
+        });
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("second pane");
+        let pane_id = active_pane_id(&app);
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < ready_deadline {
+            app.poll_terminal();
+            if app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.text().trim().is_empty())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let pane_count = |app: &Muxtrix| {
+            app.session
+                .workspaces
+                .iter()
+                .map(muxtrix_domain::Workspace::pane_count)
+                .sum::<usize>()
+        };
+        assert_eq!(pane_count(&app), 2);
+        app.send_terminal_input(b"exit 0\r".to_vec())
+            .expect("shell should accept exit");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            app.poll_terminal();
+            if pane_count(&app) == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            pane_count(&app),
+            1,
+            "a cleanly exited daemon pane must close and cascade"
+        );
+        let _ = client.send(&muxtrix_sessions::Request::Shutdown);
+        // Test daemons must not leave records behind: the session picker
+        // reads that directory.
+        muxtrix_sessions::remove_session_record(id);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closing_a_daemon_pane_releases_the_byte_channel_it_was_read_through() {
+        // The leak this pins: the daemon reports no exit for a pane it was
+        // told to kill, so nothing closed the pane's output channel and its
+        // reader thread blocked on an empty receiver for the life of the app.
+        let id = uuid::Uuid::new_v4();
+        let endpoint = muxtrix_sessions::session_endpoint(id);
+        let daemon_endpoint = endpoint.clone();
+        std::thread::spawn(move || {
+            let _ = muxtrix_sessions::daemon::run(id, "close-test".into(), daemon_endpoint);
+        });
+        assert!(muxtrix_sessions::daemon::wait_until_ready(&endpoint));
+        let (client, _, _) =
+            muxtrix_sessions::SessionClient::connect_endpoint(&endpoint).expect("attach");
+        let client = Arc::new(client);
+        let mut app = Muxtrix::new();
+        app.terminal_launcher = Arc::new(SystemTerminalLauncher {
+            client: Some(Arc::clone(&client)),
+        });
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("second pane");
+        let pane_id = active_pane_id(&app);
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < ready_deadline {
+            app.poll_terminal();
+            if app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.text().trim().is_empty())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            client.tracks_pane(pane_id.as_uuid()),
+            "the pane should be streaming before it is closed"
+        );
+
+        app.close_pane(pane_id).expect("close the pane");
+
+        // The kill travels through the pane's session thread.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && client.tracks_pane(pane_id.as_uuid()) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !client.tracks_pane(pane_id.as_uuid()),
+            "closing a pane must release its byte channel, or its reader never ends"
+        );
+        let _ = client.send(&muxtrix_sessions::Request::Shutdown);
+        // Test daemons must not leave records behind: the session picker
+        // reads that directory.
+        muxtrix_sessions::remove_session_record(id);
+    }
+
+    /// Restarting a pane in a worktree reuses the pane's durable identity
+    /// against the real daemon, on the real background launch path. The
+    /// replacement must become a live, streaming terminal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restarting_a_daemon_pane_in_a_directory_streams_its_replacement() {
+        let id = uuid::Uuid::new_v4();
+        let endpoint = muxtrix_sessions::session_endpoint(id);
+        let daemon_endpoint = endpoint.clone();
+        std::thread::spawn(move || {
+            let _ = muxtrix_sessions::daemon::run(id, "restart-test".into(), daemon_endpoint);
+        });
+        assert!(muxtrix_sessions::daemon::wait_until_ready(&endpoint));
+        let (client, _, _) =
+            muxtrix_sessions::SessionClient::connect_endpoint(&endpoint).expect("attach");
+        let client = Arc::new(client);
+        let mut app = Muxtrix::new();
+        app.terminal_launcher = Arc::new(SystemTerminalLauncher {
+            client: Some(Arc::clone(&client)),
+        });
+        // Production always launches off the UI thread.
+        app.launch_in_background = true;
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("second pane");
+        let pane_id = active_pane_id(&app);
+
+        let settle = |app: &mut Muxtrix, marker: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while std::time::Instant::now() < deadline {
+                app.poll_terminal();
+                if app.terminals[&pane_id]
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.text().contains(marker))
+                {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+        let run_marker = |app: &mut Muxtrix, marker: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while std::time::Instant::now() < deadline {
+                app.poll_terminal();
+                if matches!(
+                    app.terminals[&pane_id].launch_state,
+                    TerminalLaunchState::Running
+                ) && app
+                    .send_terminal_input_to(pane_id, format!("printf {marker}\r").into_bytes())
+                    .is_ok()
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        run_marker(&mut app, "first-shell");
+        assert!(
+            settle(&mut app, "first-shell"),
+            "the pane should stream before it is restarted"
+        );
+
+        app.restart_pane_in_directory(pane_id, std::env::temp_dir())
+            .expect("restart in the requested directory");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            app.poll_terminal();
+            if !matches!(
+                app.terminals[&pane_id].launch_state,
+                TerminalLaunchState::Starting { .. }
+            ) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            matches!(
+                app.terminals[&pane_id].launch_state,
+                TerminalLaunchState::Running
+            ),
+            "the restarted pane never became live: {:?}",
+            app.terminals[&pane_id].launch_state
+        );
+
+        run_marker(&mut app, "restarted-shell");
+        assert!(
+            settle(&mut app, "restarted-shell"),
+            "the restarted pane never streamed its own output"
+        );
+        assert!(
+            client.tracks_pane(pane_id.as_uuid()),
+            "the replacement's byte channel must still be open"
+        );
+        let _ = client.send(&muxtrix_sessions::Request::Shutdown);
+        // Test daemons must not leave records behind: the session picker
+        // reads that directory.
+        muxtrix_sessions::remove_session_record(id);
+    }
+
+    /// The same restart, taken while the pane's first launch is still in
+    /// flight — the fresh-tab-then-pick-a-worktree sequence.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restarting_a_daemon_pane_mid_launch_streams_its_replacement() {
+        let id = uuid::Uuid::new_v4();
+        let endpoint = muxtrix_sessions::session_endpoint(id);
+        let daemon_endpoint = endpoint.clone();
+        std::thread::spawn(move || {
+            let _ =
+                muxtrix_sessions::daemon::run(id, "queued-restart-test".into(), daemon_endpoint);
+        });
+        assert!(muxtrix_sessions::daemon::wait_until_ready(&endpoint));
+        let (client, _, _) =
+            muxtrix_sessions::SessionClient::connect_endpoint(&endpoint).expect("attach");
+        let client = Arc::new(client);
+        let mut app = Muxtrix::new();
+        app.terminal_launcher = Arc::new(SystemTerminalLauncher {
+            client: Some(Arc::clone(&client)),
+        });
+        app.launch_in_background = true;
+
+        app.new_tab().expect("fresh tab");
+        let pane_id = active_pane_id(&app);
+        // No poll in between: the first launch is still on its worker.
+        app.restart_pane_in_directory(pane_id, std::env::temp_dir())
+            .expect("restart into the worktree directory");
+        assert!(
+            app.queued_terminal_restarts.contains(&pane_id),
+            "the restart should have queued behind the first launch"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            app.poll_terminal();
+            if matches!(
+                app.terminals[&pane_id].launch_state,
+                TerminalLaunchState::Running
+            ) && app.queued_terminal_restarts.is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            matches!(
+                app.terminals[&pane_id].launch_state,
+                TerminalLaunchState::Running
+            ),
+            "the restarted pane never became live: {:?}",
+            app.terminals[&pane_id].launch_state
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut streamed = false;
+        while std::time::Instant::now() < deadline && !streamed {
+            app.poll_terminal();
+            let _ = app.send_terminal_input_to(pane_id, b"printf queued-marker\r".to_vec());
+            for _ in 0..25 {
+                app.poll_terminal();
+                streamed = app.terminals[&pane_id]
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.text().contains("queued-marker"));
+                if streamed {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(
+            streamed,
+            "the replacement pane never streamed: it is a live-looking terminal that \
+             receives no bytes"
+        );
+        assert_eq!(
+            app.active_workspace()
+                .expect("workspace")
+                .pane(pane_id)
+                .and_then(Pane::active_surface)
+                .and_then(|surface| match &surface.kind {
+                    muxtrix_domain::SurfaceKind::Terminal(terminal) =>
+                        terminal.working_directory.clone(),
+                    _ => None,
+                })
+                .as_deref(),
+            Some(std::env::temp_dir().as_path()),
+            "the hand-off must keep the directory the restart was chosen for"
+        );
+        let _ = client.send(&muxtrix_sessions::Request::Shutdown);
+        // Test daemons must not leave records behind: the session picker
+        // reads that directory.
+        muxtrix_sessions::remove_session_record(id);
+    }
+
+    /// A pane the host refuses to start must say so in place. The daemon
+    /// accepts the spawn request and reports the refusal afterwards, so
+    /// without this the pane renders as a live terminal that never prints.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pane_the_host_cannot_start_reports_why_instead_of_staying_blank() {
+        let id = uuid::Uuid::new_v4();
+        let endpoint = muxtrix_sessions::session_endpoint(id);
+        let daemon_endpoint = endpoint.clone();
+        std::thread::spawn(move || {
+            let _ = muxtrix_sessions::daemon::run(id, "refusal-test".into(), daemon_endpoint);
+        });
+        assert!(muxtrix_sessions::daemon::wait_until_ready(&endpoint));
+        let (client, _, _) =
+            muxtrix_sessions::SessionClient::connect_endpoint(&endpoint).expect("attach");
+        let client = Arc::new(client);
+        let mut app = Muxtrix::new();
+        app.terminal_launcher = Arc::new(SystemTerminalLauncher {
+            client: Some(Arc::clone(&client)),
+        });
+        app.launch_in_background = true;
+        let missing = std::env::temp_dir().join("muxtrix-shell-that-does-not-exist");
+        for profile in &mut app.session.profiles {
+            profile.backend = ProcessBackend::Local;
+            profile.program = missing.to_string_lossy().into_owned();
+            profile.arguments.clear();
+        }
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("second pane");
+        let pane_id = active_pane_id(&app);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            app.poll_terminal();
+            if matches!(
+                app.terminals[&pane_id].launch_state,
+                TerminalLaunchState::Failed(_)
+            ) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let TerminalLaunchState::Failed(error) = &app.terminals[&pane_id].launch_state else {
+            panic!(
+                "a pane the host never started must read as failed, not {:?}",
+                app.terminals[&pane_id].launch_state
+            );
+        };
+        assert!(
+            error.contains("muxtrix-shell-that-does-not-exist"),
+            "the pane should name what the host could not start: {error}"
+        );
+        let _ = client.send(&muxtrix_sessions::Request::Shutdown);
+        // Test daemons must not leave records behind: the session picker
+        // reads that directory.
+        muxtrix_sessions::remove_session_record(id);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn injected_prompt_command_reports_pwd_through_osc7() {
+        if std::process::Command::new("bash")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < ready_deadline {
+            app.poll_terminal();
+            if app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.text().trim().is_empty())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // The pane's sh received PROMPT_COMMAND from the launch environment;
+        // exec-ing bash inherits it, and --norc/--noprofile prove the report
+        // needs no rc-file cooperation. The cd must then surface through
+        // snapshot.pwd — the exact chain the Windows+WSL build relies on.
+        app.send_terminal_input(
+            b"exec bash --noprofile --norc
+"
+            .to_vec(),
+        )
+        .expect("shell should exec bash");
+        app.send_terminal_input(
+            b"cd /tmp
+"
+            .to_vec(),
+        )
+        .expect("bash should accept cd");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut reported = None;
+        while std::time::Instant::now() < deadline {
+            app.poll_terminal();
+            reported = app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.pwd.as_deref())
+                .and_then(decode_reported_pwd)
+                .filter(|path| path == std::path::Path::new("/tmp"));
+            if reported.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            reported,
+            Some(std::path::PathBuf::from("/tmp")),
+            "bash with injected PROMPT_COMMAND must report its pwd via OSC 7; \
+             snapshot pwd was {:?}",
+            app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.pwd.clone())
+        );
+    }
+
+    /// Waits for the pane's shell to report `expected` via OSC 7 after the
+    /// given inputs run — the exact chain WSL-hosted panes depend on.
+    #[cfg(target_os = "linux")]
+    fn assert_shell_reports_pwd(shell_command: &str, expected: &str) {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < ready_deadline {
+            app.poll_terminal();
+            if app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.text().trim().is_empty())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.send_terminal_input(format!("exec {shell_command}\r").into_bytes())
+            .expect("shell should exec");
+        // Wait for the new shell's first prompt-time report before typing:
+        // input sent during exec can still be sitting in the old shell's
+        // read buffer and would vanish with it.
+        let first_report_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < first_report_deadline {
+            app.poll_terminal();
+            if app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.pwd.is_some())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        app.send_terminal_input(format!("cd {expected}\r").into_bytes())
+            .expect("shell should accept cd");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut reported = None;
+        while std::time::Instant::now() < deadline {
+            app.poll_terminal();
+            reported = app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.pwd.as_deref())
+                .and_then(decode_reported_pwd)
+                .filter(|path| path == std::path::Path::new(expected));
+            if reported.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            reported,
+            Some(std::path::PathBuf::from(expected)),
+            "{shell_command} must report its pwd via OSC 7; snapshot pwd was {:?}; screen: {:?}",
+            app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.pwd.clone()),
+            app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.text())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staged_fish_integration_reports_pwd_through_osc7() {
+        if std::process::Command::new("fish")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        // fish only volunteers OSC 7 to allowlisted terminals; the staged
+        // conf.d snippet (gated on MUXTRIX_PANE_ID) must cover ours.
+        assert_shell_reports_pwd("fish", "/tmp");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn staged_zsh_bridge_reports_pwd_through_osc7() {
+        if std::process::Command::new("zsh")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        // The redirected ZDOTDIR bridge installs the precmd hook and then
+        // hands control back to the user's real dotfiles. The bridge is
+        // re-pointed explicitly because the pane's own shell may be zsh
+        // already — its bridge run restores ZDOTDIR, so a nested zsh would
+        // otherwise start without one (same limitation Ghostty has).
+        assert_shell_reports_pwd(
+            "env ZDOTDIR=\"$HOME/.local/share/muxtrix/shell-integration/zsh\" zsh",
+            "/tmp",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn focused_pane_detects_the_repository_it_runs_in() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        // Panes start in $HOME; the user flow is cd-ing into a repository
+        // first, so the test does the same with this crate's own repo.
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < ready_deadline {
+            app.poll_terminal();
+            if app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.text().trim().is_empty())
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.send_terminal_input(format!("cd {}\r", env!("CARGO_MANIFEST_DIR")).into_bytes())
+            .expect("shell should accept cd");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut root = None;
+        while std::time::Instant::now() < deadline {
+            app.poll_terminal();
+            root = app
+                .pane_working_directory(pane_id)
+                .as_deref()
+                .and_then(|directory| git_repository_root(directory, ""));
+            if root.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let root = root.unwrap_or_else(|| {
+            let pid = app.terminals[&pane_id]
+                .session
+                .as_ref()
+                .and_then(LiveSession::process_id);
+            let cwd = app.pane_working_directory(pane_id);
+            panic!("no repository detected: pid={pid:?} cwd={cwd:?}")
+        });
+        assert!(root.join(".git").exists());
+        let _ = pane_id;
+    }
+
+    #[test]
+    fn reported_pwd_decoding_handles_osc7_uris_and_bare_paths() {
+        // OSC 7: file:// URI, optionally with a hostname and percent-encoding.
+        assert_eq!(
+            decode_reported_pwd("file:///home/user"),
+            Some(std::path::PathBuf::from("/home/user"))
+        );
+        assert_eq!(
+            decode_reported_pwd("file://mymachine/home/user/my%20repo"),
+            Some(std::path::PathBuf::from("/home/user/my repo"))
+        );
+        // OSC 9/1337: bare paths pass through.
+        assert_eq!(
+            decode_reported_pwd("/tmp/x"),
+            Some(std::path::PathBuf::from("/tmp/x"))
+        );
+        assert_eq!(
+            decode_reported_pwd("C:\\Users\\dev"),
+            Some(std::path::PathBuf::from("C:\\Users\\dev"))
+        );
+        assert_eq!(decode_reported_pwd(""), None);
+        assert_eq!(decode_reported_pwd("file://"), None);
+    }
+
+    #[test]
+    fn default_worktree_name_skips_taken_names() {
+        let taken: BTreeSet<String> = ["worktree-1", "worktree-2"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(default_worktree_name(&taken), "worktree-3");
+        assert_eq!(default_worktree_name(&BTreeSet::new()), "worktree-1");
+    }
+
+    #[test]
+    fn rail_targets_walk_workspaces_then_fleet_in_visual_order() {
+        let app = Muxtrix::new();
+        let targets = app.rail_targets();
+        let workspace_count = targets
+            .iter()
+            .take_while(|target| matches!(target, RailTarget::Workspace(_)))
+            .count();
+        assert!(workspace_count >= 1, "workspaces lead the walk");
+        assert!(
+            targets[workspace_count..]
+                .iter()
+                .all(|target| !matches!(target, RailTarget::Workspace(_))),
+            "fleet entries never interleave with workspaces"
+        );
+        assert!(
+            matches!(
+                targets.get(workspace_count),
+                Some(RailTarget::FleetPane(..))
+            ),
+            "a one-tab workspace starts at its first visible pane row"
+        );
+        assert!(
+            targets
+                .iter()
+                .all(|target| !matches!(target, RailTarget::FleetTab(..))),
+            "navigation never lands on a hidden single-tab band"
+        );
+    }
+
+    #[test]
+    fn tabs_view_keeps_visible_tab_bands_in_the_active_workspace() {
+        let mut app = Muxtrix::new();
+        let workspace_id = app.session.active_workspace_id;
+        let first_tab = active_tab(&app).id;
+        let first_pane = active_pane_id(&app);
+        app.new_tab().expect("second tab should be created");
+        let second_tab = active_tab(&app).id;
+        let second_pane = active_pane_id(&app);
+
+        assert_eq!(
+            app.rail_targets()
+                .into_iter()
+                .filter(|target| !matches!(target, RailTarget::Workspace(_)))
+                .collect::<Vec<_>>(),
+            vec![
+                RailTarget::FleetTab(workspace_id, first_tab),
+                RailTarget::FleetPane(workspace_id, first_pane),
+                RailTarget::FleetTab(workspace_id, second_tab),
+                RailTarget::FleetPane(workspace_id, second_pane),
+            ],
+            "Tabs preserves tab bands even though workspace bands are gone"
+        );
+    }
+
+    #[test]
+    fn repos_view_groups_across_tabs_without_nested_tab_bands() {
+        let mut app = Muxtrix::new();
+        let workspace_id = app.session.active_workspace_id;
+        let first_repo_pane = active_pane_id(&app);
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+        let no_repo_pane = active_pane_id(&app);
+        app.new_tab().expect("second tab should be created");
+        let second_repo_pane = active_pane_id(&app);
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+        let other_repo_pane = active_pane_id(&app);
+
+        for (pane_id, name) in [
+            (first_repo_pane, Some("muxtrix")),
+            (no_repo_pane, None),
+            (second_repo_pane, Some("muxtrix")),
+            (other_repo_pane, Some("mailmatrix")),
+        ] {
+            let directory = app
+                .pane_working_directory(pane_id)
+                .expect("test pane should have a working directory");
+            app.pane_repositories.insert(
+                pane_id,
+                PaneRepository {
+                    directory,
+                    name: name.map(str::to_owned),
+                    worktree_name: None,
+                },
+            );
+        }
+        app.set_fleet_view(FleetView::Repos);
+
+        assert_eq!(
+            app.fleet_repository_groups(),
+            vec![
+                FleetRepositoryGroup {
+                    name: "muxtrix".into(),
+                    entries: vec![
+                        (workspace_id, first_repo_pane),
+                        (workspace_id, second_repo_pane),
+                    ],
+                },
+                FleetRepositoryGroup {
+                    name: "mailmatrix".into(),
+                    entries: vec![(workspace_id, other_repo_pane)],
+                },
+                FleetRepositoryGroup {
+                    name: NO_REPO_GROUP.into(),
+                    entries: vec![(workspace_id, no_repo_pane)],
+                },
+            ]
+        );
+        assert_eq!(
+            app.rail_targets()
+                .into_iter()
+                .filter(|target| !matches!(target, RailTarget::Workspace(_)))
+                .collect::<Vec<_>>(),
+            vec![
+                RailTarget::FleetGroup(workspace_id, first_repo_pane),
+                RailTarget::FleetPane(workspace_id, first_repo_pane),
+                RailTarget::FleetPane(workspace_id, second_repo_pane),
+                RailTarget::FleetGroup(workspace_id, other_repo_pane),
+                RailTarget::FleetPane(workspace_id, other_repo_pane),
+                RailTarget::FleetGroup(workspace_id, no_repo_pane),
+                RailTarget::FleetPane(workspace_id, no_repo_pane),
+            ],
+            "Repos uses repository bands only and preserves pane order inside each group"
+        );
+    }
+
+    #[test]
+    fn linked_worktrees_keep_the_primary_repository_group_name() {
+        let scratch = std::env::temp_dir().join(format!(
+            "muxtrix-repository-name-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let repo = scratch.join("muxtrix-source");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("file"), "one").expect("file");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "first"]);
+        let linked = scratch.join("worktrees").join("feature-a");
+        create_git_worktree(&repo, &linked, "feature-a", "").expect("linked worktree");
+
+        assert_eq!(
+            git_repository_name(&repo, "").as_deref(),
+            Some("muxtrix-source")
+        );
+        assert_eq!(
+            git_repository_name(&linked, "").as_deref(),
+            Some("muxtrix-source"),
+            "linked checkout names must not split one repository into separate groups"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn prefix_and_rail_navigation_only_exit_explicitly() {
+        let mut app = Muxtrix::new();
+
+        let _ = app.handle_keyboard(key_press(Key::Character("g".into()), Modifiers::CTRL));
+        assert!(app.prefix_armed);
+        assert_eq!(
+            app.feedback_message(),
+            Some(("Prefix — w workspaces · f fleet · Esc cancel", true)),
+            "an armed prefix is a keyboard mode, not a transient toast"
+        );
+
+        let _ = app.handle_keyboard(key_press(Key::Character("x".into()), Modifiers::empty()));
+        assert!(
+            app.prefix_armed,
+            "an unrelated key cannot cancel the prefix"
+        );
+
+        let _ = app.handle_keyboard(key_press(Key::Character("f".into()), Modifiers::empty()));
+        let target = app
+            .rail_nav
+            .expect("fleet follow-up should start navigation");
+        assert_eq!(
+            app.feedback_message(),
+            Some(("Navigate — ↑↓ move · Enter select · Esc exit", true)),
+            "rail navigation is a keyboard mode, not a transient toast"
+        );
+
+        let _ = app.handle_keyboard(key_press(Key::Character("x".into()), Modifiers::empty()));
+        assert_eq!(
+            app.rail_nav,
+            Some(target),
+            "an unrelated key cannot cancel rail navigation"
+        );
+
+        let _ = app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::empty()));
+        assert!(app.rail_nav.is_none());
+        assert!(app.feedback_message().is_none());
+    }
+
+    #[test]
+    fn rail_navigation_selection_exits_the_mode() {
+        let mut app = Muxtrix::new();
+        let _ = app.handle_keyboard(key_press(Key::Character("g".into()), Modifiers::CTRL));
+        let _ = app.handle_keyboard(key_press(Key::Character("w".into()), Modifiers::empty()));
+        assert!(matches!(app.rail_nav, Some(RailTarget::Workspace(_))));
+
+        let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+        assert!(app.rail_nav.is_none());
+        assert!(app.feedback_message().is_none());
+    }
+
+    #[test]
+    fn worktree_list_porcelain_parses_paths_and_branches() {
+        let listing = "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\nworktree /wt/one\nHEAD def\nbranch refs/heads/worktree-1\n\nworktree /wt/detached\nHEAD 123\ndetached\n";
+        let parsed = parse_worktree_list(listing);
+        assert_eq!(
+            parsed,
+            vec![
+                (std::path::PathBuf::from("/repo"), Some("main".into())),
+                (
+                    std::path::PathBuf::from("/wt/one"),
+                    Some("worktree-1".into())
+                ),
+                (std::path::PathBuf::from("/wt/detached"), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn linked_worktree_identity_uses_the_checkout_leaf_only_for_linked_trees() {
+        let base =
+            std::env::temp_dir().join(format!("muxtrix-agent-title-test-{}", uuid::Uuid::new_v4()));
+        let worktree = base.join("a-very-long-feature-name");
+        std::fs::create_dir_all(worktree.join("src")).expect("worktree fixture");
+        std::fs::write(worktree.join(".git"), "gitdir: /repo/.git/worktrees/name\n")
+            .expect("linked worktree marker");
+        assert_eq!(
+            linked_worktree_name(&worktree.join("src")),
+            Some("a-very-long-feature-name".into())
+        );
+        assert_eq!(
+            linked_worktree_name_from_convention(std::path::Path::new(
+                "/home/user/.muxtrix/worktrees/muxtrix/a-very-long-feature-name/src"
+            )),
+            Some("a-very-long-feature-name".into())
+        );
+        assert_eq!(
+            linked_worktree_name_from_convention(std::path::Path::new(
+                "/home/user/dev/muxtrix/.claude/worktrees/fix-agent-titles/src"
+            )),
+            Some("fix-agent-titles".into())
+        );
+        assert_eq!(
+            linked_worktree_name(std::path::Path::new("/repo/main")),
+            None
+        );
+    }
+
+    #[test]
+    fn fleet_location_prefers_worktree_then_repository_then_directory() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let directory = app
+            .pane_working_directory(pane_id)
+            .expect("test pane should have a working directory");
+        app.pane_repositories.insert(
+            pane_id,
+            PaneRepository {
+                directory: directory.clone(),
+                name: Some("muxtrix".into()),
+                worktree_name: Some("fleet-two-line-rows".into()),
+            },
+        );
+
+        assert_eq!(app.pane_location_label(pane_id), "fleet-two-line-rows");
+        app.pane_repositories
+            .get_mut(&pane_id)
+            .expect("repository metadata")
+            .worktree_name = None;
+        assert_eq!(app.pane_location_label(pane_id), "muxtrix");
+        let repository = app
+            .pane_repositories
+            .get_mut(&pane_id)
+            .expect("repository metadata");
+        repository.name = None;
+        assert_eq!(
+            app.pane_location_label(pane_id),
+            directory.display().to_string()
+        );
+    }
+
+    #[test]
+    fn github_default_branch_comes_from_the_github_remote_head() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should follow the Unix epoch")
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!(
+            "muxtrix-default-branch-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "remote",
+            "add",
+            "upstream",
+            "git@github.com:acme/project.git",
+        ]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/upstream/HEAD",
+            "refs/remotes/upstream/trunk",
+        ]);
+
+        assert_eq!(github_default_branch(&repo, "").as_deref(), Some("trunk"));
+
+        std::fs::remove_dir_all(repo).expect("temporary repo should be removable");
+    }
+
+    #[test]
+    fn regular_creation_leaves_the_primary_worktree_directory_unchanged() {
+        let worktrees = vec![
+            (std::path::PathBuf::from("/repo"), Some("trunk".into())),
+            (
+                std::path::PathBuf::from("/worktrees/feature"),
+                Some("feature".into()),
+            ),
+        ];
+        assert_eq!(
+            regular_creation_directory_from_worktrees(
+                std::path::Path::new("/repo/crates/app"),
+                std::path::Path::new("/repo"),
+                &worktrees,
+                Some("trunk"),
+            ),
+            std::path::PathBuf::from("/repo/crates/app")
+        );
+    }
+
+    #[test]
+    fn regular_creation_leaves_a_linked_worktree_for_the_github_default() {
+        let worktrees = vec![
+            (
+                std::path::PathBuf::from("/repo"),
+                Some("maintenance".into()),
+            ),
+            (
+                std::path::PathBuf::from("/worktrees/feature"),
+                Some("feature".into()),
+            ),
+            (
+                std::path::PathBuf::from("/worktrees/trunk"),
+                Some("trunk".into()),
+            ),
+        ];
+        assert_eq!(
+            regular_creation_directory_from_worktrees(
+                std::path::Path::new("/worktrees/feature/crates/app"),
+                std::path::Path::new("/worktrees/feature"),
+                &worktrees,
+                Some("trunk"),
+            ),
+            std::path::PathBuf::from("/worktrees/trunk")
+        );
+    }
+
+    #[test]
+    fn regular_creation_resolves_a_real_linked_checkout_to_the_primary_repo() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should follow the Unix epoch")
+            .as_nanos();
+        let scratch = std::env::temp_dir().join(format!(
+            "muxtrix-regular-pane-worktree-test-{}-{unique}",
+            std::process::id()
+        ));
+        let repo = scratch.join("repo");
+        let worktree = scratch.join("feature");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "muxtrix@example.test"]);
+        git(&repo, &["config", "user.name", "Muxtrix test"]);
+        std::fs::write(repo.join("README.md"), "fixture\n").expect("fixture file");
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "-q", "-m", "fixture"]);
+        let worktree_arg = worktree.to_string_lossy().into_owned();
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "feature", &worktree_arg],
+        );
+        let primary_nested = repo.join("crates/app");
+        let linked_nested = worktree.join("crates/app");
+        std::fs::create_dir_all(&primary_nested).expect("primary nested directory");
+        std::fs::create_dir_all(&linked_nested).expect("linked nested directory");
+
+        assert_eq!(
+            resolve_regular_creation_directory(&primary_nested, ""),
+            primary_nested,
+            "a primary-checkout pane should preserve its exact cwd"
+        );
+        assert_eq!(
+            resolve_regular_creation_directory(&linked_nested, ""),
+            repo,
+            "a linked-worktree pane should launch at the main checkout root"
+        );
+
+        std::fs::remove_dir_all(scratch).expect("temporary repo should be removable");
+    }
+
+    #[test]
+    fn worktree_defaults_fall_back_to_main_then_master_then_primary() {
+        let main = vec![
+            (std::path::PathBuf::from("/repo"), Some("release".into())),
+            (
+                std::path::PathBuf::from("/worktrees/main"),
+                Some("main".into()),
+            ),
+            (
+                std::path::PathBuf::from("/worktrees/master"),
+                Some("master".into()),
+            ),
+        ];
+        assert_eq!(
+            preferred_default_worktree(&main, None),
+            std::path::PathBuf::from("/worktrees/main")
+        );
+        assert_eq!(
+            preferred_default_worktree(&main[..1], None),
+            std::path::PathBuf::from("/repo")
+        );
+    }
+
+    #[test]
+    fn primary_and_default_worktrees_are_never_deletable() {
+        assert_eq!(
+            worktree_deletion_blocker(true, Some("release"), Some("trunk")).as_deref(),
+            Some("Primary worktree")
+        );
+        assert_eq!(
+            worktree_deletion_blocker(false, Some("trunk"), Some("trunk")).as_deref(),
+            Some("GitHub default branch")
+        );
+        assert!(worktree_deletion_blocker(false, Some("main"), Some("trunk")).is_none());
+        for fallback in ["main", "master"] {
+            assert_eq!(
+                worktree_deletion_blocker(false, Some(fallback), None).as_deref(),
+                Some("Fallback default branch")
+            );
+        }
+    }
+
+    #[test]
+    fn manager_rejects_protected_worktree_deletion_at_the_action_boundary() {
+        let mut app = Muxtrix::new();
+        app.worktree_manager = Some(WorktreeManagerState {
+            mode: WorktreeManagerMode::Manage,
+            generation: 1,
+            repo_root: Some("/repo".into()),
+            failure: None,
+            entries: vec![WorktreeManagerEntry {
+                path: "/repo".into(),
+                branch: Some("trunk".into()),
+                unpushed_commits: 0,
+                deletion_blocker: Some("Primary worktree".into()),
+                used_by: None,
+            }],
+            loading: false,
+            selected: 0,
+            busy: false,
+            error: None,
+            restart_target: None,
+        });
+
+        let _ = app.delete_worktree_entry(0);
+
+        assert_eq!(
+            app.worktree_manager
+                .as_ref()
+                .and_then(|manager| manager.error.as_deref()),
+            Some("repo is the Primary worktree and cannot be deleted")
+        );
+    }
+
+    #[test]
+    fn manage_worktrees_opens_settings_before_repository_discovery_finishes() {
+        let mut app = Muxtrix::new();
+
+        let _discovery = app.open_worktree_manager();
+
+        assert_eq!(app.active_view, ActiveView::Settings);
+        assert_eq!(app.settings_page, SettingsPage::Worktrees);
+        let manager = app
+            .worktree_manager
+            .as_ref()
+            .expect("manager should paint a loading state immediately");
+        assert!(manager.loading);
+        assert!(manager.entries.is_empty());
+    }
+
+    fn worktree_settings_app_with_entries() -> Muxtrix {
+        let mut app = Muxtrix::new();
+        app.active_view = ActiveView::Settings;
+        app.settings_page = SettingsPage::Worktrees;
+        app.worktree_manager = Some(WorktreeManagerState {
+            mode: WorktreeManagerMode::Manage,
+            generation: 1,
+            repo_root: Some("/repo".into()),
+            failure: None,
+            entries: vec![
+                WorktreeManagerEntry {
+                    path: "/repo".into(),
+                    branch: Some("trunk".into()),
+                    unpushed_commits: 0,
+                    deletion_blocker: Some("Primary worktree".into()),
+                    used_by: None,
+                },
+                WorktreeManagerEntry {
+                    path: "/repo/checkouts/feature".into(),
+                    branch: Some("feature".into()),
+                    unpushed_commits: 0,
+                    deletion_blocker: None,
+                    used_by: None,
+                },
+            ],
+            loading: false,
+            selected: 0,
+            busy: false,
+            error: None,
+            restart_target: None,
+        });
+        app
+    }
+
+    /// The page prints `↑↓ Select` in its footer, so the arrows have to reach
+    /// the inventory. The generic non-workspace branch used to consume every
+    /// key first, leaving the advertised navigation dead on arrival.
+    #[test]
+    fn worktree_settings_arrows_move_the_selection() {
+        let mut app = worktree_settings_app_with_entries();
+
+        let _ = app.handle_keyboard(key_press(
+            Key::Named(Named::ArrowDown),
+            Modifiers::default(),
+        ));
+
+        assert_eq!(
+            app.worktree_manager
+                .as_ref()
+                .map(|manager| manager.selected),
+            Some(1)
+        );
+
+        let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowUp), Modifiers::default()));
+
+        assert_eq!(
+            app.worktree_manager
+                .as_ref()
+                .map(|manager| manager.selected),
+            Some(0)
+        );
+    }
+
+    /// Manage renders only as the settings page, never as a dismissible
+    /// dialog, so Enter has nothing to confirm — and must not throw the
+    /// inventory away and strand the page on its "not loaded" notice.
+    #[test]
+    fn worktree_settings_enter_keeps_the_inventory() {
+        let mut app = worktree_settings_app_with_entries();
+
+        let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::default()));
+
+        assert!(app.worktree_manager.is_some());
+        assert_eq!(app.active_view, ActiveView::Settings);
+    }
+
+    /// `Del` is advertised in the footer, so it has to reach the removal
+    /// boundary. The protected row is the cheapest proof of routing: it fails
+    /// inside `delete_worktree_entry` without shelling out to Git.
+    #[test]
+    fn worktree_settings_delete_reaches_the_removal_boundary() {
+        let mut app = worktree_settings_app_with_entries();
+
+        let _ = app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::default()));
+
+        assert_eq!(
+            app.worktree_manager
+                .as_ref()
+                .and_then(|manager| manager.error.as_deref()),
+            Some("repo is the Primary worktree and cannot be deleted")
+        );
+    }
+
+    /// Backspace reads as "go back" on a full-window page and the footer only
+    /// advertises `Del`, so it must not quietly remove the selected checkout.
+    #[test]
+    fn worktree_settings_backspace_does_not_remove_a_checkout() {
+        let mut app = worktree_settings_app_with_entries();
+        app.worktree_manager
+            .as_mut()
+            .expect("staged manager")
+            .selected = 1;
+
+        let _ = app.handle_keyboard(key_press(
+            Key::Named(Named::Backspace),
+            Modifiers::default(),
+        ));
+
+        let manager = app.worktree_manager.as_ref().expect("staged manager");
+        assert!(manager.error.is_none());
+        assert!(!manager.busy);
+        assert_eq!(manager.entries.len(), 2);
+    }
+
+    /// Escape still returns to the terminal, and discards the settings draft
+    /// on the way out exactly as it does from every other settings page.
+    #[test]
+    fn worktree_settings_escape_returns_to_the_terminal_and_discards_the_draft() {
+        let mut app = worktree_settings_app_with_entries();
+        app.settings_draft.ui_font_size = app.settings.ui_font_size + 2.0;
+
+        let _ = app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::default()));
+
+        assert_eq!(app.active_view, ActiveView::Workspace);
+        assert_eq!(app.settings_draft.ui_font_size, app.settings.ui_font_size);
+    }
+
+    /// Lanes are derived once and shared by the header, every row, and the
+    /// ellipsis budgets, so a wider window widens the copy lanes instead of
+    /// wrapping a long branch inside a fixed box.
+    #[test]
+    fn worktree_lanes_spend_extra_width_on_the_copy_lanes() {
+        let narrow = WorktreeLanes::for_window(1000.0, false);
+        let wide = WorktreeLanes::for_window(1400.0, false);
+
+        assert!(wide.identity > narrow.identity);
+        assert!(wide.branch > narrow.branch);
+        assert_eq!(wide.status, narrow.status);
+        assert_eq!(wide.commits, narrow.commits);
+        assert_eq!(wide.action, narrow.action);
+
+        // Past the cap the table stops growing rather than stranding the
+        // action lane a screen away from the row it acts on.
+        let capped = WorktreeLanes::for_window(WORKTREE_PAGE_MAX_WIDTH + 400.0, false);
+        let beyond = WorktreeLanes::for_window(WORKTREE_PAGE_MAX_WIDTH + 900.0, false);
+        assert_eq!(capped.identity, beyond.identity);
+
+        // Stacked rows give identity the whole line rather than the narrow
+        // slice the table layout would leave it.
+        let stacked = WorktreeLanes::for_window(820.0, true);
+        let tabular = WorktreeLanes::for_window(820.0, false);
+        assert!(stacked.identity > tabular.identity);
+    }
+
+    #[test]
+    fn worktree_discovery_ignores_results_from_an_older_request() {
+        let mut app = Muxtrix::new();
+        app.worktree_manager = Some(WorktreeManagerState {
+            mode: WorktreeManagerMode::Manage,
+            generation: 2,
+            repo_root: None,
+            failure: None,
+            entries: Vec::new(),
+            loading: true,
+            selected: 0,
+            busy: false,
+            error: None,
+            restart_target: None,
+        });
+
+        let _ = app.update(Message::WorktreeManagerLoaded(
+            1,
+            Ok(WorktreeManagerDiscovery {
+                repo_root: Some("/stale".into()),
+                failure: None,
+                entries: Vec::new(),
+            }),
+        ));
+
+        let manager = app.worktree_manager.as_ref().expect("manager remains open");
+        assert!(manager.loading);
+        assert!(manager.repo_root.is_none());
+    }
+
+    #[test]
+    fn remove_unused_targets_only_unprotected_worktrees_without_panes() {
+        let entry =
+            |name: &str, blocker: Option<&str>, used_by: Option<&str>| WorktreeManagerEntry {
+                path: std::path::PathBuf::from("/worktrees").join(name),
+                branch: Some(name.into()),
+                unpushed_commits: 0,
+                deletion_blocker: blocker.map(str::to_owned),
+                used_by: used_by.map(str::to_owned),
+            };
+        let entries = vec![
+            entry("main", Some("Primary worktree"), None),
+            entry("active", None, Some("Agent pane")),
+            entry("unused-one", None, None),
+            entry("unused-two", None, None),
+        ];
+
+        assert_eq!(
+            unused_worktree_paths(&entries),
+            vec![
+                std::path::PathBuf::from("/worktrees/unused-one"),
+                std::path::PathBuf::from("/worktrees/unused-two"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bulk_worktree_removal_removes_every_requested_checkout() {
+        let scratch = std::env::temp_dir().join(format!(
+            "muxtrix-bulk-worktree-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let repo = scratch.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("file"), "one").expect("file");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "first"]);
+        let first = scratch.join("worktrees").join("first");
+        let second = scratch.join("worktrees").join("second");
+        create_git_worktree(&repo, &first, "first", "").expect("first worktree");
+        create_git_worktree(&repo, &second, "second", "").expect("second worktree");
+
+        let (removed, result) =
+            remove_git_worktrees(&repo, vec![first.clone(), second.clone()], "");
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(removed, vec![first.clone(), second.clone()]);
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert!(repo.exists());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn unpushed_status_counts_commits_missing_from_every_remote_ref() {
+        let scratch = std::env::temp_dir().join(format!(
+            "muxtrix-unpushed-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).expect("repo dir");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&scratch)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(scratch.join("file"), "one").expect("first file");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "first"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        assert_eq!(unpushed_commit_count(&scratch, ""), 0);
+
+        std::fs::write(scratch.join("file"), "two").expect("second file");
+        git(&["commit", "-qam", "second"]);
+        assert_eq!(unpushed_commit_count(&scratch, ""), 1);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn worktree_creation_survives_stale_branches_and_registrations() {
+        let scratch = std::env::temp_dir().join(format!(
+            "muxtrix-worktree-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let repo = scratch.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"], &repo);
+        std::fs::write(repo.join("file"), "x").expect("file");
+        git(&["add", "."], &repo);
+        git(&["commit", "-qm", "init"], &repo);
+
+        let first = scratch.join("worktrees").join("worktree-1");
+        create_git_worktree(&repo, &first, "worktree-1", "").expect("first worktree should create");
+        assert!(first.join(".git").exists());
+
+        // Simulate the breakage: the user deletes the folder by hand, leaving
+        // a stale registration AND the branch behind.
+        std::fs::remove_dir_all(&first).expect("delete worktree dir");
+        let retry = create_git_worktree(&repo, &first, "worktree-1", "");
+        assert!(
+            retry.is_ok(),
+            "stale registration + existing branch must not break creation: {retry:?}"
+        );
+        assert!(first.join(".git").exists());
+
+        // A branch that exists WITH a live worktree still errors clearly.
+        let second = scratch.join("worktrees").join("worktree-1-copy");
+        let conflict = create_git_worktree(&repo, &second, "worktree-1", "");
+        assert!(conflict.is_err());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn worktree_commands_require_a_git_repository() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let non_repository =
+            std::env::temp_dir().join(format!("muxtrix-non-repository-{}", uuid::Uuid::new_v4()));
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "claude".into(),
+                display_name: None,
+                state: AgentState::Idle,
+                activity: None,
+                session_id: None,
+                cwd: Some(non_repository.display().to_string()),
+                git_branch: None,
+            },
+        );
+        // The agent-reported cwd wins over the live shell process, so pointing
+        // it at a deliberately missing path guarantees a non-repository
+        // context even when a test harness places a .git marker in /tmp. The
+        // dialog still opens with the explanation, but creation is impossible.
+        let _ = app.run_command(CommandAction::NewWorktree(commands::WorktreeKind::Pane(
+            SplitAxis::Horizontal,
+        )));
+        let prompt = app
+            .worktree_prompt
+            .as_ref()
+            .expect("the dialog should open to explain the failure");
+        assert!(prompt.repo_root.is_none());
+        let _ = app.update(Message::ConfirmWorktree);
+        assert!(
+            app.worktree_prompt.is_some(),
+            "confirm must be inert without a repository"
+        );
+    }
+
+    #[test]
+    fn worktree_restart_commands_create_or_reuse_without_stale_agent_cwd() {
+        let scratch = std::env::temp_dir().join(format!(
+            "muxtrix-worktree-switcher-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let repo = scratch.join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"], &repo);
+        std::fs::write(repo.join("file"), "x").expect("file");
+        git(&["add", "."], &repo);
+        git(&["commit", "-qm", "init"], &repo);
+        let alternate = scratch.join("alternate");
+        create_git_worktree(&repo, &alternate, "alternate", "")
+            .expect("alternate worktree should be created");
+
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        if let Some(runtime) = app.terminals.remove(&pane_id)
+            && let Some(session) = &runtime.session
+        {
+            session.terminate();
+        }
+        let pane = app
+            .session
+            .workspaces
+            .iter_mut()
+            .find_map(|workspace| workspace.pane_mut(pane_id))
+            .expect("pane should exist");
+        let surface = pane
+            .surfaces
+            .iter_mut()
+            .find(|surface| surface.id == pane.active_surface_id)
+            .expect("active surface should exist");
+        let muxtrix_domain::SurfaceKind::Terminal(terminal) = &mut surface.kind else {
+            panic!("surface should be terminal");
+        };
+        terminal.working_directory = Some(repo.clone());
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "codex".into(),
+                display_name: None,
+                state: AgentState::Running,
+                activity: None,
+                session_id: Some("stale".into()),
+                cwd: Some("/definitely/not/the/repository".into()),
+                git_branch: None,
+            },
+        );
+
+        let _ = app.run_command(CommandAction::RestartPaneInWorktree);
+        let prompt = app
+            .worktree_prompt
+            .as_ref()
+            .expect("restart should open the worktree creation prompt");
+        assert_eq!(prompt.target, WorktreePromptTarget::RestartPane(pane_id));
+        assert_eq!(prompt.repo_root.as_deref(), Some(repo.as_path()));
+        assert!(app.worktree_manager.is_none());
+
+        app.worktree_prompt = None;
+        let _ = app.run_command(CommandAction::RestartPaneInExistingWorktree);
+        let manager = app
+            .worktree_manager
+            .as_ref()
+            .expect("existing-worktree command should open the picker");
+        assert_eq!(manager.mode, WorktreeManagerMode::RestartPane(pane_id));
+        assert!(manager.loading);
+        let generation = manager.generation;
+        let discovery = discover_worktree_manager(
+            WorktreeManagerMode::RestartPane(pane_id),
+            Some(repo.clone()),
+            "",
+        )
+        .expect("worktree discovery should succeed");
+        let _ = app.update(Message::WorktreeManagerLoaded(generation, Ok(discovery)));
+        let manager = app
+            .worktree_manager
+            .as_ref()
+            .expect("existing-worktree command should keep the picker open");
+        assert_eq!(manager.entries.len(), 1);
+        assert_eq!(manager.entries[0].path, alternate);
+        assert!(manager.failure.is_none());
+
+        let _ = app.update(Message::WorktreeManagerRestart(0));
+        assert_eq!(
+            app.worktree_manager
+                .as_ref()
+                .expect("switcher should remain open for confirmation")
+                .restart_target,
+            Some(0)
+        );
+        let _ = app.update(Message::CancelWorktreeManagerRestart);
+        assert_eq!(
+            app.worktree_manager
+                .as_ref()
+                .expect("switcher should remain open after going back")
+                .restart_target,
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn created_worktree_restart_preserves_identity_and_clears_transient_state() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let target = std::env::temp_dir();
+        {
+            let pane = app
+                .active_workspace_mut()
+                .expect("workspace should exist")
+                .pane_mut(pane_id)
+                .expect("pane should exist");
+            pane.custom_name = Some("kept name".into());
+            pane.attention.unread_count = 2;
+            pane.attention.message = Some("stale attention".into());
+        }
+        app.notifications.push(AgentNotification {
+            pane_id,
+            unread: true,
+        });
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "claude".into(),
+                display_name: None,
+                state: AgentState::Running,
+                activity: Some("stale activity".into()),
+                session_id: Some("stale-session".into()),
+                cwd: Some("/old/worktree".into()),
+                git_branch: Some("old".into()),
+            },
+        );
+        app.detected_agents
+            .insert(pane_id, std::time::Instant::now());
+
+        app.open_created_worktree(WorktreePromptTarget::RestartPane(pane_id), target.clone())
+            .expect("fresh terminal should launch in the requested directory");
+
+        assert_eq!(active_pane_id(&app), pane_id);
+        let pane = app
+            .active_workspace()
+            .expect("workspace should exist")
+            .pane(pane_id)
+            .expect("pane identity should survive");
+        assert_eq!(pane.custom_name.as_deref(), Some("kept name"));
+        assert_eq!(pane.attention.unread_count, 0);
+        assert!(pane.attention.message.is_none());
+        let terminal = pane
+            .active_surface()
+            .and_then(|surface| match &surface.kind {
+                muxtrix_domain::SurfaceKind::Terminal(terminal) => Some(terminal),
+                _ => None,
+            });
+        assert_eq!(
+            terminal.and_then(|terminal| terminal.working_directory.as_ref()),
+            Some(&target)
+        );
+        assert!(app.terminals[&pane_id].session.is_some());
+        assert!(!app.agent_statuses.contains_key(&pane_id));
+        assert!(!app.detected_agents.contains_key(&pane_id));
+        assert!(
+            app.notifications
+                .iter()
+                .all(|notification| notification.pane_id != pane_id)
+        );
+    }
+
+    #[test]
+    fn worktree_panes_apply_the_requested_split_axis() {
+        for expected_axis in [SplitAxis::Horizontal, SplitAxis::Vertical] {
+            let mut app = Muxtrix::new();
+            app.open_worktree(
+                commands::WorktreeKind::Pane(expected_axis),
+                std::env::temp_dir(),
+            )
+            .expect("worktree pane should open");
+
+            let root = &active_tab(&app).root;
+            assert!(
+                matches!(root, PaneTree::Split { axis, .. } if *axis == expected_axis),
+                "worktree pane should use the requested split axis: {root:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pane_local_agent_commands_set_identity_before_the_first_hook() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.observe_terminal_command(pane_id, b"codex --resume\r");
+        assert_eq!(app.agent_statuses[&pane_id].agent, "codex");
+        assert_eq!(app.pane_state_label(pane_id), "Idle");
+
+        assert_eq!(
+            agent_command("/home/user/bin/claude --continue", &app.settings),
+            Some(Agent::Claude)
+        );
+        assert_eq!(agent_command("cargo test", &app.settings), None);
+    }
+
+    #[test]
+    fn pane_dimensions_map_to_terminal_rows_and_columns() {
+        let settings = AppSettings::default();
+        assert_eq!(
+            pty_size_for_pane(Size::new(856.0, 400.0), &settings),
+            if cfg!(target_os = "macos") {
+                PtySize {
+                    rows: 23,
+                    cols: 100,
+                    pixel_width: 840,
+                    pixel_height: 384,
+                }
+            } else {
+                PtySize {
+                    rows: 17,
+                    cols: 75,
+                    pixel_width: 840,
+                    pixel_height: 384,
+                }
+            }
+        );
+        let minimum = pty_size_for_pane(Size::new(0.0, 0.0), &settings);
+        assert_eq!((minimum.cols, minimum.rows), (2, 2));
+
+        let one_pixel_wider = pty_size_for_pane(Size::new(857.0, 401.0), &settings);
+        let baseline = pty_size_for_pane(Size::new(856.0, 400.0), &settings);
+        assert!(!terminal_grid_changed(baseline, one_pixel_wider));
+    }
+
+    #[test]
+    fn stale_terminal_frames_are_rejected_after_a_grid_resize() {
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .expect("terminal actor should start");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        assert!(snapshot_matches_grid(&snapshot, initial_pty_size()));
+        assert!(!snapshot_matches_grid(
+            &snapshot,
+            PtySize {
+                rows: 30,
+                cols: 100,
+                pixel_width: 1_000,
+                pixel_height: 600,
+            }
+        ));
+        actor.shutdown().expect("terminal actor should stop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grid_resize_keeps_the_last_frame_visible_until_the_new_grid_arrives() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            app.poll_terminal();
+            if app.terminals[&pane_id].snapshot.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let previous = app.terminals[&pane_id]
+            .snapshot
+            .clone()
+            .expect("the initial terminal frame should arrive");
+
+        app.terminals
+            .get_mut(&pane_id)
+            .expect("runtime should exist")
+            .resize(Size::new(800.0, 500.0), &app.settings)
+            .expect("terminal resize should queue");
+        let runtime = &app.terminals[&pane_id];
+        assert_eq!(runtime.snapshot.as_ref(), Some(&previous));
+        assert!(!snapshot_matches_grid(&previous, runtime.size));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            app.poll_terminal();
+            if app.terminals[&pane_id]
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot_matches_grid(snapshot, app.terminals[&pane_id].size)
+                })
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            app.terminals[&pane_id].snapshot.as_ref().is_some_and(
+                |snapshot| snapshot_matches_grid(snapshot, app.terminals[&pane_id].size)
+            ),
+            "the resized terminal frame should replace the retained frame"
+        );
+    }
+
+    #[test]
+    fn fleet_context_combines_a_real_git_branch_and_directory() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should follow the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "muxtrix-git-context-{}-{unique}",
+            std::process::id()
+        ));
+        let nested = root.join("src").join("nested");
+        std::fs::create_dir_all(root.join(".git")).expect("git metadata directory should exist");
+        std::fs::create_dir_all(&nested).expect("nested working directory should exist");
+        std::fs::write(
+            root.join(".git").join("HEAD"),
+            "ref: refs/heads/feature/fleet\n",
+        )
+        .expect("HEAD should be writable");
+
+        assert_eq!(
+            git_branch_for_directory(nested.to_str()),
+            Some("feature/fleet".into())
+        );
+        std::fs::remove_dir_all(root).expect("temporary git metadata should be removable");
+    }
+
+    #[test]
+    fn pane_signal_semantics_distinguish_activity_attention_and_failure() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+
+        assert_eq!(
+            app.pane_signal_kind(pane_id, false),
+            PaneSignalKind::Neutral
+        );
+        for (state, expected) in [
+            (AgentState::Idle, PaneSignalKind::Subtle),
+            (AgentState::Running, PaneSignalKind::Active),
+            (AgentState::Waiting, PaneSignalKind::Warning),
+            (AgentState::Completed, PaneSignalKind::Neutral),
+            (AgentState::Failed, PaneSignalKind::Danger),
+            (AgentState::Stopped, PaneSignalKind::Subtle),
+        ] {
+            app.agent_statuses.insert(
+                pane_id,
+                AgentPaneStatus {
+                    agent: "codex".into(),
+                    display_name: None,
+                    state,
+                    activity: None,
+                    session_id: None,
+                    cwd: None,
+                    git_branch: None,
+                },
+            );
+            assert_eq!(app.pane_signal_kind(pane_id, true), expected);
+        }
+
+        app.agent_statuses.remove(&pane_id);
+        assert_eq!(app.pane_signal_kind(pane_id, true), PaneSignalKind::Warning);
+    }
+
+    #[test]
+    fn foreign_agent_events_cannot_demote_a_live_agent_pane() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let pane = Some(pane_id.as_uuid().to_string());
+        let running = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Running,
+            event: Some("UserPromptSubmit".into()),
+            title: "Codex · UserPromptSubmit".into(),
+            body: "Working".into(),
+            pane_id: pane.clone(),
+            session_id: Some("codex-1".into()),
+            cwd: None,
+        });
+        assert!(running.ok);
+        // A claude lifecycle event arriving with this pane's id (a stray
+        // inherited MUXTRIX_PANE_ID) must not stop or overwrite codex.
+        let foreign = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "claude".into(),
+            state: AgentState::Stopped,
+            event: Some("SessionEnd".into()),
+            title: "Claude · SessionEnd".into(),
+            body: "bye".into(),
+            pane_id: pane,
+            session_id: Some("claude-9".into()),
+            cwd: None,
+        });
+        assert!(foreign.ok);
+        let status = &app.agent_statuses[&pane_id];
+        assert_eq!(status.agent, "codex");
+        assert_eq!(status.state, AgentState::Running);
+    }
+
+    #[test]
+    fn delayed_session_start_cannot_regress_the_first_running_prompt() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let pane = Some(pane_id.as_uuid().to_string());
+
+        let running = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Running,
+            event: Some("UserPromptSubmit".into()),
+            title: "Codex · UserPromptSubmit".into(),
+            body: "Implement the feature".into(),
+            pane_id: pane.clone(),
+            session_id: Some("thread-1".into()),
+            cwd: None,
+        });
+        assert!(running.ok);
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+        assert_eq!(app.pane_signal_kind(pane_id, false), PaneSignalKind::Active);
+
+        let delayed_start = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Idle,
+            event: Some("SessionStart".into()),
+            title: "Codex · SessionStart".into(),
+            body: "Ready for input".into(),
+            pane_id: pane.clone(),
+            session_id: Some("thread-1".into()),
+            cwd: None,
+        });
+        assert!(delayed_start.ok);
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+        assert_eq!(
+            app.agent_statuses[&pane_id].activity.as_deref(),
+            Some("Implement the feature")
+        );
+        assert_eq!(app.pane_signal_kind(pane_id, false), PaneSignalKind::Active);
+
+        let next_session = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Idle,
+            event: Some("SessionStart".into()),
+            title: "Codex · SessionStart".into(),
+            body: "Ready for input".into(),
+            pane_id: pane,
+            session_id: Some("thread-2".into()),
+            cwd: None,
+        });
+        assert!(next_session.ok);
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Idle);
+        assert_eq!(app.pane_signal_kind(pane_id, false), PaneSignalKind::Subtle);
+    }
+
+    #[test]
+    fn ctrl_c_marks_only_the_interrupted_running_agent_idle() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "claude".into(),
+                display_name: None,
+                state: AgentState::Running,
+                activity: Some("Working".into()),
+                session_id: Some("session-1".into()),
+                cwd: None,
+                git_branch: None,
+            },
+        );
+
+        app.observe_agent_interrupt(pane_id, b"ordinary input");
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+
+        app.observe_agent_interrupt(pane_id, &[0x03]);
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Idle);
+        assert_eq!(
+            app.agent_statuses[&pane_id].activity.as_deref(),
+            Some("Prompt interrupted")
+        );
+        assert_eq!(app.pane_signal_kind(pane_id, false), PaneSignalKind::Subtle);
+    }
+
+    #[test]
+    fn wsl_wayland_resizes_snap_to_terminal_cells_without_affecting_other_backends() {
+        let settings = AppSettings::default();
+        assert_eq!(
+            wsl_wayland_resize_increments(true, true, false, &settings),
+            Some(Size::new(
+                settings.terminal_cell_width().round(),
+                settings.terminal_cell_height().round(),
+            ))
+        );
+        assert_eq!(
+            wsl_wayland_resize_increments(false, true, false, &settings),
+            None
+        );
+        assert_eq!(
+            wsl_wayland_resize_increments(true, false, false, &settings),
+            None
+        );
+        assert_eq!(
+            wsl_wayland_resize_increments(true, true, true, &settings),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_wheel_delta_maps_to_ghostty_scrollback_lines() {
+        assert_eq!(
+            terminal_scroll_lines(ScrollDelta::Lines { x: 0.0, y: 1.0 }, 20.0),
+            -3
+        );
+        assert_eq!(
+            terminal_scroll_lines(ScrollDelta::Pixels { x: 0.0, y: -25.0 }, 10.0),
+            3
+        );
+        assert_eq!(
+            terminal_scroll_lines(ScrollDelta::Pixels { x: 0.0, y: 0.0 }, 10.0),
+            0
+        );
+    }
+
+    #[test]
+    fn split_drag_updates_and_clamps_the_target_ratio() {
+        let mut app = Muxtrix::new();
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("horizontal split should succeed");
+        let workspace_id = app.active_workspace().expect("workspace should exist").id;
+        let tab_id = app
+            .active_workspace()
+            .expect("workspace should exist")
+            .active_tab_id;
+        let key = SplitKey {
+            workspace_id,
+            tab_id,
+            path: Vec::new(),
+        };
+        app.split_sizes
+            .insert(key.clone(), Size::new(1_000.0, 600.0));
+        app.cursor_position = Point::new(500.0, 300.0);
+        app.begin_split_drag(key.clone(), SplitAxis::Horizontal)
+            .expect("split drag should begin");
+        app.update_split_drag(Point::new(700.0, 300.0))
+            .expect("split drag should update");
+        assert_eq!(
+            split_ratio_at(&active_tab(&app).root, &[])
+                .expect("root should be split")
+                .permille(),
+            700
+        );
+        app.update_split_drag(Point::new(2_000.0, 300.0))
+            .expect("split drag should clamp");
+        assert_eq!(
+            split_ratio_at(&active_tab(&app).root, &[])
+                .expect("root should be split")
+                .permille(),
+            SplitRatio::MAX
+        );
+    }
+
+    #[test]
+    fn pane_headers_consolidate_actions_when_space_is_dense() {
+        assert!(pane_header_is_compact(720.0, 1));
+        assert!(pane_header_is_compact(1_280.0, 3));
+        assert!(!pane_header_is_compact(1_280.0, 2));
+    }
+
+    #[test]
+    fn pane_titles_spend_the_width_the_header_chrome_leaves_them() {
+        let character = 12.0 * UI_TEXT_ADVANCE_RATIO;
+        // A wide pane carrying only the fixed band should read far past the 24
+        // characters the fixed budget allowed.
+        let roomy = pane_title_char_budget(900.0 - PANE_HEADER_FIXED_WIDTH, character);
+        assert!(
+            roomy > 24,
+            "a 900px pane should beat the old fixed budget, got {roomy}"
+        );
+        // Chrome is paid for out of the title, so a busier header truncates
+        // sooner than a bare one at the same width.
+        let crowded = pane_title_char_budget(900.0 - PANE_HEADER_FIXED_WIDTH - 220.0, character);
+        assert!(
+            crowded < roomy,
+            "trailing chrome must shrink the title: {crowded} vs {roomy}"
+        );
+        // The budget must never claim more than the space it was handed, or
+        // the state label and controls get pushed off the card.
+        let available = 900.0 - PANE_HEADER_FIXED_WIDTH - 220.0;
+        assert!((crowded as f32) * character <= available);
+        // Panes narrower than their own chrome still show something.
+        assert_eq!(pane_title_char_budget(0.0, character), 1);
+    }
+
+    #[test]
+    fn the_footer_leaves_its_login_a_usable_lane() {
+        // The dot and the collapse control are paid for out of the rail before
+        // the login is, so the lane can only shrink when the footer's own
+        // anatomy grows. The measured ellipsis will honour whatever is left —
+        // including a lane too narrow to say anything — so guard that an
+        // ordinary account name still reads in full.
+        let settings = AppSettings::default();
+        let ordinary = "@phoenixmatrix".chars().count() as f32
+            * settings.ui_pixels(10.0)
+            * UI_TEXT_ADVANCE_RATIO;
+        assert!(
+            GITHUB_STATUS_LABEL_WIDTH >= ordinary,
+            "the footer starved its login: {GITHUB_STATUS_LABEL_WIDTH}px of lane for {ordinary}px of copy"
+        );
+    }
+
+    #[test]
+    fn a_backend_supplied_shell_names_no_program_in_the_header() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        for profile in &mut app.session.profiles {
+            profile.name = "WSL shell".into();
+            profile.program = String::new();
+        }
+        assert_eq!(
+            app.pane_program(pane_id),
+            None,
+            "a profile without a program has no command to chip"
+        );
+        // Copy with room for a fallback still says something truthful.
+        assert_eq!(app.pane_command(pane_id), "WSL shell");
+    }
+
+    #[test]
+    fn agent_events_without_pane_identity_cannot_leak_into_the_focused_session() {
+        let mut app = Muxtrix::new();
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("second pane should open");
+        let focused = active_pane_id(&app);
+        app.agent_statuses.insert(
+            focused,
+            AgentPaneStatus {
+                agent: "codex".into(),
+                display_name: None,
+                state: AgentState::Completed,
+                activity: Some("Turn complete".into()),
+                session_id: Some("idle-session".into()),
+                cwd: None,
+                git_branch: None,
+            },
+        );
+
+        let response = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Running,
+            event: Some("UserPromptSubmit".into()),
+            title: "Codex · UserPromptSubmit".into(),
+            body: "Agent is running".into(),
+            pane_id: None,
+            session_id: Some("unrelated-session".into()),
+            cwd: None,
+        });
+
+        assert!(!response.ok);
+        assert_eq!(app.agent_statuses[&focused].state, AgentState::Completed);
+        assert_eq!(app.pane_state_label(focused), "Idle");
+    }
+
+    #[test]
+    fn background_agent_notification_marks_and_focus_clears_attention() {
+        let mut app = Muxtrix::new();
+        let original_pane = active_pane_id(&app);
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+
+        app.record_notification(
+            original_pane,
+            TerminalNotification {
+                title: "Codex".into(),
+                body: "Needs approval".into(),
+            },
+        );
+
+        let pane = app
+            .active_workspace()
+            .expect("workspace should exist")
+            .pane(original_pane)
+            .expect("original pane should exist");
+        assert_eq!(pane.attention.unread_count, 1);
+        assert_eq!(pane.attention.message.as_deref(), Some("Needs approval"));
+        assert!(app.notifications[0].unread);
+
+        app.focus_pane(original_pane)
+            .expect("notification pane should focus");
+        let pane = app
+            .active_workspace()
+            .expect("workspace should exist")
+            .pane(original_pane)
+            .expect("original pane should exist");
+        assert_eq!(pane.attention.unread_count, 0);
+        assert!(!app.notifications[0].unread);
+        assert!(app.global_alerts.is_empty());
+    }
+
+    #[test]
+    fn completed_agent_clears_background_attention_without_creating_more() {
+        let mut app = Muxtrix::new();
+        let completed_pane = active_pane_id(&app);
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+
+        app.record_notification(
+            completed_pane,
+            TerminalNotification {
+                title: "Codex".into(),
+                body: "Needs approval".into(),
+            },
+        );
+        let response = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Completed,
+            event: Some("Stop".into()),
+            title: "Codex · Stop".into(),
+            body: "Turn complete".into(),
+            pane_id: Some(completed_pane.as_uuid().to_string()),
+            session_id: Some("completed-session".into()),
+            cwd: None,
+        });
+
+        assert!(response.ok);
+        assert_eq!(app.pane_state_label(completed_pane), "Idle");
+        let pane = app
+            .active_workspace()
+            .expect("workspace should exist")
+            .pane(completed_pane)
+            .expect("completed pane should exist");
+        assert_eq!(pane.attention.unread_count, 0);
+        assert!(pane.attention.message.is_none());
+        assert!(
+            app.notifications
+                .iter()
+                .filter(|notification| notification.pane_id == completed_pane)
+                .all(|notification| !notification.unread)
+        );
+        assert!(
+            !app.pane_needs_attention(completed_pane, 1),
+            "a completed turn must remain neutral even if stale unread data is restored"
+        );
+    }
+
+    #[test]
+    fn a_completed_turn_reads_as_idle_without_losing_its_internal_state() {
+        assert_eq!(
+            agent_state_label(AgentState::Completed),
+            agent_state_label(AgentState::Idle),
+            "a finished turn and an untouched composer both read as Idle"
+        );
+        assert_eq!(agent_state_label(AgentState::Completed), "Idle");
+
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "codex".into(),
+                display_name: None,
+                state: AgentState::Completed,
+                activity: None,
+                session_id: None,
+                cwd: None,
+                git_branch: None,
+            },
+        );
+        assert_eq!(app.pane_state_label(pane_id), "Idle");
+        // Only the word is shared. The state itself still decides attention and
+        // the signal a finished turn wears, so it must survive the relabel.
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Completed);
+        assert!(!app.pane_needs_attention(pane_id, 1));
+        assert_eq!(app.pane_signal_kind(pane_id, true), PaneSignalKind::Neutral);
+    }
+
+    #[test]
+    fn completed_agent_stays_done_until_a_working_screen_starts_the_next_turn() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "codex".into(),
+                display_name: None,
+                state: AgentState::Completed,
+                activity: Some("Turn complete".into()),
+                session_id: Some("thread-1".into()),
+                cwd: None,
+                git_branch: None,
+            },
+        );
+
+        app.apply_agent_screen_classification(
+            pane_id,
+            "codex",
+            1,
+            agent_screen::Classification {
+                state: agent_screen::ScreenState::Idle,
+                rule: "codex.live_prompt",
+            },
+        );
+        assert_eq!(
+            app.agent_statuses[&pane_id].state,
+            AgentState::Completed,
+            "an idle composer should preserve the completed-turn signal"
+        );
+
+        app.apply_agent_screen_classification(
+            pane_id,
+            "codex",
+            2,
+            agent_screen::Classification {
+                state: agent_screen::ScreenState::Running,
+                rule: "codex.osc_title_running",
+            },
+        );
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+        assert_eq!(
+            app.agent_statuses[&pane_id].activity.as_deref(),
+            Some("Agent is working")
+        );
+        assert_eq!(app.agent_running_frame_revisions.get(&pane_id), Some(&2));
+    }
+
+    #[test]
+    fn isolated_hook_discovery_is_read_only() {
+        assert!(hook_discovery_may_migrate_paths(false, false, false));
+        assert!(!hook_discovery_may_migrate_paths(true, false, false));
+        assert!(!hook_discovery_may_migrate_paths(false, true, false));
+        assert!(!hook_discovery_may_migrate_paths(false, false, true));
+        assert!(!hook_discovery_may_migrate_paths(true, true, true));
+    }
+
+    #[test]
+    fn codex_auto_approval_hooks_never_create_attention() {
+        let mut app = Muxtrix::new();
+        let original_pane = active_pane_id(&app);
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+        let pane = Some(original_pane.as_uuid().to_string());
+
+        for request_number in 1..=3 {
+            let waiting = app.handle_control_request(ControlRequest::AgentEvent {
+                agent: "codex".into(),
+                state: AgentState::Waiting,
+                event: Some("PermissionRequest".into()),
+                title: "Codex · PermissionRequest".into(),
+                body: format!("Tool {request_number} needs approval"),
+                pane_id: pane.clone(),
+                session_id: Some("thread-1".into()),
+                cwd: None,
+            });
+            assert!(waiting.ok);
+            assert_eq!(
+                app.active_workspace()
+                    .expect("workspace should exist")
+                    .pane(original_pane)
+                    .expect("original pane should exist")
+                    .attention
+                    .unread_count,
+                0,
+                "a request sent to the automatic reviewer is not user attention"
+            );
+            assert_eq!(
+                app.agent_statuses[&original_pane].state,
+                AgentState::Running
+            );
+
+            let resumed = app.handle_control_request(ControlRequest::AgentEvent {
+                agent: "codex".into(),
+                state: AgentState::Running,
+                event: Some("PostToolUse".into()),
+                title: "Codex · PostToolUse".into(),
+                body: format!("Tool {request_number} finished"),
+                pane_id: pane.clone(),
+                session_id: Some("thread-1".into()),
+                cwd: None,
+            });
+            assert!(resumed.ok);
+            assert_eq!(
+                app.agent_statuses[&original_pane].state,
+                AgentState::Running
+            );
+            assert_eq!(
+                app.active_workspace()
+                    .expect("workspace should exist")
+                    .pane(original_pane)
+                    .expect("original pane should exist")
+                    .attention
+                    .unread_count,
+                0,
+                "automatic approval cycles must not accumulate attention"
+            );
+            assert!(
+                app.notifications
+                    .iter()
+                    .filter(|notification| notification.pane_id == original_pane)
+                    .all(|notification| !notification.unread)
+            );
+        }
+    }
+
+    #[test]
+    fn visible_prompt_owns_attention_until_the_screen_resolves_it() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let pane = Some(pane_id.as_uuid().to_string());
+        let start = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Running,
+            event: Some("UserPromptSubmit".into()),
+            title: "Codex · UserPromptSubmit".into(),
+            body: "Working".into(),
+            pane_id: pane.clone(),
+            session_id: Some("thread-1".into()),
+            cwd: None,
+        });
+        assert!(start.ok);
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+
+        app.apply_agent_screen_classification(
+            pane_id,
+            "codex",
+            1,
+            agent_screen::Classification {
+                state: agent_screen::ScreenState::Waiting,
+                rule: "codex.live_strong_blocker",
+            },
+        );
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Waiting);
+        assert_eq!(
+            app.active_workspace()
+                .expect("workspace should exist")
+                .pane(pane_id)
+                .expect("pane should exist")
+                .attention
+                .unread_count,
+            1,
+            "a visible prompt in a background pane should create attention"
+        );
+
+        let post_tool = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Running,
+            event: Some("PostToolUse".into()),
+            title: "Codex · PostToolUse".into(),
+            body: "A parallel tool finished".into(),
+            pane_id: pane,
+            session_id: Some("thread-1".into()),
+            cwd: None,
+        });
+        assert!(post_tool.ok);
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Waiting);
+        assert_eq!(
+            app.active_workspace()
+                .expect("workspace should exist")
+                .pane(pane_id)
+                .expect("pane should exist")
+                .attention
+                .unread_count,
+            1,
+            "late tool output must not clear the visible prompt"
+        );
+
+        app.apply_agent_screen_classification(
+            pane_id,
+            "codex",
+            2,
+            agent_screen::Classification {
+                state: agent_screen::ScreenState::Running,
+                rule: "codex.osc_title_spinner",
+            },
+        );
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+        assert_eq!(
+            app.active_workspace()
+                .expect("workspace should exist")
+                .pane(pane_id)
+                .expect("pane should exist")
+                .attention
+                .unread_count,
+            0,
+            "working screen evidence should clear the prompt attention"
+        );
+    }
+
+    #[test]
+    fn retained_idle_screen_only_yields_to_a_newer_frame() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let pane = Some(pane_id.as_uuid().to_string());
+        let running_revision = app.terminals[&pane_id].snapshot_revision;
+        let start = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Running,
+            event: Some("UserPromptSubmit".into()),
+            title: "Codex · UserPromptSubmit".into(),
+            body: "Working".into(),
+            pane_id: pane,
+            session_id: Some("thread-1".into()),
+            cwd: None,
+        });
+        assert!(start.ok);
+
+        app.apply_agent_screen_classification(
+            pane_id,
+            "codex",
+            running_revision,
+            agent_screen::Classification {
+                state: agent_screen::ScreenState::Idle,
+                rule: "codex.osc_title_idle",
+            },
+        );
+
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+        assert_eq!(
+            app.agent_statuses[&pane_id].activity.as_deref(),
+            Some("Working")
+        );
+
+        app.apply_agent_screen_classification(
+            pane_id,
+            "codex",
+            running_revision.wrapping_add(1),
+            agent_screen::Classification {
+                state: agent_screen::ScreenState::Idle,
+                rule: "codex.osc_title_idle",
+            },
+        );
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Idle);
+        assert_eq!(
+            app.agent_statuses[&pane_id].activity.as_deref(),
+            Some("Ready for input")
+        );
+    }
+
+    #[test]
+    fn redesigned_workspace_chrome_is_stateful_without_affecting_terminals() {
+        let mut app = Muxtrix::new();
+        assert!(!app.sidebar_collapsed);
+        assert!(app.maximized_pane.is_none());
+        assert!(!app.settings.show_status_bar);
+
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+        let focused = active_pane_id(&app);
+        let workspace = app.active_workspace().expect("workspace should exist");
+        let tab = workspace.active_tab().expect("active tab should exist");
+        let titles: Vec<_> = pane_ids_in_layout(&tab.root)
+            .into_iter()
+            .filter_map(|pane_id| {
+                tab.panes[&pane_id]
+                    .active_surface()
+                    .map(|surface| surface.title.as_str())
+            })
+            .collect();
+        assert_eq!(titles, vec!["shell 1", "shell 2"]);
+
+        let _ = app.update(Message::ToggleSidebar);
+        let _ = app.update(Message::ToggleMaximize(focused));
+        let _ = app.update(Message::TogglePaneMenu(focused));
+        assert!(app.sidebar_collapsed);
+        assert_eq!(app.maximized_pane, Some(focused));
+        assert_eq!(app.pane_menu, Some(focused));
+        assert_eq!(app.terminals.len(), 2);
+
+        let _ = app.update(Message::ToggleMaximize(focused));
+        let _ = app.update(Message::TogglePaneMenu(focused));
+        assert!(app.maximized_pane.is_none());
+        assert!(app.pane_menu.is_none());
+    }
+
+    #[test]
+    fn pane_menu_dismisses_without_reaching_the_terminal() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+
+        let _ = app.update(Message::TogglePaneMenu(pane_id));
+        let _ = app.update(Message::DismissPaneMenu);
+        assert!(app.pane_menu.is_none());
+
+        let _ = app.update(Message::TogglePaneMenu(pane_id));
+        let _ = app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::empty()));
+        assert!(app.pane_menu.is_none());
+        assert!(app.pending_terminal_input.is_empty());
+
+        let _ = app.update(Message::TogglePaneMenu(pane_id));
+        let _ = app.update(Message::ToggleMaximizeFromPaneMenu(pane_id));
+        assert!(app.pane_menu.is_none());
+        assert_eq!(app.maximized_pane, Some(pane_id));
+    }
+
+    #[test]
+    fn maximized_pane_blocks_hidden_layout_mutations() {
+        let mut app = Muxtrix::new();
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+        let pane_id = active_pane_id(&app);
+        let pane_count = app
+            .active_workspace()
+            .expect("workspace should exist")
+            .active_tab()
+            .expect("active tab should exist")
+            .panes
+            .len();
+
+        let _ = app.update(Message::ToggleMaximize(pane_id));
+        assert_eq!(app.maximized_pane, Some(pane_id));
+
+        let _ = app.update(Message::Split(SplitAxis::Vertical));
+        assert_eq!(
+            app.active_workspace()
+                .expect("workspace should exist")
+                .active_tab()
+                .expect("active tab should exist")
+                .panes
+                .len(),
+            pane_count
+        );
+        assert_eq!(
+            app.status,
+            "Restore panes before splitting the focused pane"
+        );
+
+        app.palette.visible = true;
+        app.palette.query = "split".into();
+        app.palette.selected = 0;
+        let _ = app.update(Message::CommandSelected(0));
+        assert!(
+            app.palette.visible,
+            "a disabled palette row must not execute"
+        );
+        assert_eq!(
+            app.active_workspace()
+                .expect("workspace should exist")
+                .active_tab()
+                .expect("active tab should exist")
+                .panes
+                .len(),
+            pane_count
+        );
+
+        let _ = app.update(Message::CommandQueryChanged(String::new()));
+        let commands = commands::filtered("");
+        assert!(app.command_enabled(commands[app.palette.selected].action));
+        assert!(
+            app.palette.selected > 0,
+            "disabled leading rows are skipped"
+        );
+    }
+
+    #[test]
+    fn app_workspaces_keep_independent_terminal_fleets() {
+        let mut app = Muxtrix::new();
+        let first_workspace = app.session.active_workspace_id;
+        let first_pane = active_pane_id(&app);
+
+        create_test_workspace(&mut app);
+        let second_workspace = app.session.active_workspace_id;
+        let second_pane = active_pane_id(&app);
+        assert_ne!(first_workspace, second_workspace);
+        assert_ne!(first_pane, second_pane);
+        assert_eq!(app.terminals.len(), 2);
+
+        app.switch_workspace(first_workspace)
+            .expect("first workspace should switch");
+        assert_eq!(active_pane_id(&app), first_pane);
+        app.close_workspace().expect("first workspace should close");
+        assert_eq!(app.session.active_workspace_id, second_workspace);
+        assert!(!app.terminals.contains_key(&first_pane));
+        assert!(app.terminals.contains_key(&second_pane));
+    }
+
+    #[test]
+    fn tabs_start_with_one_pane_and_last_pane_closes_the_tab() {
+        let mut app = Muxtrix::new();
+        let original_tab = active_tab(&app).id;
+        let original_pane = active_pane_id(&app);
+
+        app.new_tab().expect("tab should be created");
+        let new_tab = active_tab(&app).id;
+        let new_pane = active_pane_id(&app);
+        assert_ne!(original_tab, new_tab);
+        assert_eq!(active_tab(&app).panes.len(), 1);
+        assert!(app.terminals.contains_key(&new_pane));
+
+        app.close_pane(new_pane)
+            .expect("closing the tab root pane should close its tab");
+        let workspace = app.active_workspace().expect("workspace should exist");
+        assert_eq!(workspace.tabs.len(), 1);
+        assert_eq!(workspace.active_tab_id, original_tab);
+        assert!(app.terminals.contains_key(&original_pane));
+        assert!(!app.terminals.contains_key(&new_pane));
+    }
+
+    #[test]
+    fn closing_the_final_tab_requests_workspace_confirmation() {
+        let mut app = Muxtrix::new();
+        let workspace_id = app.session.active_workspace_id;
+        let pane_id = active_pane_id(&app);
+
+        app.close_pane(pane_id)
+            .expect("last pane should request confirmation");
+
+        assert_eq!(app.close_workspace_prompt, Some(workspace_id));
+        assert_eq!(app.session.workspaces.len(), 1);
+        assert_eq!(app.session.workspaces[0].tabs.len(), 1);
+        assert!(app.terminals.contains_key(&pane_id));
+    }
+
+    #[test]
+    fn tab_drag_reorders_and_moves_tabs_between_workspaces() {
+        let mut app = Muxtrix::new();
+        let first_workspace = app.session.active_workspace_id;
+        let first_tab = active_tab(&app).id;
+        app.new_tab().expect("second tab should be created");
+        let moved_tab = active_tab(&app).id;
+        app.tab_drag = Some(TabDrag {
+            tab_id: moved_tab,
+            target_workspace_id: first_workspace,
+            target_index: 0,
+        });
+        app.finish_tab_drag().expect("tab should reorder");
+        assert_eq!(app.session.workspaces[0].tabs[0].id, moved_tab);
+        assert_eq!(app.session.workspaces[0].tabs[1].id, first_tab);
+
+        create_test_workspace(&mut app);
+        let second_workspace = app.session.active_workspace_id;
+        app.tab_drag = Some(TabDrag {
+            tab_id: moved_tab,
+            target_workspace_id: second_workspace,
+            target_index: 0,
+        });
+        app.finish_tab_drag()
+            .expect("tab should move between workspaces");
+        assert_eq!(app.session.active_workspace_id, second_workspace);
+        assert_eq!(app.session.workspaces[0].tabs.len(), 1);
+        assert_eq!(app.session.workspaces[0].tabs[0].id, first_tab);
+        assert_eq!(app.session.workspaces[1].tabs[0].id, moved_tab);
+    }
+
+    #[test]
+    fn windows_shell_setting_builds_native_and_wsl_profiles() {
+        let mut settings = AppSettings::default();
+        let native = windows_profile(&settings, ProfileId::new());
+        assert_eq!(native.backend, ProcessBackend::Local);
+        assert_eq!(native.program, "powershell.exe");
+
+        settings.windows_shell_backend = WindowsShellBackend::Wsl;
+        settings.wsl_distribution = " Ubuntu-24.04 ".into();
+        let wsl = windows_profile(&settings, ProfileId::new());
+        assert_eq!(
+            wsl.backend,
+            ProcessBackend::Wsl {
+                distribution: Some("Ubuntu-24.04".into())
+            }
+        );
+        assert!(wsl.program.is_empty());
+        assert!(wsl.arguments.is_empty());
+        assert_eq!(wsl.working_directory, Some("~".into()));
+    }
+
+    #[test]
+    fn wsl_registry_discovery_filters_utility_distros_and_duplicates() {
+        assert_eq!(
+            visible_wsl_distribution_names([
+                "Ubuntu-24.04".into(),
+                "docker-desktop".into(),
+                "Debian".into(),
+                "ubuntu-24.04".into(),
+                "rancher-desktop-data".into(),
+            ]),
+            ["Debian", "Ubuntu-24.04"]
+        );
+    }
+
+    #[test]
+    fn fleet_views_only_project_the_active_workspace() {
+        let mut app = Muxtrix::new();
+        let first = active_pane_id(&app);
+        let first_workspace = app.session.active_workspace_id;
+        app.agent_statuses
+            .insert(first, agent_status("claude-code"));
+        create_test_workspace(&mut app);
+        let second = active_pane_id(&app);
+        let second_workspace = app.session.active_workspace_id;
+        assert_eq!(app.settings.fleet_view, FleetView::Tabs);
+        assert_eq!(app.fleet_entries(), vec![(second_workspace, second)]);
+
+        app.agent_statuses.insert(second, agent_status("codex"));
+        let _ = app.update(Message::SetFleetView(FleetView::Agents));
+        assert_eq!(
+            app.fleet_entries(),
+            vec![(second_workspace, second)],
+            "agents from inactive workspaces must stay out of the rail"
+        );
+
+        let _ = app.update(Message::SwitchWorkspace(first_workspace));
+        assert_eq!(app.fleet_entries(), vec![(first_workspace, first)]);
+        let _ = app.update(Message::SetFleetView(FleetView::Tabs));
+        assert_eq!(app.fleet_entries(), vec![(first_workspace, first)]);
+    }
+
+    fn agent_status(agent: &str) -> AgentPaneStatus {
+        AgentPaneStatus {
+            agent: agent.into(),
+            display_name: None,
+            state: AgentState::Running,
+            activity: None,
+            session_id: None,
+            cwd: None,
+            git_branch: None,
+        }
+    }
+
+    #[test]
+    fn a_pane_projecting_the_roster_reports_the_roster_not_its_own_state() {
+        let mut app = Muxtrix::new();
+        let pane = active_pane_id(&app);
+        // The conversation behind the roster is backgrounded; whatever state it
+        // last held must not be what the row shows.
+        app.agent_statuses.insert(pane, agent_status("claude-code"));
+        assert_eq!(app.pane_state_label(pane), "Running");
+
+        app.agents_view_panes.insert(pane);
+        // Before the first read the count is genuinely unknown.
+        assert_eq!(app.pane_state_label(pane), "Agents");
+
+        app.agents_roster = Some(agents_roster::AgentsRoster {
+            working: 3,
+            blocked: 0,
+            failed: 0,
+            completed: 1,
+            idle: 0,
+        });
+        assert_eq!(app.pane_state_label(pane), "3 working");
+        assert_eq!(app.pane_signal_kind(pane, false), PaneSignalKind::Active);
+        assert_eq!(app.pane_activity(pane, None), "3 working · 1 idle");
+
+        // Leaving the view hands the row straight back to the pane's own state.
+        app.agents_view_panes.remove(&pane);
+        assert_eq!(app.pane_state_label(pane), "Running");
+    }
+
+    /// The state a healthy fleet spends most of its time in still has to reach
+    /// the row: a finished roster reads like a finished agent, never like a
+    /// pane with nothing to say.
+    #[test]
+    fn a_finished_roster_still_reports_a_state_and_a_signal() {
+        let mut app = Muxtrix::new();
+        let pane = active_pane_id(&app);
+        app.agent_statuses.insert(pane, agent_status("claude-code"));
+        app.agents_view_panes.insert(pane);
+        app.agents_roster = Some(agents_roster::AgentsRoster {
+            working: 0,
+            blocked: 0,
+            failed: 0,
+            completed: 4,
+            idle: 2,
+        });
+        // Six sessions are resting; naming only the four that finished would be
+        // untrue now that both halves wear the same word.
+        assert_eq!(app.pane_state_label(pane), "6 idle");
+        assert_eq!(app.pane_signal_kind(pane, false), PaneSignalKind::Neutral);
+        assert_eq!(app.pane_activity(pane, None), "6 idle");
+    }
+
+    #[test]
+    fn a_blocked_member_raises_the_rosters_row_to_human_attention() {
+        let mut app = Muxtrix::new();
+        let pane = active_pane_id(&app);
+        app.agent_statuses.insert(pane, agent_status("claude-code"));
+        app.agents_view_panes.insert(pane);
+        app.agents_roster = Some(agents_roster::AgentsRoster {
+            working: 3,
+            blocked: 1,
+            failed: 0,
+            completed: 0,
+            idle: 0,
+        });
+        assert_eq!(app.pane_state_label(pane), "1 needs input");
+        assert_eq!(app.pane_signal_kind(pane, false), PaneSignalKind::Warning);
+    }
+
+    /// A roll-up that cannot run is a fact about Muxtrix, not about the fleet.
+    /// The row says so instead of waiting on a read that will never land.
+    #[test]
+    fn a_roster_that_cannot_be_read_says_so_instead_of_waiting_forever() {
+        let mut app = Muxtrix::new();
+        let pane = active_pane_id(&app);
+        app.agent_statuses.insert(pane, agent_status("claude-code"));
+        app.agents_view_panes.insert(pane);
+        assert_eq!(app.pane_state_label(pane), "Agents");
+
+        let _ = app.update(Message::AgentsRosterLoaded(Err(
+            "could not run `claude agents --json`: not found".into(),
+        )));
+        assert_eq!(app.pane_state_label(pane), "Unavailable");
+        assert!(app.pane_activity(pane, None).contains("not found"));
+
+        // A later read that lands replaces the reason with the counts.
+        let _ = app.update(Message::AgentsRosterLoaded(Ok(
+            agents_roster::AgentsRoster {
+                working: 1,
+                blocked: 0,
+                failed: 0,
+                completed: 0,
+                idle: 0,
+            },
+        )));
+        assert_eq!(app.pane_state_label(pane), "1 working");
+        assert_eq!(app.pane_activity(pane, None), "1 working");
+    }
+
+    #[test]
+    fn an_empty_roster_is_reported_rather_than_left_blank() {
+        let mut app = Muxtrix::new();
+        let pane = active_pane_id(&app);
+        app.agent_statuses.insert(pane, agent_status("claude-code"));
+        app.agents_view_panes.insert(pane);
+        app.agents_roster = Some(agents_roster::AgentsRoster::default());
+        assert_eq!(app.pane_state_label(pane), "No agents");
+        assert_eq!(app.pane_signal_kind(pane, false), PaneSignalKind::Neutral);
+    }
+
+    #[test]
+    fn toggling_into_the_roster_and_back_never_renames_a_fleet_row() {
+        // Claude Code retitles the pane on the way in and on the way out. The
+        // row must keep the identity its work earned.
+        assert_eq!(
+            harness_terminal_title("◐ Port the idle rule", "claude-code"),
+            Some("Port the idle rule".into())
+        );
+        for chrome in [
+            "claude agents",
+            "2 awaiting input · claude agents",
+            "current session",
+        ] {
+            assert_eq!(
+                harness_terminal_title(chrome, "claude-code"),
+                None,
+                "{chrome}"
+            );
+        }
+    }
+
+    #[test]
+    fn agents_view_keeps_tab_order_and_never_drops_unrecognized_agents() {
+        let mut app = Muxtrix::new();
+        let claude_pane = active_pane_id(&app);
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+        let unknown_pane = active_pane_id(&app);
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+        let codex_pane = active_pane_id(&app);
+        app.agent_statuses
+            .insert(claude_pane, agent_status("claude-code"));
+        app.agent_statuses
+            .insert(unknown_pane, agent_status("gemini"));
+        app.agent_statuses.insert(codex_pane, agent_status("codex"));
+
+        assert_eq!(agent_display_name("claude-code"), "Claude Code");
+
+        app.set_fleet_view(FleetView::Agents);
+        assert_eq!(app.settings_draft.fleet_view, FleetView::Agents);
+        let workspace_id = app.session.active_workspace_id;
+        let pane_order = pane_ids_in_layout(&active_tab(&app).root);
+        assert!(pane_order.contains(&unknown_pane));
+        let expected_entries = pane_order
+            .iter()
+            .map(|pane_id| (workspace_id, *pane_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            app.fleet_entries(),
+            expected_entries,
+            "agent type must not regroup panes away from their tab order"
+        );
+        assert_eq!(
+            app.rail_targets()
+                .into_iter()
+                .filter(|target| !matches!(target, RailTarget::Workspace(_)))
+                .collect::<Vec<_>>(),
+            pane_order
+                .into_iter()
+                .map(|pane_id| RailTarget::FleetPane(workspace_id, pane_id))
+                .collect::<Vec<_>>(),
+            "rail navigation follows the visible flat agent order without hidden bands"
+        );
+    }
+
+    #[test]
+    fn collapsed_rail_ignores_expanded_fleet_projections() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let _ = app.update(Message::Split(SplitAxis::Horizontal));
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "claude".into(),
+                display_name: None,
+                state: AgentState::Running,
+                activity: None,
+                session_id: None,
+                cwd: None,
+                git_branch: None,
+            },
+        );
+        let _ = app.update(Message::SetFleetView(FleetView::Agents));
+        assert_eq!(app.fleet_entries().len(), 1);
+
+        // The collapsed rail has no reachable toggle, so it must always be
+        // able to navigate to every pane.
+        app.sidebar_collapsed = true;
+        assert_eq!(app.fleet_entries().len(), 2);
+
+        app.set_fleet_view(FleetView::Repos);
+        assert_eq!(app.fleet_entries().len(), 2);
+    }
+
+    #[test]
+    fn shell_rows_report_their_launch_command() {
+        let app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let command = app.pane_command(pane_id);
+        assert!(!command.is_empty());
+        assert!(
+            !command.contains('/'),
+            "the command should be a basename or profile name, not a path: {command}"
+        );
+    }
+
+    #[test]
+    fn typed_control_requests_manage_panes_and_agent_attention() {
+        let mut app = Muxtrix::new();
+        let original = active_pane_id(&app);
+        let response = app.handle_control_request(ControlRequest::Split {
+            direction: SplitDirection::Right,
+        });
+        assert!(response.ok);
+        let second = active_pane_id(&app);
+        assert_ne!(original, second);
+
+        let response = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Waiting,
+            event: Some("PermissionRequest".into()),
+            title: "Codex · PermissionRequest".into(),
+            body: "Codex needs approval".into(),
+            pane_id: Some(original.as_uuid().to_string()),
+            session_id: Some("thread-1".into()),
+            cwd: Some("/workspace".into()),
+        });
+        assert!(response.ok);
+        assert_eq!(
+            app.active_workspace()
+                .expect("workspace should exist")
+                .pane(original)
+                .expect("original pane should exist")
+                .attention
+                .unread_count,
+            0
+        );
+        assert_eq!(app.agent_statuses[&original].state, AgentState::Running);
+        assert_eq!(app.pane_activity(original, None), "Codex needs approval");
+        assert_ne!(app.pane_activity(original, None), "Ready for input");
+
+        let response = app.handle_control_request(ControlRequest::ListPanes);
+        assert!(response.ok);
+        assert_eq!(response.panes.len(), 2);
+        assert!(response.panes.iter().any(|pane| pane.focused));
+
+        let response = app.handle_control_request(ControlRequest::Close {
+            pane_id: Some(original.as_uuid().to_string()),
+        });
+        assert!(response.ok);
+        assert_eq!(
+            app.active_workspace()
+                .expect("workspace should exist")
+                .active_tab()
+                .expect("active tab should exist")
+                .panes
+                .len(),
+            1
+        );
+        assert!(!app.terminals.contains_key(&original));
+    }
+
+    #[test]
+    fn wsl_sessions_share_pane_identity_with_windows_hook_processes() {
+        let pane_id = PaneId::new();
+        let mut plan = LaunchPlan {
+            executable: "wsl.exe".into(),
+            arguments: Vec::new(),
+            working_directory: None,
+            environment: Vec::new(),
+        };
+        add_muxtrix_environment(
+            &mut plan,
+            &ProcessBackend::Wsl { distribution: None },
+            pane_id,
+            Some("EXISTING/p:MUXTRIX_PANE_ID/u"),
+            Some("muxtrix-test-endpoint"),
+            Some("/home/user/.local/share/muxtrix/shell-integration/zsh"),
+        );
+
+        assert!(
+            plan.environment
+                .contains(&("MUXTRIX_PANE_ID".into(), pane_id.as_uuid().to_string()))
+        );
+        assert!(plan.environment.contains(&(
+            "WSLENV".into(),
+            "EXISTING/p:MUXTRIX_PANE_ID/u:MUXTRIX_CONTROL_ENDPOINT:PROMPT_COMMAND:ZDOTDIR".into()
+        )));
+        assert!(plan.environment.contains(&(
+            "ZDOTDIR".into(),
+            "/home/user/.local/share/muxtrix/shell-integration/zsh".into()
+        )));
+        assert!(
+            plan.environment
+                .iter()
+                .any(|(name, value)| name == "PROMPT_COMMAND" && value.contains("]7;file://"))
+        );
+        assert!(plan.environment.contains(&(
+            "MUXTRIX_CONTROL_ENDPOINT".into(),
+            "muxtrix-test-endpoint".into()
+        )));
+    }
+
+    #[test]
+    fn native_sessions_receive_the_exact_control_endpoint_too() {
+        let pane_id = PaneId::new();
+        let mut plan = LaunchPlan {
+            executable: "powershell.exe".into(),
+            arguments: Vec::new(),
+            working_directory: None,
+            environment: Vec::new(),
+        };
+        add_muxtrix_environment(
+            &mut plan,
+            &ProcessBackend::Local,
+            pane_id,
+            None,
+            Some("muxtrix-native-endpoint"),
+            None,
+        );
+
+        assert!(plan.environment.contains(&(
+            "MUXTRIX_CONTROL_ENDPOINT".into(),
+            "muxtrix-native-endpoint".into()
+        )));
+        assert!(!plan.environment.iter().any(|(name, _)| name == "WSLENV"));
+    }
+}

@@ -1,0 +1,63 @@
+[package]
+name = "muxtrix"
+default-run = "muxtrix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Native GPU terminal workspace for supervising coding agents"
+repository.workspace = true
+
+[features]
+e2e = []
+
+[dependencies]
+async-channel.workspace = true
+iced.workspace = true
+fontdb.workspace = true
+libghostty-vt.workspace = true
+muxtrix-domain = { path = "../muxtrix-domain" }
+muxtrix-control = { path = "../muxtrix-control" }
+muxtrix-platform = { path = "../muxtrix-platform" }
+muxtrix-sessions = { path = "../muxtrix-sessions" }
+uuid.workspace = true
+muxtrix-terminal = { path = "../muxtrix-terminal" }
+png.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ttf-parser.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56.0"
+
+# Plain build-dependency: cfg(windows) here would gate on the HOST, which
+# breaks icon embedding when cross-compiling the Windows binary from WSL.
+# build.rs skips the resource step for non-Windows TARGETS at runtime.
+[build-dependencies]
+winresource = "0.1.31"
+
+[dev-dependencies]
+x11rb = { version = "0.13.2", features = ["xtest"] }
+
+[[test]]
+name = "headless_e2e"
+path = "tests/headless_e2e.rs"
+required-features = ["e2e"]
+
+[lints]
+workspace = true
+
+[package.metadata.deb]
+maintainer = "Francois Ward <fward@hey.com>"
+copyright = "2026 Francois Ward"
+extended-description = "Native GPU terminal workspace for supervising coding agents, with worktrees, fleet supervision, and Ghostty-compatible theming."
+section = "utils"
+priority = "optional"
+depends = "$auto, hicolor-icon-theme"
+assets = [
+    ["target/release/muxtrix", "usr/bin/", "755"],
+    ["target/release/muxtrixctl", "usr/bin/", "755"],
+    ["assets/muxtrix.desktop", "usr/share/applications/", "644"],
+    ["assets/muxtrix-icon.png", "usr/share/icons/hicolor/256x256/apps/muxtrix.png", "644"],
+    ["../../THIRD_PARTY_NOTICES.md", "usr/share/doc/muxtrix/", "644"],
+]

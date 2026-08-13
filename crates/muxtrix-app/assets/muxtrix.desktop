@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Muxtrix
+Comment=Supervise coding agents in native terminal workspaces
+Exec=muxtrix
+TryExec=muxtrix
+Icon=muxtrix
+Terminal=false
+Categories=Development;
+Keywords=terminal;agent;workspace;development;
+StartupNotify=true
