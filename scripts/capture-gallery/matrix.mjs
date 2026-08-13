@@ -444,10 +444,10 @@ add({
 // ── GitHub panel ────────────────────────────────────────────────────────────
 add({
   slug: "github-panel",
-  title: "GitHub review panel",
+  title: "Repository panel · local changes",
   group: "GitHub",
   capture: "github-panel",
-  check: "Docked panel at ≥1080 width: PR header, check summary, file list.",
+  check: "The Local tab is selected and shows only the focused pane's working-tree changes.",
 });
 add({
   slug: "github-panel-floating",
@@ -458,11 +458,77 @@ add({
   check: "Below 1080 the panel floats over the workspace — check the scrim and right alignment.",
 });
 add({
+  slug: "github-pull-requests",
+  title: "Repository panel · pull requests",
+  group: "GitHub",
+  capture: "github-pull-requests",
+  check: "The Pull requests tab presents a searchable, compact open-PR inventory with stable title, author, branch, and state lanes.",
+});
+add({
+  slug: "github-pull-request-search",
+  title: "Pull requests · filtered",
+  group: "GitHub",
+  capture: "github-pull-request-search",
+  check: "Searching by title narrows the list and reports the matched count without moving the search field.",
+});
+add({
+  slug: "github-pull-requests-scrolled",
+  title: "Pull requests · virtualized tail",
+  group: "GitHub",
+  capture: "github-pull-requests-scrolled",
+  check: "The 120-item virtualized list reaches its tail without blank rows or layout shifts.",
+});
+add({
   slug: "github-scrolled",
-  title: "GitHub panel · file list scrolled",
+  title: "Pull request · changed files scrolled",
   group: "GitHub",
   capture: "github-scrolled",
-  check: "Windowed file list scrolled to the end; no blank rows at the tail.",
+  check: "The selected PR's virtualized changed-file list reaches its tail without blank rows.",
+});
+add({
+  slug: "github-diff",
+  title: "GitHub · unified diff",
+  group: "GitHub",
+  capture: "github-diff",
+  viewport: "1440x800",
+  check: "At a width that holds at least 80 terminal cells, long logical lines wrap without a horizontal scrollbar while line numbers and add/delete/hunk treatments remain aligned.",
+});
+add({
+  slug: "github-diff-minimum",
+  title: "GitHub diff · minimum window (720×480)",
+  group: "GitHub",
+  capture: "github-diff",
+  viewport: "720x480",
+  check: "At minimum width the compact diff header stays inside its surface while the file panel remains usable.",
+});
+add({
+  slug: "github-diff-horizontal",
+  title: "GitHub diff · below wrap threshold (1024×680)",
+  group: "GitHub",
+  capture: "github-diff",
+  viewport: "1024x680",
+  check: "When the code lane cannot hold about 80 terminal cells, logical lines stay intact and horizontal scrolling remains available.",
+});
+add({
+  slug: "github-diff-binary",
+  title: "GitHub diff · no textual patch",
+  group: "GitHub",
+  capture: "github-diff-binary",
+  check: "Binary and oversized patches explain why no text is available without collapsing either surface.",
+});
+add({
+  slug: "github-diff-loading",
+  title: "GitHub diff · loading",
+  group: "GitHub",
+  capture: "github-diff-loading",
+  check: "Loading preserves the full viewer and file navigation layout.",
+});
+add({
+  slug: "github-diff-error",
+  title: "GitHub diff · error",
+  group: "GitHub",
+  capture: "github-diff-error",
+  check: "Diff errors remain scoped to the viewer and leave file navigation available.",
 });
 add({
   slug: "github-blocked",
@@ -494,10 +560,10 @@ add({
 });
 add({
   slug: "github-no-pr",
-  title: "GitHub · no pull request",
+  title: "GitHub · no open pull requests",
   group: "GitHub",
   capture: "github-no-pr",
-  check: "Diff summary without a PR, and the offer to open one.",
+  check: "The PR tab explains that the repository has no open pull requests.",
 });
 add({
   slug: "github-auth",
@@ -515,17 +581,31 @@ add({
 });
 add({
   slug: "github-loading",
-  title: "GitHub · loading",
+  title: "Local changes · loading",
   group: "GitHub",
   capture: "github-loading",
-  check: "Loading placeholder should reserve the panel's shape.",
+  check: "The Local tab loader reserves the panel shape while actions remain unavailable.",
+});
+add({
+  slug: "github-pull-requests-loading",
+  title: "Pull requests · loading",
+  group: "GitHub",
+  capture: "github-pull-requests-loading",
+  check: "Opening the PR tab shows the nine-dot loader without exposing stale list rows or refresh actions.",
+});
+add({
+  slug: "github-refreshing",
+  title: "Local changes · refreshing",
+  group: "GitHub",
+  capture: "github-refreshing",
+  check: "Refresh replaces stale local files with the nine-dot loader; repository identity and Close remain while Refresh and file actions disappear.",
 });
 add({
   slug: "github-error",
-  title: "GitHub · gh error",
+  title: "Local changes · Git error",
   group: "GitHub",
   capture: "github-error",
-  check: "Raw gh error text must wrap inside the panel rather than overflow it.",
+  check: "A local Git error stays scoped to the Local tab with a direct retry action.",
 });
 add({
   slug: "github-unavailable",
@@ -619,6 +699,7 @@ for (const [slug, title, appearance] of [
     ["palette", "Command palette", "palette"],
     ["fleet-agents", "Fleet · Agents", "fleet-agents"],
     ["github-panel", "GitHub panel", "github-panel"],
+    ["github-diff", "GitHub diff", "github-diff"],
     ["worktree-manager", "Worktrees", "worktree-manager"],
     ["theme-gallery", "Theme gallery", "theme-gallery"],
     ["needs-input", "Agent needs input", "needs-input"],
