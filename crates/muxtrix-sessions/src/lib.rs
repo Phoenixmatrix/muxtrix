@@ -222,6 +222,37 @@ pub struct SessionClient {
     pane_spawn_failures: Arc<Mutex<HashMap<Uuid, String>>>,
 }
 
+/// Publishes a pane's terminal state before closing its output stream.
+///
+/// The terminal actor treats a closed output channel as PTY EOF and immediately
+/// asks the client whether that EOF was a clean exit. Dropping the sender first
+/// therefore races the actor: it can observe EOF before `pane_exits` is filled
+/// and retain an ordinary `exit` as an unresponsive, unclean pane.
+fn finish_tracked_pane(
+    outputs: &Mutex<HashMap<Uuid, Sender<Vec<u8>>>>,
+    exits: &Mutex<HashMap<Uuid, bool>>,
+    spawn_failures: &Mutex<HashMap<Uuid, String>>,
+    pane: Uuid,
+    clean: bool,
+    spawn_failure: Option<&str>,
+) {
+    // Hold the output registry until every piece of state queried after EOF is
+    // visible. `register_pane` and `unregister_pane` use this same lock as the
+    // lifecycle boundary, so an already-forgotten pane is never regrown.
+    let mut outputs = outputs.lock().expect("outputs");
+    if !outputs.contains_key(&pane) {
+        return;
+    }
+    exits.lock().expect("exits").insert(pane, clean);
+    if let Some(error) = spawn_failure {
+        spawn_failures
+            .lock()
+            .expect("spawn failures")
+            .insert(pane, error.to_owned());
+    }
+    outputs.remove(&pane);
+}
+
 impl SessionClient {
     pub fn connect_endpoint(
         endpoint: &str,
@@ -276,15 +307,14 @@ impl SessionClient {
                             continue;
                         }
                         Event::Exited { pane, clean } => {
-                            // Closing the pane's output channel is the EOF
-                            // its reader thread is waiting for. A pane the
-                            // client already unregistered is gone for good;
-                            // recording its exit would regrow the maps that
-                            // unregistering just cleared.
-                            let tracked = outputs.lock().expect("outputs").remove(pane).is_some();
-                            if tracked {
-                                exits.lock().expect("exits").insert(*pane, *clean);
-                            }
+                            finish_tracked_pane(
+                                &outputs,
+                                &exits,
+                                &spawn_failures,
+                                *pane,
+                                *clean,
+                                None,
+                            );
                             continue;
                         }
                         Event::Spawned {
@@ -296,17 +326,17 @@ impl SessionClient {
                         }
                         Event::SpawnFailed { pane, error } => {
                             // Failure reads as an unclean immediate exit;
-                            // dropping the sender is the reader's EOF. The
-                            // reason is kept so the pane can say why it is
+                            // dropping the sender is the reader's EOF. Record
+                            // the reason first so the pane can say why it is
                             // empty instead of looking like a live terminal.
-                            let tracked = outputs.lock().expect("outputs").remove(pane).is_some();
-                            if tracked {
-                                exits.lock().expect("exits").insert(*pane, false);
-                                spawn_failures
-                                    .lock()
-                                    .expect("spawn failures")
-                                    .insert(*pane, error.clone());
-                            }
+                            finish_tracked_pane(
+                                &outputs,
+                                &exits,
+                                &spawn_failures,
+                                *pane,
+                                false,
+                                Some(error),
+                            );
                             continue;
                         }
                         _ => {}
@@ -354,6 +384,10 @@ impl SessionClient {
     /// flag makes it swallow the terminal's own responses.
     pub fn register_pane(&self, pane: Uuid) -> Receiver<Vec<u8>> {
         let (sender, receiver) = mpsc::channel();
+        // This lock is the pane lifecycle boundary. Holding it while stale
+        // metadata is cleared prevents a concurrent exit event from leaving
+        // the replacement with its predecessor's status.
+        let mut outputs = self.pane_outputs.lock().expect("outputs");
         self.pane_exits.lock().expect("exits").remove(&pane);
         self.pane_pids.lock().expect("pids").remove(&pane);
         self.pane_replaying.lock().expect("replaying").remove(&pane);
@@ -361,10 +395,7 @@ impl SessionClient {
             .lock()
             .expect("spawn failures")
             .remove(&pane);
-        self.pane_outputs
-            .lock()
-            .expect("outputs")
-            .insert(pane, sender);
+        outputs.insert(pane, sender);
         receiver
     }
 
@@ -372,7 +403,9 @@ impl SessionClient {
     /// is the EOF its reader thread blocks on — a pane dropped without this
     /// strands that thread, and its bookkeeping, for the life of the process.
     pub fn unregister_pane(&self, pane: Uuid) {
-        self.pane_outputs.lock().expect("outputs").remove(&pane);
+        // Keep EOF last here as well. If the reader wakes while this method is
+        // still clearing state, it must never find stale exit metadata.
+        let mut outputs = self.pane_outputs.lock().expect("outputs");
         self.pane_exits.lock().expect("exits").remove(&pane);
         self.pane_pids.lock().expect("pids").remove(&pane);
         self.pane_replaying.lock().expect("replaying").remove(&pane);
@@ -380,6 +413,7 @@ impl SessionClient {
             .lock()
             .expect("spawn failures")
             .remove(&pane);
+        outputs.remove(&pane);
     }
 
     /// Whether the client is still streaming this pane. False once the pane
@@ -450,5 +484,27 @@ mod tests {
             serde_json::from_str("{\"event\":\"exited\",\"pane\":\"00000000-0000-0000-0000-000000000000\",\"clean\":true}")
                 .expect("deserialize");
         assert!(matches!(event, Event::Exited { clean: true, .. }));
+    }
+
+    #[test]
+    fn pane_exit_is_visible_when_its_output_stream_reaches_eof() {
+        let pane = Uuid::new_v4();
+        let (sender, receiver) = mpsc::channel();
+        let outputs = Arc::new(Mutex::new(HashMap::from([(pane, sender)])));
+        let exits = Arc::new(Mutex::new(HashMap::new()));
+        let spawn_failures = Arc::new(Mutex::new(HashMap::new()));
+        let observed_exits = Arc::clone(&exits);
+
+        let observer = std::thread::spawn(move || {
+            assert!(receiver.recv().is_err(), "the output stream should close");
+            observed_exits.lock().expect("exits").get(&pane).copied()
+        });
+
+        finish_tracked_pane(&outputs, &exits, &spawn_failures, pane, true, None);
+
+        assert_eq!(
+            observer.join().expect("EOF observer should finish"),
+            Some(true)
+        );
     }
 }
