@@ -337,13 +337,36 @@ it becomes an opaque right-aligned overlay at the same width, separated from
 the terminal by a restrained shadow cast only to the left. Opening, closing,
 refreshing, or scrolling the ledger must not disturb terminal geometry.
 
-The ledger reads from decision to evidence: repository and branch identity,
-merge readiness, pull-request identity, review and check state, then changed
-files. Readiness always pairs its semantic signal with a concise text label and
+The ledger separates two different truths with one recessed Local/Pull requests
+switch. Local is the focused pane's working tree and never requires GitHub
+authentication. Pull requests is the repository's remote inventory. The active
+tab alone owns Refresh, loading, errors, scrolling, and selection; switching
+tabs must not make local edits look like pull-request changes or vice versa.
+Repository and branch identity stay fixed above the switch.
+
+Local refreshes when the panel opens, when Refresh is used, and once after pane,
+tab, or workspace focus moves to another local pane. Focus queues one
+asynchronous Git read; it does not introduce a repeating timer. A repository
+change replaces both tab caches, while movement within one repository updates
+only local state. Pull requests load only when their tab is first opened or
+explicitly refreshed.
+
+The pull-request list fetches lightweight summaries, then searches title,
+number, author, head, and base locally. Continuous 58 px rows keep title and
+state above identity and branch metadata. The search keeps a visible `Search`
+label above the field; placeholder text is guidance, never the field's only
+name. Render only visible rows plus bounded overscan. Filtering resets the list
+to its start, and filtering or refresh clamps both scroll offset and keyboard
+cursor to the new result set so virtualization never produces a blank viewport
+from stale position. Selecting a pull request replaces the list with its
+readiness, identity, checks, and paginated changed files. Only that selection
+fetches full metadata and patches, so repositories with many open pull requests
+do not pay the cost of every file list. A quiet back row returns to the
+searchable list.
+Readiness always pairs its semantic signal with a concise text label and
 explanation. Green means ready or passed, amber means pending or blocked on
 human or remote work, red means failed or conflicting, and neutral means
-unknown, draft, or absent. These meanings extend the established state palette;
-color is never the only carrier of meaning.
+unknown or draft; color is never the only carrier of meaning.
 
 The fleet footer owns GitHub account state even when the ledger is closed. Its
 expanded form shows account or connection copy with a state dot; its collapsed
@@ -355,19 +378,27 @@ shaped and ellipsized against the width the footer's remaining anatomy leaves it
 — the mark, the two gaps, the dot, and the collapse control — so a long account
 name stops inside its own lane instead of running under the dot or pushing
 collapse off the rail's edge.
-When authentication is unavailable or in progress, the ledger replaces review
-data with one centered explanation and one truthful next action. Successful
-browser authentication refreshes the same surface rather than introducing a
-second flow.
+When authentication is unavailable or in progress, only Pull requests replaces
+its body with one centered explanation and one truthful next action; Local
+remains usable. Successful browser authentication refreshes the pull-request
+surface rather than introducing a second flow.
 
-A full repository load owns the ledger body. Initial loading and manual refresh
-both replace review readiness, merge controls, errors, and file rows with one
-centered 3 x 3 dot activity mark and truthful Reading or Refreshing copy. The
-repository and branch remain in the header for context, and Close remains
-available; Refresh disappears until the replacement state lands. The dots
-animate inside a fixed footprint without moving adjacent copy. The lightweight
-pull-request probe after window refocus stays silent and never takes over the
-ledger.
+A full load owns the active tab body. Initial loading and manual refresh replace
+its evidence and actions with one centered 3 x 3 dot activity mark and truthful
+Local, pull-request-list, or selected-pull-request copy. The repository, branch,
+and tab switch remain for context, but the switch is disabled; Close remains
+available and Refresh disappears until replacement state lands. The dots
+animate inside a fixed footprint without moving adjacent copy. There is no
+window-focus polling or background pull-request probe.
+
+Keyboard ownership is explicit and opt-in. Merely opening the ledger never
+claims terminal keys; interacting with a ledger tab, search field, row, or file
+list moves keyboard ownership into the panel, and focusing a terminal moves it
+back out. While the ledger owns focus, Tab and Shift+Tab traverse only the
+controls present in the active tab or detail view, arrows move the active list,
+Enter activates its cursor, and Escape steps back or releases panel focus. A
+text field keeps ordinary editing keys. Panel navigation keys are handled only
+while that ownership is present, so an open ledger cannot steal shell input.
 
 Changed files use continuous 42 px ruled rows under a compact summary band.
 Render only the visible rows plus bounded overscan. Each row keeps its path and
@@ -376,8 +407,10 @@ on the right. The path truncates before those lanes; counts never move or wrap.
 Use success for additions, danger for deletions or conflicts, and neutral copy
 for ordinary modifications.
 
-Selecting a changed file opens a full-height unified diff while the ledger
-stays visible for file navigation. Back and Escape return to the workspace.
+Selecting a local or pull-request file opens the same full-height unified diff
+while the ledger stays visible in its originating tab for file navigation. Back
+and Escape return to the workspace; returning from a PR detail returns to its
+searchable list.
 The diff's code lane is measured in configured terminal cells after both line
 number gutters and their spacing. At 80 columns or wider, logical lines wrap at
 glyph boundaries inside the available lane and horizontal scrolling disappears;

@@ -9,9 +9,9 @@ use serde_json::json;
 use muxtrix_control::AgentState;
 
 use super::{
-    ActiveView, Agent, AgentPaneStatus, GitHubDiffState, GitHubPanelState, HookScope, HookStatus,
-    Message, Muxtrix, PaneRepository, TerminalMouseButton, WorktreeManagerEntry,
-    WorktreeManagerMode, WorktreeManagerState, github,
+    ActiveView, Agent, AgentPaneStatus, GitHubDiffSource, GitHubDiffState, GitHubPanelState,
+    GitHubPanelTab, HookScope, HookStatus, Message, Muxtrix, PaneRepository, TerminalMouseButton,
+    WorktreeManagerEntry, WorktreeManagerMode, WorktreeManagerState, github,
 };
 use crate::settings::FleetView;
 
@@ -81,11 +81,11 @@ const STAGED_GITHUB_PATCH: &str = concat!(
     "     })\n",
     " }\n",
     " \n",
-    "+/// Fetch only the PR summary after the app regains focus.\n",
-    "+pub(crate) fn probe_pull_request(\n",
+    "+/// Fetch lightweight summaries only when the PR tab opens.\n",
+    "+pub(crate) fn list_pull_requests(\n",
     "+    repository: &Repository,\n",
-    "+) -> Result<Option<PullRequest>, String> {\n",
-    "+    load_pull_request(repository)\n",
+    "+) -> Result<Vec<PullRequestSummary>, String> {\n",
+    "+    load_pull_request_summaries(repository)\n",
     "+}\n",
     "+\n",
     " pub(crate) fn merge(\n",
@@ -165,6 +165,7 @@ enum Stage {
 enum TickAction {
     Wait,
     ScrollGitHubToEnd,
+    ScrollGitHubPullRequestsToEnd,
     Capture,
 }
 
@@ -597,17 +598,31 @@ impl Scenario {
                 if self.capturing("github-scrolled") && self.settle_ticks == 2 {
                     return Ok(TickAction::ScrollGitHubToEnd);
                 }
+                if self.capturing("github-pull-requests-scrolled") && self.settle_ticks == 2 {
+                    return Ok(TickAction::ScrollGitHubPullRequestsToEnd);
+                }
                 if self.capturing("github-scrolled")
                     && self.settle_ticks >= 5
                     && app
                         .github_panel
                         .as_ref()
-                        .is_none_or(|panel| panel.file_scroll_offset <= 0.0)
+                        .is_none_or(|panel| panel.selected_pull_request_file_scroll_offset <= 0.0)
                 {
                     return Err("GitHub file list did not report a scrolled offset".into());
                 }
+                if self.capturing("github-pull-requests-scrolled")
+                    && self.settle_ticks >= 5
+                    && app
+                        .github_panel
+                        .as_ref()
+                        .is_none_or(|panel| panel.pull_request_scroll_offset <= 0.0)
+                {
+                    return Err("GitHub pull request list did not report a scrolled offset".into());
+                }
                 if self.settle_ticks
-                    >= if self.capturing("github-scrolled") {
+                    >= if self.capturing("github-scrolled")
+                        || self.capturing("github-pull-requests-scrolled")
+                    {
                         5
                     } else {
                         4
@@ -740,112 +755,55 @@ impl Scenario {
                 || self.capturing("github-merge-confirmation")
                 || self.capturing("github-no-pr")
                 || self.capturing("github-scrolled")
+                || self.capturing("github-pull-requests")
+                || self.capturing("github-pull-request-search")
+                || self.capturing("github-pull-requests-scrolled")
                 || self.capturing("github-diff")
                 || self.capturing("github-diff-binary")
                 || self.capturing("github-diff-loading")
                 || self.capturing("github-diff-error"))
         {
-            let repository = github::Repository {
-                root: "/home/user/.muxtrix/worktrees/muxtrix/github-support".into(),
-                name: "muxtrix".into(),
-                owner_and_name: Some("Phoenixmatrix/muxtrix".into()),
-                branch: "github-support".into(),
-                wsl_distribution: "Ubuntu-24.04".into(),
-            };
-            let mut files = Vec::new();
-            let names = [
-                "crates/muxtrix-app/src/github.rs",
-                "crates/muxtrix-app/src/main.rs",
-                "crates/muxtrix-app/src/commands.rs",
-                "crates/muxtrix-app/src/e2e.rs",
-                "crates/muxtrix-app/assets/icons/github.svg",
-                "crates/muxtrix-app/assets/icons/refresh.svg",
-                "docs/ARCHITECTURE.md",
-                "docs/TESTING.md",
-                "Cargo.lock",
-                "crates/muxtrix-app/Cargo.toml",
-                "README.md",
-                "DESIGN.md",
-                "PRODUCT.md",
-                "docs/DESIGN_SURFACE_APP_SHELL.md",
-            ];
-            for (index, name) in names.iter().cycle().take(74).enumerate() {
-                files.push(github::FileChange {
-                    path: if index < names.len() {
-                        (*name).into()
-                    } else {
-                        format!("github/panel_row_{index:02}.rs")
-                    },
-                    status: if index != 0 && index % 11 == 0 {
-                        "Added".into()
-                    } else {
-                        "Modified".into()
-                    },
-                    additions: 3 + index * 2,
-                    deletions: index % 9,
-                    previous_path: None,
-                    patch: (index == 0).then(|| STAGED_GITHUB_PATCH.into()),
-                });
-            }
-            let additions = files.iter().map(|file| file.additions).sum();
-            let deletions = files.iter().map(|file| file.deletions).sum();
             app.github_auth = github::AuthStatus::Authenticated {
                 login: "phoenixmatrix".into(),
             };
-            app.github_panel = Some(GitHubPanelState {
-                repository,
-                data: Some(github::PanelData {
-                    branch: "github-support".into(),
-                    additions,
-                    deletions,
-                    files,
-                    pull_request: (!self.capturing("github-no-pr")).then_some(
-                        github::PullRequest {
-                            number: 391,
-                            title: "Native GitHub review panel".into(),
-                            url: "https://github.com/Phoenixmatrix/muxtrix/pull/391".into(),
-                            author: "phoenixmatrix".into(),
-                            head: "github-support".into(),
-                            head_oid: "deadbeefcafebabe".into(),
-                            base: "main".into(),
-                            additions,
-                            deletions,
-                            changed_files: 74,
-                            draft: false,
-                            mergeable: "MERGEABLE".into(),
-                            merge_state: "CLEAN".into(),
-                            review_decision: "APPROVED".into(),
-                            checks: github::CheckSummary {
-                                passed: 7,
-                                pending: 0,
-                                failed: 0,
-                            },
-                        },
-                    ),
-                    pull_request_error: None,
-                }),
-                loading: false,
-                error: None,
-                merge_confirmation: self.capturing("github-merge-confirmation"),
-                merging: false,
-                file_scroll_offset: 0.0,
-                request_generation: 0,
-                probe_in_flight: false,
-                last_probe: None,
-                loading_phase: 0,
-            });
+            let mut panel = staged_github_panel();
+            if self.capturing("github-no-pr") {
+                panel.active_tab = GitHubPanelTab::PullRequests;
+                panel.pull_requests = Some(Vec::new());
+            } else if self.capturing("github-pull-requests")
+                || self.capturing("github-pull-request-search")
+                || self.capturing("github-pull-requests-scrolled")
+            {
+                panel.active_tab = GitHubPanelTab::PullRequests;
+                if self.capturing("github-pull-request-search") {
+                    panel.pull_request_query = "mouse".into();
+                    // Reproduce filtering from a deep virtualized scroll. The
+                    // final matching row must remain visible, never a blank
+                    // viewport while the widget catches up to the new offset.
+                    panel.pull_request_scroll_offset = 9_999.0;
+                }
+            } else if !self.capturing("github-panel") {
+                panel.active_tab = GitHubPanelTab::PullRequests;
+                panel.selected_pull_request_number = Some(391);
+                let files = panel
+                    .data
+                    .as_ref()
+                    .map_or_else(Vec::new, |data| data.files.clone());
+                panel.selected_pull_request = Some(staged_github_pull_request_details(files));
+            }
+            panel.merge_confirmation = self.capturing("github-merge-confirmation");
             if self.capturing("github-blocked")
-                && let Some(pull_request) = app
-                    .github_panel
+                && let Some(pull_request) = panel
+                    .selected_pull_request
                     .as_mut()
-                    .and_then(|panel| panel.data.as_mut())
-                    .and_then(|data| data.pull_request.as_mut())
+                    .map(|details| &mut details.pull_request)
             {
                 pull_request.checks.passed = 5;
                 pull_request.checks.pending = 0;
                 pull_request.checks.failed = 2;
                 pull_request.merge_state = "BLOCKED".into();
             }
+            app.github_panel = Some(panel);
             if self.capturing("github-diff")
                 || self.capturing("github-diff-binary")
                 || self.capturing("github-diff-loading")
@@ -876,6 +834,7 @@ impl Scenario {
                     |document| super::github_diff_line_starts(document, wrap_columns),
                 );
                 app.github_diff = Some(GitHubDiffState {
+                    source: GitHubDiffSource::PullRequest(391),
                     path: "crates/muxtrix-app/src/github.rs".into(),
                     status: "Modified".into(),
                     additions: 14,
@@ -895,25 +854,10 @@ impl Scenario {
             && (self.capturing("github-auth") || self.capturing("github-auth-collapsed"))
         {
             app.github_auth = github::AuthStatus::NeedsAuthentication;
-            app.github_panel = Some(GitHubPanelState {
-                repository: github::Repository {
-                    root: "/home/user/dev/muxtrix".into(),
-                    name: "muxtrix".into(),
-                    owner_and_name: Some("Phoenixmatrix/muxtrix".into()),
-                    branch: "github-support".into(),
-                    wsl_distribution: "Ubuntu-24.04".into(),
-                },
-                data: None,
-                loading: false,
-                error: None,
-                merge_confirmation: false,
-                merging: false,
-                file_scroll_offset: 0.0,
-                request_generation: 0,
-                probe_in_flight: false,
-                last_probe: None,
-                loading_phase: 0,
-            });
+            let mut panel = GitHubPanelState::loading(staged_repository());
+            panel.active_tab = GitHubPanelTab::PullRequests;
+            panel.loading = false;
+            app.github_panel = Some(panel);
             app.sidebar_collapsed = self.capturing("github-auth-collapsed");
         } else if self.capturing("github-long-login") {
             // GitHub's own 39-character ceiling on a login: the rail
@@ -1488,19 +1432,19 @@ impl Scenario {
             app.github_auth = github::AuthStatus::Authenticated {
                 login: "phoenixmatrix".into(),
             };
-            app.github_panel = Some(GitHubPanelState {
-                repository: staged_repository(),
-                data: None,
-                loading: true,
-                error: None,
-                merge_confirmation: false,
-                merging: false,
-                file_scroll_offset: 0.0,
-                request_generation: 0,
-                probe_in_flight: false,
-                last_probe: None,
-                loading_phase: 4,
-            });
+            let mut panel = GitHubPanelState::loading(staged_repository());
+            panel.loading_phase = 4;
+            app.github_panel = Some(panel);
+        } else if self.capturing("github-pull-requests-loading") {
+            app.github_auth = github::AuthStatus::Authenticated {
+                login: "phoenixmatrix".into(),
+            };
+            let mut panel = staged_github_panel();
+            panel.active_tab = GitHubPanelTab::PullRequests;
+            panel.pull_requests = None;
+            panel.pull_requests_loading = true;
+            panel.loading_phase = 4;
+            app.github_panel = Some(panel);
         } else if self.capturing("github-refreshing") {
             app.github_auth = github::AuthStatus::Authenticated {
                 login: "phoenixmatrix".into(),
@@ -1513,44 +1457,23 @@ impl Scenario {
             app.github_auth = github::AuthStatus::Authenticated {
                 login: "phoenixmatrix".into(),
             };
-            app.github_panel = Some(GitHubPanelState {
-                repository: staged_repository(),
-                data: None,
-                loading: false,
-                error: Some(
-                    "gh: could not resolve to a Repository with the name 'Phoenixmatrix/muxtrix'"
-                        .into(),
-                ),
-                merge_confirmation: false,
-                merging: false,
-                file_scroll_offset: 0.0,
-                request_generation: 0,
-                probe_in_flight: false,
-                last_probe: None,
-                loading_phase: 0,
-            });
+            let mut panel = GitHubPanelState::loading(staged_repository());
+            panel.loading = false;
+            panel.error = Some("Git could not read the focused pane's working tree.".into());
+            app.github_panel = Some(panel);
         } else if self.capturing("github-unavailable") {
             app.github_auth = github::AuthStatus::Unavailable {
                 reason: "The GitHub CLI (gh) is not installed".into(),
             };
-            app.github_panel = Some(GitHubPanelState {
-                repository: staged_repository(),
-                data: None,
-                loading: false,
-                error: None,
-                merge_confirmation: false,
-                merging: false,
-                file_scroll_offset: 0.0,
-                request_generation: 0,
-                probe_in_flight: false,
-                last_probe: None,
-                loading_phase: 0,
-            });
+            let mut panel = GitHubPanelState::loading(staged_repository());
+            panel.active_tab = GitHubPanelTab::PullRequests;
+            panel.loading = false;
+            app.github_panel = Some(panel);
         } else if self.capturing("github-merging") {
             app.github_auth = github::AuthStatus::Authenticated {
                 login: "phoenixmatrix".into(),
             };
-            let mut panel = staged_github_panel();
+            let mut panel = staged_github_pull_request_panel();
             panel.merge_confirmation = true;
             panel.merging = true;
             app.github_panel = Some(panel);
@@ -1558,11 +1481,11 @@ impl Scenario {
             app.github_auth = github::AuthStatus::Authenticated {
                 login: "phoenixmatrix".into(),
             };
-            let mut panel = staged_github_panel();
+            let mut panel = staged_github_pull_request_panel();
             if let Some(pull_request) = panel
-                .data
+                .selected_pull_request
                 .as_mut()
-                .and_then(|data| data.pull_request.as_mut())
+                .map(|details| &mut details.pull_request)
             {
                 pull_request.draft = true;
                 pull_request.review_decision = "REVIEW_REQUIRED".into();
@@ -1806,6 +1729,12 @@ impl Muxtrix {
                     super::GITHUB_FILE_SCROLL_ID,
                 ))
             }
+            Ok(TickAction::ScrollGitHubPullRequestsToEnd) => {
+                self.e2e = Some(scenario);
+                iced::widget::operation::snap_to_end(iced::widget::Id::new(
+                    super::GITHUB_PULL_REQUEST_SCROLL_ID,
+                ))
+            }
             Ok(TickAction::Capture) => {
                 self.e2e = Some(scenario);
                 iced::window::latest().then(|window| match window {
@@ -1850,8 +1779,8 @@ fn staged_repository() -> github::Repository {
     }
 }
 
-/// A loaded review panel: enough files to overflow the list, and an approved
-/// pull request the merge states can vary from.
+/// A loaded repository panel with local changes plus a large, independently
+/// virtualized pull-request inventory.
 fn staged_github_panel() -> GitHubPanelState {
     let names = [
         "crates/muxtrix-app/src/github.rs",
@@ -1891,48 +1820,114 @@ fn staged_github_panel() -> GitHubPanelState {
             patch: (index == 0).then(|| STAGED_GITHUB_PATCH.into()),
         })
         .collect::<Vec<_>>();
-    let additions = files.iter().map(|file| file.additions).sum();
-    let deletions = files.iter().map(|file| file.deletions).sum();
+    let additions = files.iter().map(|file| file.additions).sum::<usize>();
+    let deletions = files.iter().map(|file| file.deletions).sum::<usize>();
+    let pull_requests = (0..120)
+        .map(|index| github::PullRequestSummary {
+            number: 391 - index as u64,
+            title: if index == 0 {
+                "Native GitHub review panel".into()
+            } else if index == 1 {
+                "Harden terminal mouse reporting over SSH".into()
+            } else if index == 2 {
+                "Keep worktree cleanup recoverable".into()
+            } else {
+                format!("Repository maintenance batch {}", 120 - index)
+            },
+            url: format!(
+                "https://github.com/Phoenixmatrix/muxtrix/pull/{}",
+                391 - index
+            ),
+            author: if index % 4 == 0 {
+                "phoenixmatrix".into()
+            } else {
+                format!("contributor-{}", index % 11)
+            },
+            head: if index == 0 {
+                "github-support".into()
+            } else {
+                format!("maintenance-{index}")
+            },
+            base: "main".into(),
+            draft: index % 9 == 4,
+        })
+        .collect();
 
     GitHubPanelState {
         repository: staged_repository(),
+        active_tab: GitHubPanelTab::Local,
+        context_loading: false,
         data: Some(github::PanelData {
             branch: "github-support".into(),
             additions,
             deletions,
-            files,
-            pull_request: Some(github::PullRequest {
-                number: 391,
-                title: "Native GitHub review panel".into(),
-                url: "https://github.com/Phoenixmatrix/muxtrix/pull/391".into(),
-                author: "phoenixmatrix".into(),
-                head: "github-support".into(),
-                head_oid: "deadbeefcafebabe".into(),
-                base: "main".into(),
-                additions,
-                deletions,
-                changed_files: 74,
-                draft: false,
-                mergeable: "MERGEABLE".into(),
-                merge_state: "CLEAN".into(),
-                review_decision: "APPROVED".into(),
-                checks: github::CheckSummary {
-                    passed: 7,
-                    pending: 0,
-                    failed: 0,
-                },
-            }),
-            pull_request_error: None,
+            files: files.clone(),
         }),
         loading: false,
         error: None,
+        pull_requests: Some(pull_requests),
+        pull_requests_loading: false,
+        pull_requests_error: None,
+        pull_request_query: String::new(),
+        pull_request_scroll_offset: 0.0,
+        pull_request_keyboard_cursor: None,
+        keyboard_focus: None,
+        selected_pull_request_number: None,
+        selected_pull_request: None,
+        selected_pull_request_loading: false,
+        selected_pull_request_error: None,
+        selected_pull_request_file_scroll_offset: 0.0,
+        file_keyboard_cursor: None,
         merge_confirmation: false,
         merging: false,
         file_scroll_offset: 0.0,
         request_generation: 0,
-        probe_in_flight: false,
-        last_probe: None,
+        pull_request_generation: 0,
+        pull_request_detail_generation: 0,
         loading_phase: 0,
+    }
+}
+
+fn staged_github_pull_request_panel() -> GitHubPanelState {
+    let mut panel = staged_github_panel();
+    panel.active_tab = GitHubPanelTab::PullRequests;
+    panel.selected_pull_request_number = Some(391);
+    let files = panel
+        .data
+        .as_ref()
+        .map_or_else(Vec::new, |data| data.files.clone());
+    panel.selected_pull_request = Some(staged_github_pull_request_details(files));
+    panel
+}
+
+fn staged_github_pull_request_details(
+    files: Vec<github::FileChange>,
+) -> github::PullRequestDetails {
+    let additions = files.iter().map(|file| file.additions).sum();
+    let deletions = files.iter().map(|file| file.deletions).sum();
+    github::PullRequestDetails {
+        pull_request: github::PullRequest {
+            number: 391,
+            title: "Native GitHub review panel".into(),
+            url: "https://github.com/Phoenixmatrix/muxtrix/pull/391".into(),
+            author: "phoenixmatrix".into(),
+            head: "github-support".into(),
+            head_oid: "deadbeefcafebabe".into(),
+            base: "main".into(),
+            additions,
+            deletions,
+            changed_files: files.len(),
+            draft: false,
+            mergeable: "MERGEABLE".into(),
+            merge_state: "CLEAN".into(),
+            review_decision: "APPROVED".into(),
+            checks: github::CheckSummary {
+                passed: 7,
+                pending: 0,
+                failed: 0,
+            },
+        },
+        files,
     }
 }
 

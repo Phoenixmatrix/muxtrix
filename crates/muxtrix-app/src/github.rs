@@ -90,6 +90,38 @@ pub(crate) struct PullRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PullRequestSummary {
+    pub(crate) number: u64,
+    pub(crate) title: String,
+    pub(crate) url: String,
+    pub(crate) author: String,
+    pub(crate) head: String,
+    pub(crate) base: String,
+    pub(crate) draft: bool,
+}
+
+impl PullRequestSummary {
+    pub(crate) fn matches(&self, query: &str) -> bool {
+        let query = query.trim().to_ascii_lowercase();
+        query.is_empty()
+            || self.title.to_ascii_lowercase().contains(&query)
+            || self.author.to_ascii_lowercase().contains(&query)
+            || self.head.to_ascii_lowercase().contains(&query)
+            || self.base.to_ascii_lowercase().contains(&query)
+            || self
+                .number
+                .to_string()
+                .contains(query.trim_start_matches('#'))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PullRequestDetails {
+    pub(crate) pull_request: PullRequest,
+    pub(crate) files: Vec<FileChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MergeReadiness {
     Ready,
     Draft,
@@ -142,8 +174,6 @@ pub(crate) struct PanelData {
     pub(crate) files: Vec<FileChange>,
     pub(crate) additions: usize,
     pub(crate) deletions: usize,
-    pub(crate) pull_request: Option<PullRequest>,
-    pub(crate) pull_request_error: Option<String>,
 }
 
 pub(crate) fn repository_from(
@@ -266,7 +296,7 @@ pub(crate) fn authenticate() -> Result<AuthStatus, String> {
     }
 }
 
-pub(crate) fn load(repository: &Repository) -> Result<PanelData, String> {
+pub(crate) fn load_local(repository: &Repository) -> Result<PanelData, String> {
     let status = git(
         &repository.root,
         &repository.wsl_distribution,
@@ -287,18 +317,6 @@ pub(crate) fn load(repository: &Repository) -> Result<PanelData, String> {
     if numstat.status.success() {
         apply_numstat(&mut files, &String::from_utf8_lossy(&numstat.stdout));
     }
-    let (pull_request, mut pull_request_error) = match load_pull_request(repository) {
-        Ok(pull_request) => (pull_request, None),
-        Err(error) => (None, Some(error)),
-    };
-    if let Some(pull_request) = pull_request.as_ref()
-        && let Some(owner_and_name) = repository.owner_and_name.as_deref()
-    {
-        match load_pull_request_files(owner_and_name, pull_request.number) {
-            Ok(pull_request_files) => files = pull_request_files,
-            Err(error) => pull_request_error = Some(error),
-        }
-    }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let additions = files.iter().map(|file| file.additions).sum();
     let deletions = files.iter().map(|file| file.deletions).sum();
@@ -307,15 +325,49 @@ pub(crate) fn load(repository: &Repository) -> Result<PanelData, String> {
         files,
         additions,
         deletions,
-        pull_request,
-        pull_request_error,
     })
 }
 
-/// Fetch only the PR summary. This is used once after the app regains focus;
-/// it deliberately avoids local Git scans and the paginated PR-files call.
-pub(crate) fn probe_pull_request(repository: &Repository) -> Result<Option<PullRequest>, String> {
-    load_pull_request(repository)
+pub(crate) fn list_pull_requests(
+    repository: &Repository,
+) -> Result<Vec<PullRequestSummary>, String> {
+    let owner_and_name = github_repository(repository)?;
+    let output = console_command("gh")
+        .args([
+            "pr",
+            "list",
+            "--repo",
+            owner_and_name,
+            "--state",
+            "open",
+            "--limit",
+            "1000",
+            "--json",
+            "number,title,url,author,headRefName,baseRefName,isDraft",
+        ])
+        .output()
+        .map_err(|error| format!("GitHub pull requests could not be read: {error}"))?;
+    if !output.status.success() {
+        return Err(nonempty_failure(
+            &output,
+            "GitHub pull requests are unavailable.",
+        ));
+    }
+    parse_pull_request_summaries(&output.stdout)
+}
+
+pub(crate) fn load_pull_request_details(
+    repository: &Repository,
+    number: u64,
+) -> Result<PullRequestDetails, String> {
+    let owner_and_name = github_repository(repository)?;
+    let pull_request = load_pull_request(repository, number)?;
+    let mut files = load_pull_request_files(owner_and_name, number)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(PullRequestDetails {
+        pull_request,
+        files,
+    })
 }
 
 pub(crate) fn load_diff(
@@ -551,25 +603,19 @@ pub(crate) fn merge(
     }
 }
 
-fn load_pull_request(repository: &Repository) -> Result<Option<PullRequest>, String> {
-    let output = pull_request_view_command(repository)?
+fn load_pull_request(repository: &Repository, number: u64) -> Result<PullRequest, String> {
+    let output = pull_request_view_command(repository, number)?
         .output()
         .map_err(|error| format!("GitHub pull request details could not be read: {error}"))?;
     if !output.status.success() {
         let failure = output_failure(&output);
-        let lower = failure.to_ascii_lowercase();
-        if lower.contains("no pull requests found")
-            || lower.contains("could not find a pull request")
-        {
-            return Ok(None);
-        }
         return Err(if failure.is_empty() {
             "GitHub pull request details are unavailable.".into()
         } else {
             failure
         });
     }
-    parse_pull_request(&output.stdout).map(Some)
+    parse_pull_request(&output.stdout)
 }
 
 #[derive(Debug, Deserialize)]
@@ -592,6 +638,18 @@ struct PullRequestResponse {
     review_decision: String,
     #[serde(default)]
     status_check_rollup: Vec<PullRequestCheck>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestSummaryResponse {
+    number: u64,
+    title: String,
+    url: String,
+    author: Option<PullRequestAuthor>,
+    head_ref_name: String,
+    base_ref_name: String,
+    is_draft: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -636,6 +694,25 @@ fn parse_pull_request_files(bytes: &[u8]) -> Result<Vec<FileChange>, String> {
             additions: file.additions,
             deletions: file.deletions,
             patch: file.patch,
+        })
+        .collect())
+}
+
+fn parse_pull_request_summaries(bytes: &[u8]) -> Result<Vec<PullRequestSummary>, String> {
+    let responses: Vec<PullRequestSummaryResponse> = serde_json::from_slice(bytes)
+        .map_err(|error| format!("GitHub returned an invalid pull request list: {error}"))?;
+    Ok(responses
+        .into_iter()
+        .map(|pull_request| PullRequestSummary {
+            number: pull_request.number,
+            title: pull_request.title,
+            url: pull_request.url,
+            author: pull_request
+                .author
+                .map_or_else(|| "Unknown author".into(), |author| author.login),
+            head: pull_request.head_ref_name,
+            base: pull_request.base_ref_name,
+            draft: pull_request.is_draft,
         })
         .collect())
 }
@@ -692,13 +769,13 @@ fn github_repository(repository: &Repository) -> Result<&str, String> {
         .ok_or_else(|| "The origin remote is not a GitHub repository.".into())
 }
 
-fn pull_request_view_command(repository: &Repository) -> Result<Command, String> {
+fn pull_request_view_command(repository: &Repository, number: u64) -> Result<Command, String> {
     let owner_and_name = github_repository(repository)?;
     let mut command = console_command("gh");
     command.args([
         "pr",
         "view",
-        &repository.branch,
+        &number.to_string(),
         "--repo",
         owner_and_name,
         "--json",
@@ -829,7 +906,8 @@ mod tests {
             branch: "wsl-fix".into(),
             wsl_distribution: "Ubuntu-24.04".into(),
         };
-        let command = pull_request_view_command(&repository).expect("GitHub command should build");
+        let command =
+            pull_request_view_command(&repository, 42).expect("GitHub command should build");
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -841,7 +919,39 @@ mod tests {
                 .windows(2)
                 .any(|arguments| { arguments == ["--repo", "Phoenixmatrix/muxtrix"] })
         );
-        assert!(arguments.iter().any(|argument| argument == "wsl-fix"));
+        assert!(arguments.iter().any(|argument| argument == "42"));
+    }
+
+    #[test]
+    fn pull_request_search_matches_identity_and_branches() {
+        let pull_request = PullRequestSummary {
+            number: 391,
+            title: "Native GitHub review panel".into(),
+            url: "https://github.com/example/repo/pull/391".into(),
+            author: "phoenixmatrix".into(),
+            head: "github-support".into(),
+            base: "main".into(),
+            draft: false,
+        };
+
+        assert!(pull_request.matches("review panel"));
+        assert!(pull_request.matches("#391"));
+        assert!(pull_request.matches("PHOENIX"));
+        assert!(pull_request.matches("github-support"));
+        assert!(!pull_request.matches("unrelated"));
+    }
+
+    #[test]
+    fn pull_request_list_parser_keeps_searchable_identity() {
+        let pull_requests = parse_pull_request_summaries(
+            br#"[{"number":17,"title":"Keep diffs readable","url":"https://github.com/example/repo/pull/17","author":{"login":"octocat"},"headRefName":"diff-wrap","baseRefName":"main","isDraft":false}]"#,
+        )
+        .expect("GitHub list should parse");
+
+        assert_eq!(pull_requests.len(), 1);
+        assert_eq!(pull_requests[0].number, 17);
+        assert_eq!(pull_requests[0].author, "octocat");
+        assert!(pull_requests[0].matches("diff-wrap"));
     }
 
     #[test]

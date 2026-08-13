@@ -116,13 +116,15 @@ light and square heavy boxes with pixel-connectivity assertions, plus double,
 dashed, diagonal, junction, horizontal-rule, and full-block fixtures. The
 worktree flow exposes
 `worktree-dialog`, `worktree-manager`, `worktree-switcher`, and
-`worktree-restart-confirmation` captures. The GitHub flow exposes `github-panel`
-for a ready pull request with a 74-file windowed list, `github-blocked`,
+`worktree-restart-confirmation` captures. The repository flow exposes
+`github-panel` for local changes; `github-pull-requests`,
+`github-pull-request-search`, and `github-pull-requests-scrolled` for the
+searchable, virtualized remote inventory; and `github-blocked`,
 `github-merge-confirmation`, `github-no-pr`, `github-scrolled`, `github-auth`,
-and `github-auth-collapsed` for its important readiness, confirmation, empty,
-scrolling, and auth states. `github-loading` and `github-refreshing` cover the
-same animated loading shell before data and while replacing cached review
-state. The full-screen file review flow adds `github-diff`,
+and `github-auth-collapsed` for selected-PR readiness, confirmation, empty,
+file-scrolling, and auth states. `github-loading`, `github-refreshing`, and
+`github-pull-requests-loading` cover the tab-specific animated loading shells.
+The full-screen file review flow adds `github-diff`,
 `github-diff-binary`, `github-diff-loading`, and `github-diff-error` for its
 normal and hardened fallback states.
 Combine any capture with
