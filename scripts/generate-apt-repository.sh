@@ -28,6 +28,9 @@ trap 'rm -f "${release_output}"' EXIT
     cd "${repository}"
     rm -f Packages Packages.* Release
     dpkg-scanpackages --multiversion pool /dev/null > Packages
+    # dpkg-scanpackages terminates its final stanza with an extra blank line,
+    # which makes `git diff --check` reject the generated repository.
+    sed -i '${/^$/d;}' Packages
     gzip --no-name --keep --force Packages
 
     # apt-ftparchive otherwise sees the previous Release while it scans and
