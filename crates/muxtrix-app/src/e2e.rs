@@ -9,9 +9,9 @@ use serde_json::json;
 use muxtrix_control::AgentState;
 
 use super::{
-    ActiveView, Agent, AgentPaneStatus, GitHubPanelState, HookScope, HookStatus, Message, Muxtrix,
-    PaneRepository, TerminalMouseButton, WorktreeManagerEntry, WorktreeManagerMode,
-    WorktreeManagerState, github,
+    ActiveView, Agent, AgentPaneStatus, GitHubDiffState, GitHubPanelState, HookScope, HookStatus,
+    Message, Muxtrix, PaneRepository, TerminalMouseButton, WorktreeManagerEntry,
+    WorktreeManagerMode, WorktreeManagerState, github,
 };
 use crate::settings::FleetView;
 
@@ -76,6 +76,36 @@ const TERMINAL_PALETTE_SCRIPT: &str = concat!(
 );
 const TERMINAL_PALETTE_MARKER: &str = "palette-ready";
 const SELECTION_FOLLOW_MARKER: &str = "selection-follow-target";
+const STAGED_GITHUB_PATCH: &str = concat!(
+    "@@ -312,10 +312,18 @@ pub(crate) fn load(repository: &Repository) -> Result<PanelData, String> {\n",
+    "     })\n",
+    " }\n",
+    " \n",
+    "+/// Fetch only the PR summary after the app regains focus.\n",
+    "+pub(crate) fn probe_pull_request(\n",
+    "+    repository: &Repository,\n",
+    "+) -> Result<Option<PullRequest>, String> {\n",
+    "+    load_pull_request(repository)\n",
+    "+}\n",
+    "+\n",
+    " pub(crate) fn merge(\n",
+    "     repository: &Repository,\n",
+    "     number: u64,\n",
+    "@@ -328,7 +336,6 @@ pub(crate) fn merge(\n",
+    "-    let branch = repository.branch.clone();\n",
+    "     let owner_and_name = github_repository(repository)?;\n",
+    "     let number = number.to_string();\n",
+    "     let output = console_command(\"gh\")\n",
+    "@@ -344,6 +351,9 @@ pub(crate) fn merge(\n",
+    "         .output()\n",
+    "         .map_err(|error| format!(\"GitHub merge could not start: {error}\"))?;\n",
+    "+    // The branch remains intact so the user can decide when to remove it after reviewing the complete merge result.\n",
+    "+    // This deliberately keeps the command asynchronous from the renderer.\n",
+    "+\n",
+    "     if output.status.success() {\n",
+    "         Ok(format!(\"Merged pull request #{number}\"))\n",
+    "     } else {\n",
+);
 
 pub(super) struct Scenario {
     report_path: PathBuf,
@@ -709,7 +739,11 @@ impl Scenario {
                 || self.capturing("github-blocked")
                 || self.capturing("github-merge-confirmation")
                 || self.capturing("github-no-pr")
-                || self.capturing("github-scrolled"))
+                || self.capturing("github-scrolled")
+                || self.capturing("github-diff")
+                || self.capturing("github-diff-binary")
+                || self.capturing("github-diff-loading")
+                || self.capturing("github-diff-error"))
         {
             let repository = github::Repository {
                 root: "/home/user/.muxtrix/worktrees/muxtrix/github-support".into(),
@@ -742,13 +776,15 @@ impl Scenario {
                     } else {
                         format!("github/panel_row_{index:02}.rs")
                     },
-                    status: if index % 11 == 0 {
+                    status: if index != 0 && index % 11 == 0 {
                         "Added".into()
                     } else {
                         "Modified".into()
                     },
                     additions: 3 + index * 2,
                     deletions: index % 9,
+                    previous_path: None,
+                    patch: (index == 0).then(|| STAGED_GITHUB_PATCH.into()),
                 });
             }
             let additions = files.iter().map(|file| file.additions).sum();
@@ -793,6 +829,9 @@ impl Scenario {
                 merge_confirmation: self.capturing("github-merge-confirmation"),
                 merging: false,
                 file_scroll_offset: 0.0,
+                request_generation: 0,
+                probe_in_flight: false,
+                last_probe: None,
             });
             if self.capturing("github-blocked")
                 && let Some(pull_request) = app
@@ -805,6 +844,40 @@ impl Scenario {
                 pull_request.checks.pending = 0;
                 pull_request.checks.failed = 2;
                 pull_request.merge_state = "BLOCKED".into();
+            }
+            if self.capturing("github-diff")
+                || self.capturing("github-diff-binary")
+                || self.capturing("github-diff-loading")
+                || self.capturing("github-diff-error")
+            {
+                app.active_view = ActiveView::GitHubDiff;
+                app.github_diff = Some(GitHubDiffState {
+                    path: "crates/muxtrix-app/src/github.rs".into(),
+                    status: "Modified".into(),
+                    additions: 14,
+                    deletions: 1,
+                    document: if self.capturing("github-diff") {
+                        Some(github::parse_diff(STAGED_GITHUB_PATCH.as_bytes()))
+                    } else if self.capturing("github-diff-binary") {
+                        Some(github::DiffDocument {
+                            lines: Vec::new(),
+                            notice: Some(
+                                "GitHub did not provide a textual patch. The file may be binary or the diff may be too large."
+                                    .into(),
+                            ),
+                            truncated: false,
+                            max_columns: 0,
+                        })
+                    } else {
+                        None
+                    },
+                    loading: self.capturing("github-diff-loading"),
+                    error: self
+                        .capturing("github-diff-error")
+                        .then(|| "Git could not read this file's diff.".into()),
+                    generation: 1,
+                    scroll_offset: 0.0,
+                });
             }
         } else if self.settle_ticks == 1
             && (self.capturing("github-auth") || self.capturing("github-auth-collapsed"))
@@ -824,6 +897,9 @@ impl Scenario {
                 merge_confirmation: false,
                 merging: false,
                 file_scroll_offset: 0.0,
+                request_generation: 0,
+                probe_in_flight: false,
+                last_probe: None,
             });
             app.sidebar_collapsed = self.capturing("github-auth-collapsed");
         } else if self.capturing("github-long-login") {
@@ -1407,6 +1483,9 @@ impl Scenario {
                 merge_confirmation: false,
                 merging: false,
                 file_scroll_offset: 0.0,
+                request_generation: 0,
+                probe_in_flight: false,
+                last_probe: None,
             });
         } else if self.capturing("github-error") {
             app.github_auth = github::AuthStatus::Authenticated {
@@ -1423,6 +1502,9 @@ impl Scenario {
                 merge_confirmation: false,
                 merging: false,
                 file_scroll_offset: 0.0,
+                request_generation: 0,
+                probe_in_flight: false,
+                last_probe: None,
             });
         } else if self.capturing("github-unavailable") {
             app.github_auth = github::AuthStatus::Unavailable {
@@ -1436,6 +1518,9 @@ impl Scenario {
                 merge_confirmation: false,
                 merging: false,
                 file_scroll_offset: 0.0,
+                request_generation: 0,
+                probe_in_flight: false,
+                last_probe: None,
             });
         } else if self.capturing("github-merging") {
             app.github_auth = github::AuthStatus::Authenticated {
@@ -1771,13 +1856,15 @@ fn staged_github_panel() -> GitHubPanelState {
             } else {
                 format!("github/panel_row_{index:02}.rs")
             },
-            status: if index % 11 == 0 {
+            status: if index != 0 && index % 11 == 0 {
                 "Added".into()
             } else {
                 "Modified".into()
             },
             additions: 3 + index * 2,
             deletions: index % 9,
+            previous_path: None,
+            patch: (index == 0).then(|| STAGED_GITHUB_PATCH.into()),
         })
         .collect::<Vec<_>>();
     let additions = files.iter().map(|file| file.additions).sum();
@@ -1818,6 +1905,9 @@ fn staged_github_panel() -> GitHubPanelState {
         merge_confirmation: false,
         merging: false,
         file_scroll_offset: 0.0,
+        request_generation: 0,
+        probe_in_flight: false,
+        last_probe: None,
     }
 }
 

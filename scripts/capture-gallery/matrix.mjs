@@ -465,6 +465,42 @@ add({
   check: "Windowed file list scrolled to the end; no blank rows at the tail.",
 });
 add({
+  slug: "github-diff",
+  title: "GitHub · unified diff",
+  group: "GitHub",
+  capture: "github-diff",
+  check: "Full-height diff viewer keeps the selected file visible in the navigation panel, with aligned line numbers and legible add/delete/hunk treatments.",
+});
+add({
+  slug: "github-diff-minimum",
+  title: "GitHub diff · minimum window (720×480)",
+  group: "GitHub",
+  capture: "github-diff",
+  viewport: "720x480",
+  check: "At minimum width the compact diff header stays inside its surface while the file panel remains usable.",
+});
+add({
+  slug: "github-diff-binary",
+  title: "GitHub diff · no textual patch",
+  group: "GitHub",
+  capture: "github-diff-binary",
+  check: "Binary and oversized patches explain why no text is available without collapsing either surface.",
+});
+add({
+  slug: "github-diff-loading",
+  title: "GitHub diff · loading",
+  group: "GitHub",
+  capture: "github-diff-loading",
+  check: "Loading preserves the full viewer and file navigation layout.",
+});
+add({
+  slug: "github-diff-error",
+  title: "GitHub diff · error",
+  group: "GitHub",
+  capture: "github-diff-error",
+  check: "Diff errors remain scoped to the viewer and leave file navigation available.",
+});
+add({
   slug: "github-blocked",
   title: "GitHub · checks failing",
   group: "GitHub",
@@ -619,6 +655,7 @@ for (const [slug, title, appearance] of [
     ["palette", "Command palette", "palette"],
     ["fleet-agents", "Fleet · Agents", "fleet-agents"],
     ["github-panel", "GitHub panel", "github-panel"],
+    ["github-diff", "GitHub diff", "github-diff"],
     ["worktree-manager", "Worktrees", "worktree-manager"],
     ["theme-gallery", "Theme gallery", "theme-gallery"],
     ["needs-input", "Agent needs input", "needs-input"],

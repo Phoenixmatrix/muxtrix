@@ -118,9 +118,11 @@ worktree flow exposes
 `worktree-dialog`, `worktree-manager`, `worktree-switcher`, and
 `worktree-restart-confirmation` captures. The GitHub flow exposes `github-panel`
 for a ready pull request with a 74-file windowed list, `github-blocked`,
-`github-merge-confirmation`,
-`github-no-pr`, `github-scrolled`, `github-auth`, and `github-auth-collapsed`
-for its important readiness, confirmation, empty, scrolling, and auth states.
+`github-merge-confirmation`, `github-no-pr`, `github-scrolled`, `github-auth`,
+and `github-auth-collapsed` for its important readiness, confirmation, empty,
+scrolling, and auth states. The full-screen file review flow adds `github-diff`,
+`github-diff-binary`, `github-diff-loading`, and `github-diff-error` for its
+normal and hardened fallback states.
 Combine any capture with
 `MUXTRIX_E2E_SCREENSHOT_RGBA=/tmp/muxtrix-settings.rgba` when inspecting the GPU
 output without exposing a host window.

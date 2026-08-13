@@ -26,10 +26,42 @@ pub(crate) struct Repository {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileChange {
     pub(crate) path: String,
+    pub(crate) previous_path: Option<String>,
     pub(crate) status: String,
     pub(crate) additions: usize,
     pub(crate) deletions: usize,
+    /// GitHub's unified patch for this file. The API omits this for binary
+    /// and very large files; local working-tree entries leave it unset too.
+    pub(crate) patch: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiffLineKind {
+    Metadata,
+    Hunk,
+    Context,
+    Addition,
+    Deletion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiffLine {
+    pub(crate) kind: DiffLineKind,
+    pub(crate) old_line: Option<usize>,
+    pub(crate) new_line: Option<usize>,
+    pub(crate) text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiffDocument {
+    pub(crate) lines: Vec<DiffLine>,
+    pub(crate) notice: Option<String>,
+    pub(crate) truncated: bool,
+    pub(crate) max_columns: usize,
+}
+
+const DIFF_MAX_BYTES: usize = 4 * 1024 * 1024;
+const DIFF_MAX_LINES: usize = 50_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckSummary {
@@ -280,6 +312,200 @@ pub(crate) fn load(repository: &Repository) -> Result<PanelData, String> {
     })
 }
 
+/// Fetch only the PR summary. This is used once after the app regains focus;
+/// it deliberately avoids local Git scans and the paginated PR-files call.
+pub(crate) fn probe_pull_request(repository: &Repository) -> Result<Option<PullRequest>, String> {
+    load_pull_request(repository)
+}
+
+pub(crate) fn load_diff(
+    repository: &Repository,
+    file: &FileChange,
+    github_patch: bool,
+) -> Result<DiffDocument, String> {
+    validate_relative_git_path(&file.path)?;
+    if let Some(previous) = file.previous_path.as_deref() {
+        validate_relative_git_path(previous)?;
+    }
+    if github_patch {
+        let Some(patch) = file.patch.as_deref() else {
+            return Ok(DiffDocument {
+                lines: Vec::new(),
+                notice: Some(
+                    "GitHub did not provide a textual patch. The file may be binary or the diff may be too large."
+                        .into(),
+                ),
+                truncated: false,
+                max_columns: 0,
+            });
+        };
+        let mut document = parse_diff(patch.as_bytes());
+        let shown_additions = document
+            .lines
+            .iter()
+            .filter(|line| line.kind == DiffLineKind::Addition)
+            .count();
+        let shown_deletions = document
+            .lines
+            .iter()
+            .filter(|line| line.kind == DiffLineKind::Deletion)
+            .count();
+        if shown_additions < file.additions || shown_deletions < file.deletions {
+            document.truncated = true;
+            document.notice = Some(
+                "GitHub returned only part of this patch. Showing the available lines.".into(),
+            );
+        }
+        return Ok(document);
+    }
+
+    let output = if file.status == "Untracked" {
+        git(
+            &repository.root,
+            &repository.wsl_distribution,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--no-index",
+                "--",
+                "/dev/null",
+                &file.path,
+            ],
+        )?
+    } else if let Some(previous) = file.previous_path.as_deref() {
+        git(
+            &repository.root,
+            &repository.wsl_distribution,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "HEAD",
+                "--",
+                previous,
+                &file.path,
+            ],
+        )?
+    } else {
+        git(
+            &repository.root,
+            &repository.wsl_distribution,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "HEAD",
+                "--",
+                &file.path,
+            ],
+        )?
+    };
+    // `git diff --no-index` returns one when differences exist.
+    if !output.status.success() && !(file.status == "Untracked" && output.status.code() == Some(1))
+    {
+        return Err(nonempty_failure(
+            &output,
+            "Git could not read this file's diff.",
+        ));
+    }
+    let mut document = parse_diff(&output.stdout);
+    if document.lines.is_empty() && document.notice.is_none() {
+        document.notice = Some("This file has no textual changes to display.".into());
+    }
+    Ok(document)
+}
+
+fn validate_relative_git_path(path: &str) -> Result<(), String> {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("Git returned an unsafe repository-relative file path.".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_diff(bytes: &[u8]) -> DiffDocument {
+    let byte_truncated = bytes.len() > DIFF_MAX_BYTES;
+    let bytes = &bytes[..bytes.len().min(DIFF_MAX_BYTES)];
+    let text = String::from_utf8_lossy(bytes);
+    let mut old_line = None;
+    let mut new_line = None;
+    let mut lines = Vec::new();
+    let mut line_truncated = false;
+    for raw in text.lines() {
+        if lines.len() == DIFF_MAX_LINES {
+            line_truncated = true;
+            break;
+        }
+        let (kind, old, new) = if raw.starts_with("@@") {
+            if let Some((old_start, new_start)) = parse_hunk_starts(raw) {
+                old_line = Some(old_start);
+                new_line = Some(new_start);
+            }
+            (DiffLineKind::Hunk, None, None)
+        } else if raw.starts_with("+++")
+            || raw.starts_with("---")
+            || raw.starts_with("diff ")
+            || raw.starts_with("index ")
+            || raw.starts_with("new file ")
+            || raw.starts_with("deleted file ")
+            || raw.starts_with("similarity ")
+            || raw.starts_with("rename ")
+            || raw.starts_with('\\')
+        {
+            (DiffLineKind::Metadata, None, None)
+        } else if raw.starts_with('+') {
+            let current = new_line;
+            new_line = new_line.map(|line| line + 1);
+            (DiffLineKind::Addition, None, current)
+        } else if raw.starts_with('-') {
+            let current = old_line;
+            old_line = old_line.map(|line| line + 1);
+            (DiffLineKind::Deletion, current, None)
+        } else {
+            let current_old = old_line;
+            let current_new = new_line;
+            old_line = old_line.map(|line| line + 1);
+            new_line = new_line.map(|line| line + 1);
+            (DiffLineKind::Context, current_old, current_new)
+        };
+        lines.push(DiffLine {
+            kind,
+            old_line: old,
+            new_line: new,
+            text: raw.replace('\t', "    "),
+        });
+    }
+    let truncated = byte_truncated || line_truncated;
+    let max_columns = lines
+        .iter()
+        .map(|line| line.text.chars().count())
+        .max()
+        .unwrap_or(0);
+    DiffDocument {
+        lines,
+        notice: truncated.then(|| {
+            "Diff truncated after 4 MiB or 50,000 lines to keep the viewer responsive.".into()
+        }),
+        truncated,
+        max_columns,
+    }
+}
+
+fn parse_hunk_starts(line: &str) -> Option<(usize, usize)> {
+    let mut ranges = line.split_whitespace();
+    let _marker = ranges.next()?;
+    let old = ranges.next()?.strip_prefix('-')?;
+    let new = ranges.next()?.strip_prefix('+')?;
+    let start = |range: &str| range.split(',').next()?.parse::<usize>().ok();
+    Some((start(old)?, start(new)?))
+}
+
 fn load_pull_request_files(owner_and_name: &str, number: u64) -> Result<Vec<FileChange>, String> {
     let endpoint = format!("repos/{owner_and_name}/pulls/{number}/files");
     let output = console_command("gh")
@@ -383,9 +609,11 @@ struct PullRequestCheck {
 #[derive(Debug, Deserialize)]
 struct PullRequestFileResponse {
     filename: String,
+    previous_filename: Option<String>,
     status: String,
     additions: usize,
     deletions: usize,
+    patch: Option<String>,
 }
 
 fn parse_pull_request_files(bytes: &[u8]) -> Result<Vec<FileChange>, String> {
@@ -396,6 +624,7 @@ fn parse_pull_request_files(bytes: &[u8]) -> Result<Vec<FileChange>, String> {
         .flatten()
         .map(|file| FileChange {
             path: file.filename,
+            previous_path: file.previous_filename,
             status: match file.status.as_str() {
                 "added" => "Added",
                 "removed" => "Deleted",
@@ -406,6 +635,7 @@ fn parse_pull_request_files(bytes: &[u8]) -> Result<Vec<FileChange>, String> {
             .into(),
             additions: file.additions,
             deletions: file.deletions,
+            patch: file.patch,
         })
         .collect())
 }
@@ -503,9 +733,13 @@ fn parse_status(status: &str) -> Vec<FileChange> {
             .to_owned();
             Some(FileChange {
                 path,
+                previous_path: raw_path
+                    .rsplit_once(" -> ")
+                    .map(|(source, _)| source.trim_matches('"').to_owned()),
                 status,
                 additions: 0,
                 deletions: 0,
+                patch: None,
             })
         })
         .collect()
@@ -621,7 +855,84 @@ mod tests {
         assert_eq!(files.len(), 4);
         assert_eq!(files[0].additions, 12);
         assert_eq!(files[2].path, "src/moved.rs");
+        assert_eq!(files[2].previous_path.as_deref(), Some("old.rs"));
         assert_eq!(files[3].status, "Untracked");
+    }
+
+    #[test]
+    fn unified_diff_parser_tracks_line_numbers_and_kinds() {
+        let document = parse_diff(
+            b"diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -10,3 +10,4 @@ fn main() {\n unchanged\n-old\n+new\n+extra\n trailing\n",
+        );
+
+        assert!(!document.truncated);
+        assert_eq!(document.lines[0].kind, DiffLineKind::Metadata);
+        assert_eq!(document.lines[3].kind, DiffLineKind::Hunk);
+        assert_eq!(
+            (document.lines[4].old_line, document.lines[4].new_line),
+            (Some(10), Some(10))
+        );
+        assert_eq!(
+            (document.lines[5].kind, document.lines[5].old_line),
+            (DiffLineKind::Deletion, Some(11))
+        );
+        assert_eq!(
+            (document.lines[6].kind, document.lines[6].new_line),
+            (DiffLineKind::Addition, Some(11))
+        );
+        assert_eq!(document.lines[8].old_line, Some(12));
+        assert_eq!(document.lines[8].new_line, Some(13));
+    }
+
+    #[test]
+    fn unified_diff_parser_bounds_large_documents() {
+        let input = " context\n".repeat(DIFF_MAX_LINES + 1);
+        let document = parse_diff(input.as_bytes());
+
+        assert_eq!(document.lines.len(), DIFF_MAX_LINES);
+        assert!(document.truncated);
+        assert!(
+            document
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("truncated"))
+        );
+    }
+
+    #[test]
+    fn diff_paths_must_stay_inside_the_repository() {
+        assert!(validate_relative_git_path("src/main.rs").is_ok());
+        assert!(validate_relative_git_path("../secrets.txt").is_err());
+        assert!(validate_relative_git_path("/etc/passwd").is_err());
+        assert!(validate_relative_git_path("").is_err());
+    }
+
+    #[test]
+    fn partial_github_patches_are_labeled_instead_of_presented_as_complete() {
+        let repository = Repository {
+            root: "/unused".into(),
+            name: "muxtrix".into(),
+            owner_and_name: Some("example/muxtrix".into()),
+            branch: "diff-viewer".into(),
+            wsl_distribution: String::new(),
+        };
+        let file = FileChange {
+            path: "src/main.rs".into(),
+            previous_path: None,
+            status: "Modified".into(),
+            additions: 8,
+            deletions: 4,
+            patch: Some("@@ -1 +1 @@\n-old\n+new".into()),
+        };
+
+        let document = load_diff(&repository, &file, true).expect("patch should parse");
+        assert!(document.truncated);
+        assert!(
+            document
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("only part"))
+        );
     }
 
     #[test]
@@ -658,11 +969,18 @@ mod tests {
     #[test]
     fn paginated_pull_request_files_are_flattened() {
         let files = parse_pull_request_files(
-            br#"[[{"filename":"src/main.rs","status":"modified","additions":12,"deletions":3}],[{"filename":"src/new.rs","status":"added","additions":8,"deletions":0}]]"#,
+            br#"[[{"filename":"src/main.rs","status":"renamed","previous_filename":"src/lib.rs","additions":12,"deletions":3,"patch":"@@ -1 +1 @@\n-old\n+new"}],[{"filename":"src/new.rs","status":"added","additions":8,"deletions":0}]]"#,
         )
         .expect("pull request file payload should parse");
         assert_eq!(files.len(), 2);
-        assert_eq!(files[0].status, "Modified");
+        assert_eq!(files[0].status, "Renamed");
+        assert_eq!(files[0].previous_path.as_deref(), Some("src/lib.rs"));
+        assert!(
+            files[0]
+                .patch
+                .as_deref()
+                .is_some_and(|patch| patch.contains("+new"))
+        );
         assert_eq!(files[1].status, "Added");
         assert_eq!(files[1].additions, 8);
     }
