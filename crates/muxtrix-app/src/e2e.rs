@@ -832,6 +832,7 @@ impl Scenario {
                 request_generation: 0,
                 probe_in_flight: false,
                 last_probe: None,
+                loading_phase: 0,
             });
             if self.capturing("github-blocked")
                 && let Some(pull_request) = app
@@ -851,32 +852,43 @@ impl Scenario {
                 || self.capturing("github-diff-error")
             {
                 app.active_view = ActiveView::GitHubDiff;
+                let document = if self.capturing("github-diff") {
+                    Some(github::parse_diff(STAGED_GITHUB_PATCH.as_bytes()))
+                } else if self.capturing("github-diff-binary") {
+                    Some(github::DiffDocument {
+                        lines: Vec::new(),
+                        notice: Some(
+                            "GitHub did not provide a textual patch. The file may be binary or the diff may be too large."
+                                .into(),
+                        ),
+                        truncated: false,
+                        max_columns: 0,
+                    })
+                } else {
+                    None
+                };
+                let wrap_columns = super::github_diff_wrap_columns(
+                    app.window_size.width,
+                    app.settings.terminal_cell_width(),
+                );
+                let line_starts = document.as_ref().map_or_else(
+                    || vec![0],
+                    |document| super::github_diff_line_starts(document, wrap_columns),
+                );
                 app.github_diff = Some(GitHubDiffState {
                     path: "crates/muxtrix-app/src/github.rs".into(),
                     status: "Modified".into(),
                     additions: 14,
                     deletions: 1,
-                    document: if self.capturing("github-diff") {
-                        Some(github::parse_diff(STAGED_GITHUB_PATCH.as_bytes()))
-                    } else if self.capturing("github-diff-binary") {
-                        Some(github::DiffDocument {
-                            lines: Vec::new(),
-                            notice: Some(
-                                "GitHub did not provide a textual patch. The file may be binary or the diff may be too large."
-                                    .into(),
-                            ),
-                            truncated: false,
-                            max_columns: 0,
-                        })
-                    } else {
-                        None
-                    },
+                    document,
                     loading: self.capturing("github-diff-loading"),
                     error: self
                         .capturing("github-diff-error")
                         .then(|| "Git could not read this file's diff.".into()),
                     generation: 1,
                     scroll_offset: 0.0,
+                    wrap_columns,
+                    line_starts,
                 });
             }
         } else if self.settle_ticks == 1
@@ -900,6 +912,7 @@ impl Scenario {
                 request_generation: 0,
                 probe_in_flight: false,
                 last_probe: None,
+                loading_phase: 0,
             });
             app.sidebar_collapsed = self.capturing("github-auth-collapsed");
         } else if self.capturing("github-long-login") {
@@ -1486,7 +1499,16 @@ impl Scenario {
                 request_generation: 0,
                 probe_in_flight: false,
                 last_probe: None,
+                loading_phase: 4,
             });
+        } else if self.capturing("github-refreshing") {
+            app.github_auth = github::AuthStatus::Authenticated {
+                login: "phoenixmatrix".into(),
+            };
+            let mut panel = staged_github_panel();
+            panel.loading = true;
+            panel.loading_phase = 4;
+            app.github_panel = Some(panel);
         } else if self.capturing("github-error") {
             app.github_auth = github::AuthStatus::Authenticated {
                 login: "phoenixmatrix".into(),
@@ -1505,6 +1527,7 @@ impl Scenario {
                 request_generation: 0,
                 probe_in_flight: false,
                 last_probe: None,
+                loading_phase: 0,
             });
         } else if self.capturing("github-unavailable") {
             app.github_auth = github::AuthStatus::Unavailable {
@@ -1521,6 +1544,7 @@ impl Scenario {
                 request_generation: 0,
                 probe_in_flight: false,
                 last_probe: None,
+                loading_phase: 0,
             });
         } else if self.capturing("github-merging") {
             app.github_auth = github::AuthStatus::Authenticated {
@@ -1908,6 +1932,7 @@ fn staged_github_panel() -> GitHubPanelState {
         request_generation: 0,
         probe_in_flight: false,
         last_probe: None,
+        loading_phase: 0,
     }
 }
 

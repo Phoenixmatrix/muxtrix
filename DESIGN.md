@@ -360,12 +360,31 @@ data with one centered explanation and one truthful next action. Successful
 browser authentication refreshes the same surface rather than introducing a
 second flow.
 
+A full repository load owns the ledger body. Initial loading and manual refresh
+both replace review readiness, merge controls, errors, and file rows with one
+centered 3 x 3 dot activity mark and truthful Reading or Refreshing copy. The
+repository and branch remain in the header for context, and Close remains
+available; Refresh disappears until the replacement state lands. The dots
+animate inside a fixed footprint without moving adjacent copy. The lightweight
+pull-request probe after window refocus stays silent and never takes over the
+ledger.
+
 Changed files use continuous 42 px ruled rows under a compact summary band.
 Render only the visible rows plus bounded overscan. Each row keeps its path and
 secondary status on the left, then fixed monospaced addition and deletion lanes
 on the right. The path truncates before those lanes; counts never move or wrap.
 Use success for additions, danger for deletions or conflicts, and neutral copy
 for ordinary modifications.
+
+Selecting a changed file opens a full-height unified diff while the ledger
+stays visible for file navigation. Back and Escape return to the workspace.
+The diff's code lane is measured in configured terminal cells after both line
+number gutters and their spacing. At 80 columns or wider, logical lines wrap at
+glyph boundaries inside the available lane and horizontal scrolling disappears;
+continuations keep the semantic line background but no repeated line numbers.
+Below 80 columns, lines remain intact behind horizontal scrolling because
+wrapping would fragment the code. Both modes retain bounded vertical
+virtualization, and resizing across the threshold anchors the same logical line.
 
 Merge is a guarded inline action, not a modal interruption. Enable it only when
 GitHub reports a clean, mergeable pull request whose checks and review

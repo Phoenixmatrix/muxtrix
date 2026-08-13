@@ -469,7 +469,8 @@ add({
   title: "GitHub · unified diff",
   group: "GitHub",
   capture: "github-diff",
-  check: "Full-height diff viewer keeps the selected file visible in the navigation panel, with aligned line numbers and legible add/delete/hunk treatments.",
+  viewport: "1440x800",
+  check: "At a width that holds at least 80 terminal cells, long logical lines wrap without a horizontal scrollbar while line numbers and add/delete/hunk treatments remain aligned.",
 });
 add({
   slug: "github-diff-minimum",
@@ -478,6 +479,14 @@ add({
   capture: "github-diff",
   viewport: "720x480",
   check: "At minimum width the compact diff header stays inside its surface while the file panel remains usable.",
+});
+add({
+  slug: "github-diff-horizontal",
+  title: "GitHub diff · below wrap threshold (1024×680)",
+  group: "GitHub",
+  capture: "github-diff",
+  viewport: "1024x680",
+  check: "When the code lane cannot hold about 80 terminal cells, logical lines stay intact and horizontal scrolling remains available.",
 });
 add({
   slug: "github-diff-binary",
@@ -555,6 +564,13 @@ add({
   group: "GitHub",
   capture: "github-loading",
   check: "Loading placeholder should reserve the panel's shape.",
+});
+add({
+  slug: "github-refreshing",
+  title: "GitHub · refreshing loaded review",
+  group: "GitHub",
+  capture: "github-refreshing",
+  check: "Refresh replaces stale review evidence with the nine-dot loader; repository identity and Close remain while Refresh, Merge, and files disappear.",
 });
 add({
   slug: "github-error",

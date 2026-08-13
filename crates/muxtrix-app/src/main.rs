@@ -475,6 +475,7 @@ struct GitHubPanelState {
     request_generation: u64,
     probe_in_flight: bool,
     last_probe: Option<std::time::Instant>,
+    loading_phase: u8,
 }
 
 impl GitHubPanelState {
@@ -490,6 +491,7 @@ impl GitHubPanelState {
             request_generation: 0,
             probe_in_flight: false,
             last_probe: None,
+            loading_phase: 0,
         }
     }
 }
@@ -505,6 +507,8 @@ struct GitHubDiffState {
     error: Option<String>,
     generation: u64,
     scroll_offset: f32,
+    wrap_columns: Option<usize>,
+    line_starts: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -925,6 +929,7 @@ enum Message {
     AgentsRosterLoaded(Result<agents_roster::AgentsRoster, String>),
     PaneRepositoriesLoaded(Result<Vec<(PaneId, PaneRepository)>, String>),
     BlinkCursor,
+    AnimateGitHubLoading,
     Keyboard(keyboard::Event),
     ResizePane(PaneId, Size),
     ResizeSplit(SplitKey, Size),
@@ -1117,6 +1122,9 @@ const PALETTE_SCROLL_ID: &str = "muxtrix-command-palette-scroll";
 const GITHUB_FILE_SCROLL_ID: &str = "muxtrix-github-file-scroll";
 const GITHUB_DIFF_LINE_HEIGHT: f32 = 24.0;
 const GITHUB_DIFF_OVERSCAN: usize = 16;
+const GITHUB_DIFF_CHROME_WIDTH: f32 = 122.0;
+const GITHUB_DIFF_MIN_WRAP_COLUMNS: usize = 80;
+const GITHUB_LOADING_DOT_COUNT: u8 = 9;
 const GITHUB_PROBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
 const WORKSPACE_CREATE_INPUT_ID: &str = "muxtrix-workspace-create-input";
 const RENAME_INPUT_ID: &str = "muxtrix-rename-input";
@@ -1729,7 +1737,7 @@ impl Muxtrix {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             Subscription::run_with(
                 EventSubscription(self.event_receiver.clone()),
                 event_subscription,
@@ -1737,6 +1745,19 @@ impl Muxtrix {
             iced::time::every(std::time::Duration::from_millis(500)).map(|_| Message::BlinkCursor),
             iced::event::listen_with(app_event),
         ];
+        let animate_github_loading = self.window_focused
+            && self
+                .github_panel
+                .as_ref()
+                .is_some_and(|panel| panel.loading);
+        #[cfg(feature = "e2e")]
+        let animate_github_loading = animate_github_loading && self.e2e.is_none();
+        if animate_github_loading {
+            subscriptions.push(
+                iced::time::every(std::time::Duration::from_millis(90))
+                    .map(|_| Message::AnimateGitHubLoading),
+            );
+        }
         #[cfg(feature = "e2e")]
         let subscriptions = if self.e2e.is_some() {
             let mut with_e2e = subscriptions;
@@ -1867,6 +1888,12 @@ impl Muxtrix {
                 }
                 self.sync_session_layout();
                 return self.refresh_background_metadata();
+            }
+            Message::AnimateGitHubLoading => {
+                if let Some(panel) = self.github_panel.as_mut().filter(|panel| panel.loading) {
+                    panel.loading_phase = (panel.loading_phase + 1) % GITHUB_LOADING_DOT_COUNT;
+                }
+                return Task::none();
             }
             Message::Keyboard(event) => {
                 return self.handle_keyboard(event);
@@ -2070,6 +2097,7 @@ impl Muxtrix {
             }
             Message::WindowResized(size) => {
                 self.window_size = size;
+                self.reflow_github_diff();
                 return Task::none();
             }
             Message::WindowFocusChanged(focused) => {
@@ -2456,6 +2484,10 @@ impl Muxtrix {
                 return Task::none();
             }
             Message::GitHubDiffLoaded(root, path, generation, result) => {
+                let wrap_columns = github_diff_wrap_columns(
+                    self.window_size.width,
+                    self.settings.terminal_cell_width(),
+                );
                 let Some(diff) = self
                     .github_diff
                     .as_mut()
@@ -2473,6 +2505,8 @@ impl Muxtrix {
                 diff.loading = false;
                 match *result {
                     Ok(document) => {
+                        diff.line_starts = github_diff_line_starts(&document, wrap_columns);
+                        diff.wrap_columns = wrap_columns;
                         diff.document = Some(document);
                         diff.error = None;
                     }
@@ -4761,6 +4795,7 @@ impl Muxtrix {
             return Task::none();
         };
         panel.loading = true;
+        panel.loading_phase = 0;
         panel.probe_in_flight = false;
         panel.error = None;
         panel.merge_confirmation = false;
@@ -4846,6 +4881,8 @@ impl Muxtrix {
             error: None,
             generation,
             scroll_offset: 0.0,
+            wrap_columns: None,
+            line_starts: vec![0],
         });
         self.active_view = ActiveView::GitHubDiff;
         let path = file.path.clone();
@@ -4860,6 +4897,29 @@ impl Muxtrix {
                 )
             },
         )
+    }
+
+    fn reflow_github_diff(&mut self) {
+        let wrap_columns =
+            github_diff_wrap_columns(self.window_size.width, self.settings.terminal_cell_width());
+        let Some(diff) = self
+            .github_diff
+            .as_mut()
+            .filter(|diff| diff.wrap_columns != wrap_columns)
+        else {
+            return;
+        };
+        let Some(document) = diff.document.as_ref() else {
+            diff.wrap_columns = wrap_columns;
+            return;
+        };
+        let old_visual_row = (diff.scroll_offset / GITHUB_DIFF_LINE_HEIGHT).floor() as usize;
+        let anchor_line = github_diff_line_for_visual_row(&diff.line_starts, old_visual_row);
+        let line_starts = github_diff_line_starts(document, wrap_columns);
+        diff.scroll_offset = line_starts.get(anchor_line).copied().unwrap_or_default() as f32
+            * GITHUB_DIFF_LINE_HEIGHT;
+        diff.line_starts = line_starts;
+        diff.wrap_columns = wrap_columns;
     }
 
     fn confirm_github_merge(&mut self) -> Task<Message> {
@@ -7610,18 +7670,6 @@ impl Muxtrix {
             .owner_and_name
             .as_deref()
             .unwrap_or(&panel.repository.name);
-        let refresh = app_tooltip(
-            button(icon(IconKind::Refresh, tokens.muted, 14.0))
-                .on_press_maybe((!panel.loading).then_some(Message::RefreshGitHubPanel))
-                .width(30)
-                .height(30)
-                .padding(7)
-                .style(move |_, status| quiet_button_style(tokens, false, status)),
-            "Refresh repository",
-            tooltip::Position::Bottom,
-            tokens,
-            self.settings.ui_pixels(9.0),
-        );
         let close = app_tooltip(
             button(icon(IconKind::Close, tokens.muted, 13.0))
                 .on_press(Message::CloseGitHubPanel)
@@ -7634,6 +7682,22 @@ impl Muxtrix {
             tokens,
             self.settings.ui_pixels(9.0),
         );
+        let mut header_actions = row![].spacing(4).align_y(Alignment::Center);
+        if !panel.loading {
+            header_actions = header_actions.push(app_tooltip(
+                button(icon(IconKind::Refresh, tokens.muted, 14.0))
+                    .on_press(Message::RefreshGitHubPanel)
+                    .width(30)
+                    .height(30)
+                    .padding(7)
+                    .style(move |_, status| quiet_button_style(tokens, false, status)),
+                "Refresh repository",
+                tooltip::Position::Bottom,
+                tokens,
+                self.settings.ui_pixels(9.0),
+            ));
+        }
+        header_actions = header_actions.push(close);
         let header = container(
             row![
                 icon(IconKind::GitHub, tokens.text, 17.0),
@@ -7660,8 +7724,7 @@ impl Muxtrix {
                 ]
                 .spacing(2)
                 .width(Fill),
-                refresh,
-                close,
+                header_actions,
             ]
             .spacing(9)
             .align_y(Alignment::Center),
@@ -7671,16 +7734,18 @@ impl Muxtrix {
 
         let body: Element<'_, Message> = match &self.github_auth {
             github::AuthStatus::Authenticated { .. } => {
-                if let Some(data) = panel.data.as_ref() {
-                    self.github_data_view(panel, data, tokens)
-                } else if panel.loading {
+                if panel.loading {
+                    self.github_panel_loading_state(panel, tokens)
+                } else if let Some(error) = panel.error.as_deref() {
                     self.github_centered_state(
-                        IconKind::Refresh,
-                        "Reading repository…",
-                        "Collecting local changes and pull request details.",
-                        None,
+                        IconKind::GitHub,
+                        "Repository unavailable",
+                        error,
+                        Some(("Try again", Message::RefreshGitHubPanel)),
                         tokens,
                     )
+                } else if let Some(data) = panel.data.as_ref() {
+                    self.github_data_view(panel, data, tokens)
                 } else {
                     self.github_centered_state(
                         IconKind::GitHub,
@@ -7758,6 +7823,84 @@ impl Muxtrix {
         ]
         .width(GITHUB_PANEL_WIDTH)
         .height(Fill)
+        .into()
+    }
+
+    fn github_panel_loading_state<'a>(
+        &'a self,
+        panel: &'a GitHubPanelState,
+        tokens: DesignTokens,
+    ) -> Element<'a, Message> {
+        let refreshing = panel.data.is_some();
+        let mut dots = column![].spacing(5).align_x(Alignment::Center);
+        for row_index in 0..3 {
+            let mut dot_row = row![].spacing(5).align_y(Alignment::Center);
+            for column_index in 0..3 {
+                let index = row_index * 3 + column_index;
+                let distance = (panel.loading_phase + GITHUB_LOADING_DOT_COUNT - index as u8)
+                    % GITHUB_LOADING_DOT_COUNT;
+                let color = match distance {
+                    0 => tokens.accent,
+                    1 => Color {
+                        a: 0.68,
+                        ..tokens.accent
+                    },
+                    2 => Color {
+                        a: 0.38,
+                        ..tokens.accent
+                    },
+                    _ => tokens.line_strong,
+                };
+                dot_row = dot_row.push(signal_dot(color, 6.0));
+            }
+            dots = dots.push(dot_row);
+        }
+        let indicator = container(dots)
+            .width(52)
+            .height(52)
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center)
+            .style(move |_| container::Style {
+                background: Some(tokens.panel_raised.into()),
+                border: Border {
+                    color: tokens.line_strong,
+                    width: 1.0,
+                    radius: 12.0.into(),
+                },
+                ..container::Style::default()
+            });
+        container(
+            column![
+                indicator,
+                text(if refreshing {
+                    "Refreshing repository…"
+                } else {
+                    "Reading repository…"
+                })
+                .size(self.settings.ui_pixels(13.0))
+                .font(Font {
+                    weight: font::Weight::Semibold,
+                    ..Font::DEFAULT
+                })
+                .color(tokens.text),
+                text(if refreshing {
+                    "Checking local changes, pull request status, and review readiness."
+                } else {
+                    "Collecting local changes and pull request details."
+                })
+                .size(self.settings.ui_pixels(9.0))
+                .color(tokens.muted)
+                .center()
+                .width(280),
+            ]
+            .spacing(10)
+            .align_x(Alignment::Center),
+        )
+        .width(Fill)
+        .height(Fill)
+        .center_x(Fill)
+        .center_y(Fill)
+        .padding(24)
         .into()
     }
 
@@ -8356,28 +8499,40 @@ impl Muxtrix {
             - github_diff_header_height(self.window_size.width)
             - notice_height)
             .max(120.0);
-        let (first, last) =
-            github_diff_window(document.lines.len(), diff.scroll_offset, viewport_height);
-        let content_width = (document.max_columns as f32 * self.settings.terminal_cell_width()
-            + 112.0)
-            .max((self.window_size.width - GITHUB_PANEL_WIDTH).max(320.0));
-        let mut rows = column![container("").height(first as f32 * GITHUB_DIFF_LINE_HEIGHT)]
+        let (first, last, top_rows, bottom_rows) =
+            github_diff_window(&diff.line_starts, diff.scroll_offset, viewport_height);
+        let wrapped = diff.wrap_columns.is_some();
+        let content_width = if wrapped {
+            Fill
+        } else {
+            Length::Fixed(
+                (document.max_columns as f32 * self.settings.terminal_cell_width()
+                    + GITHUB_DIFF_CHROME_WIDTH)
+                    .max((self.window_size.width - GITHUB_PANEL_WIDTH).max(320.0)),
+            )
+        };
+        let mut rows = column![container("").height(top_rows as f32 * GITHUB_DIFF_LINE_HEIGHT)]
             .spacing(0)
-            .width(Length::Fixed(content_width));
-        for line in &document.lines[first..last] {
-            rows = rows.push(self.github_diff_line(line, tokens));
+            .width(content_width);
+        for (line_index, line) in document.lines[first..last].iter().enumerate() {
+            let line_index = first + line_index;
+            let visual_rows = diff.line_starts[line_index + 1] - diff.line_starts[line_index];
+            rows = rows.push(self.github_diff_line(line, visual_rows, wrapped, tokens));
         }
-        rows = rows.push(
-            container("").height((document.lines.len() - last) as f32 * GITHUB_DIFF_LINE_HEIGHT),
-        );
+        rows = rows.push(container("").height(bottom_rows as f32 * GITHUB_DIFF_LINE_HEIGHT));
+        let direction = if wrapped {
+            scrollable::Direction::Vertical(scrollable::Scrollbar::default())
+        } else {
+            scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::default(),
+                horizontal: scrollable::Scrollbar::default(),
+            }
+        };
         let viewer: Element<'_, Message> = scrollable(rows)
             .id(iced::widget::Id::new("muxtrix-github-diff"))
             .width(Fill)
             .height(Fill)
-            .direction(scrollable::Direction::Both {
-                vertical: scrollable::Scrollbar::default(),
-                horizontal: scrollable::Scrollbar::default(),
-            })
+            .direction(direction)
             .on_scroll(|viewport| Message::GitHubDiffScrolled(viewport.absolute_offset().y))
             .into();
         if let Some(notice) = document.notice.as_deref() {
@@ -8404,6 +8559,8 @@ impl Muxtrix {
     fn github_diff_line<'a>(
         &'a self,
         line: &'a github::DiffLine,
+        visual_rows: usize,
+        wrapped: bool,
         tokens: DesignTokens,
     ) -> Element<'a, Message> {
         let (foreground, background) = match line.kind {
@@ -8437,8 +8594,20 @@ impl Muxtrix {
                 .font(self.settings.terminal_font.iced())
                 .color(tokens.faint)
                 .align_x(iced::alignment::Horizontal::Right)
+                .line_height(Pixels(GITHUB_DIFF_LINE_HEIGHT))
                 .width(42)
         };
+        let code = text(&line.text)
+            .size(self.settings.terminal_font_pixels())
+            .font(self.settings.terminal_font.iced())
+            .color(foreground)
+            .line_height(Pixels(GITHUB_DIFF_LINE_HEIGHT))
+            .width(if wrapped { Fill } else { Length::Shrink })
+            .wrapping(if wrapped {
+                iced::widget::text::Wrapping::Glyph
+            } else {
+                iced::widget::text::Wrapping::None
+            });
         container(
             row![
                 number(line.old_line),
@@ -8447,16 +8616,12 @@ impl Muxtrix {
                     .width(1)
                     .height(Fill)
                     .style(move |_| container::Style::default().background(tokens.line)),
-                text(&line.text)
-                    .size(self.settings.terminal_font_pixels())
-                    .font(self.settings.terminal_font.iced())
-                    .color(foreground)
-                    .wrapping(iced::widget::text::Wrapping::None),
+                code,
             ]
             .spacing(7)
-            .align_y(Alignment::Center),
+            .align_y(Alignment::Start),
         )
-        .height(GITHUB_DIFF_LINE_HEIGHT)
+        .height(visual_rows.max(1) as f32 * GITHUB_DIFF_LINE_HEIGHT)
         .padding([0, 8])
         .width(Fill)
         .style(move |_| container::Style {
@@ -11978,14 +12143,61 @@ fn github_file_window(file_count: usize, offset: f32, viewport_height: f32) -> (
     (first, last)
 }
 
-fn github_diff_window(line_count: usize, offset: f32, viewport_height: f32) -> (usize, usize) {
+fn github_diff_wrap_columns(window_width: f32, cell_width: f32) -> Option<usize> {
+    let text_width = (window_width - GITHUB_PANEL_WIDTH - GITHUB_DIFF_CHROME_WIDTH).max(0.0);
+    let columns = (text_width / cell_width.max(1.0)).floor() as usize;
+    (columns >= GITHUB_DIFF_MIN_WRAP_COLUMNS).then_some(columns)
+}
+
+fn github_diff_line_starts(
+    document: &github::DiffDocument,
+    wrap_columns: Option<usize>,
+) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(document.lines.len() + 1);
+    starts.push(0);
+    let mut visual_rows = 0usize;
+    for line in &document.lines {
+        let rows = wrap_columns.map_or(1, |columns| {
+            line.text.chars().count().max(1).div_ceil(columns.max(1))
+        });
+        visual_rows = visual_rows.saturating_add(rows);
+        starts.push(visual_rows);
+    }
+    starts
+}
+
+fn github_diff_line_for_visual_row(line_starts: &[usize], visual_row: usize) -> usize {
+    line_starts
+        .partition_point(|start| *start <= visual_row)
+        .saturating_sub(1)
+        .min(line_starts.len().saturating_sub(1))
+}
+
+fn github_diff_window(
+    line_starts: &[usize],
+    offset: f32,
+    viewport_height: f32,
+) -> (usize, usize, usize, usize) {
+    let line_count = line_starts.len().saturating_sub(1);
+    let total_rows = line_starts.last().copied().unwrap_or_default();
     let visible = (viewport_height / GITHUB_DIFF_LINE_HEIGHT).ceil() as usize;
     let raw_first = (offset.max(0.0) / GITHUB_DIFF_LINE_HEIGHT).floor() as usize;
-    let first = raw_first
-        .saturating_sub(GITHUB_DIFF_OVERSCAN)
+    let first_row = raw_first.saturating_sub(GITHUB_DIFF_OVERSCAN);
+    let last_row = raw_first
+        .saturating_add(visible)
+        .saturating_add(GITHUB_DIFF_OVERSCAN)
+        .min(total_rows);
+    let first = github_diff_line_for_visual_row(line_starts, first_row).min(line_count);
+    let mut last = line_starts
+        .partition_point(|start| *start < last_row)
         .min(line_count);
-    let last = (first + visible + GITHUB_DIFF_OVERSCAN * 2).min(line_count);
-    (first, last)
+    if last < line_count && last <= first {
+        last = first + 1;
+    }
+    let top_rows = line_starts.get(first).copied().unwrap_or(total_rows);
+    let bottom_rows =
+        total_rows.saturating_sub(line_starts.get(last).copied().unwrap_or(total_rows));
+    (first, last, top_rows, bottom_rows)
 }
 
 fn github_diff_header_height(window_width: f32) -> f32 {
@@ -16933,10 +17145,53 @@ mod tests {
 
     #[test]
     fn github_diff_window_bounds_large_files_with_overscan() {
-        assert_eq!(github_diff_window(50_000, 0.0, 480.0), (0, 52));
-        let (first, last) = github_diff_window(50_000, 24_000.0, 480.0);
-        assert_eq!((first, last), (984, 1_036));
-        assert_eq!(github_diff_window(3, 9_999.0, 480.0), (3, 3));
+        let line_starts = (0..=50_000).collect::<Vec<_>>();
+        assert_eq!(
+            github_diff_window(&line_starts, 0.0, 480.0),
+            (0, 36, 0, 49_964)
+        );
+        let (first, last, top_rows, bottom_rows) =
+            github_diff_window(&line_starts, 24_000.0, 480.0);
+        assert_eq!(
+            (first, last, top_rows, bottom_rows),
+            (984, 1_036, 984, 48_964)
+        );
+        assert_eq!(
+            github_diff_window(&[0, 1, 2, 3], 9_999.0, 480.0),
+            (3, 3, 3, 0)
+        );
+    }
+
+    #[test]
+    fn github_diff_wraps_only_when_the_code_lane_holds_eighty_cells() {
+        let threshold = GITHUB_PANEL_WIDTH
+            + GITHUB_DIFF_CHROME_WIDTH
+            + GITHUB_DIFF_MIN_WRAP_COLUMNS as f32 * 8.0;
+        assert_eq!(github_diff_wrap_columns(threshold - 1.0, 8.0), None);
+        assert_eq!(
+            github_diff_wrap_columns(threshold, 8.0),
+            Some(GITHUB_DIFF_MIN_WRAP_COLUMNS)
+        );
+    }
+
+    #[test]
+    fn github_diff_layout_counts_wrapped_visual_rows_without_repeating_gutters() {
+        let document = github::DiffDocument {
+            lines: vec![github::DiffLine {
+                kind: github::DiffLineKind::Addition,
+                old_line: None,
+                new_line: Some(12),
+                text: format!("+{}", "x".repeat(160)),
+            }],
+            notice: None,
+            truncated: false,
+            max_columns: 161,
+        };
+        let starts = github_diff_line_starts(&document, Some(80));
+
+        assert_eq!(starts, vec![0, 3]);
+        assert_eq!(github_diff_line_for_visual_row(&starts, 0), 0);
+        assert_eq!(github_diff_line_for_visual_row(&starts, 2), 0);
     }
 
     #[test]
@@ -17040,6 +17295,7 @@ mod tests {
             request_generation: 0,
             probe_in_flight: false,
             last_probe: None,
+            loading_phase: 0,
         });
 
         drop(app.update(Message::OpenGitHubDiff("src/main.rs".into())));
