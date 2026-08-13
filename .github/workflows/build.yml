@@ -15,32 +15,14 @@ concurrency:
   group: muxtrix-release-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  ZIG_VERSION: 0.15.2
+
 jobs:
-  build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    continue-on-error: ${{ matrix.experimental || false }}
+  checks:
+    name: Checks and headless E2E
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x86_64
-            runner: ubuntu-latest
-            artifact: muxtrix-linux-x86_64
-            asset: muxtrix-linux-x86_64.tar.gz
-          # Windows and macOS lanes are parked while Actions minutes are
-          # exhausted — releases build locally via scripts/release.sh.
-          # Re-enable by uncommenting; the steps below still support them.
-          # - name: Windows x86_64
-          #   runner: windows-latest
-          #   artifact: muxtrix-windows-x86_64
-          #   asset: muxtrix-windows-x86_64.zip
-          # - name: macOS arm64
-          #   runner: macos-latest
-          #   artifact: muxtrix-macos-arm64
-          #   asset: muxtrix-macos-arm64.tar.gz
-          #   experimental: true
 
     steps:
       - name: Check out source
@@ -55,13 +37,12 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.15.2
+          version: ${{ env.ZIG_VERSION }}
 
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Install Linux build and headless-rendering dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
@@ -76,18 +57,9 @@ jobs:
             libxinerama-dev \
             libxrandr-dev \
             mesa-vulkan-drivers \
-            desktop-file-utils \
-            file \
             pkg-config \
             xauth \
             xvfb
-
-      - name: Install Linux release packaging tools
-        # Parked with the release lanes; local releases package instead.
-        if: false && runner.os == 'Linux'
-        run: |
-          cargo install cargo-deb --locked
-          cargo install cargo-zigbuild --locked
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -99,136 +71,208 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run Linux headless application E2E
-        if: runner.os == 'Linux'
         run: cargo test -p muxtrix --features e2e --test headless_e2e --locked -- --test-threads=1
 
+  build:
+    name: Build ${{ matrix.name }}
+    needs: checks
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+            artifact: muxtrix-linux-x86_64
+          - name: Windows x86_64
+            runner: windows-2025
+            artifact: muxtrix-windows-x86_64
+          - name: macOS arm64
+            runner: macos-15
+            artifact: muxtrix-macos-arm64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Install Linux release dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            desktop-file-utils \
+            file \
+            libgl1-mesa-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxrandr-dev \
+            pkg-config
+          cargo install cargo-deb --locked
+          cargo install cargo-zigbuild --locked
+
       - name: Build portable Linux release binaries
-        # Parked with the release lanes; local releases package instead.
-        if: false && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         run: |
           cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.34 -p muxtrix --bin muxtrix
           cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.34 -p muxtrix-control --bin muxtrixctl
 
-      - name: Build native release binaries
-        # Parked with the release lanes; local releases package instead.
-        if: false && runner.os != 'Linux'
+      - name: Build native Windows release binaries
+        if: runner.os == 'Windows'
         run: |
           cargo build --release --locked -p muxtrix --bin muxtrix
           cargo build --release --locked -p muxtrix-control --bin muxtrixctl
 
-      - name: Stage Linux binaries
-        # Parked with the release lanes; local releases package instead.
-        if: false
-        id: package-linux
+      - name: Build native macOS release binaries
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
         run: |
+          cargo build --release --locked -p muxtrix --bin muxtrix
+          cargo build --release --locked -p muxtrix-control --bin muxtrixctl
+
+      - name: Package Linux release
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
-            asset="muxtrix-${version}-linux-x64.tar.gz"
+            archive="muxtrix-${version}-linux-x64.tar.gz"
+            deb="muxtrix_${version}_amd64.deb"
           else
-            asset="${{ matrix.asset }}"
+            archive="muxtrix-linux-x86_64.tar.gz"
+            deb="muxtrix_continuous_amd64.deb"
           fi
           mkdir -p dist/package
           cp target/x86_64-unknown-linux-gnu/release/muxtrix dist/package/
           cp target/x86_64-unknown-linux-gnu/release/muxtrixctl dist/package/
           cp THIRD_PARTY_NOTICES.md dist/package/
           tar --create --gzip \
-            --file "dist/${asset}" \
+            --file "dist/${archive}" \
             --directory dist/package \
-            .
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            deb_asset="muxtrix_${version}_amd64.deb"
-          else
-            deb_asset="muxtrix_continuous_amd64.deb"
-          fi
+            muxtrix \
+            muxtrixctl \
+            THIRD_PARTY_NOTICES.md
           cargo deb \
             -p muxtrix \
             --target x86_64-unknown-linux-gnu \
             --no-build \
             --no-strip \
-            --output "dist/${deb_asset}"
-          scripts/verify-deb-package.sh "dist/${deb_asset}"
-          echo "release_asset=${asset}" >> "${GITHUB_OUTPUT}"
-          echo "deb_asset=${deb_asset}" >> "${GITHUB_OUTPUT}"
+            --output "dist/${deb}"
+          scripts/verify-deb-package.sh "dist/${deb}"
+          rm -rf dist/package
 
-      - name: Stage Windows binaries
-        # Parked with the release lanes; local releases package instead.
-        if: false
-        id: package-windows
+      - name: Package Windows release
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           if ($env:GITHUB_REF_TYPE -eq "tag") {
             $Version = $env:GITHUB_REF_NAME.Substring(1)
             $Asset = "muxtrix-$Version-x64.zip"
           } else {
-            $Asset = "${{ matrix.asset }}"
+            $Asset = "muxtrix-windows-x86_64.zip"
           }
           ./.github/scripts/package-windows.ps1 `
             -MuxtrixPath target/release/muxtrix.exe `
             -ControlPath target/release/muxtrixctl.exe `
             -NoticesPath THIRD_PARTY_NOTICES.md `
             -OutputPath "dist/$Asset"
-          "release_asset=$Asset" >> $env:GITHUB_OUTPUT
 
-      - name: Stage macOS binaries
-        # Parked with the release lanes; local releases package instead.
-        if: false
-        id: package-macos
+      - name: Sign and package macOS release
+        if: runner.os == 'macOS'
         run: |
+          set -euo pipefail
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME#v}"
             asset="muxtrix-${version}-macos-arm64.tar.gz"
           else
-            asset="${{ matrix.asset }}"
+            asset="muxtrix-macos-arm64.tar.gz"
           fi
+          codesign --force --sign - target/release/muxtrix target/release/muxtrixctl
+          codesign --verify --verbose target/release/muxtrix
+          codesign --verify --verbose target/release/muxtrixctl
+          test "$(uname -m)" = arm64
+          lipo -verify_arch arm64 target/release/muxtrix
+          lipo -verify_arch arm64 target/release/muxtrixctl
           mkdir -p dist/package
-          cp target/release/muxtrix dist/package/
-          cp target/release/muxtrixctl dist/package/
+          cp target/release/muxtrix target/release/muxtrixctl dist/package/
           cp THIRD_PARTY_NOTICES.md dist/package/
-          tar --create --gzip \
+          COPYFILE_DISABLE=1 tar --create --gzip \
             --file "dist/${asset}" \
             --directory dist/package \
-            .
-          echo "release_asset=${asset}" >> "${GITHUB_OUTPUT}"
+            muxtrix \
+            muxtrixctl \
+            THIRD_PARTY_NOTICES.md
+          rm -rf dist/package
 
-      - name: Upload Linux binaries
-        # Parked with the release lanes; local releases package instead.
-        if: false
+      - name: Upload packaged binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            dist/${{ steps.package-linux.outputs.release_asset }}
-            dist/${{ steps.package-linux.outputs.deb_asset }}
+          path: dist/*
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
-      - name: Upload Windows binaries
-        # Parked with the release lanes; local releases package instead.
-        if: false
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: dist/${{ steps.package-windows.outputs.release_asset }}
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Upload macOS binaries
-        # Parked with the release lanes; local releases package instead.
-        if: false
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: dist/${{ steps.package-macos.outputs.release_asset }}
-          if-no-files-found: error
-          retention-days: 1
-
-  publish:
-    name: Publish continuous release
-    # Parked while Actions minutes are exhausted; scripts/release.sh
-    # publishes from a developer machine instead.
-    if: false
+  validate_homebrew:
+    name: Validate Homebrew installation
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: source
+
+      - name: Download macOS package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: muxtrix-macos-arm64
+          path: dist
+
+      - name: Install and test the generated formula
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          asset="muxtrix-${version}-macos-arm64.tar.gz"
+          archive="${GITHUB_WORKSPACE}/dist/${asset}"
+          hash="$(shasum -a 256 "${archive}" | cut -d ' ' -f 1)"
+          formula="${RUNNER_TEMP}/muxtrix.rb"
+          source/scripts/render-homebrew-formula.sh \
+            "${version}" \
+            "file://${archive}" \
+            "${hash}" \
+            "${formula}"
+          ruby -c "${formula}"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "${formula}"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew test "${formula}"
+
+  publish_continuous:
+    name: Publish continuous release
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
@@ -246,21 +290,29 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Create checksums
+      - name: Validate and checksum continuous assets
         run: |
+          set -euo pipefail
           test -f dist/muxtrix-linux-x86_64.tar.gz
           test -f dist/muxtrix-windows-x86_64.zip
+          test -f dist/muxtrix-macos-arm64.tar.gz
           test -f dist/muxtrix_continuous_amd64.deb
           cd dist
-          ls muxtrix-* muxtrix_* | xargs sha256sum > SHA256SUMS
+          sha256sum \
+            muxtrix-linux-x86_64.tar.gz \
+            muxtrix-windows-x86_64.zip \
+            muxtrix-macos-arm64.tar.gz \
+            muxtrix_continuous_amd64.deb \
+            > SHA256SUMS
 
       - name: Publish rolling prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           tag=continuous
           title="Muxtrix Continuous Build"
-          notes="Automated development build from commit ${GITHUB_SHA}. Includes native Linux, Windows x86_64, and macOS arm64 binaries plus a Debian package. These builds are unsigned."
+          notes="Automated development build from commit ${GITHUB_SHA}. Includes native Linux x64, Windows x64, and macOS arm64 binaries plus a Debian package. The macOS binaries are ad-hoc signed but not notarized; all other release binaries are unsigned."
 
           git tag --force "$tag" "$GITHUB_SHA"
           git push --force origin "refs/tags/$tag"
@@ -281,38 +333,28 @@ jobs:
           fi
 
   publish_tag:
-    name: Publish versioned release and update Scoop
-    # Parked while Actions minutes are exhausted; scripts/release.sh
-    # publishes from a developer machine instead.
-    if: false
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: Publish versioned GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build
+      - validate_homebrew
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      windows_asset: ${{ steps.release.outputs.windows_asset }}
+      linux_asset: ${{ steps.release.outputs.linux_asset }}
+      macos_asset: ${{ steps.release.outputs.macos_asset }}
+      deb_asset: ${{ steps.release.outputs.deb_asset }}
 
     steps:
-      - name: Require the private bucket token
-        env:
-          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
-        run: |
-          if [[ -z "${SCOOP_BUCKET_TOKEN}" ]]; then
-            echo "::error::SCOOP_BUCKET_TOKEN is required for versioned releases"
-            exit 1
-          fi
-
-      - name: Check out application source
+      - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          path: source
           fetch-depth: 0
-
-      - name: Check out private Scoop bucket
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: Phoenixmatrix/scoop-muxtrix
-          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
-          path: scoop-bucket
 
       - name: Install Rust for release metadata validation
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
@@ -326,9 +368,8 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Validate tag, package, and manifest
+      - name: Validate tag and release assets
         id: release
-        shell: bash
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
@@ -338,10 +379,7 @@ jobs:
             exit 1
           fi
 
-          cargo_version="$(cargo metadata \
-            --manifest-path source/Cargo.toml \
-            --format-version 1 \
-            --no-deps \
+          cargo_version="$(cargo metadata --format-version 1 --no-deps \
             | jq -r '.packages[] | select(.name == "muxtrix") | .version')"
           if [[ "${cargo_version}" != "${version}" ]]; then
             echo "::error::Tag ${tag} does not match Cargo version ${cargo_version}"
@@ -352,49 +390,36 @@ jobs:
           linux_asset="muxtrix-${version}-linux-x64.tar.gz"
           macos_asset="muxtrix-${version}-macos-arm64.tar.gz"
           deb_asset="muxtrix_${version}_amd64.deb"
-          windows_path="dist/${windows_asset}"
-          linux_path="dist/${linux_asset}"
-          test -f "${windows_path}"
-          test -f "${linux_path}"
-          test -f "dist/${deb_asset}"
-          if [[ ! -f "dist/${macos_asset}" ]]; then
-            echo "::warning::macOS asset missing; publishing without it"
-            macos_asset=""
-          fi
+          for asset in "${windows_asset}" "${linux_asset}" "${macos_asset}" "${deb_asset}"; do
+            test -f "dist/${asset}"
+          done
 
-          archive_entries="$(unzip -Z1 "${windows_path}" | LC_ALL=C sort)"
-          if [[ "${archive_entries}" != $'THIRD_PARTY_NOTICES.md\nmuxtrix.exe\nmuxtrixctl.exe' ]]; then
-            echo "::error::Windows archive must contain the two executables and third-party notice file at its root"
+          windows_entries="$(unzip -Z1 "dist/${windows_asset}" | LC_ALL=C sort)"
+          if [[ "${windows_entries}" != $'THIRD_PARTY_NOTICES.md\nmuxtrix.exe\nmuxtrixctl.exe' ]]; then
+            echo "::error::Unexpected Windows archive contents"
             exit 1
           fi
-
-          hash="$(sha256sum "${windows_path}" | cut -d ' ' -f 1)"
-          url="https://github.com/Phoenixmatrix/muxtrix/releases/download/${tag}/${windows_asset}"
-          manifest="scoop-bucket/bucket/muxtrix.json"
-          jq \
-            --arg version "${version}" \
-            --arg url "${url}" \
-            --arg hash "${hash}" \
-            '.version = $version
-             | .architecture."64bit".url = $url
-             | .architecture."64bit".hash = $hash' \
-            "${manifest}" > "${manifest}.tmp"
-          mv "${manifest}.tmp" "${manifest}"
-
-          jq -e \
-            --arg version "${version}" \
-            --arg url "${url}" \
-            --arg hash "${hash}" \
-            '.version == $version
-             and .architecture."64bit".url == $url
-             and .architecture."64bit".hash == $hash' \
-            "${manifest}" > /dev/null
-          manifest_hash="$(jq -r '.architecture."64bit".hash' "${manifest}")"
-          printf '%s  %s\n' "${manifest_hash}" "${windows_path}" | sha256sum --check --strict
+          for archive in "${linux_asset}" "${macos_asset}"; do
+            archive_entries="$(tar --list --gzip --file "dist/${archive}" \
+              | sed 's#^\./##' \
+              | grep -v '/$' \
+              | LC_ALL=C sort)"
+            if [[ "${archive_entries}" != $'THIRD_PARTY_NOTICES.md\nmuxtrix\nmuxtrixctl' ]]; then
+              echo "::error::Unexpected contents in ${archive}"
+              exit 1
+            fi
+          done
+          test "$(dpkg-deb --field "dist/${deb_asset}" Version)" = "${version}-1"
 
           (
             cd dist
-            sha256sum "${windows_asset}" "${linux_asset}" ${macos_asset:+"${macos_asset}"} "${deb_asset}" > SHA256SUMS
+            sha256sum \
+              "${windows_asset}" \
+              "${linux_asset}" \
+              "${macos_asset}" \
+              "${deb_asset}" \
+              > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
           )
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
@@ -403,60 +428,256 @@ jobs:
           echo "macos_asset=${macos_asset}" >> "${GITHUB_OUTPUT}"
           echo "deb_asset=${deb_asset}" >> "${GITHUB_OUTPUT}"
 
-      - name: Publish immutable private release
+      - name: Publish or verify immutable release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
           VERSION: ${{ steps.release.outputs.version }}
-          WINDOWS_ASSET: ${{ steps.release.outputs.windows_asset }}
-          LINUX_ASSET: ${{ steps.release.outputs.linux_asset }}
-          MACOS_ASSET: ${{ steps.release.outputs.macos_asset }}
-          DEB_ASSET: ${{ steps.release.outputs.deb_asset }}
         run: |
-          if gh release view "${TAG}" --repo Phoenixmatrix/muxtrix > /dev/null 2>&1; then
-            echo "::error::Release ${TAG} already exists; versioned assets are immutable"
+          set -euo pipefail
+          if gh release view "${TAG}" > /dev/null 2>&1; then
+            mkdir existing-release
+            gh release download "${TAG}" --dir existing-release
+            (
+              cd existing-release
+              sha256sum --check --strict ../dist/SHA256SUMS
+            )
+            echo "Release ${TAG} already contains the expected immutable assets"
+          else
+            gh release create "${TAG}" dist/* \
+              --verify-tag \
+              --title "Muxtrix ${VERSION}" \
+              --notes "Muxtrix ${VERSION} for Linux x64, Windows x64, and macOS arm64. The macOS binaries are ad-hoc signed but not notarized; all other binaries are unsigned. Verify downloads against SHA256SUMS."
+          fi
+
+  validate_homebrew_release:
+    name: Validate published Homebrew release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish_tag
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: source
+
+      - name: Download macOS package metadata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: muxtrix-macos-arm64
+          path: dist
+
+      - name: Fetch, install, and test through Homebrew
+        env:
+          TAG: ${{ needs.publish_tag.outputs.tag }}
+          VERSION: ${{ needs.publish_tag.outputs.version }}
+          MACOS_ASSET: ${{ needs.publish_tag.outputs.macos_asset }}
+        run: |
+          set -euo pipefail
+          hash="$(shasum -a 256 "dist/${MACOS_ASSET}" | cut -d ' ' -f 1)"
+          url="https://github.com/Phoenixmatrix/muxtrix/releases/download/${TAG}/${MACOS_ASSET}"
+          formula="${RUNNER_TEMP}/muxtrix.rb"
+          source/scripts/render-homebrew-formula.sh \
+            "${VERSION}" \
+            "${url}" \
+            "${hash}" \
+            "${formula}"
+          ruby -c "${formula}"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "${formula}"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew test "${formula}"
+
+  publish_scoop:
+    name: Publish Scoop manifest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish_tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Require the Scoop bucket token
+        env:
+          SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+        run: |
+          if [[ -z "${SCOOP_BUCKET_TOKEN}" ]]; then
+            echo "::error::SCOOP_BUCKET_TOKEN is required for tagged releases"
             exit 1
           fi
-          assets=("dist/${WINDOWS_ASSET}" "dist/${LINUX_ASSET}" "dist/${DEB_ASSET}")
-          if [[ -n "${MACOS_ASSET}" && -f "dist/${MACOS_ASSET}" ]]; then
-            assets+=("dist/${MACOS_ASSET}")
-          fi
-          gh release create "${TAG}" "${assets[@]}" \
-            dist/SHA256SUMS \
-            --repo Phoenixmatrix/muxtrix \
-            --verify-tag \
-            --title "Muxtrix ${VERSION}" \
-              --notes "Muxtrix ${VERSION} for Windows x64 and Linux x64. These builds are unsigned; verify them against SHA256SUMS."
 
-      - name: Commit private Scoop manifest
+      - name: Check out Scoop bucket
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Phoenixmatrix/scoop-muxtrix
+          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          path: scoop-bucket
+
+      - name: Download Windows package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: muxtrix-windows-x86_64
+          path: dist
+
+      - name: Update and validate Scoop manifest
+        env:
+          TAG: ${{ needs.publish_tag.outputs.tag }}
+          VERSION: ${{ needs.publish_tag.outputs.version }}
+          WINDOWS_ASSET: ${{ needs.publish_tag.outputs.windows_asset }}
+        run: |
+          set -euo pipefail
+          path="dist/${WINDOWS_ASSET}"
+          hash="$(sha256sum "${path}" | cut -d ' ' -f 1)"
+          url="https://github.com/Phoenixmatrix/muxtrix/releases/download/${TAG}/${WINDOWS_ASSET}"
+          manifest="scoop-bucket/bucket/muxtrix.json"
+          jq \
+            --arg version "${VERSION}" \
+            --arg url "${url}" \
+            --arg hash "${hash}" \
+            '.version = $version
+             | .license = "MIT"
+             | .architecture."64bit".url = $url
+             | .architecture."64bit".hash = $hash' \
+            "${manifest}" > "${manifest}.tmp"
+          mv "${manifest}.tmp" "${manifest}"
+          jq -e \
+            --arg version "${VERSION}" \
+            --arg url "${url}" \
+            --arg hash "${hash}" \
+            '.version == $version
+             and .license == "MIT"
+             and .architecture."64bit".url == $url
+             and .architecture."64bit".hash == $hash' \
+            "${manifest}" > /dev/null
+          printf '%s  %s\n' "${hash}" "${path}" | sha256sum --check --strict
+
+      - name: Commit Scoop manifest
         working-directory: scoop-bucket
         env:
-          VERSION: ${{ steps.release.outputs.version }}
+          VERSION: ${{ needs.publish_tag.outputs.version }}
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add bucket/muxtrix.json
           git diff --cached --check
-          git commit -m "Update Muxtrix to ${VERSION}"
-          git push origin HEAD:main
+          if git diff --cached --quiet; then
+            echo "Scoop manifest is already at ${VERSION}"
+          else
+            git commit -m "Update Muxtrix to ${VERSION}"
+            git push origin HEAD:main
+          fi
 
-      - name: Publish flat apt repository branch
+  publish_homebrew:
+    name: Publish Homebrew formula
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - publish_tag
+      - validate_homebrew_release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Require the Homebrew tap token
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [[ -z "${HOMEBREW_TAP_TOKEN}" ]]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is required for tagged releases"
+            exit 1
+          fi
+
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: source
+
+      - name: Check out Homebrew tap
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Phoenixmatrix/homebrew-muxtrix
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Download macOS package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: muxtrix-macos-arm64
+          path: dist
+
+      - name: Update and validate Homebrew formula
+        env:
+          TAG: ${{ needs.publish_tag.outputs.tag }}
+          VERSION: ${{ needs.publish_tag.outputs.version }}
+          MACOS_ASSET: ${{ needs.publish_tag.outputs.macos_asset }}
+        run: |
+          set -euo pipefail
+          path="dist/${MACOS_ASSET}"
+          hash="$(sha256sum "${path}" | cut -d ' ' -f 1)"
+          url="https://github.com/Phoenixmatrix/muxtrix/releases/download/${TAG}/${MACOS_ASSET}"
+          mkdir -p homebrew-tap/Formula
+          source/scripts/render-homebrew-formula.sh \
+            "${VERSION}" \
+            "${url}" \
+            "${hash}" \
+            homebrew-tap/Formula/muxtrix.rb
+          ruby -c homebrew-tap/Formula/muxtrix.rb
+          grep --fixed-strings --line-regexp "  url \"${url}\"" homebrew-tap/Formula/muxtrix.rb
+          grep --fixed-strings --line-regexp "  sha256 \"${hash}\"" homebrew-tap/Formula/muxtrix.rb
+
+      - name: Commit Homebrew formula
+        working-directory: homebrew-tap
+        env:
+          VERSION: ${{ needs.publish_tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/muxtrix.rb
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "Homebrew formula is already at ${VERSION}"
+          else
+            git commit -m "Update Muxtrix to ${VERSION}"
+            git push origin HEAD:main
+          fi
+
+  publish_apt:
+    name: Publish apt repository
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish_tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: source
+
+      - name: Download Debian package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: muxtrix-linux-x86_64
+          path: dist
+
+      - name: Generate, verify, and publish apt repository
         env:
           GH_TOKEN: ${{ github.token }}
-          DEB_ASSET: ${{ steps.release.outputs.deb_asset }}
-          VERSION: ${{ steps.release.outputs.version }}
+          DEB_ASSET: ${{ needs.publish_tag.outputs.deb_asset }}
+          VERSION: ${{ needs.publish_tag.outputs.version }}
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends dpkg-dev apt-utils
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           if git -C source ls-remote --exit-code origin apt-repo > /dev/null 2>&1; then
-            git clone --branch apt-repo --single-branch \
-              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" apt-repo
+            git clone --branch apt-repo --single-branch "${remote}" apt-repo
           else
             mkdir apt-repo
             git -C apt-repo init --initial-branch apt-repo
-            git -C apt-repo remote add origin \
-              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git -C apt-repo remote add origin "${remote}"
           fi
           mkdir -p apt-repo/pool
           cp "dist/${DEB_ASSET}" apt-repo/pool/
@@ -465,5 +686,21 @@ jobs:
           git -C apt-repo config user.name "github-actions[bot]"
           git -C apt-repo config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C apt-repo add --all
-          git -C apt-repo commit -m "Publish muxtrix ${VERSION} to the apt repository"
-          git -C apt-repo push origin HEAD:apt-repo
+          git -C apt-repo diff --cached --check
+          if git -C apt-repo diff --cached --quiet; then
+            echo "apt repository is already at ${VERSION}"
+          else
+            git -C apt-repo commit -m "Publish muxtrix ${VERSION} to the apt repository"
+            git -C apt-repo push origin HEAD:apt-repo
+          fi
+
+          repository_url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/apt-repo"
+          for attempt in 1 2 3 4 5 6; do
+            if source/scripts/verify-apt-repository.sh "${repository_url}" "${VERSION}"; then
+              exit 0
+            fi
+            echo "Public apt source has not refreshed yet (attempt ${attempt}/6)"
+            sleep 10
+          done
+          echo "::error::Public apt source did not serve muxtrix ${VERSION}-1"
+          exit 1

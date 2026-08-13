@@ -4,28 +4,33 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-    echo "usage: $0 REPOSITORY_DIRECTORY EXPECTED_UPSTREAM_VERSION" >&2
+    echo "usage: $0 REPOSITORY_DIRECTORY_OR_URL EXPECTED_UPSTREAM_VERSION" >&2
     exit 2
 fi
 
-repository="$(realpath "$1")"
 expected_version="$2"
+if [[ "$1" =~ ^https?:// ]]; then
+    repository_uri="${1%/}"
+else
+    repository="$(realpath "$1")"
+    for file in Packages Packages.gz Release; do
+        if [[ ! -f "${repository}/${file}" ]]; then
+            echo "error: apt repository is missing ${file}" >&2
+            exit 1
+        fi
+    done
 
-for file in Packages Packages.gz Release; do
-    if [[ ! -f "${repository}/${file}" ]]; then
-        echo "error: apt repository is missing ${file}" >&2
+    if ! gzip --decompress --stdout "${repository}/Packages.gz" \
+        | cmp --silent - "${repository}/Packages"; then
+        echo "error: Packages.gz does not match Packages" >&2
         exit 1
     fi
-done
+    if grep --extended-regexp --quiet '[[:space:]][0-9]+ Release$' "${repository}/Release"; then
+        echo "error: Release must not contain a checksum for itself" >&2
+        exit 1
+    fi
 
-if ! gzip --decompress --stdout "${repository}/Packages.gz" \
-    | cmp --silent - "${repository}/Packages"; then
-    echo "error: Packages.gz does not match Packages" >&2
-    exit 1
-fi
-if grep --extended-regexp --quiet '[[:space:]][0-9]+ Release$' "${repository}/Release"; then
-    echo "error: Release must not contain a checksum for itself" >&2
-    exit 1
+    repository_uri="file:${repository// /%20}"
 fi
 
 apt_root="$(mktemp -d "${TMPDIR:-/tmp}/muxtrix-apt-client.XXXXXX")"
@@ -37,8 +42,7 @@ mkdir -p \
     "${apt_root}/state/lists/partial"
 touch "${apt_root}/etc/apt.conf"
 
-repository_uri="${repository// /%20}"
-printf 'deb [trusted=yes] file:%s ./\n' "${repository_uri}" \
+printf 'deb [trusted=yes] %s ./\n' "${repository_uri}" \
     > "${apt_root}/etc/sources.list"
 
 apt_options=(

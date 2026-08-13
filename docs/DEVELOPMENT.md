@@ -48,25 +48,34 @@ PowerShell with Rust MSVC and the same Zig 0.15.2 pin; see `docs/TESTING.md`.
 
 ## Continuous builds
 
-Every push to `main` runs `.github/workflows/build.yml` on a GitHub-hosted
-Linux runner. The job runs formatting, unit and integration tests, and Clippy
-with warnings denied before building `muxtrix` and `muxtrixctl` in release
-mode, then runs the real application E2E on a private Xvfb display. The
-workflow can also be run manually from GitHub's Actions page.
+Every push to `main` runs `.github/workflows/build.yml`. A Linux checks job runs
+formatting, unit and integration tests, Clippy with warnings denied, and the
+real application E2E on a private Xvfb display. Native release jobs then build
+Linux x64, Windows x64, and macOS arm64 artifacts. The workflow can also be run
+manually from GitHub's Actions page.
 
 ## Releases
 
 Releases are cut from tags in the exact `vMAJOR.MINOR.PATCH` form and publish
-versioned Linux x64 and Windows x64 assets. The Windows ZIP is created with
-stable entry order and timestamps and contains only `muxtrix.exe` and
-`muxtrixctl.exe` at its root. Release binaries are unsigned; verify downloads
-against the published `SHA256SUMS`.
+versioned Linux x64, Windows x64, and macOS arm64 assets. The tag must match the
+workspace version. All three platform jobs and a real Homebrew formula install
+must pass before the GitHub release is created. Scoop, Homebrew, and apt are
+then updated in parallel from those exact versioned assets.
+
+The Windows ZIP is created with stable entry order and timestamps and contains
+only `muxtrix.exe`, `muxtrixctl.exe`, and `THIRD_PARTY_NOTICES.md` at its root.
+The macOS binaries are ad-hoc signed and checked as arm64 before packaging, but
+are not Developer ID signed or notarized. Verify every download against the
+published `SHA256SUMS`.
 
 Linux release binaries are built through `cargo-zigbuild` against glibc 2.34
 even when the release host is newer. Keep the version suffix on
 `x86_64-unknown-linux-gnu.2.34` and pass the unsuffixed Rust target to
 `cargo-deb`; otherwise a release made on a newer Ubuntu can silently require
 that host's newer libc.
+
+See `docs/RELEASING.md` for the repository secrets, package repository
+permissions, and tag procedure.
 
 If a sandbox prevents Cargo or Zig from writing their normal user caches,
 point `CARGO_HOME` and `ZIG_GLOBAL_CACHE_DIR` at ignored, writable directories.

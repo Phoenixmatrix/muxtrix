@@ -46,6 +46,7 @@ body:
         - Linux under WSLg
         - Windows (native shells)
         - Windows with sessions in WSL2
+        - macOS (Homebrew/release build)
         - macOS (built from source)
         - Other
     validations:
