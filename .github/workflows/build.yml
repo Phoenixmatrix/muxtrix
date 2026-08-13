@@ -258,15 +258,17 @@ jobs:
           asset="muxtrix-${version}-macos-arm64.tar.gz"
           archive="${GITHUB_WORKSPACE}/dist/${asset}"
           hash="$(shasum -a 256 "${archive}" | cut -d ' ' -f 1)"
-          formula="${RUNNER_TEMP}/muxtrix.rb"
+          tap="phoenixmatrix/muxtrix-validation"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew tap-new "${tap}"
+          formula="$(brew --repository "${tap}")/Formula/muxtrix.rb"
           source/scripts/render-homebrew-formula.sh \
             "${version}" \
             "file://${archive}" \
             "${hash}" \
             "${formula}"
           ruby -c "${formula}"
-          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "${formula}"
-          HOMEBREW_NO_AUTO_UPDATE=1 brew test "${formula}"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install "${tap}/muxtrix"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew test "${tap}/muxtrix"
 
   publish_continuous:
     name: Publish continuous release
@@ -478,15 +480,17 @@ jobs:
           set -euo pipefail
           hash="$(shasum -a 256 "dist/${MACOS_ASSET}" | cut -d ' ' -f 1)"
           url="https://github.com/Phoenixmatrix/muxtrix/releases/download/${TAG}/${MACOS_ASSET}"
-          formula="${RUNNER_TEMP}/muxtrix.rb"
+          tap="phoenixmatrix/muxtrix-validation"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew tap-new "${tap}"
+          formula="$(brew --repository "${tap}")/Formula/muxtrix.rb"
           source/scripts/render-homebrew-formula.sh \
             "${VERSION}" \
             "${url}" \
             "${hash}" \
             "${formula}"
           ruby -c "${formula}"
-          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "${formula}"
-          HOMEBREW_NO_AUTO_UPDATE=1 brew test "${formula}"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install "${tap}/muxtrix"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew test "${tap}/muxtrix"
 
   publish_scoop:
     name: Publish Scoop manifest
