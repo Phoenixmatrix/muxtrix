@@ -816,8 +816,7 @@ impl Scenario {
                     Some(github::DiffDocument {
                         lines: Vec::new(),
                         notice: Some(
-                            "GitHub did not provide a textual patch. The file may be binary or the diff may be too large."
-                                .into(),
+                            "This is a binary file, so there is no textual diff to display.".into(),
                         ),
                         truncated: false,
                         max_columns: 0,
@@ -1913,7 +1912,9 @@ fn staged_github_pull_request_details(
             author: "phoenixmatrix".into(),
             head: "github-support".into(),
             head_oid: "deadbeefcafebabe".into(),
+            head_repository: "Phoenixmatrix/muxtrix".into(),
             base: "main".into(),
+            base_oid: "feedfacecafebabe".into(),
             additions,
             deletions,
             changed_files: files.len(),

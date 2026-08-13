@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use serde::Deserialize;
 
@@ -62,6 +63,11 @@ pub(crate) struct DiffDocument {
 
 const DIFF_MAX_BYTES: usize = 4 * 1024 * 1024;
 const DIFF_MAX_LINES: usize = 50_000;
+/// Bound the two source blobs before asking Git to compare them. The rendered
+/// diff has a tighter cap, but this larger ceiling recovers the files GitHub
+/// commonly omits from its inline `patch` field without letting a generated
+/// artifact consume unbounded memory.
+const REMOTE_DIFF_SOURCE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckSummary {
@@ -78,7 +84,9 @@ pub(crate) struct PullRequest {
     pub(crate) author: String,
     pub(crate) head: String,
     pub(crate) head_oid: String,
+    pub(crate) head_repository: String,
     pub(crate) base: String,
+    pub(crate) base_oid: String,
     pub(crate) additions: usize,
     pub(crate) deletions: usize,
     pub(crate) changed_files: usize,
@@ -468,6 +476,320 @@ pub(crate) fn load_diff(
     Ok(document)
 }
 
+/// Loads a pull-request file diff without assuming GitHub included the
+/// optional inline patch. Large textual patches are reconstructed lazily from
+/// the base and head blobs only when the user opens that file; binary and
+/// exceptionally large sources degrade to an honest non-text notice.
+pub(crate) fn load_pull_request_diff(
+    repository: &Repository,
+    pull_request: &PullRequest,
+    file: &FileChange,
+) -> Result<DiffDocument, String> {
+    validate_relative_git_path(&file.path)?;
+    if let Some(previous) = file.previous_path.as_deref() {
+        validate_relative_git_path(previous)?;
+    }
+    let inline = if file.patch.is_some() {
+        let document = load_diff(repository, file, true)?;
+        if !document.truncated {
+            return Ok(document);
+        }
+        Some(document)
+    } else {
+        None
+    };
+
+    match reconstruct_pull_request_diff(repository, pull_request, file) {
+        Ok(document) if !document.lines.is_empty() || inline.is_none() => Ok(document),
+        Ok(_) | Err(_) if inline.is_some() => Ok(inline.expect("inline patch checked above")),
+        Err(error) => Err(error),
+        Ok(document) => Ok(document),
+    }
+}
+
+fn reconstruct_pull_request_diff(
+    repository: &Repository,
+    pull_request: &PullRequest,
+    file: &FileChange,
+) -> Result<DiffDocument, String> {
+    let previous_path = file.previous_path.as_deref().unwrap_or(&file.path);
+    let before = if file.status == "Added" {
+        Vec::new()
+    } else {
+        match load_remote_file(
+            github_repository(repository)?,
+            &pull_request.base_oid,
+            previous_path,
+            "base",
+        )? {
+            RemoteFile::Content(bytes) => bytes,
+            RemoteFile::TooLarge => return Ok(remote_diff_too_large()),
+        }
+    };
+    let after = if file.status == "Deleted" {
+        Vec::new()
+    } else {
+        match load_remote_file(
+            if pull_request.head_repository.is_empty() {
+                github_repository(repository)?
+            } else {
+                &pull_request.head_repository
+            },
+            &pull_request.head_oid,
+            &file.path,
+            "head",
+        )? {
+            RemoteFile::Content(bytes) => bytes,
+            RemoteFile::TooLarge => return Ok(remote_diff_too_large()),
+        }
+    };
+
+    if looks_binary(&before) || looks_binary(&after) {
+        return Ok(DiffDocument {
+            lines: Vec::new(),
+            notice: Some("This is a binary file, so there is no textual diff to display.".into()),
+            truncated: false,
+            max_columns: 0,
+        });
+    }
+
+    diff_remote_file_contents(&before, &after)
+}
+
+fn load_remote_file(
+    owner_and_name: &str,
+    oid: &str,
+    path: &str,
+    revision_label: &str,
+) -> Result<RemoteFile, String> {
+    let endpoint = format!(
+        "repos/{owner_and_name}/contents/{}?ref={}",
+        percent_encode_github_path(path),
+        percent_encode_github_path(oid),
+    );
+    let mut command = console_command("gh");
+    command
+        .args([
+            "api",
+            "-H",
+            "Accept: application/vnd.github.raw+json",
+            &endpoint,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("GitHub could not load the {revision_label} file: {error}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "GitHub did not expose the requested file contents.".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "GitHub did not expose diagnostics for the file request.".to_owned())?;
+    // Drain diagnostics concurrently so an unexpectedly verbose CLI error can
+    // never block the bounded content read. Only the first 64 KiB is retained.
+    let stderr_reader = std::thread::spawn(move || drain_with_storage_limit(stderr, 64 * 1024));
+    let mut bytes = Vec::with_capacity(REMOTE_DIFF_SOURCE_MAX_BYTES.min(256 * 1024));
+    let read_result = stdout
+        .by_ref()
+        .take((REMOTE_DIFF_SOURCE_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes);
+    let too_large = bytes.len() > REMOTE_DIFF_SOURCE_MAX_BYTES;
+    if too_large || read_result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("GitHub file loading did not finish cleanly: {error}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "GitHub's diagnostic reader stopped unexpectedly.".to_owned())?;
+    read_result.map_err(|error| format!("GitHub file contents could not be read: {error}"))?;
+    if too_large {
+        return Ok(RemoteFile::TooLarge);
+    }
+    if !status.success() {
+        let failure = String::from_utf8_lossy(&stderr).trim().to_owned();
+        return Err(if failure.is_empty() {
+            format!("GitHub could not load the {revision_label} version of {path}.")
+        } else {
+            failure
+        });
+    }
+    Ok(RemoteFile::Content(bytes))
+}
+
+enum RemoteFile {
+    Content(Vec<u8>),
+    TooLarge,
+}
+
+fn remote_diff_too_large() -> DiffDocument {
+    DiffDocument {
+        lines: Vec::new(),
+        notice: Some(
+            "This file is larger than 16 MiB, so Muxtrix did not build an in-memory diff. Open the pull request on GitHub to inspect it."
+                .into(),
+        ),
+        truncated: false,
+        max_columns: 0,
+    }
+}
+
+fn drain_with_storage_limit(mut reader: impl std::io::Read, limit: usize) -> Vec<u8> {
+    let mut stored = Vec::with_capacity(limit.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    while let Ok(read) = reader.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        let keep = read.min(limit.saturating_sub(stored.len()));
+        stored.extend_from_slice(&buffer[..keep]);
+    }
+    stored
+}
+
+fn percent_encode_github_path(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8 * 1024).any(|byte| *byte == 0)
+}
+
+fn diff_remote_file_contents(before: &[u8], after: &[u8]) -> Result<DiffDocument, String> {
+    let files = TemporaryDiffFiles::create(before, after)?;
+    let output = console_command("git")
+        .args(["diff", "--no-index", "--no-color", "--no-ext-diff", "--"])
+        .arg(&files.before)
+        .arg(&files.after)
+        .output()
+        .map_err(|error| format!("Git could not reconstruct this pull request diff: {error}"))?;
+    // `git diff --no-index` returns one when differences exist.
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(nonempty_failure(
+            &output,
+            "Git could not reconstruct this pull request diff.",
+        ));
+    }
+    let patch = diff_hunks(&output.stdout);
+    if patch.is_empty() {
+        return Ok(DiffDocument {
+            lines: Vec::new(),
+            notice: Some(
+                if output
+                    .stdout
+                    .windows(12)
+                    .any(|window| window == b"Binary files")
+                {
+                    "This is a binary file, so there is no textual diff to display.".into()
+                } else {
+                    "The base and head versions have no textual differences.".into()
+                },
+            ),
+            truncated: false,
+            max_columns: 0,
+        });
+    }
+    Ok(parse_diff(patch))
+}
+
+fn diff_hunks(diff: &[u8]) -> &[u8] {
+    let mut start = 0;
+    for line in diff.split_inclusive(|byte| *byte == b'\n') {
+        if line.starts_with(b"@@") {
+            return &diff[start..];
+        }
+        start += line.len();
+    }
+    &[]
+}
+
+struct TemporaryDiffFiles {
+    root: PathBuf,
+    before: PathBuf,
+    after: PathBuf,
+}
+
+impl TemporaryDiffFiles {
+    fn create(before: &[u8], after: &[u8]) -> Result<Self, String> {
+        let root = std::env::temp_dir().join(format!(
+            "muxtrix-pr-diff-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        create_private_directory(&root)
+            .map_err(|error| format!("A temporary diff directory could not be created: {error}"))?;
+        let files = Self {
+            before: root.join("base"),
+            after: root.join("head"),
+            root,
+        };
+        write_private_file(&files.before, before)
+            .and_then(|()| write_private_file(&files.after, after))
+            .map_err(|error| {
+                format!("Temporary pull request files could not be written: {error}")
+            })?;
+        Ok(files)
+    }
+}
+
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
+
+#[cfg(unix)]
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)
+}
+
+impl Drop for TemporaryDiffFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.before);
+        let _ = std::fs::remove_file(&self.after);
+        let _ = std::fs::remove_dir(&self.root);
+    }
+}
+
 fn validate_relative_git_path(path: &str) -> Result<(), String> {
     let path = Path::new(path);
     if path.as_os_str().is_empty()
@@ -627,7 +949,9 @@ struct PullRequestResponse {
     author: Option<PullRequestAuthor>,
     head_ref_name: String,
     head_ref_oid: String,
+    head_repository: Option<PullRequestRepository>,
     base_ref_name: String,
+    base_ref_oid: String,
     additions: usize,
     deletions: usize,
     changed_files: usize,
@@ -655,6 +979,12 @@ struct PullRequestSummaryResponse {
 #[derive(Debug, Deserialize)]
 struct PullRequestAuthor {
     login: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullRequestRepository {
+    name_with_owner: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -745,7 +1075,12 @@ fn parse_pull_request(bytes: &[u8]) -> Result<PullRequest, String> {
             .map_or_else(|| "Unknown author".into(), |author| author.login),
         head: response.head_ref_name,
         head_oid: response.head_ref_oid,
+        head_repository: response
+            .head_repository
+            .map(|repository| repository.name_with_owner)
+            .unwrap_or_default(),
         base: response.base_ref_name,
+        base_oid: response.base_ref_oid,
         additions: response.additions,
         deletions: response.deletions,
         changed_files: response.changed_files,
@@ -779,7 +1114,7 @@ fn pull_request_view_command(repository: &Repository, number: u64) -> Result<Com
         "--repo",
         owner_and_name,
         "--json",
-        "number,title,url,author,headRefName,headRefOid,baseRefName,additions,deletions,changedFiles,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup",
+        "number,title,url,author,headRefName,headRefOid,headRepository,baseRefName,baseRefOid,additions,deletions,changedFiles,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup",
     ]);
     Ok(command)
 }
@@ -1046,6 +1381,98 @@ mod tests {
     }
 
     #[test]
+    fn omitted_large_text_patch_can_be_reconstructed_from_file_contents() {
+        let mut before = (0..12_000)
+            .map(|line| format!("shared line {line}\n"))
+            .collect::<String>();
+        let mut after = before.clone();
+        before.push_str("old ending\n");
+        after.push_str("new ending\n");
+
+        let document = diff_remote_file_contents(before.as_bytes(), after.as_bytes())
+            .expect("large textual source should diff");
+
+        assert!(
+            document
+                .lines
+                .iter()
+                .any(|line| line.kind == DiffLineKind::Deletion && line.text == "-old ending")
+        );
+        assert!(
+            document
+                .lines
+                .iter()
+                .any(|line| line.kind == DiffLineKind::Addition && line.text == "+new ending")
+        );
+        assert!(document.notice.is_none());
+    }
+
+    #[test]
+    fn github_content_paths_are_encoded_without_losing_directory_boundaries() {
+        assert_eq!(
+            percent_encode_github_path("docs/design notes/日本語+#.md"),
+            "docs/design%20notes/%E6%97%A5%E6%9C%AC%E8%AA%9E%2B%23.md"
+        );
+    }
+
+    #[test]
+    fn binary_detection_is_bounded_and_explicit() {
+        assert!(looks_binary(b"header\0payload"));
+        assert!(!looks_binary(b"ordinary UTF-8 text\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconstructed_diff_files_are_owner_only_and_removed_after_use() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root;
+        {
+            let files = TemporaryDiffFiles::create(b"private base", b"private head")
+                .expect("private diff files should be created");
+            root = files.root.clone();
+            assert_eq!(
+                std::fs::metadata(&files.root)
+                    .expect("directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&files.before)
+                    .expect("file metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn diagnostic_drain_stores_only_its_declared_limit() {
+        let bytes = vec![b'x'; 128 * 1024];
+        assert_eq!(
+            drain_with_storage_limit(bytes.as_slice(), 64 * 1024).len(),
+            64 * 1024
+        );
+    }
+
+    #[test]
+    fn pull_request_parser_keeps_both_blob_repositories_and_oids() {
+        let pull_request = parse_pull_request(
+            br#"{"number":42,"title":"Large diff","url":"https://github.com/example/repo/pull/42","author":{"login":"octocat"},"headRefName":"large-diff","headRefOid":"head123","headRepository":{"nameWithOwner":"fork/repo"},"baseRefName":"main","baseRefOid":"base456","additions":2,"deletions":1,"changedFiles":1,"isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","statusCheckRollup":[]}"#,
+        )
+        .expect("pull request should parse");
+
+        assert_eq!(pull_request.head_repository, "fork/repo");
+        assert_eq!(pull_request.head_oid, "head123");
+        assert_eq!(pull_request.base_oid, "base456");
+    }
+
+    #[test]
     fn pull_request_readiness_accounts_for_checks_and_conflicts() {
         let mut pull_request = PullRequest {
             number: 42,
@@ -1054,7 +1481,9 @@ mod tests {
             author: "octocat".into(),
             head: "github-panel".into(),
             head_oid: "abc123".into(),
+            head_repository: "example/repo".into(),
             base: "main".into(),
+            base_oid: "def456".into(),
             additions: 40,
             deletions: 8,
             changed_files: 4,

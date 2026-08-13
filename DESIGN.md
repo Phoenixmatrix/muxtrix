@@ -411,6 +411,12 @@ Selecting a local or pull-request file opens the same full-height unified diff
 while the ledger stays visible in its originating tab for file navigation. Back
 and Escape return to the workspace; returning from a PR detail returns to its
 searchable list.
+When GitHub omits an inline patch for a large textual file, opening that file
+may reconstruct its diff lazily from the exact base and head blobs; never add
+that cost to pull-request or file-list loading. Bound each source download
+before buffering it, write any comparison inputs to owner-only temporary
+storage, retain the viewer's existing truncation limits, and distinguish
+binary, oversized, network-error, and retry states with truthful copy.
 The diff's code lane is measured in configured terminal cells after both line
 number gutters and their spacing. At 80 columns or wider, logical lines wrap at
 glyph boundaries inside the available lane and horizontal scrolling disappears;

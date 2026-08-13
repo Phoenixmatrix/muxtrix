@@ -1086,6 +1086,7 @@ enum Message {
     ),
     GitHubFileScrolled(f32),
     OpenGitHubDiff(String),
+    RetryGitHubDiff,
     CloseGitHubDiff,
     GitHubDiffLoaded(
         std::path::PathBuf,
@@ -2791,6 +2792,12 @@ impl Muxtrix {
                 if let Some(panel) = self.github_panel.as_mut() {
                     panel.keyboard_focus = Some(GitHubPanelKeyboardFocus::Files);
                 }
+                return self.open_github_diff(path);
+            }
+            Message::RetryGitHubDiff => {
+                let Some(path) = self.github_diff.as_ref().map(|diff| diff.path.clone()) else {
+                    return Task::none();
+                };
                 return self.open_github_diff(path);
             }
             Message::CloseGitHubDiff => {
@@ -5441,13 +5448,13 @@ impl Muxtrix {
         let Some(panel) = self.github_panel.as_ref() else {
             return Task::none();
         };
-        let file_and_source = match panel.active_tab {
+        let file_source_and_pull_request = match panel.active_tab {
             GitHubPanelTab::Local => panel
                 .data
                 .as_ref()
                 .and_then(|data| data.files.iter().find(|file| file.path == path))
                 .cloned()
-                .map(|file| (file, GitHubDiffSource::Local)),
+                .map(|file| (file, GitHubDiffSource::Local, None)),
             GitHubPanelTab::PullRequests => {
                 panel.selected_pull_request.as_ref().and_then(|details| {
                     details
@@ -5459,12 +5466,13 @@ impl Muxtrix {
                             (
                                 file,
                                 GitHubDiffSource::PullRequest(details.pull_request.number),
+                                Some(details.pull_request.clone()),
                             )
                         })
                 })
             }
         };
-        let Some((file, source)) = file_and_source else {
+        let Some((file, source, pull_request)) = file_source_and_pull_request else {
             self.status = "The selected file is no longer in the change set.".into();
             return Task::none();
         };
@@ -5474,7 +5482,6 @@ impl Muxtrix {
             .map_or(1, |diff| diff.generation.wrapping_add(1));
         let repository = panel.repository.clone();
         let root = repository.root.clone();
-        let github_patch = matches!(source, GitHubDiffSource::PullRequest(_));
         self.github_diff = Some(GitHubDiffState {
             source,
             path: file.path.clone(),
@@ -5492,7 +5499,12 @@ impl Muxtrix {
         self.active_view = ActiveView::GitHubDiff;
         let path = file.path.clone();
         perform_blocking(
-            move || github::load_diff(&repository, &file, github_patch),
+            move || match pull_request {
+                Some(pull_request) => {
+                    github::load_pull_request_diff(&repository, &pull_request, &file)
+                }
+                None => github::load_diff(&repository, &file, false),
+            },
             move |result| {
                 Message::GitHubDiffLoaded(
                     root,
@@ -8359,11 +8371,17 @@ impl Muxtrix {
             // from assistive technology; selecting it again is a safe no-op.
             let message =
                 (!panel.active_loading()).then_some(Message::SelectGitHubPanelTab(target));
-            button(centered_button_content(
-                text(label)
-                    .size(self.settings.ui_pixels(9.0))
-                    .wrapping(iced::widget::text::Wrapping::None),
-            ))
+            button(
+                container(
+                    text(label)
+                        .size(self.settings.ui_pixels(9.0))
+                        .wrapping(iced::widget::text::Wrapping::None),
+                )
+                .width(Fill)
+                .height(Fill)
+                .center_x(Fill)
+                .center_y(Fill),
+            )
             .on_press_maybe(message)
             .height(28)
             .width(Fill)
@@ -8721,19 +8739,24 @@ impl Muxtrix {
     ) -> Element<'a, Message> {
         if let Some(number) = panel.selected_pull_request_number {
             let back = button(
-                row![
-                    icon(IconKind::Back, tokens.muted, 11.0),
-                    text("Pull requests")
-                        .size(self.settings.ui_pixels(8.5))
-                        .color(tokens.muted),
-                    container("").width(Fill),
-                    text(format!("#{number}"))
-                        .size(self.settings.ui_pixels(8.0))
-                        .font(self.settings.terminal_font.iced())
-                        .color(tokens.faint),
-                ]
-                .spacing(7)
-                .align_y(Alignment::Center),
+                container(
+                    row![
+                        icon(IconKind::Back, tokens.muted, 11.0),
+                        text("Pull requests")
+                            .size(self.settings.ui_pixels(8.5))
+                            .color(tokens.muted),
+                        container("").width(Fill),
+                        text(format!("#{number}"))
+                            .size(self.settings.ui_pixels(8.0))
+                            .font(self.settings.terminal_font.iced())
+                            .color(tokens.faint),
+                    ]
+                    .spacing(7)
+                    .align_y(Alignment::Center),
+                )
+                .width(Fill)
+                .height(Fill)
+                .center_y(Fill),
             )
             .on_press_maybe(
                 (!panel.selected_pull_request_loading).then_some(Message::CloseGitHubPullRequest),
@@ -9455,7 +9478,13 @@ impl Muxtrix {
                 tokens,
             )
         } else if let Some(error) = diff.error.as_deref() {
-            self.github_centered_state(IconKind::File, "Diff unavailable", error, None, tokens)
+            self.github_centered_state(
+                IconKind::File,
+                "Diff unavailable",
+                error,
+                Some(("Try again", Message::RetryGitHubDiff)),
+                tokens,
+            )
         } else if let Some(document) = diff.document.as_ref() {
             self.github_diff_document_view(diff, document, tokens)
         } else {
