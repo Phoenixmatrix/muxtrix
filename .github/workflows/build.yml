@@ -211,8 +211,8 @@ jobs:
           codesign --verify --verbose target/release/muxtrix
           codesign --verify --verbose target/release/muxtrixctl
           test "$(uname -m)" = arm64
-          lipo -verify_arch arm64 target/release/muxtrix
-          lipo -verify_arch arm64 target/release/muxtrixctl
+          lipo target/release/muxtrix -verify_arch arm64
+          lipo target/release/muxtrixctl -verify_arch arm64
           mkdir -p dist/package
           cp target/release/muxtrix target/release/muxtrixctl dist/package/
           cp THIRD_PARTY_NOTICES.md dist/package/
