@@ -10,6 +10,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use libghostty_vt::fmt::Format;
+use libghostty_vt::key::Mods as GhosttyMods;
+use libghostty_vt::mouse::{
+    Action as GhosttyMouseAction, Button as GhosttyMouseButton, Encoder as MouseEncoder,
+    EncoderSize as MouseEncoderSize, Event as GhosttyMouseEvent, Position as GhosttyMousePosition,
+};
 use libghostty_vt::render::{CellIterator, Dirty, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::screen::TrackedGridRef;
@@ -42,6 +47,10 @@ pub struct GridSnapshot {
     /// mouse-reporting or alternate-screen application. Such a program may
     /// repaint its own content in place instead of moving this viewport.
     pub application_scroll: bool,
+    /// Whether the running program enabled terminal mouse tracking. Pointer
+    /// buttons and motion belong to the program while this is true; terminal
+    /// hosts conventionally reserve Shift for local text selection.
+    pub mouse_reporting: bool,
     /// The selected columns of each viewport row, as the emulator resolved
     /// them for this frame. The selection is terminal state anchored to
     /// tracked references, so these ranges already account for whatever the
@@ -153,8 +162,35 @@ pub struct CursorSnapshot {
     pub blinking: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalMouseAction {
+    Press,
+    Release,
+    Motion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalMouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalMouseEvent {
+    pub action: TerminalMouseAction,
+    pub button: Option<TerminalMouseButton>,
+    /// Pointer position in terminal-content pixels, excluding host padding.
+    pub x: f32,
+    pub y: f32,
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
+}
+
 struct TerminalCore {
     terminal: Terminal<'static, 'static>,
+    mouse_encoder: MouseEncoder<'static>,
     render_state: RenderState<'static>,
     row_iterator: RowIterator<'static>,
     cell_iterator: CellIterator<'static>,
@@ -185,6 +221,20 @@ struct SelectionFollow {
 impl TerminalCore {
     fn new(options: TerminalOptions) -> Result<Self, TerminalActorError> {
         let mut terminal = Terminal::new(options).map_err(ghostty_error)?;
+        let mut mouse_encoder = MouseEncoder::new().map_err(ghostty_error)?;
+        mouse_encoder
+            .set_options_from_terminal(&terminal)
+            .set_size(MouseEncoderSize {
+                screen_width: u32::from(options.cols),
+                screen_height: u32::from(options.rows),
+                cell_width: 1,
+                cell_height: 1,
+                padding_top: 0,
+                padding_bottom: 0,
+                padding_right: 0,
+                padding_left: 0,
+            })
+            .set_track_last_cell(true);
         let pty_responses = Rc::new(RefCell::new(Vec::new()));
         let callback_responses = Rc::clone(&pty_responses);
         terminal
@@ -195,6 +245,7 @@ impl TerminalCore {
 
         Ok(Self {
             terminal,
+            mouse_encoder,
             render_state: RenderState::new().map_err(ghostty_error)?,
             row_iterator: RowIterator::new().map_err(ghostty_error)?,
             cell_iterator: CellIterator::new().map_err(ghostty_error)?,
@@ -295,7 +346,11 @@ impl TerminalCore {
 
     fn feed(&mut self, bytes: &[u8]) {
         let was_synchronized = self.synchronized_output_active();
+        let previous_mouse_protocol = self.mouse_protocol_state();
         self.terminal.vt_write(bytes);
+        if self.mouse_protocol_state() != previous_mouse_protocol {
+            self.mouse_encoder.set_options_from_terminal(&self.terminal);
+        }
         let is_synchronized = self.synchronized_output_active();
         self.sync_output_started_at = match (was_synchronized, is_synchronized) {
             (false, true) => Some(Instant::now()),
@@ -358,6 +413,82 @@ impl TerminalCore {
         let alternate_screen =
             mode(Mode::ALT_SCREEN) || mode(Mode::ALT_SCREEN_SAVE) || mode(Mode::ALT_SCREEN_LEGACY);
         mouse_reporting || (alternate_screen && mode(Mode::ALT_SCROLL))
+    }
+
+    fn mouse_reporting(&self) -> bool {
+        let mode = |mode: Mode| self.terminal.mode(mode).unwrap_or(false);
+        mode(Mode::X10_MOUSE)
+            || mode(Mode::NORMAL_MOUSE)
+            || mode(Mode::BUTTON_MOUSE)
+            || mode(Mode::ANY_MOUSE)
+    }
+
+    fn mouse_protocol_state(&self) -> [bool; 8] {
+        let mode = |mode: Mode| self.terminal.mode(mode).unwrap_or(false);
+        [
+            mode(Mode::X10_MOUSE),
+            mode(Mode::NORMAL_MOUSE),
+            mode(Mode::BUTTON_MOUSE),
+            mode(Mode::ANY_MOUSE),
+            mode(Mode::UTF8_MOUSE),
+            mode(Mode::SGR_MOUSE),
+            mode(Mode::URXVT_MOUSE),
+            mode(Mode::SGR_PIXELS_MOUSE),
+        ]
+    }
+
+    fn set_mouse_geometry(
+        &mut self,
+        screen_width: u32,
+        screen_height: u32,
+        cell_width: u32,
+        cell_height: u32,
+    ) {
+        self.mouse_encoder.set_size(MouseEncoderSize {
+            screen_width,
+            screen_height,
+            cell_width: cell_width.max(1),
+            cell_height: cell_height.max(1),
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_right: 0,
+            padding_left: 0,
+        });
+    }
+
+    fn encode_mouse(&mut self, event: TerminalMouseEvent) -> Result<Vec<u8>, TerminalActorError> {
+        let action = match event.action {
+            TerminalMouseAction::Press => GhosttyMouseAction::Press,
+            TerminalMouseAction::Release => GhosttyMouseAction::Release,
+            TerminalMouseAction::Motion => GhosttyMouseAction::Motion,
+        };
+        let button = event.button.map(|button| match button {
+            TerminalMouseButton::Left => GhosttyMouseButton::Left,
+            TerminalMouseButton::Middle => GhosttyMouseButton::Middle,
+            TerminalMouseButton::Right => GhosttyMouseButton::Right,
+        });
+        let mut modifiers = GhosttyMods::empty();
+        modifiers.set(GhosttyMods::SHIFT, event.shift);
+        modifiers.set(GhosttyMods::ALT, event.alt);
+        modifiers.set(GhosttyMods::CTRL, event.control);
+
+        let mut encoded_event = GhosttyMouseEvent::new().map_err(ghostty_error)?;
+        encoded_event
+            .set_action(action)
+            .set_button(button)
+            .set_mods(modifiers)
+            .set_position(GhosttyMousePosition {
+                x: event.x,
+                y: event.y,
+            });
+        self.mouse_encoder.set_any_button_pressed(
+            event.action != TerminalMouseAction::Release && event.button.is_some(),
+        );
+        let mut bytes = Vec::new();
+        self.mouse_encoder
+            .encode_to_vec(&encoded_event, &mut bytes)
+            .map_err(ghostty_error)?;
+        Ok(bytes)
     }
 
     fn encode_wheel(&self, lines: isize, cell: Option<(u16, u16)>) -> Option<Vec<u8>> {
@@ -440,6 +571,7 @@ impl TerminalCore {
             return Ok(snapshot.clone());
         }
         let application_scroll = self.application_owns_wheel();
+        let mouse_reporting = self.mouse_reporting();
         let snapshot = self
             .render_state
             .update(&self.terminal)
@@ -583,6 +715,7 @@ impl TerminalCore {
                 visible: scrollbar.len,
             },
             application_scroll,
+            mouse_reporting,
             selection,
         };
         self.reconcile_selection_follow(&mut result)?;
@@ -1214,6 +1347,7 @@ enum LiveCommand {
         lines: isize,
         cell: Option<(u16, u16)>,
     },
+    Mouse(TerminalMouseEvent),
     Snapshot(Sender<Result<GridSnapshot, LiveSessionError>>),
     SelectionStart {
         column: u16,
@@ -1481,6 +1615,12 @@ impl LiveSession {
         self.send(LiveCommand::Wheel { lines, cell })
     }
 
+    /// Routes a normalized pointer event through the terminal's active mouse
+    /// tracking mode and encoding format on the session thread.
+    pub fn mouse(&self, event: TerminalMouseEvent) -> Result<(), LiveSessionError> {
+        self.send(LiveCommand::Mouse(event))
+    }
+
     /// Scroll the viewport to an absolute row in the scrollback buffer.
     pub fn scroll_viewport_to(&self, row: usize) -> Result<(), LiveSessionError> {
         self.send(LiveCommand::ScrollViewportTo(row))
@@ -1574,6 +1714,12 @@ fn run_live_session(
     } = init;
     let mut terminal = match TerminalCore::new(options) {
         Ok(mut terminal) => {
+            terminal.set_mouse_geometry(
+                u32::from(size.pixel_width),
+                u32::from(size.pixel_height),
+                (u32::from(size.pixel_width) / u32::from(size.cols).max(1)).max(1),
+                (u32::from(size.pixel_height) / u32::from(size.rows).max(1)).max(1),
+            );
             if let Some(theme) = theme
                 && let Err(error) = terminal.apply_theme(theme)
             {
@@ -1758,6 +1904,12 @@ fn run_live_session(
                 {
                     events.push(LiveSessionEvent::Error(error.to_string()));
                 }
+                terminal.set_mouse_geometry(
+                    u32::from(size.pixel_width),
+                    u32::from(size.pixel_height),
+                    cell_width_px,
+                    cell_height_px,
+                );
                 terminal.sync_output_started_at = None;
                 match terminal.snapshot() {
                     Ok(snapshot) => events.push(LiveSessionEvent::Frame(snapshot)),
@@ -1796,6 +1948,15 @@ fn run_live_session(
                     }
                 }
             }
+            LiveCommand::Mouse(event) => match terminal.encode_mouse(event) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    if let Err(error) = session.write_all(&bytes) {
+                        events.push(LiveSessionEvent::Error(error.to_string()));
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => events.push(LiveSessionEvent::Error(error.to_string())),
+            },
             LiveCommand::Snapshot(response) => {
                 let result = terminal
                     .snapshot()
@@ -1976,6 +2137,78 @@ mod tests {
         // Leaving the alternate screen restores viewport scrolling.
         terminal.feed(b"\x1b[?1000l\x1b[?1049l");
         assert_eq!(terminal.encode_wheel(-3, None), None);
+        Ok(())
+    }
+
+    #[test]
+    fn mouse_events_route_by_the_programs_tracking_mode() -> Result<(), TerminalActorError> {
+        let mut terminal = TerminalCore::new(options())?;
+        let event = |action, button| TerminalMouseEvent {
+            action,
+            button,
+            x: 4.2,
+            y: 2.2,
+            shift: false,
+            alt: false,
+            control: false,
+        };
+
+        assert!(!terminal.mouse_reporting());
+        assert!(
+            terminal
+                .encode_mouse(event(
+                    TerminalMouseAction::Press,
+                    Some(TerminalMouseButton::Left)
+                ))?
+                .is_empty(),
+            "a shell that did not enable mouse tracking keeps host-side selection"
+        );
+
+        terminal.feed(b"\x1b[?1003h\x1b[?1006h");
+        assert!(terminal.mouse_reporting());
+        assert_eq!(
+            terminal.encode_mouse(event(
+                TerminalMouseAction::Press,
+                Some(TerminalMouseButton::Left)
+            ))?,
+            b"\x1b[<0;5;3M"
+        );
+        assert_eq!(
+            terminal.encode_mouse(TerminalMouseEvent {
+                x: 5.2,
+                ..event(TerminalMouseAction::Motion, None)
+            })?,
+            b"\x1b[<35;6;3M",
+            "mode 1003 must receive hover motion even with no button down"
+        );
+        assert_eq!(
+            terminal.encode_mouse(event(
+                TerminalMouseAction::Release,
+                Some(TerminalMouseButton::Left)
+            ))?,
+            b"\x1b[<0;5;3m"
+        );
+
+        terminal.feed(b"\x1b[?1003l\x1b[?1000h");
+        assert!(
+            terminal
+                .encode_mouse(event(TerminalMouseAction::Motion, None))?
+                .is_empty(),
+            "mode 1000 reports buttons, not hover motion"
+        );
+
+        terminal.feed(b"\x1b[?1000l\x1b[?9h\x1b[?1006l");
+        assert!(
+            terminal.mouse_reporting(),
+            "legacy X10 mode still owns clicks"
+        );
+        assert_eq!(
+            terminal.encode_mouse(event(
+                TerminalMouseAction::Press,
+                Some(TerminalMouseButton::Right)
+            ))?,
+            [0x1b, b'[', b'M', 34, 37, 35]
+        );
         Ok(())
     }
 
@@ -2172,9 +2405,13 @@ mod tests {
         // Mouse reporting alone routes the wheel to the program too, even on
         // the primary screen.
         terminal.feed(b"\x1b[?1000h");
-        assert!(terminal.snapshot()?.application_scroll);
+        let snapshot = terminal.snapshot()?;
+        assert!(snapshot.application_scroll);
+        assert!(snapshot.mouse_reporting);
         terminal.feed(b"\x1b[?1000l");
-        assert!(!terminal.snapshot()?.application_scroll);
+        let snapshot = terminal.snapshot()?;
+        assert!(!snapshot.application_scroll);
+        assert!(!snapshot.mouse_reporting);
 
         // The flag must agree with where the wheel actually goes.
         for sequence in [
@@ -2630,6 +2867,7 @@ mod tests {
                 scrollbar: ScrollbarSnapshot::default(),
                 title: None,
                 application_scroll: false,
+                mouse_reporting: false,
                 selection: Vec::new(),
             }
         }

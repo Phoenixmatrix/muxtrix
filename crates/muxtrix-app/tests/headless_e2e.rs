@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io::{BufRead as _, BufReader, Write as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -89,6 +90,9 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         "muxtrix-e2e-control-{}-{unique}.sock",
         std::process::id()
     ));
+    let mouse_probe_path =
+        std::env::temp_dir().join(format!("muxtrix-e2e-mouse-{}-{unique}", std::process::id()));
+    write_mouse_probe(&mouse_probe_path)?;
     let home_path =
         std::env::temp_dir().join(format!("muxtrix-e2e-home-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&home_path)?;
@@ -180,6 +184,29 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     connection.flush()?;
     thread::sleep(Duration::from_millis(200));
     eprintln!("opened the pane menu and dismissed it with an outside click");
+    type_text(
+        &connection,
+        mouse_probe_path
+            .to_str()
+            .ok_or("non-UTF-8 mouse probe path")?,
+    )?;
+    tap_keysym(&connection, 0xff0d)?;
+    connection.flush()?;
+    thread::sleep(Duration::from_millis(300));
+    connection
+        .xtest_fake_input(
+            MOTION_NOTIFY_EVENT,
+            0,
+            0,
+            root,
+            terminal_x.saturating_add(32),
+            terminal_y,
+            0,
+        )?
+        .check()?;
+    connection.flush()?;
+    thread::sleep(Duration::from_millis(350));
+    eprintln!("delivered pointer motion to a mouse-reporting terminal program");
     connection
         .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, terminal_x, terminal_y, 0)?
         .check()?;
@@ -333,6 +360,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     let _ = std::fs::remove_file(&report_path);
     let _ = std::fs::remove_file(&config_path);
     let _ = std::fs::remove_file(&control_path);
+    let _ = std::fs::remove_file(&mouse_probe_path);
     let _ = std::fs::remove_dir_all(&home_path);
     if requested_screenshot.is_none() {
         let _ = std::fs::remove_file(&screenshot_path);
@@ -358,6 +386,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         "pane_overflow_click_away",
         "terminal_mouse_wheel_scrollback",
         "terminal_scrollbar_click_and_drag",
+        "terminal_program_mouse_motion",
         "terminal_drawing_glyphs_are_pixel_continuous",
         "terminal_rounded_box_is_pixel_connected",
         "terminal_heavy_box_is_pixel_connected",
@@ -372,6 +401,39 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         report["metrics"]["screenshot_height"],
         u64::from(final_viewport.1)
     );
+    Ok(())
+}
+
+fn write_mouse_probe(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::write(
+        path,
+        r#"#!/usr/bin/env python3
+import os
+import select
+import sys
+import termios
+import tty
+
+fd = sys.stdin.fileno()
+original = termios.tcgetattr(fd)
+data = b""
+try:
+    tty.setraw(fd)
+    sys.stdout.write("\x1b[?1003h\x1b[?1006h")
+    sys.stdout.flush()
+    if select.select([fd], [], [], 3)[0]:
+        data = os.read(fd, 64)
+finally:
+    sys.stdout.write("\x1b[?1003l\x1b[?1006l\r\n")
+    sys.stdout.flush()
+    termios.tcsetattr(fd, termios.TCSADRAIN, original)
+
+print("mouse-report-ok" if data.startswith(b"\x1b[<35;") else "mouse-report-fail")
+"#,
+    )?;
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions)?;
     Ok(())
 }
 

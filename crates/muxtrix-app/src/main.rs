@@ -35,7 +35,8 @@ use muxtrix_domain::{
 use muxtrix_platform::{LaunchPlan, PtySize};
 use muxtrix_terminal::{
     EventNotifier, GridSnapshot, LiveSession, LiveSessionEvent, ScrollbarSnapshot, TerminalActor,
-    TerminalNotification, TerminalTheme,
+    TerminalMouseAction, TerminalMouseButton, TerminalMouseEvent, TerminalNotification,
+    TerminalTheme,
 };
 
 mod agent_screen;
@@ -224,6 +225,10 @@ struct Muxtrix {
     terminal_pointer_positions: BTreeMap<PaneId, Point>,
     terminal_scrollbar_positions: BTreeMap<PaneId, Point>,
     terminal_scroll_drag: Option<TerminalScrollDrag>,
+    /// A button press currently owned by a mouse-reporting terminal program.
+    /// Keeping this at the host level lets a release outside the pane still
+    /// reach the program that accepted the press.
+    terminal_mouse_capture: Option<TerminalMouseCapture>,
     /// A possible terminal selection gesture. The emulator owns an actual
     /// selection only after this crosses the drag threshold; an ordinary
     /// click merely clears the previous selection and focuses the pane.
@@ -772,6 +777,12 @@ struct TerminalSelectionDrag {
     active: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TerminalMouseCapture {
+    pane_id: PaneId,
+    button: TerminalMouseButton,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum SplitBranch {
     First,
@@ -895,8 +906,8 @@ enum Message {
     TerminalPointerMoved(PaneId, Point),
     TerminalScrollbarMoved(PaneId, Point),
     BeginTerminalScroll(PaneId),
-    BeginTerminalSelection(PaneId),
-    EndTerminalSelection(PaneId),
+    TerminalMousePressed(PaneId, TerminalMouseButton),
+    TerminalMouseReleased(PaneId, TerminalMouseButton),
     OpenPaneContextMenu(PaneId),
     CopyTerminalSelection(PaneId),
     PastePane(PaneId),
@@ -1605,6 +1616,7 @@ impl Muxtrix {
             terminal_pointer_positions: BTreeMap::new(),
             terminal_scrollbar_positions: BTreeMap::new(),
             terminal_scroll_drag: None,
+            terminal_mouse_capture: None,
             terminal_selection_drag: None,
             terminal_command_buffers: BTreeMap::new(),
             event_notifier,
@@ -1837,6 +1849,9 @@ impl Muxtrix {
                 if let Err(error) = self.finish_tab_drag() {
                     self.status = error;
                 }
+                if let Err(error) = self.release_terminal_mouse_capture() {
+                    self.status = format!("Terminal mouse release failed: {error}");
+                }
                 self.split_drag = None;
                 self.terminal_scroll_drag = None;
                 self.terminal_selection_drag = None;
@@ -1877,6 +1892,27 @@ impl Muxtrix {
                     if let Some(Err(error)) = result {
                         self.status = format!("Selection failed: {error}");
                     }
+                } else if self
+                    .terminals
+                    .get(&pane_id)
+                    .and_then(|runtime| runtime.snapshot.as_ref())
+                    .is_some_and(|snapshot| snapshot.mouse_reporting)
+                {
+                    let button = self
+                        .terminal_mouse_capture
+                        .filter(|capture| capture.pane_id == pane_id)
+                        .map(|capture| capture.button);
+                    let event = terminal_mouse_event(
+                        position,
+                        TerminalMouseAction::Motion,
+                        button,
+                        self.keyboard_modifiers,
+                    );
+                    if let Some(runtime) = self.terminals.get(&pane_id)
+                        && let Err(error) = runtime.mouse(event)
+                    {
+                        self.status = format!("Terminal mouse motion failed: {error}");
+                    }
                 }
                 return Task::none();
             }
@@ -1895,43 +1931,12 @@ impl Muxtrix {
                 }
                 return Task::none();
             }
-            Message::BeginTerminalSelection(pane_id) => {
-                if terminal_link_modifiers(self.keyboard_modifiers)
-                    && let Some(link) = self.hovered_terminal_link(pane_id)
-                {
-                    let uri = link.uri;
-                    let target = uri.clone();
-                    return Task::perform(
-                        async move { open_web_url(&target).map_err(|error| error.to_string()) },
-                        move |result| Message::TerminalLinkOpened(uri.clone(), result),
-                    );
-                }
-                let position = self
-                    .terminal_pointer_positions
-                    .get(&pane_id)
-                    .copied()
-                    .unwrap_or(Point::ORIGIN);
-                let cell = self.terminal_grid_cell_at(pane_id, position);
-                if let Some(runtime) = self.terminals.get_mut(&pane_id)
-                    && let Err(error) = runtime.selection_clear()
-                {
-                    self.status = format!("Selection failed: {error}");
-                }
-                self.terminal_selection_drag = Some(TerminalSelectionDrag {
-                    pane_id,
-                    origin: position,
-                    anchor: cell,
-                    active: false,
-                });
-                let _ = self.focus_pane(pane_id);
-                return Task::none();
+            Message::TerminalMousePressed(pane_id, button) => {
+                return self.begin_terminal_mouse(pane_id, button);
             }
-            Message::EndTerminalSelection(pane_id) => {
-                if self
-                    .terminal_selection_drag
-                    .is_some_and(|drag| drag.pane_id == pane_id)
-                {
-                    self.terminal_selection_drag = None;
+            Message::TerminalMouseReleased(pane_id, button) => {
+                if let Err(error) = self.end_terminal_mouse(pane_id, button) {
+                    self.status = format!("Terminal mouse release failed: {error}");
                 }
                 return Task::none();
             }
@@ -5231,6 +5236,124 @@ impl Muxtrix {
         // repainting application, the terminal session preserves the selected
         // text and re-anchors it after the new frame arrives.
         runtime.wheel(lines, cell)
+    }
+
+    fn begin_terminal_mouse(
+        &mut self,
+        pane_id: PaneId,
+        button: TerminalMouseButton,
+    ) -> Task<Message> {
+        let _ = self.focus_pane(pane_id);
+        let position = self
+            .terminal_pointer_positions
+            .get(&pane_id)
+            .copied()
+            .unwrap_or(Point::ORIGIN);
+        let mouse_reporting = self
+            .terminals
+            .get(&pane_id)
+            .and_then(|runtime| runtime.snapshot.as_ref())
+            .is_some_and(|snapshot| snapshot.mouse_reporting);
+
+        // Match Ghostty's default host policy: a mouse-reporting program owns
+        // unmodified pointer input, while Shift escapes capture so terminal
+        // text can still be selected locally.
+        if mouse_reporting && !self.keyboard_modifiers.shift() {
+            let event = terminal_mouse_event(
+                position,
+                TerminalMouseAction::Press,
+                Some(button),
+                self.keyboard_modifiers,
+            );
+            let result = self
+                .terminals
+                .get_mut(&pane_id)
+                .ok_or_else(|| format!("pane {pane_id:?} has no terminal runtime"))
+                .and_then(|runtime| {
+                    runtime
+                        .selection_clear()
+                        .and_then(|()| runtime.mouse(event))
+                });
+            match result {
+                Ok(()) => {
+                    self.terminal_mouse_capture = Some(TerminalMouseCapture { pane_id, button });
+                }
+                Err(error) => self.status = format!("Terminal mouse press failed: {error}"),
+            }
+            return Task::none();
+        }
+
+        match button {
+            TerminalMouseButton::Left => {
+                if terminal_link_modifiers(self.keyboard_modifiers)
+                    && let Some(link) = self.hovered_terminal_link(pane_id)
+                {
+                    let uri = link.uri;
+                    let target = uri.clone();
+                    return Task::perform(
+                        async move { open_web_url(&target).map_err(|error| error.to_string()) },
+                        move |result| Message::TerminalLinkOpened(uri.clone(), result),
+                    );
+                }
+                let cell = self.terminal_grid_cell_at(pane_id, position);
+                if let Some(runtime) = self.terminals.get_mut(&pane_id)
+                    && let Err(error) = runtime.selection_clear()
+                {
+                    self.status = format!("Selection failed: {error}");
+                }
+                self.terminal_selection_drag = Some(TerminalSelectionDrag {
+                    pane_id,
+                    origin: position,
+                    anchor: cell,
+                    active: false,
+                });
+            }
+            TerminalMouseButton::Right => self.pane_menu = Some(pane_id),
+            TerminalMouseButton::Middle => {}
+        }
+        Task::none()
+    }
+
+    fn end_terminal_mouse(
+        &mut self,
+        pane_id: PaneId,
+        button: TerminalMouseButton,
+    ) -> Result<(), String> {
+        if self
+            .terminal_selection_drag
+            .is_some_and(|drag| drag.pane_id == pane_id)
+        {
+            self.terminal_selection_drag = None;
+        }
+        if !self
+            .terminal_mouse_capture
+            .is_some_and(|capture| capture.pane_id == pane_id && capture.button == button)
+        {
+            return Ok(());
+        }
+        self.terminal_mouse_capture = None;
+        let position = self
+            .terminal_pointer_positions
+            .get(&pane_id)
+            .copied()
+            .unwrap_or(Point::ORIGIN);
+        let event = terminal_mouse_event(
+            position,
+            TerminalMouseAction::Release,
+            Some(button),
+            self.keyboard_modifiers,
+        );
+        self.terminals
+            .get(&pane_id)
+            .ok_or_else(|| format!("pane {pane_id:?} has no terminal runtime"))?
+            .mouse(event)
+    }
+
+    fn release_terminal_mouse_capture(&mut self) -> Result<(), String> {
+        let Some(capture) = self.terminal_mouse_capture else {
+            return Ok(());
+        };
+        self.end_terminal_mouse(capture.pane_id, capture.button)
     }
 
     fn scroll_terminal_to(&mut self, pane_id: PaneId, offset: u64) -> Result<(), String> {
@@ -10796,9 +10919,30 @@ impl Muxtrix {
             .on_enter(Message::EnterTerminal(pane_id))
             .on_exit(Message::LeaveTerminal(pane_id))
             .on_move(move |position| Message::TerminalPointerMoved(pane_id, position))
-            .on_press(Message::BeginTerminalSelection(pane_id))
-            .on_release(Message::EndTerminalSelection(pane_id))
-            .on_right_press(Message::OpenPaneContextMenu(pane_id))
+            .on_press(Message::TerminalMousePressed(
+                pane_id,
+                TerminalMouseButton::Left,
+            ))
+            .on_release(Message::TerminalMouseReleased(
+                pane_id,
+                TerminalMouseButton::Left,
+            ))
+            .on_middle_press(Message::TerminalMousePressed(
+                pane_id,
+                TerminalMouseButton::Middle,
+            ))
+            .on_middle_release(Message::TerminalMouseReleased(
+                pane_id,
+                TerminalMouseButton::Middle,
+            ))
+            .on_right_press(Message::TerminalMousePressed(
+                pane_id,
+                TerminalMouseButton::Right,
+            ))
+            .on_right_release(Message::TerminalMouseReleased(
+                pane_id,
+                TerminalMouseButton::Right,
+            ))
             .on_scroll(move |delta| Message::ScrollTerminal(pane_id, delta))
             .interaction(terminal_mouse_interaction(hovered_link.is_some()));
         let terminal_view = sensor(terminal_view)
@@ -14252,6 +14396,14 @@ impl TerminalRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn mouse(&self, event: TerminalMouseEvent) -> Result<(), String> {
+        self.session
+            .as_ref()
+            .ok_or_else(|| "terminal process has exited".to_owned())?
+            .mouse(event)
+            .map_err(|error| error.to_string())
+    }
+
     fn scroll_to(&self, row: usize) -> Result<(), String> {
         self.session
             .as_ref()
@@ -14333,6 +14485,23 @@ fn terminal_grid_cell_at(position: Point, settings: &AppSettings, size: PtySize)
         .floor()
         .clamp(0.0, f32::from(size.rows.saturating_sub(1))) as u16;
     (column, row)
+}
+
+fn terminal_mouse_event(
+    position: Point,
+    action: TerminalMouseAction,
+    button: Option<TerminalMouseButton>,
+    modifiers: Modifiers,
+) -> TerminalMouseEvent {
+    TerminalMouseEvent {
+        action,
+        button,
+        x: position.x - TERMINAL_PADDING / 2.0,
+        y: position.y - TERMINAL_PADDING / 2.0,
+        shift: modifiers.shift(),
+        alt: modifiers.alt(),
+        control: modifiers.control(),
+    }
 }
 
 fn terminal_selection_drag_started(origin: Point, current: Point) -> bool {
@@ -17285,7 +17454,10 @@ mod tests {
             .has_selection = true;
 
         let _ = app.update(Message::TerminalPointerMoved(pane_id, origin));
-        let _ = app.update(Message::BeginTerminalSelection(pane_id));
+        let _ = app.update(Message::TerminalMousePressed(
+            pane_id,
+            TerminalMouseButton::Left,
+        ));
         assert!(
             !app.terminals[&pane_id].has_selection,
             "mouse-down should dismiss the previous selection immediately"
@@ -17297,7 +17469,10 @@ mod tests {
 
         let click_jitter = Point::new(origin.x + 1.0, origin.y + 1.0);
         let _ = app.update(Message::TerminalPointerMoved(pane_id, click_jitter));
-        let _ = app.update(Message::EndTerminalSelection(pane_id));
+        let _ = app.update(Message::TerminalMouseReleased(
+            pane_id,
+            TerminalMouseButton::Left,
+        ));
         assert!(app.terminal_selection_drag.is_none());
         assert!(
             !app.terminals[&pane_id].has_selection,
@@ -17305,7 +17480,10 @@ mod tests {
         );
 
         let _ = app.update(Message::TerminalPointerMoved(pane_id, origin));
-        let _ = app.update(Message::BeginTerminalSelection(pane_id));
+        let _ = app.update(Message::TerminalMousePressed(
+            pane_id,
+            TerminalMouseButton::Left,
+        ));
         let _ = app.update(Message::TerminalPointerMoved(
             pane_id,
             Point::new(origin.x + TERMINAL_SELECTION_DRAG_THRESHOLD + 1.0, origin.y),
@@ -17317,6 +17495,38 @@ mod tests {
         assert!(
             app.terminals[&pane_id].has_selection,
             "crossing the drag threshold should still select terminal text"
+        );
+    }
+
+    #[test]
+    fn mouse_reporting_reserves_plain_clicks_and_shift_restores_selection() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.terminals
+            .get_mut(&pane_id)
+            .expect("the initial pane should have a runtime")
+            .snapshot = Some(snapshot_in_mode(b"\x1b[?1003h\x1b[?1006h"));
+        let position = Point::new(120.0, 80.0);
+        let _ = app.update(Message::TerminalPointerMoved(pane_id, position));
+
+        let _ = app.update(Message::TerminalMousePressed(
+            pane_id,
+            TerminalMouseButton::Left,
+        ));
+        assert!(
+            app.terminal_selection_drag.is_none(),
+            "an unmodified click belongs to the mouse-reporting program"
+        );
+
+        app.keyboard_modifiers = Modifiers::SHIFT;
+        let _ = app.update(Message::TerminalMousePressed(
+            pane_id,
+            TerminalMouseButton::Left,
+        ));
+        assert!(
+            app.terminal_selection_drag
+                .is_some_and(|drag| drag.pane_id == pane_id),
+            "Shift must escape program mouse capture for local text selection"
         );
     }
 

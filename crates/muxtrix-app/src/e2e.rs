@@ -10,7 +10,8 @@ use muxtrix_control::AgentState;
 
 use super::{
     ActiveView, Agent, AgentPaneStatus, GitHubPanelState, HookScope, HookStatus, Message, Muxtrix,
-    PaneRepository, WorktreeManagerEntry, WorktreeManagerMode, WorktreeManagerState, github,
+    PaneRepository, TerminalMouseButton, WorktreeManagerEntry, WorktreeManagerMode,
+    WorktreeManagerState, github,
 };
 use crate::settings::FleetView;
 
@@ -19,6 +20,7 @@ const SCREENSHOT_ENV: &str = "MUXTRIX_E2E_SCREENSHOT_RGBA";
 const EXTERNAL_MARKER: &str = "alpha beta";
 const TERMINAL_URL_MARKER: &str = "https://example.com/docs";
 const PANE_MENU_CLICK_AWAY_MARKER: &str = "pane-menu-click-away-ready";
+const MOUSE_REPORT_MARKER: &str = "mouse-report-ok";
 // Both markers have to fit on one row of a split pane at the minimum
 // supported window: at 720px wide each half is around a dozen columns, and a
 // marker that wraps can never be found in a single row of the snapshot.
@@ -105,6 +107,7 @@ pub(super) struct Scenario {
     pane_menu_click_away_observed: bool,
     terminal_scroll_observed: bool,
     terminal_scrollbar_observed: bool,
+    terminal_mouse_reporting_observed: bool,
     tab_lifecycle_observed: bool,
     /// The `MUXTRIX_E2E_CAPTURE` state this run ends on, empty for the plain
     /// workspace frame. One name per staged surface; `capturing` is the only
@@ -168,6 +171,7 @@ impl Scenario {
             pane_menu_click_away_observed: false,
             terminal_scroll_observed: false,
             terminal_scrollbar_observed: false,
+            terminal_mouse_reporting_observed: false,
             tab_lifecycle_observed: false,
             capture: std::env::var_os("MUXTRIX_E2E_CAPTURE")
                 .map_or_else(String::new, |value| value.to_string_lossy().into_owned()),
@@ -187,6 +191,8 @@ impl Scenario {
         } else if self.pane_menu_click_open_observed {
             self.pane_menu_click_away_observed = true;
         }
+        self.terminal_mouse_reporting_observed |=
+            pane_contains(app, self.initial_pane, MOUSE_REPORT_MARKER);
         if self.started.elapsed() > Duration::from_secs(20) {
             let terminal = self.third_pane.and_then(|pane_id| {
                 app.terminals.get(&pane_id).map(|runtime| {
@@ -305,9 +311,15 @@ impl Scenario {
                     };
                     let last = column + SECOND_MARKER.chars().count() - 1;
                     let _ = app.update(Message::TerminalPointerMoved(second, point(column, row)));
-                    let _ = app.update(Message::BeginTerminalSelection(second));
+                    let _ = app.update(Message::TerminalMousePressed(
+                        second,
+                        TerminalMouseButton::Left,
+                    ));
                     let _ = app.update(Message::TerminalPointerMoved(second, point(last, row)));
-                    let _ = app.update(Message::EndTerminalSelection(second));
+                    let _ = app.update(Message::TerminalMouseReleased(
+                        second,
+                        TerminalMouseButton::Left,
+                    ));
                     self.selection_dragged = true;
                     return Ok(TickAction::Wait);
                 }
@@ -1523,6 +1535,9 @@ impl Scenario {
         if !self.terminal_scrollbar_observed {
             return Err("terminal scrollbar interaction was not observed".into());
         }
+        if !self.terminal_mouse_reporting_observed {
+            return Err("a mouse-reporting program did not receive pointer motion".into());
+        }
         if !self.tab_lifecycle_observed {
             return Err("workspace tab creation was not observed".into());
         }
@@ -1602,6 +1617,7 @@ impl Scenario {
                 "pane_overflow_click_away": true,
                 "terminal_mouse_wheel_scrollback": true,
                 "terminal_scrollbar_click_and_drag": true,
+                "terminal_program_mouse_motion": true,
                 "workspace_tab_default_pane_and_switch": true,
                 "terminal_drawing_glyphs_are_pixel_continuous": terminal_glyph_continuity
                     .is_none_or(|(longest, solid_rows)| {
