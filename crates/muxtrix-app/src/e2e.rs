@@ -11,7 +11,8 @@ use muxtrix_control::AgentState;
 use super::{
     ActiveView, Agent, AgentPaneStatus, CommandAction, GitHubDiffSource, GitHubDiffState,
     GitHubPanelState, GitHubPanelTab, HookScope, HookStatus, Message, Muxtrix, PaneRepository,
-    TerminalMouseButton, WorktreeManagerEntry, WorktreeManagerMode, WorktreeManagerState, github,
+    TerminalLaunchState, TerminalMouseButton, WorktreeManagerEntry, WorktreeManagerMode,
+    WorktreeManagerState, github,
 };
 use crate::settings::{FleetScope, FleetView};
 
@@ -971,6 +972,17 @@ impl Scenario {
                 .ok_or_else(|| "active tab is missing".to_owned())?
                 .focused_pane_id;
             app.pane_menu = Some(focused);
+        } else if self.settle_ticks == 1 && self.capturing("wsl-starting") {
+            // Preserve the real terminal frame while holding its launch state
+            // at the slow Windows-to-WSL handoff. This proves the rail and
+            // workspace roll-up describe progress without raising attention.
+            let runtime = app
+                .terminals
+                .get_mut(&self.initial_pane)
+                .ok_or_else(|| "WSL startup capture pane is missing".to_owned())?;
+            runtime.launch_state = TerminalLaunchState::Starting {
+                attempt_id: u64::MAX,
+            };
         } else if self.settle_ticks == 1 && self.capturing("fleet-all-workspaces") {
             let active_workspace_id = app.session.active_workspace_id;
             if let Some(workspace) = app
