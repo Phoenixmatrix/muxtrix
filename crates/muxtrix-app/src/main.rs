@@ -61,8 +61,8 @@ use process::console_command;
 #[cfg(any(target_os = "windows", test))]
 use settings::WindowsShellBackend;
 use settings::{
-    AppSettings, Appearance, FleetView, FontWeight, InstalledFontCatalog, TerminalFont, UiFont,
-    font_with_style,
+    AppSettings, Appearance, DEFAULT_TERMINAL_SCROLLBACK_LINES, FleetView, FontWeight,
+    InstalledFontCatalog, TerminalFont, UiFont, font_with_style,
 };
 use themes::{TerminalThemeId, TerminalThemePreset};
 
@@ -340,6 +340,7 @@ struct TerminalLaunchRequest {
     wsl_distribution: String,
     pane_id: PaneId,
     theme: TerminalTheme,
+    max_scrollback: usize,
     notifier: EventNotifier,
     control_endpoint: Option<String>,
     target_size: PtySize,
@@ -423,6 +424,7 @@ impl SystemTerminalLauncher {
         let session = start_live_session_with_client(
             &profile,
             request.pane_id,
+            request.max_scrollback,
             request.theme,
             request.notifier,
             request.control_endpoint.as_deref(),
@@ -998,6 +1000,34 @@ impl std::fmt::Display for DefaultAgentChoice {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrollbackLimitChoice(usize);
+
+impl ScrollbackLimitChoice {
+    const ALL: [Self; 6] = [
+        Self(1_000),
+        Self(5_000),
+        Self(DEFAULT_TERMINAL_SCROLLBACK_LINES),
+        Self(25_000),
+        Self(50_000),
+        Self(100_000),
+    ];
+}
+
+impl std::fmt::Display for ScrollbackLimitChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            1_000 => formatter.write_str("1,000 lines"),
+            5_000 => formatter.write_str("5,000 lines"),
+            10_000 => formatter.write_str("10,000 lines"),
+            25_000 => formatter.write_str("25,000 lines"),
+            50_000 => formatter.write_str("50,000 lines"),
+            100_000 => formatter.write_str("100,000 lines"),
+            lines => write!(formatter, "{lines} lines"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaletteMove {
     Next,
     Previous,
@@ -1179,6 +1209,7 @@ enum Message {
     SettingsUiFontWeight(FontWeight),
     SettingsTerminalFontSize(f32),
     SettingsLineHeight(f32),
+    SettingsScrollbackLimit(ScrollbackLimitChoice),
     SettingsUiFontSize(f32),
     SetFleetView(FleetView),
     SettingsDefaultAgent(DefaultAgentChoice),
@@ -1483,6 +1514,7 @@ impl Muxtrix {
             wsl_distribution: self.settings.wsl_distribution.clone(),
             pane_id,
             theme: self.settings.terminal_theme.preset().terminal_theme(),
+            max_scrollback: self.settings.terminal_scrollback_lines,
             notifier: Arc::clone(&self.event_notifier),
             control_endpoint: self.control_endpoint.clone(),
             target_size,
@@ -1747,6 +1779,7 @@ impl Muxtrix {
                 &profile,
                 initial_pane_id,
                 "shell 1",
+                settings.terminal_scrollback_lines,
                 settings.terminal_theme.preset().terminal_theme(),
                 Arc::clone(&event_notifier),
                 control_endpoint.as_deref(),
@@ -3154,6 +3187,10 @@ impl Muxtrix {
                 self.settings_draft.terminal_line_height = height;
                 return Task::none();
             }
+            Message::SettingsScrollbackLimit(limit) => {
+                self.settings_draft.terminal_scrollback_lines = limit.0;
+                return Task::none();
+            }
             Message::SettingsUiFontSize(size) => {
                 self.settings_draft.ui_font_size = size;
                 return Task::none();
@@ -4235,6 +4272,7 @@ impl Muxtrix {
                     let runtime = TerminalRuntime::attach(
                         *pane_id,
                         &title,
+                        self.settings.terminal_scrollback_lines,
                         theme,
                         Arc::clone(&self.event_notifier),
                         Arc::clone(&client),
@@ -12377,6 +12415,14 @@ impl Muxtrix {
         ]
         .spacing(12)
         .align_y(Alignment::Center);
+        let scrollback_limit = pick_list(
+            ScrollbackLimitChoice::ALL,
+            Some(ScrollbackLimitChoice(
+                self.settings_draft.terminal_scrollback_lines,
+            )),
+            Message::SettingsScrollbackLimit,
+        )
+        .width(220);
         let typography_preview = container(
             text("$ cargo test --workspace\n✓ all checks passed")
                 .font(font_with_style(
@@ -12435,8 +12481,8 @@ impl Muxtrix {
             &self.settings_draft,
         );
         let terminal = settings_section(
-            "Terminal typography",
-            "Installed monospace fonts and terminal grid metrics",
+            "Terminal text and history",
+            "Fonts, grid metrics, and scrollback history",
             column![
                 settings_row(
                     "Font family",
@@ -12474,6 +12520,13 @@ impl Muxtrix {
                     "Line height",
                     "Vertical spacing between terminal rows",
                     line_height,
+                    &self.settings_draft
+                ),
+                settings_divider(tokens),
+                settings_row(
+                    "Scrollback history",
+                    "Maximum lines kept by each new or restarted pane",
+                    scrollback_limit,
                     &self.settings_draft
                 ),
                 settings_divider(tokens),
@@ -12583,7 +12636,7 @@ impl Muxtrix {
         let footer = container(
             row![
                 text(format!(
-                    "{font_restart}Preferences apply when saved; shell changes affect new panes; hook actions apply immediately"
+                    "{font_restart}Preferences apply when saved; shell and scrollback affect new and restarted panes; hook actions apply immediately"
                 ))
                 .size(self.settings_draft.ui_pixels(9.0))
                 .color(tokens.faint)
@@ -16735,11 +16788,19 @@ impl TerminalRuntime {
         profile: &LaunchProfile,
         pane_id: PaneId,
         fallback_title: &str,
+        max_scrollback: usize,
         theme: TerminalTheme,
         notifier: EventNotifier,
         control_endpoint: Option<&str>,
     ) -> (Self, String) {
-        match start_live_session(profile, pane_id, theme, notifier, control_endpoint) {
+        match start_live_session(
+            profile,
+            pane_id,
+            max_scrollback,
+            theme,
+            notifier,
+            control_endpoint,
+        ) {
             Ok(session) => (
                 Self {
                     preview: "Starting local terminal…".into(),
@@ -16783,6 +16844,7 @@ impl TerminalRuntime {
     fn attach(
         pane_id: PaneId,
         title: &str,
+        max_scrollback: usize,
         theme: TerminalTheme,
         notifier: EventNotifier,
         client: Arc<muxtrix_sessions::SessionClient>,
@@ -16808,7 +16870,7 @@ impl TerminalRuntime {
             TerminalOptions {
                 cols: size.cols,
                 rows: size.rows,
-                max_scrollback: 10_000,
+                max_scrollback,
             },
             theme,
             Some(notifier),
@@ -18432,7 +18494,7 @@ fn ghostty_preview() -> Result<String, String> {
     let actor = TerminalActor::spawn(TerminalOptions {
         cols: 80,
         rows: 24,
-        max_scrollback: 10_000,
+        max_scrollback: DEFAULT_TERMINAL_SCROLLBACK_LINES,
     })
     .map_err(|error| error.to_string())?;
     actor
@@ -18566,6 +18628,7 @@ impl muxtrix_terminal::SessionBackend for RemotePaneBackend {
 fn start_live_session(
     profile: &LaunchProfile,
     pane_id: PaneId,
+    max_scrollback: usize,
     theme: TerminalTheme,
     notifier: EventNotifier,
     control_endpoint: Option<&str>,
@@ -18573,6 +18636,7 @@ fn start_live_session(
     start_live_session_with_client(
         profile,
         pane_id,
+        max_scrollback,
         theme,
         notifier,
         control_endpoint,
@@ -18583,6 +18647,7 @@ fn start_live_session(
 fn start_live_session_with_client(
     profile: &LaunchProfile,
     pane_id: PaneId,
+    max_scrollback: usize,
     theme: TerminalTheme,
     notifier: EventNotifier,
     control_endpoint: Option<&str>,
@@ -18605,7 +18670,7 @@ fn start_live_session_with_client(
     let options = TerminalOptions {
         cols: size.cols,
         rows: size.rows,
-        max_scrollback: 10_000,
+        max_scrollback,
     };
     // Daemon-owned PTYs survive this GUI closing. Production never silently
     // falls back to an in-process PTY: doing so can repeat the same blocked
@@ -19556,8 +19621,14 @@ mod tests {
 
     /// Launches a session over [`RecordingBackend`], mirroring how the system
     /// launcher sizes a freshly spawned PTY.
-    struct RecordingLauncher {
+    #[derive(Clone, Default)]
+    struct RecordedLaunches {
         sizes: Arc<Mutex<Vec<PtySize>>>,
+        scrollback_limits: Arc<Mutex<Vec<usize>>>,
+    }
+
+    struct RecordingLauncher {
+        recorded: RecordedLaunches,
         idle: Mutex<Vec<std::sync::mpsc::Sender<Vec<u8>>>>,
     }
 
@@ -19565,9 +19636,14 @@ mod tests {
         fn launch(&self, request: TerminalLaunchRequest) -> Result<LaunchedTerminal, String> {
             let (sender, receiver) = std::sync::mpsc::channel();
             self.idle.lock().expect("idle readers").push(sender);
+            self.recorded
+                .scrollback_limits
+                .lock()
+                .expect("recorded scrollback limits")
+                .push(request.max_scrollback);
             let backend = RecordingBackend {
                 reader: Some(ParkedReader { bytes: receiver }),
-                sizes: Arc::clone(&self.sizes),
+                sizes: Arc::clone(&self.recorded.sizes),
             };
             let session = LiveSession::spawn_remote(
                 Box::new(backend),
@@ -19575,7 +19651,7 @@ mod tests {
                 TerminalOptions {
                     cols: initial_pty_size().cols,
                     rows: initial_pty_size().rows,
-                    max_scrollback: 10_000,
+                    max_scrollback: request.max_scrollback,
                 },
                 request.theme,
                 Some(request.notifier),
@@ -19685,14 +19761,14 @@ mod tests {
         false
     }
 
-    fn install_recording_launcher(app: &mut Muxtrix) -> Arc<Mutex<Vec<PtySize>>> {
-        let sizes = Arc::new(Mutex::new(Vec::new()));
+    fn install_recording_launcher(app: &mut Muxtrix) -> RecordedLaunches {
+        let recorded = RecordedLaunches::default();
         app.terminal_launcher = Arc::new(RecordingLauncher {
-            sizes: Arc::clone(&sizes),
+            recorded: recorded.clone(),
             idle: Mutex::new(Vec::new()),
         });
         app.launch_in_background = true;
-        sizes
+        recorded
     }
 
     fn release_launcher(gate: &Arc<(Mutex<bool>, std::sync::Condvar)>) {
@@ -20022,7 +20098,8 @@ mod tests {
     #[test]
     fn a_pane_measured_during_its_launch_keeps_that_size_once_the_session_arrives() {
         let mut app = Muxtrix::new();
-        let sizes = install_recording_launcher(&mut app);
+        app.settings.terminal_scrollback_lines = 25_000;
+        let recorded = install_recording_launcher(&mut app);
         app.split_terminal(SplitAxis::Horizontal)
             .expect("pane creation should enqueue a launch");
         let pane_id = active_pane_id(&app);
@@ -20058,7 +20135,8 @@ mod tests {
         // The live session forwards resizes on its own thread.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline
-            && sizes
+            && recorded
+                .sizes
                 .lock()
                 .expect("recorded sizes")
                 .last()
@@ -20067,9 +20145,22 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(
-            sizes.lock().expect("recorded sizes").last().copied(),
+            recorded
+                .sizes
+                .lock()
+                .expect("recorded sizes")
+                .last()
+                .copied(),
             Some(expected),
             "the PTY should end up sized to the pane it is drawn into"
+        );
+        assert_eq!(
+            *recorded
+                .scrollback_limits
+                .lock()
+                .expect("recorded scrollback limits"),
+            vec![25_000],
+            "new panes should use the configured scrollback history"
         );
     }
 

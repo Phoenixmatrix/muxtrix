@@ -39,7 +39,6 @@ struct PiTitle<'a> {
 /// Codex and Claude approval hooks are advisory because their harnesses may
 /// auto-resolve them. Pi's approval events are exact, so only those two agents
 /// require a visible blocker before entering Waiting.
-
 pub(crate) fn requires_screen_confirmed_wait(agent: &str) -> bool {
     matches!(
         agent.to_ascii_lowercase().as_str(),
