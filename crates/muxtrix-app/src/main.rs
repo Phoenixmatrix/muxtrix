@@ -20334,7 +20334,7 @@ mod tests {
             github::PullRequestSummaryStatus::Open
         );
         assert_eq!(
-            github_keyboard_focus_step(&panel, GitHubPanelKeyboardFocus::DraftAction, true),
+            github_keyboard_focus_step(panel, GitHubPanelKeyboardFocus::DraftAction, true),
             GitHubPanelKeyboardFocus::MergeAction
         );
     }
