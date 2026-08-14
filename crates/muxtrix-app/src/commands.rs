@@ -77,7 +77,7 @@ pub(crate) struct Command {
     pub(crate) action: CommandAction,
 }
 
-const COMMANDS: [Command; 31] = [
+const COMMANDS: [Command; 32] = [
     Command {
         title: "Split pane right",
         subtitle: "Open an independent terminal beside the focused pane",
@@ -289,6 +289,13 @@ const COMMANDS: [Command; 31] = [
         action: CommandAction::LaunchAgent(Agent::Claude),
     },
     Command {
+        title: "Launch Oh My Pi",
+        subtitle: "Start the configured Oh My Pi command in a new terminal pane",
+        keywords: "agent open run coding pi omp oh my pi",
+        shortcut: "",
+        action: CommandAction::LaunchAgent(Agent::Pi),
+    },
+    Command {
         title: "Return to workspace",
         subtitle: "Leave settings and show terminal panes",
         keywords: "terminal back home",
@@ -347,6 +354,9 @@ mod tests {
             commands[0].action,
             CommandAction::LaunchAgent(Agent::Claude)
         );
+        let commands = filtered("launch pi");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].action, CommandAction::LaunchAgent(Agent::Pi));
     }
 
     #[test]

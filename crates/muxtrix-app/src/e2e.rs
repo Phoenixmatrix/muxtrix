@@ -739,14 +739,30 @@ impl Scenario {
             app.open_settings();
             app.hook_statuses = Agent::ALL
                 .into_iter()
-                .map(|agent| HookStatus {
-                    agent,
-                    scope: HookScope::User,
-                    target: "/home/user/.claude/settings.json".into(),
-                    installed: agent == Agent::Codex,
-                    managed_entries: 9,
-                    backup_available: true,
-                    unreachable_entries: if agent == Agent::Claude { 9 } else { 0 },
+                .map(|agent| {
+                    let managed_entries = match agent {
+                        Agent::Codex => 8,
+                        Agent::Claude => 9,
+                        Agent::Pi => 4,
+                    };
+                    HookStatus {
+                        agent,
+                        scope: HookScope::User,
+                        target: match agent {
+                            Agent::Codex => "/home/user/.codex/hooks.json",
+                            Agent::Claude => "/home/user/.claude/settings.json",
+                            Agent::Pi => "/home/user/.omp/agent/extensions/muxtrix-lifecycle.ts",
+                        }
+                        .into(),
+                        installed: agent == Agent::Codex,
+                        managed_entries,
+                        backup_available: true,
+                        unreachable_entries: if agent == Agent::Claude {
+                            managed_entries
+                        } else {
+                            0
+                        },
+                    }
                 })
                 .collect();
         } else if self.settle_ticks == 1
@@ -909,10 +925,10 @@ impl Scenario {
                 self.tab_pane
                     .ok_or_else(|| "new-tab pane was not recorded".to_owned())?,
                 AgentPaneStatus {
-                    agent: "gemini".into(),
-                    display_name: Some("audit-release-assets".into()),
+                    agent: "pi".into(),
+                    display_name: Some("oh-my-pi-release-audit".into()),
                     state: AgentState::Completed,
-                    activity: Some("Checks passed".into()),
+                    activity: Some("Oh My Pi checks passed".into()),
                     session_id: None,
                     cwd: Some("/home/user/dev/muxtrix".into()),
                     git_branch: Some("release".into()),
@@ -927,7 +943,7 @@ impl Scenario {
                 (
                     self.tab_pane
                         .ok_or_else(|| "new-tab pane was not recorded".to_owned())?,
-                    None,
+                    Some("oh-my-pi-release-audit"),
                 ),
             ] {
                 let directory = app
@@ -1278,7 +1294,7 @@ impl Scenario {
                     AgentState::Stopped,
                     Some("Interrupted"),
                 ),
-                (tab_pane, "gemini", "idle-scout", AgentState::Idle, None),
+                (tab_pane, "pi", "idle-scout", AgentState::Idle, None),
             ] {
                 app.agent_statuses.insert(
                     pane_id,
