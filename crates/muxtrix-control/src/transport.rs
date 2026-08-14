@@ -1,6 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,8 +9,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use interprocess::local_socket::{
-    GenericFilePath, GenericNamespaced, ListenerOptions, Name, Stream, ToFsName as _,
-    ToNsName as _,
+    GenericFilePath, GenericNamespaced, ListenerNonblockingMode, ListenerOptions, Name, Stream,
+    ToFsName as _, ToNsName as _,
     traits::{Listener as _, Stream as _},
 };
 use thiserror::Error;
@@ -102,6 +102,55 @@ impl Endpoint {
     }
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn socket_identity(endpoint: &Endpoint) -> io::Result<SocketIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(&endpoint.address)?;
+    Ok(SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn remove_socket_if_unchanged(endpoint: &Endpoint, expected: SocketIdentity) -> io::Result<bool> {
+    match socket_identity(endpoint) {
+        Ok(current) if current == expected => match std::fs::remove_file(&endpoint.address) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error),
+        },
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// Removes a Unix socket only while the path still names the listener that
+/// created this guard. Another process may replace a socket path without
+/// waking its old listener; unconditional name reclamation would then delete
+/// the replacement's endpoint during old-server teardown.
+#[cfg(unix)]
+struct OwnedSocketPath {
+    endpoint: Endpoint,
+    identity: SocketIdentity,
+}
+
+#[cfg(unix)]
+impl Drop for OwnedSocketPath {
+    fn drop(&mut self) {
+        let _ = remove_socket_if_unchanged(&self.endpoint, self.identity);
+    }
+}
+
 fn user_endpoint_suffix() -> String {
     let identity = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -138,10 +187,59 @@ impl ControlServer {
         endpoint: Endpoint,
         notifier: Option<ControlNotifier>,
     ) -> Result<Self, ControlError> {
-        let listener = ListenerOptions::new()
-            .name(endpoint.name()?)
-            .try_overwrite(true)
-            .create_sync()?;
+        let create_listener = || -> Result<_, ControlError> {
+            ListenerOptions::new()
+                .name(endpoint.name()?)
+                .nonblocking(ListenerNonblockingMode::Accept)
+                .create_sync()
+                .map_err(ControlError::Io)
+        };
+        let mut listener = match create_listener() {
+            Ok(listener) => listener,
+            #[cfg(unix)]
+            Err(ControlError::Io(bind_error)) if bind_error.kind() == io::ErrorKind::AddrInUse => {
+                let occupied_identity = socket_identity(&endpoint).ok();
+                // Connecting is the ownership probe. A listener that accepts
+                // but never answers may be overloaded, not stale, so protocol
+                // response time must never authorize unlinking its endpoint.
+                match Stream::connect(endpoint.name()?) {
+                    Ok(stream) => {
+                        drop(stream);
+                        return Err(ControlError::Io(bind_error));
+                    }
+                    Err(connect_error)
+                        if connect_error.kind() == io::ErrorKind::ConnectionRefused =>
+                    {
+                        let Some(occupied_identity) = occupied_identity else {
+                            return Err(ControlError::Io(bind_error));
+                        };
+                        match remove_socket_if_unchanged(&endpoint, occupied_identity) {
+                            Ok(true) => create_listener()?,
+                            Ok(false) => return Err(ControlError::Io(bind_error)),
+                            Err(error) => return Err(ControlError::Io(error)),
+                        }
+                    }
+                    // The endpoint disappeared after bind reported it occupied.
+                    // Retry normally; a concurrent live owner wins with
+                    // AddrInUse and is never overwritten.
+                    Err(connect_error) if connect_error.kind() == io::ErrorKind::NotFound => {
+                        create_listener()?
+                    }
+                    Err(_) => return Err(ControlError::Io(bind_error)),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+
+        #[cfg(unix)]
+        let socket_path = {
+            let identity = socket_identity(&endpoint)?;
+            listener.do_not_reclaim_name_on_drop();
+            OwnedSocketPath {
+                endpoint: endpoint.clone(),
+                identity,
+            }
+        };
 
         #[cfg(unix)]
         {
@@ -155,15 +253,26 @@ impl ControlServer {
         let thread = thread::Builder::new()
             .name("muxtrix-control".into())
             .spawn(move || {
-                while let Ok(stream) = listener.accept() {
-                    if !thread_running.load(Ordering::Acquire) {
-                        break;
+                #[cfg(unix)]
+                let _socket_path = socket_path;
+                while thread_running.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok(stream) => {
+                            if !thread_running.load(Ordering::Acquire) {
+                                break;
+                            }
+                            let sender = sender.clone();
+                            let notifier = notifier.clone();
+                            let _ = thread::Builder::new()
+                                .name("muxtrix-control-client".into())
+                                .spawn(move || handle_connection(stream, sender, notifier));
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::park_timeout(Duration::from_millis(50));
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
                     }
-                    let sender = sender.clone();
-                    let notifier = notifier.clone();
-                    let _ = thread::Builder::new()
-                        .name("muxtrix-control-client".into())
-                        .spawn(move || handle_connection(stream, sender, notifier));
                 }
             })?;
 
@@ -199,12 +308,11 @@ impl ControlServer {
 impl Drop for ControlServer {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
-        if let Ok(name) = self.endpoint.name()
-            && let Ok(mut stream) = Stream::connect(name)
-        {
-            let _ = stream.write_all(b"\n");
-        }
         if let Some(thread) = self.thread.take() {
+            // The listener is nonblocking, so unparking the idle accept loop is
+            // enough to stop it. This does not depend on the endpoint pathname
+            // still referring to this server.
+            thread.thread().unpark();
             let _ = thread.join();
         }
     }
@@ -289,17 +397,21 @@ pub enum ControlError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn local_transport_round_trips_typed_requests() {
-        let endpoint = if cfg!(windows) {
-            Endpoint::platform(format!("muxtrix-test-{}", std::process::id()))
+    fn test_endpoint(label: &str) -> Endpoint {
+        if cfg!(windows) {
+            Endpoint::platform(format!("muxtrix-test-{label}-{}", std::process::id()))
         } else {
             Endpoint::file(std::env::temp_dir().join(format!(
-                "muxtrix-control-test-{}-{:?}.sock",
+                "muxtrix-control-test-{label}-{}-{:?}.sock",
                 std::process::id(),
                 std::thread::current().id()
             )))
-        };
+        }
+    }
+
+    #[test]
+    fn local_transport_round_trips_typed_requests() {
+        let endpoint = test_endpoint("round-trip");
         let server = ControlServer::bind(endpoint.clone()).expect("server should bind");
         let handler = std::thread::spawn(move || {
             let incoming = loop {
@@ -316,6 +428,82 @@ mod tests {
         assert!(response.ok);
         assert_eq!(response.message.as_deref(), Some("pong"));
         handler.join().expect("handler should finish");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connected_but_unresponsive_endpoint_is_never_reclaimed() {
+        use std::os::unix::net::UnixListener;
+
+        let endpoint = test_endpoint("live-owner");
+        let path = PathBuf::from(endpoint.environment_value());
+        let owner = UnixListener::bind(&path).expect("live owner should bind");
+        let owner_identity =
+            socket_identity(&endpoint).expect("live endpoint should have identity");
+
+        let error = match ControlServer::bind(endpoint.clone()) {
+            Ok(server) => {
+                drop(server);
+                panic!("a connected endpoint must never be overwritten");
+            }
+            Err(ControlError::Io(error)) => error,
+            Err(error) => panic!("unexpected bind error: {error}"),
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(
+            socket_identity(&endpoint).expect("live endpoint should remain"),
+            owner_identity
+        );
+        drop(owner);
+        std::fs::remove_file(path).expect("test endpoint should be removable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connection_refused_endpoint_is_reclaimed() {
+        use std::os::unix::net::UnixListener;
+
+        let endpoint = test_endpoint("stale-owner");
+        let path = PathBuf::from(endpoint.environment_value());
+        let stale = UnixListener::bind(&path).expect("stale owner should bind");
+        drop(stale);
+
+        let server = ControlServer::bind(endpoint).expect("stale endpoint should be reclaimed");
+        drop(server);
+
+        assert!(!path.exists(), "server teardown should remove its socket");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_server_ignores_a_replaced_socket_path() {
+        use std::os::unix::net::UnixListener;
+
+        let endpoint = test_endpoint("replaced-owner");
+        let path = PathBuf::from(endpoint.environment_value());
+        let server = ControlServer::bind(endpoint.clone()).expect("server should bind");
+        std::fs::remove_file(&path).expect("original endpoint should be replaceable");
+        let replacement = UnixListener::bind(&path).expect("replacement should bind");
+        let replacement_identity =
+            socket_identity(&endpoint).expect("replacement should have identity");
+        let (finished_sender, finished_receiver) = mpsc::sync_channel(1);
+
+        let teardown = std::thread::spawn(move || {
+            drop(server);
+            let _ = finished_sender.send(());
+        });
+
+        finished_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server teardown must not wait for a pathname wake-up");
+        teardown.join().expect("server teardown should finish");
+        assert_eq!(
+            socket_identity(&endpoint).expect("replacement endpoint should remain"),
+            replacement_identity
+        );
+        drop(replacement);
+        std::fs::remove_file(path).expect("test endpoint should be removable");
     }
 
     #[test]
