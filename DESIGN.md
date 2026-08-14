@@ -233,7 +233,7 @@ The collapsed fleet rail keeps pane identity as well as state: each ruled row
 shows its numeric pane identity and signal without shortcut notation, while its
 tooltip exposes the full title, state, and latest truthful activity.
 
-Only installed monospaced families appear in Terminal typography. Never offer
+Only installed monospaced families appear in Terminal text and history. Never offer
 a named font that would silently fall back to proportional text; unavailable
 saved choices recover to System monospace and surface a global warning.
 
