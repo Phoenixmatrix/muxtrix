@@ -6824,7 +6824,6 @@ impl Muxtrix {
                             self.agent_running_frame_revisions
                                 .insert(pane_id, frame_revision);
                         }
-                        self.status = format!("{agent}: {body}");
                         return ControlResponse::success(
                             "agent lifecycle metadata updated; live screen retains state authority",
                         );
@@ -6862,11 +6861,8 @@ impl Muxtrix {
                             // a request for the user. It also resolves any
                             // attention left by an earlier waiting state.
                             self.clear_pane_attention(pane_id);
-                            self.status = format!("{agent}: {body}");
                         }
-                        AgentState::Idle | AgentState::Running | AgentState::Stopped => {
-                            self.status = format!("{agent}: {body}");
-                        }
+                        AgentState::Idle | AgentState::Running | AgentState::Stopped => {}
                     }
                     ControlResponse::success("agent lifecycle state updated")
                 }
@@ -7018,9 +7014,6 @@ impl Muxtrix {
                     body: activity.into(),
                 },
             );
-        } else {
-            debug_assert!(!classification.rule.is_empty());
-            self.status = format!("{agent}: {activity}");
         }
     }
 
@@ -7119,7 +7112,6 @@ impl Muxtrix {
             pane.attention.unread_count = pane.attention.unread_count.saturating_add(1);
             pane.attention.message = Some(notification.body.clone());
         }
-        self.status = format!("{}: {}", notification.title, notification.body);
         self.notifications.push(AgentNotification {
             pane_id,
             unread: !focused,
@@ -23083,6 +23075,46 @@ mod tests {
         assert_eq!(pane.attention.unread_count, 0);
         assert!(!app.notifications[0].unread);
         assert!(app.global_alerts.is_empty());
+    }
+
+    #[test]
+    fn agent_lifecycle_updates_fleet_without_repainting_workspace_status() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.settings.show_status_bar = true;
+        app.status = "Process status".into();
+
+        let running = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Running,
+            event: Some("UserPromptSubmit".into()),
+            title: "Codex · UserPromptSubmit".into(),
+            body: "Agent is running".into(),
+            pane_id: Some(pane_id.as_uuid().to_string()),
+            session_id: Some("thread-1".into()),
+            cwd: Some("/workspace".into()),
+        });
+
+        assert!(running.ok);
+        assert_eq!(app.status, "Process status");
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+        assert_eq!(app.pane_activity(pane_id, None), "Agent is running");
+
+        let completed = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Completed,
+            event: Some("Stop".into()),
+            title: "Codex · Stop".into(),
+            body: "Agent completed a turn".into(),
+            pane_id: Some(pane_id.as_uuid().to_string()),
+            session_id: Some("thread-1".into()),
+            cwd: Some("/workspace".into()),
+        });
+
+        assert!(completed.ok);
+        assert_eq!(app.status, "Process status");
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Completed);
+        assert_eq!(app.pane_activity(pane_id, None), "Agent completed a turn");
     }
 
     #[test]
