@@ -117,9 +117,10 @@ Muxtrix subscribes to session start/end, prompt submission, permission, stop,
 and sub-agent events for Codex and Claude Code. Claude Code also contributes
 notification and teammate-idle events. Oh My Pi does not use Codex/Claude-style
 JSON hook arrays; its managed module is a native `.omp` extension that listens
-to `session_start`, `agent_start`, `agent_end`, and `session_shutdown`. Hooks
-identify the pane, session, working directory, and coarse turn boundaries.
-Completion and failure still create attention on the originating fleet entry.
+to session lifecycle, agent lifecycle, approval, compaction, and handoff
+maintenance events. Hooks identify the pane, session, working directory, and
+coarse turn boundaries. Completion and failure still create attention on the
+originating fleet entry.
 
 For Codex and Claude Code, hooks are not the authority for live interactive
 state. Codex emits `PermissionRequest` before its automatic reviewer decides,
@@ -129,8 +130,9 @@ from the current terminal screen and OSC title. Only a recognized, visible
 approval or answer surface can create `Needs input`; only newer screen evidence
 can clear it. `Done` preserves the previous completion while the composer is
 idle, but a positively recognized working frame starts the next turn even when
-its `UserPromptSubmit` hook was delayed or unavailable. Existing hook
-installations require no repair for this change.
+its `UserPromptSubmit` hook was delayed or unavailable. Codex and Claude Code
+installations require no repair for this screen-authority change; Pi
+installations missing maintenance events are repaired through hook status/re-add.
 See [Agent state detection](AGENT_STATE_DETECTION.md) for the research,
 precedence rules, tradeoffs, and limitations.
 
