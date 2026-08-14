@@ -166,6 +166,7 @@ enum TickAction {
     Wait,
     ScrollGitHubToEnd,
     ScrollGitHubPullRequestsToEnd,
+    ScrollSettingsToEnd,
     Capture,
 }
 
@@ -601,6 +602,9 @@ impl Scenario {
                 if self.capturing("github-pull-requests-scrolled") && self.settle_ticks == 2 {
                     return Ok(TickAction::ScrollGitHubPullRequestsToEnd);
                 }
+                if self.capturing("settings-version-mismatch") && self.settle_ticks == 2 {
+                    return Ok(TickAction::ScrollSettingsToEnd);
+                }
                 if self.capturing("github-scrolled")
                     && self.settle_ticks >= 5
                     && app
@@ -622,6 +626,7 @@ impl Scenario {
                 if self.settle_ticks
                     >= if self.capturing("github-scrolled")
                         || self.capturing("github-pull-requests-scrolled")
+                        || self.capturing("settings-version-mismatch")
                     {
                         5
                     } else {
@@ -731,12 +736,20 @@ impl Scenario {
                 )
                 .map_err(|error| error.to_string())?;
         } else if self.capturing("settings") {
-            app.open_settings();
+            drop(app.open_settings());
+        } else if self.capturing("settings-version-mismatch") {
+            drop(app.open_settings());
+            let installed = next_patch_version(env!("CARGO_PKG_VERSION"));
+            app.installed_versions =
+                super::InstalledVersionsState::Ready(super::InstalledVersions {
+                    muxtrix: Ok(installed.clone()),
+                    muxtrixctl: Ok(installed),
+                });
         } else if self.capturing("hook-repair") {
             // Hooks whose muxtrixctl was removed under them: they still
             // read as Muxtrix's own by their text, so the row has to
             // say why it cannot work rather than call itself installed.
-            app.open_settings();
+            drop(app.open_settings());
             app.hook_statuses = Agent::ALL
                 .into_iter()
                 .map(|agent| {
@@ -1738,6 +1751,16 @@ impl Scenario {
     }
 }
 
+fn next_patch_version(version: &str) -> String {
+    let Some((prefix, patch)) = version.rsplit_once('.') else {
+        return format!("{version}+installed");
+    };
+    patch.parse::<u64>().map_or_else(
+        |_| format!("{version}+installed"),
+        |patch| format!("{prefix}.{}", patch + 1),
+    )
+}
+
 impl Muxtrix {
     pub(super) fn drive_e2e(&mut self) -> Task<Message> {
         let Some(mut scenario) = self.e2e.take() else {
@@ -1758,6 +1781,12 @@ impl Muxtrix {
                 self.e2e = Some(scenario);
                 iced::widget::operation::snap_to_end(iced::widget::Id::new(
                     super::GITHUB_PULL_REQUEST_SCROLL_ID,
+                ))
+            }
+            Ok(TickAction::ScrollSettingsToEnd) => {
+                self.e2e = Some(scenario);
+                iced::widget::operation::snap_to_end(iced::widget::Id::new(
+                    super::SETTINGS_PREFERENCES_SCROLL_ID,
                 ))
             }
             Ok(TickAction::Capture) => {

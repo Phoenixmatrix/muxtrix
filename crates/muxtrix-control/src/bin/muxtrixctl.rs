@@ -32,6 +32,10 @@ fn run(arguments: &[String]) -> Result<(), String> {
     let Some(command) = arguments.first().map(String::as_str) else {
         return Err(usage());
     };
+    if matches!(command, "--version" | "-V") {
+        println!("muxtrixctl {}", muxtrix_control::VERSION);
+        return Ok(());
+    }
     if command == "hooks" {
         return run_hooks(&arguments[1..]);
     }
@@ -320,7 +324,8 @@ fn agent_display_name(agent: &str) -> &str {
 }
 
 fn usage() -> String {
-    "usage: muxtrixctl <ping|notify|launch|split|focus|close|send|capture|panes|hooks> ...".into()
+    "usage: muxtrixctl [--version] <ping|notify|launch|split|focus|close|send|capture|panes|hooks> ..."
+        .into()
 }
 
 fn hooks_usage() -> String {
@@ -336,6 +341,12 @@ mod tests {
         let arguments = vec!["send".into(), "echo test".into(), "--pane".into()];
         let error = run(&arguments).expect_err("a missing pane id should be rejected");
         assert_eq!(error, "--pane requires a value on the same command");
+    }
+
+    #[test]
+    fn version_flag_is_a_complete_command() {
+        assert_eq!(run(&["--version".into()]), Ok(()));
+        assert_eq!(run(&["-V".into()]), Ok(()));
     }
 
     #[test]

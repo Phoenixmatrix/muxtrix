@@ -280,6 +280,13 @@ local-only-commit risk, and actions have distinct lanes; repository discovery
 and per-checkout Git inspection happen off the UI thread behind an immediate
 loading state.
 
+Preferences ends with a Versions group for the Muxtrix window and its local
+control service. Each row keeps the active build primary and the installed
+binary comparison secondary. The disk probe runs off the UI thread against the
+package-managed launch path retained at startup, so replacing an executable
+while this window remains open produces an amber, textual restart notice
+instead of silently reporting the old inode as current.
+
 The inventory's lanes are derived once from the window's real width and shared
 by the header, every row, and the ellipsis budgets, so the three cannot drift
 apart. The three trailing lanes hold bounded copy and stay fixed; identity and
