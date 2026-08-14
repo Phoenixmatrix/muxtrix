@@ -38,6 +38,8 @@ pub(crate) enum CommandAction {
     RestartPaneInExistingWorktreeWithAgent,
     ManageWorktrees,
     ManageSessions,
+    FleetCurrentWorkspace,
+    FleetAllWorkspaces,
     FleetTabs,
     FleetAgents,
     FleetRepos,
@@ -90,7 +92,7 @@ pub(crate) struct Command {
     pub(crate) action: CommandAction,
 }
 
-const COMMANDS: [Command; 36] = [
+const COMMANDS: [Command; 38] = [
     Command {
         title: "Split pane right",
         subtitle: "Open an independent terminal beside the focused pane",
@@ -281,9 +283,23 @@ const COMMANDS: [Command; 36] = [
         action: CommandAction::ManageSessions,
     },
     Command {
+        title: "Fleet: show current workspace",
+        subtitle: "Limit the fleet rail to panes in the selected workspace",
+        keywords: "fleet scope current selected workspace only rail sidebar",
+        shortcut: "",
+        action: CommandAction::FleetCurrentWorkspace,
+    },
+    Command {
+        title: "Fleet: show all workspaces",
+        subtitle: "Group panes from every workspace in the fleet rail",
+        keywords: "fleet scope all every workspaces group rail sidebar",
+        shortcut: "",
+        action: CommandAction::FleetAllWorkspaces,
+    },
+    Command {
         title: "Fleet: show tabs",
         subtitle: "List every pane in tab order in the fleet rail",
-        keywords: "fleet view rail sidebar panes tabs all toggle",
+        keywords: "fleet view rail sidebar panes tabs toggle",
         shortcut: "",
         action: CommandAction::FleetTabs,
     },
@@ -405,6 +421,13 @@ mod tests {
         let commands = filtered("fleet repository");
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].action, CommandAction::FleetRepos);
+    }
+
+    #[test]
+    fn all_workspace_scope_command_is_searchable() {
+        let commands = filtered("fleet every workspaces");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].action, CommandAction::FleetAllWorkspaces);
     }
 
     #[test]

@@ -55,7 +55,16 @@ pub(crate) enum WindowsShellBackend {
     Wsl,
 }
 
-/// How the fleet projects the selected workspace's panes.
+/// Which workspaces contribute panes to the fleet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum FleetScope {
+    #[default]
+    CurrentWorkspace,
+    AllWorkspaces,
+}
+
+/// How the fleet projects panes inside its selected workspace scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum FleetView {
@@ -603,6 +612,7 @@ pub(crate) struct AppSettings {
     pub(crate) ui_font_weight: FontWeight,
     pub(crate) ui_font_size: f32,
     pub(crate) fleet_view: FleetView,
+    pub(crate) fleet_scope: FleetScope,
     pub(crate) terminal_theme: TerminalThemeId,
     pub(crate) terminal_font: TerminalFont,
     pub(crate) terminal_font_weight: FontWeight,
@@ -627,6 +637,7 @@ impl Default for AppSettings {
             ui_font_weight: FontWeight::Normal,
             ui_font_size: 16.0,
             fleet_view: FleetView::Tabs,
+            fleet_scope: FleetScope::CurrentWorkspace,
             terminal_theme: TerminalThemeId::MuxtrixDark,
             terminal_font: TerminalFont::SystemMonospace,
             terminal_font_weight: FontWeight::Normal,
@@ -887,6 +898,7 @@ mod tests {
             ui_font_weight: FontWeight::Medium,
             ui_font_size: 99.0,
             fleet_view: FleetView::Agents,
+            fleet_scope: FleetScope::AllWorkspaces,
             terminal_theme: TerminalThemeId::Dracula,
             terminal_font: TerminalFont::named("Cascadia Mono"),
             terminal_font_weight: FontWeight::Semibold,
@@ -914,6 +926,7 @@ mod tests {
         assert_eq!(restored.ui_font, UiFont::named("Inter"));
         assert_eq!(restored.ui_font_weight, FontWeight::Medium);
         assert_eq!(restored.fleet_view, FleetView::Agents);
+        assert_eq!(restored.fleet_scope, FleetScope::AllWorkspaces);
         assert_eq!(restored.terminal_theme, TerminalThemeId::Dracula);
         assert_eq!(restored.appearance, Appearance::Dark);
         assert!(restored.show_status_bar);
@@ -955,6 +968,17 @@ mod tests {
     }
 
     #[test]
+    fn all_workspaces_fleet_scope_round_trips_with_its_stable_settings_name() {
+        let encoded =
+            serde_json::to_string(&FleetScope::AllWorkspaces).expect("scope should serialize");
+        assert_eq!(encoded, "\"all-workspaces\"");
+        assert_eq!(
+            serde_json::from_str::<FleetScope>(&encoded).expect("scope should deserialize"),
+            FleetScope::AllWorkspaces
+        );
+    }
+
+    #[test]
     fn font_weights_follow_the_faces_available_for_a_family() {
         assert_eq!(
             font_weight_choices([390, 610, 700, 610]),
@@ -984,10 +1008,10 @@ mod tests {
 
     #[test]
     fn old_or_partial_settings_receive_defaults() {
-        let restored: AppSettings =
-            serde_json::from_str(r#"{"terminal_font_size":18.0,"fleet_scope":"all-workspaces"}"#)
-                .expect("partial settings with the retired fleet scope should deserialize");
+        let restored: AppSettings = serde_json::from_str(r#"{"terminal_font_size":18.0}"#)
+            .expect("partial settings should deserialize");
         assert_eq!(restored.terminal_font_size, 18.0);
+        assert_eq!(restored.fleet_scope, FleetScope::CurrentWorkspace);
         assert_eq!(restored.terminal_font, TerminalFont::SystemMonospace);
         assert_eq!(restored.ui_font_size, 16.0);
         assert_eq!(restored.ui_font, UiFont::SystemSans);

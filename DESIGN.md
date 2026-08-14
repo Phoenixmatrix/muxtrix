@@ -54,27 +54,32 @@ and panes runs through command-palette actions that open one shared focused
 rename dialog; workspace rows carry no inline edit affordances. A pane rename
 is an override: clearing it restores the automatic terminal/agent title.
 
-The fleet follows the selected workspace without repeating its workspace name.
-The right-aligned rail header carries a three-segment Tabs/Agents/Repos toggle
-with 10 pt labels. Tabs lists every pane in tab order under its existing tab bands, while
-Agents is a flat filter of that same order containing agent panes only, with a
-quiet empty state when none are running. Repos lists every pane under one
-recessed band for the Git repository detected from its live working directory,
-merging panes from different tabs when their repository names match. Panes
-outside Git collect in a final `No Repo` band. Repos never nests tab bands:
-the repository alone is enough context. Detection is cached by working
-directory and runs away from the UI thread so WSL-aware Git probes cannot
-interrupt terminal rendering. The selected segment owns both the raised fill and its own
-border so the active projection is unambiguous. The choice persists as a
-settings preference without visiting the settings screen.
+The Fleet scope is explicit. `This` follows the selected workspace without
+repeating its workspace name. `All` lists every workspace in session order and
+inserts a recessed uppercase workspace band before that workspace's visible
+rows; selecting a band switches to that workspace without changing the scope.
+The rail header carries a compact This/All scope toggle beside the
+Tabs/Agents/Repos projection toggle. Tabs lists every pane in tab order under
+its existing tab bands. Agents filters that same order to agent panes only; in
+All scope each non-empty workspace remains a separate group, and an entirely
+empty result keeps the quiet explanatory state. Repos lists every pane under
+the Git repository detected from its live working directory. It merges panes
+from different tabs only within one workspace; equal repository names in
+different workspaces remain under their respective workspace bands. Panes
+outside Git collect in a final `No Repo` band for that workspace. Repos never
+nests tab bands: workspace and repository are enough context. Detection is
+cached by working directory and runs away from the UI thread so WSL-aware Git
+probes cannot interrupt terminal rendering. Each selected segment owns both
+the raised fill and its own border. Scope and projection persist as settings
+preferences without visiting the settings screen.
 
 Fleet rows show only what is true for their pane. Every expanded row uses two
 lines: state signal and linked-worktree name (or repository name, falling back
 to the live directory) first; pane title and truthful state second. Agent panes
 carry their reported lifecycle. Plain terminal panes use their real terminal
 state such as Shell, Starting, Exited, or Unavailable rather than fabricating an
-agent lifecycle. Shortcut numbers follow the currently displayed order within
-the selected workspace, in every projection.
+agent lifecycle. Shortcut numbers follow the currently displayed order — and
+workspace session order in All scope — in every projection.
 
 The supported minimum window is 720 x 480 logical pixels. The rail collapses
 only when the user collapses it — never automatically on resize. Terminal
@@ -166,11 +171,11 @@ row spends that lane on truthful activity or command copy instead. Unread count
 sits immediately before state when present. Both flexible text lanes are shaped
 in the configured interface face and ellipsized to the measured width left
 after fixed trailing content claims its space. Direct pane navigation remains
-keyboard-only: expanded rows never print Ctrl/Cmd+1 through 9 hints. Tabs and
-repositories group under recessed uppercase bands that carry an amber rollup
-dot when any pane inside needs a person. Repos uses only its repository bands,
-with no nested tab grouping. The workspace card above the fleet keeps the
-roll-up: name, state, counts, and the live mono path.
+keyboard-only: expanded rows never print Ctrl/Cmd+1 through 9 hints. Workspaces,
+tabs, and repositories group under recessed uppercase bands that carry an amber
+rollup dot when a visible pane inside needs a person. Repos uses workspace and
+repository bands only, with no nested tab grouping. The workspace cards above
+the fleet keep their roll-ups: name, state, counts, and the live mono path.
 
 A rail row never changes type weight with its state. Weight is the one property
 that alters text metrics, so varying it re-fits the row's own ellipsis and

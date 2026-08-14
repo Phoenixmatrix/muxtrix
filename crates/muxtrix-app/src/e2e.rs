@@ -13,7 +13,7 @@ use super::{
     GitHubPanelState, GitHubPanelTab, HookScope, HookStatus, Message, Muxtrix, PaneRepository,
     TerminalMouseButton, WorktreeManagerEntry, WorktreeManagerMode, WorktreeManagerState, github,
 };
-use crate::settings::FleetView;
+use crate::settings::{FleetScope, FleetView};
 
 const REPORT_ENV: &str = "MUXTRIX_E2E_REPORT";
 const SCREENSHOT_ENV: &str = "MUXTRIX_E2E_SCREENSHOT_RGBA";
@@ -971,6 +971,49 @@ impl Scenario {
                 .ok_or_else(|| "active tab is missing".to_owned())?
                 .focused_pane_id;
             app.pane_menu = Some(focused);
+        } else if self.settle_ticks == 1 && self.capturing("fleet-all-workspaces") {
+            let active_workspace_id = app.session.active_workspace_id;
+            if let Some(workspace) = app
+                .session
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == active_workspace_id)
+            {
+                workspace.name = "muxtrix-core".into();
+            }
+            app.agent_statuses.insert(
+                self.initial_pane,
+                AgentPaneStatus {
+                    agent: "codex".into(),
+                    display_name: Some("fleet-scope".into()),
+                    state: AgentState::Waiting,
+                    activity: Some("Needs approval".into()),
+                    session_id: None,
+                    cwd: Some("/home/user/dev/muxtrix".into()),
+                    git_branch: Some("main".into()),
+                },
+            );
+            app.workspace_name_draft = "release-audit".into();
+            app.create_workspace()?;
+            let release_pane = app
+                .active_workspace()?
+                .active_tab()
+                .ok_or_else(|| "capture workspace has no active tab".to_owned())?
+                .focused_pane_id;
+            app.agent_statuses.insert(
+                release_pane,
+                AgentPaneStatus {
+                    agent: "claude".into(),
+                    display_name: Some("release-audit".into()),
+                    state: AgentState::Running,
+                    activity: Some("Running release checks".into()),
+                    session_id: None,
+                    cwd: Some("/home/user/dev/muxtrix".into()),
+                    git_branch: Some("release".into()),
+                },
+            );
+            app.settings.fleet_scope = FleetScope::AllWorkspaces;
+            app.settings.fleet_view = FleetView::Tabs;
         } else if self.capturing("fleet-agents") {
             // Stage different harnesses across both tabs so the capture
             // proves Agents is one flat selected-workspace projection.
