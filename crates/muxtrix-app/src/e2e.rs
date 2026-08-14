@@ -1664,7 +1664,7 @@ impl Scenario {
             panel.merging = true;
             panel.loading_phase = 4;
             app.github_panel = Some(panel);
-        } else if self.capturing("github-draft-pr") {
+        } else if self.capturing("github-draft-pr") || self.capturing("github-draft-error") {
             app.github_auth = github::AuthStatus::Authenticated {
                 login: "phoenixmatrix".into(),
             };
@@ -1680,6 +1680,10 @@ impl Scenario {
                 pull_request.checks.passed = 4;
                 pull_request.checks.pending = 3;
                 pull_request.checks.failed = 0;
+            }
+            if self.capturing("github-draft-error") {
+                panel.pull_request_action_error =
+                    Some("GitHub could not mark this pull request ready for review.".into());
             }
             app.github_panel = Some(panel);
         } else if self.capturing("layout-vertical") {
@@ -2093,6 +2097,8 @@ fn staged_github_panel() -> GitHubPanelState {
         selected_pull_request_error: None,
         selected_pull_request_file_scroll_offset: 0.0,
         file_keyboard_cursor: None,
+        pull_request_action_error: None,
+        draft_state_updating: false,
         merge_confirmation: false,
         merging: false,
         file_scroll_offset: 0.0,
