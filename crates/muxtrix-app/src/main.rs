@@ -544,7 +544,7 @@ impl GitHubPanelState {
     }
 
     fn active_loading(&self) -> bool {
-        if self.context_loading {
+        if self.context_loading || self.merging {
             return true;
         }
         match self.active_tab {
@@ -5724,6 +5724,10 @@ impl Muxtrix {
         let Some(panel) = self.github_panel.as_mut() else {
             return Task::none();
         };
+        if panel.merging {
+            panel.merge_confirmation = false;
+            return Task::none();
+        }
         let Some(pull_request) = panel
             .selected_pull_request
             .as_ref()
@@ -5738,11 +5742,14 @@ impl Muxtrix {
                 Some("This pull request is not ready to merge yet.".into());
             return Task::none();
         }
-        panel.merging = true;
-        let repository = panel.repository.clone();
-        let root = repository.root.clone();
         let number = pull_request.number;
         let head_oid = pull_request.head_oid.clone();
+        panel.merging = true;
+        panel.merge_confirmation = false;
+        panel.selected_pull_request_error = None;
+        panel.loading_phase = 0;
+        let repository = panel.repository.clone();
+        let root = repository.root.clone();
         perform_blocking(
             move || github::merge(&repository, number, &head_oid),
             move |result| {
@@ -9178,7 +9185,8 @@ impl Muxtrix {
                 .center_y(Fill),
             )
             .on_press_maybe(
-                (!panel.selected_pull_request_loading).then_some(Message::CloseGitHubPullRequest),
+                (!panel.selected_pull_request_loading && !panel.merging)
+                    .then_some(Message::CloseGitHubPullRequest),
             )
             .height(36)
             .width(Fill)
@@ -9509,15 +9517,31 @@ impl Muxtrix {
         tokens: DesignTokens,
     ) -> Element<'a, Message> {
         let readiness = pull_request.readiness();
-        let (readiness_label, readiness_detail, readiness_color) =
-            github_readiness_copy(readiness.clone(), tokens);
-        let mut merge = button(centered_button_label(
-            if panel.merging { "Merging…" } else { "Merge" },
-            self.settings.ui_pixels(8.5),
-        ))
-        .height(30)
-        .padding([0, 12])
-        .style(move |_, status| github_merge_button_style(tokens, status));
+        let (readiness_label, readiness_detail, readiness_color) = if panel.merging {
+            (
+                "Merge in progress",
+                "Waiting for GitHub to finish the merge",
+                tokens.accent,
+            )
+        } else {
+            github_readiness_copy(readiness.clone(), tokens)
+        };
+        let merge_label: Element<'_, Message> = if panel.merging {
+            centered_button_content(
+                row![
+                    signal_dot(tokens.accent, 4.5),
+                    text("Merging…").size(self.settings.ui_pixels(8.5)),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+            )
+        } else {
+            centered_button_label("Merge", self.settings.ui_pixels(8.5))
+        };
+        let mut merge = button(merge_label)
+            .height(30)
+            .padding([0, 12])
+            .style(move |_, status| github_merge_button_style(tokens, status));
         if readiness == github::MergeReadiness::Ready && !panel.merging && !panel.merge_confirmation
         {
             merge = merge.on_press(Message::RequestGitHubMerge);
@@ -9599,7 +9623,90 @@ impl Muxtrix {
         .spacing(6)
         .align_y(Alignment::Center);
 
-        let confirmation: Element<'_, Message> = if panel.merge_confirmation {
+        let merge_progress: Element<'_, Message> = if panel.merging {
+            let active_dot = (panel.loading_phase / 3) % 3;
+            let mut dots = row![].spacing(4).align_y(Alignment::Center);
+            for index in 0..3 {
+                let color = if index == active_dot {
+                    tokens.accent
+                } else if (index + 1) % 3 == active_dot {
+                    Color {
+                        a: 0.52,
+                        ..tokens.accent
+                    }
+                } else {
+                    tokens.line_strong
+                };
+                dots = dots.push(signal_dot(color, 5.0));
+            }
+            container(
+                row![
+                    container(dots)
+                        .width(38)
+                        .height(30)
+                        .align_x(iced::alignment::Horizontal::Center)
+                        .align_y(iced::alignment::Vertical::Center)
+                        .style(move |_| {
+                            container::Style::default()
+                                .background(tokens.panel_raised)
+                                .border(Border {
+                                    color: Color {
+                                        a: 0.42,
+                                        ..tokens.accent
+                                    },
+                                    width: 1.0,
+                                    radius: 7.0.into(),
+                                })
+                        }),
+                    column![
+                        text(format!("Merging pull request #{}…", pull_request.number))
+                            .size(self.settings.ui_pixels(9.0))
+                            .font(Font {
+                                weight: font::Weight::Semibold,
+                                ..Font::DEFAULT
+                            })
+                            .color(tokens.accent),
+                        text("GitHub is creating the merge commit. The branch is kept.")
+                            .size(self.settings.ui_pixels(8.0))
+                            .color(tokens.muted),
+                    ]
+                    .spacing(2)
+                    .width(Fill),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+            .padding(10)
+            .width(Fill)
+            .style(move |_| container::Style {
+                background: Some(
+                    Color {
+                        a: 0.09,
+                        ..tokens.accent
+                    }
+                    .into(),
+                ),
+                border: Border {
+                    color: Color {
+                        a: 0.38,
+                        ..tokens.accent
+                    },
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                shadow: Shadow {
+                    color: Color::from_rgba8(0, 0, 0, 0.18),
+                    offset: Vector::new(0.0, 2.0),
+                    blur_radius: 10.0,
+                },
+                ..container::Style::default()
+            })
+            .into()
+        } else {
+            container("").height(0).into()
+        };
+
+        let confirmation: Element<'_, Message> = if panel.merge_confirmation && !panel.merging {
             container(
                 column![
                     text(format!("Merge pull request #{}?", pull_request.number))
@@ -9658,7 +9765,7 @@ impl Muxtrix {
             container("").height(0).into()
         };
 
-        container(column![readiness_row, title, stats, confirmation].spacing(10))
+        container(column![readiness_row, title, stats, merge_progress, confirmation].spacing(10))
             .padding(12)
             .width(Fill)
             .into()
@@ -19103,6 +19210,61 @@ mod tests {
         assert!(panel.pull_requests_loading);
         assert!(app.github_diff.is_none());
         assert_eq!(app.active_view, ActiveView::Workspace);
+    }
+
+    #[test]
+    fn confirming_github_merge_locks_action_and_enters_loading_state() {
+        let mut app = Muxtrix::new();
+        let repository = github::Repository {
+            root: std::env::temp_dir(),
+            name: "muxtrix".into(),
+            owner_and_name: Some("example/muxtrix".into()),
+            branch: "main".into(),
+            wsl_distribution: String::new(),
+        };
+        let mut panel = GitHubPanelState::loading(repository);
+        panel.active_tab = GitHubPanelTab::PullRequests;
+        panel.loading = false;
+        panel.merge_confirmation = true;
+        panel.selected_pull_request_number = Some(42);
+        panel.selected_pull_request = Some(github::PullRequestDetails {
+            pull_request: github::PullRequest {
+                number: 42,
+                title: "Lock merge action".into(),
+                url: "https://github.com/example/muxtrix/pull/42".into(),
+                author: "octocat".into(),
+                head: "merge-lock".into(),
+                head_oid: "deadbeef".into(),
+                head_repository: "example/muxtrix".into(),
+                base: "main".into(),
+                base_oid: "feedface".into(),
+                additions: 1,
+                deletions: 0,
+                changed_files: 0,
+                draft: false,
+                mergeable: "MERGEABLE".into(),
+                merge_state: "CLEAN".into(),
+                review_decision: "APPROVED".into(),
+                checks: github::CheckSummary {
+                    passed: 1,
+                    pending: 0,
+                    failed: 0,
+                },
+            },
+            files: Vec::new(),
+        });
+        app.github_auth = github::AuthStatus::Authenticated {
+            login: "octocat".into(),
+        };
+        app.github_panel = Some(panel);
+
+        drop(app.update(Message::ConfirmGitHubMerge));
+
+        let panel = app.github_panel.as_ref().expect("panel should remain open");
+        assert!(panel.merging);
+        assert!(!panel.merge_confirmation);
+        assert!(panel.active_loading());
+        assert!(panel.selected_pull_request_error.is_none());
     }
 
     #[test]
