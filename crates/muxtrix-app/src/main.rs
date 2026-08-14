@@ -11795,6 +11795,7 @@ impl Muxtrix {
             {
                 PaneSignalKind::Danger
             }
+            _ if attention => PaneSignalKind::Warning,
             _ if self.terminals.get(&pane_id).is_some_and(|runtime| {
                 matches!(
                     runtime.launch_state,
@@ -11802,7 +11803,10 @@ impl Muxtrix {
                 )
             }) =>
             {
-                PaneSignalKind::Warning
+                // A slow WSL launch is progress, not a request for the user.
+                // Keep the signal neutral while the nearby label says exactly
+                // what is happening; amber is reserved for actionable input.
+                PaneSignalKind::Neutral
             }
             _ if self.terminals.get(&pane_id).is_some_and(|runtime| {
                 matches!(
@@ -11813,7 +11817,6 @@ impl Muxtrix {
             {
                 PaneSignalKind::Subtle
             }
-            _ if attention => PaneSignalKind::Warning,
             _ => PaneSignalKind::Neutral,
         }
     }
@@ -11860,8 +11863,26 @@ impl Muxtrix {
             PaneSignalKind::Danger => "Failed",
             PaneSignalKind::Warning => "Needs input",
             PaneSignalKind::Active => "Working",
+            PaneSignalKind::Subtle | PaneSignalKind::Neutral
+                if self.workspace_has_pending_terminal(workspace) =>
+            {
+                "Starting"
+            }
             PaneSignalKind::Subtle | PaneSignalKind::Neutral => "Ready",
         }
+    }
+
+    fn workspace_has_pending_terminal(&self, workspace: &Workspace) -> bool {
+        workspace.tabs.iter().any(|tab| {
+            tab.root.pane_ids().into_iter().any(|pane_id| {
+                self.terminals.get(&pane_id).is_some_and(|runtime| {
+                    matches!(
+                        runtime.launch_state,
+                        TerminalLaunchState::PreparingHost | TerminalLaunchState::Starting { .. }
+                    )
+                })
+            })
+        })
     }
 
     fn workspace_context(&self, workspace: &Workspace) -> String {
@@ -25195,6 +25216,42 @@ mod tests {
 
         app.agent_statuses.remove(&pane_id);
         assert_eq!(app.pane_signal_kind(pane_id, true), PaneSignalKind::Warning);
+    }
+
+    #[test]
+    fn pending_wsl_launch_is_neutral_and_truthfully_rolls_up_as_starting() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+
+        app.terminals
+            .insert(pane_id, TerminalRuntime::preparing_host("WSL shell"));
+        assert_eq!(app.pane_state_label(pane_id), "Preparing");
+        assert_eq!(
+            app.pane_signal_kind(pane_id, false),
+            PaneSignalKind::Neutral
+        );
+        assert_eq!(
+            app.workspace_state_label(app.active_workspace().expect("active workspace")),
+            "Starting"
+        );
+
+        app.terminals
+            .insert(pane_id, TerminalRuntime::starting("WSL shell", 1, None));
+        assert_eq!(app.pane_state_label(pane_id), "Starting");
+        assert_eq!(
+            app.pane_signal_kind(pane_id, false),
+            PaneSignalKind::Neutral
+        );
+        assert_eq!(
+            app.workspace_state_label(app.active_workspace().expect("active workspace")),
+            "Starting"
+        );
+
+        assert_eq!(
+            app.pane_signal_kind(pane_id, true),
+            PaneSignalKind::Warning,
+            "real unread attention must still outrank launch progress"
+        );
     }
 
     #[test]
