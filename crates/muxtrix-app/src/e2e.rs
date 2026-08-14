@@ -1265,6 +1265,55 @@ impl Scenario {
                 },
             );
             app.settings.fleet_view = FleetView::Repos;
+        } else if self.capturing("fleet-tabs-duplicates") {
+            // Tabs view should spend the pane row on pane-specific activity
+            // when the worktree/repository line already names the checkout.
+            // The renamed tab bands stay visible as the grouping context.
+            let second = self.second_pane()?;
+            let tab_pane = self
+                .tab_pane
+                .ok_or_else(|| "new-tab pane was not recorded".to_owned())?;
+            let original_tab = self
+                .original_tab
+                .ok_or_else(|| "original tab was not recorded".to_owned())?;
+            for tab in &mut app.active_workspace_mut()?.tabs {
+                if tab.id == original_tab {
+                    tab.name = "backend-review".into();
+                } else if tab.panes.contains_key(&tab_pane) {
+                    tab.name = "feature-ui".into();
+                }
+            }
+            let stage_pane =
+                |app: &mut Muxtrix, pane_id: PaneId, worktree: &str| -> Result<(), String> {
+                    let directory = app
+                        .pane_working_directory(pane_id)
+                        .ok_or_else(|| format!("pane {pane_id:?} has no working directory"))?;
+                    app.pane_repositories.insert(
+                        pane_id,
+                        PaneRepository {
+                            directory,
+                            name: Some("muxtrix".into()),
+                            worktree_name: Some(worktree.into()),
+                        },
+                    );
+                    let pane = app
+                        .session
+                        .workspaces
+                        .iter_mut()
+                        .find_map(|workspace| workspace.pane_mut(pane_id))
+                        .ok_or_else(|| format!("pane {pane_id:?} is missing"))?;
+                    let surface = pane
+                        .surfaces
+                        .iter_mut()
+                        .find(|surface| surface.id == pane.active_surface_id)
+                        .ok_or_else(|| format!("pane {pane_id:?} has no active surface"))?;
+                    surface.title = worktree.into();
+                    Ok(())
+                };
+            stage_pane(app, self.initial_pane, "muxtrix")?;
+            stage_pane(app, second, "feature-ui")?;
+            stage_pane(app, tab_pane, "feature-ui")?;
+            app.settings.fleet_view = FleetView::Tabs;
         } else if self.capturing("fleet-tabs-collapsed") {
             app.sidebar_collapsed = true;
         } else if self.capturing("fleet-agents-collapsed") {

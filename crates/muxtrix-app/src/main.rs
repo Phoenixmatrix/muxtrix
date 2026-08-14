@@ -10481,7 +10481,7 @@ impl Muxtrix {
         let signal_kind = self.pane_signal_kind(pane_id, attention);
         let signal = signal_kind.color(tokens);
         let location = self.pane_location_label(pane_id);
-        let title = self.pane_title(workspace, pane_id);
+        let title = self.fleet_pane_identity_label(workspace, pane_id, &location);
         let is_agent = self.agent_statuses.contains_key(&pane_id);
         let pane_state = self.pane_state_label(pane_id);
         // Agents report a real lifecycle, so their rows carry state, activity,
@@ -10536,7 +10536,7 @@ impl Muxtrix {
         );
         let pane_identity = row![
             container("").width(15),
-            EllipsizedText::new(
+            EllipsizedText::owned(
                 title,
                 self.settings.ui_pixels(9.0),
                 title_font,
@@ -10614,6 +10614,31 @@ impl Muxtrix {
                     .unwrap_or_else(|| agent_display_name(&status.agent))
             },
         )
+    }
+
+    fn fleet_pane_identity_label(
+        &self,
+        workspace: &Workspace,
+        pane_id: PaneId,
+        location: &str,
+    ) -> String {
+        let title = self.pane_title(workspace, pane_id);
+        let has_custom_name = workspace
+            .pane(pane_id)
+            .is_some_and(|pane| pane.custom_name.is_some());
+        if !has_custom_name && same_fleet_label(title, location) {
+            if self.agent_statuses.contains_key(&pane_id) || self.shows_agents_roster(pane_id) {
+                return self.pane_activity(pane_id, None);
+            }
+            let command = self.pane_command(pane_id);
+            if command.is_empty() {
+                self.pane_activity(pane_id, None)
+            } else {
+                command
+            }
+        } else {
+            title.to_owned()
+        }
     }
 
     /// True while this pane is showing Claude Code's Agents view.
@@ -15025,6 +15050,12 @@ fn ellipsize_start(value: &str, max_characters: usize) -> String {
 fn single_line_ellipsize(value: &str, max_characters: usize) -> String {
     let single_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
     ellipsize(&single_line, max_characters)
+}
+
+fn same_fleet_label(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    !left.is_empty() && left.eq_ignore_ascii_case(right)
 }
 
 fn git_branch_for_directory(cwd: Option<&str>) -> Option<String> {
@@ -21897,6 +21928,111 @@ mod tests {
         assert_eq!(
             app.pane_location_label(pane_id),
             directory.display().to_string()
+        );
+    }
+
+    #[test]
+    fn fleet_row_spends_duplicate_automatic_titles_on_command_copy() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let duplicate = "fleet-two-line-rows";
+        {
+            let pane = active_tab_mut(&mut app)
+                .panes
+                .get_mut(&pane_id)
+                .expect("pane should exist");
+            let surface = pane
+                .surfaces
+                .iter_mut()
+                .find(|surface| surface.id == pane.active_surface_id)
+                .expect("surface should exist");
+            surface.title = duplicate.into();
+        }
+        let directory = app
+            .pane_working_directory(pane_id)
+            .expect("test pane should have a working directory");
+        app.pane_repositories.insert(
+            pane_id,
+            PaneRepository {
+                directory,
+                name: Some("muxtrix".into()),
+                worktree_name: Some(duplicate.into()),
+            },
+        );
+
+        let location = app.pane_location_label(pane_id);
+        let command = app.pane_command(pane_id);
+        assert!(!command.is_empty(), "the fallback must still be truthful");
+        assert_eq!(
+            app.fleet_pane_identity_label(
+                app.active_workspace().expect("workspace should exist"),
+                pane_id,
+                &location
+            ),
+            command
+        );
+    }
+
+    #[test]
+    fn fleet_row_preserves_intentional_pane_names_even_when_repeated() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let duplicate = "fleet-two-line-rows";
+        active_tab_mut(&mut app)
+            .panes
+            .get_mut(&pane_id)
+            .expect("pane should exist")
+            .custom_name = Some(duplicate.into());
+        let location = duplicate.to_owned();
+
+        assert_eq!(
+            app.fleet_pane_identity_label(
+                app.active_workspace().expect("workspace should exist"),
+                pane_id,
+                &location
+            ),
+            duplicate
+        );
+    }
+
+    #[test]
+    fn fleet_row_spends_duplicate_agent_titles_on_activity_copy() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let duplicate = "feature-ui";
+        let activity = "Rewriting the rail";
+        let directory = app
+            .pane_working_directory(pane_id)
+            .expect("test pane should have a working directory");
+        app.pane_repositories.insert(
+            pane_id,
+            PaneRepository {
+                directory,
+                name: Some("muxtrix".into()),
+                worktree_name: Some(duplicate.into()),
+            },
+        );
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "claude".into(),
+                display_name: Some(duplicate.into()),
+                state: AgentState::Running,
+                activity: Some(activity.into()),
+                session_id: None,
+                cwd: None,
+                git_branch: None,
+            },
+        );
+        let location = app.pane_location_label(pane_id);
+
+        assert_eq!(
+            app.fleet_pane_identity_label(
+                app.active_workspace().expect("workspace should exist"),
+                pane_id,
+                &location
+            ),
+            activity
         );
     }
 

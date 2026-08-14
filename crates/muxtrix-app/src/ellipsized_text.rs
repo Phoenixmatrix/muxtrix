@@ -24,16 +24,6 @@ pub(super) struct EllipsizedText<'a> {
 }
 
 impl<'a> EllipsizedText<'a> {
-    pub(super) fn new(content: &'a str, size: impl Into<Pixels>, font: Font, color: Color) -> Self {
-        Self {
-            content: Cow::Borrowed(content),
-            size: size.into(),
-            font,
-            color,
-            width: Fill,
-        }
-    }
-
     pub(super) fn owned(
         content: String,
         size: impl Into<Pixels>,
