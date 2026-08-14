@@ -1868,7 +1868,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix"
-version = "0.1.50"
+version = "0.1.51"
 dependencies = [
  "async-channel",
  "fontdb",
@@ -1891,7 +1891,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-control"
-version = "0.1.50"
+version = "0.1.51"
 dependencies = [
  "interprocess",
  "serde",
@@ -1902,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-domain"
-version = "0.1.50"
+version = "0.1.51"
 dependencies = [
  "serde",
  "serde_json",
@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-platform"
-version = "0.1.50"
+version = "0.1.51"
 dependencies = [
  "muxtrix-domain",
  "portable-pty",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-sessions"
-version = "0.1.50"
+version = "0.1.51"
 dependencies = [
  "base64",
  "interprocess",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-terminal"
-version = "0.1.50"
+version = "0.1.51"
 dependencies = [
  "libghostty-vt",
  "muxtrix-platform",
