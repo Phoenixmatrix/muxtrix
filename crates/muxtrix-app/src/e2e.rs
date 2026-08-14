@@ -1499,8 +1499,8 @@ impl Scenario {
                 login: "phoenixmatrix".into(),
             };
             let mut panel = staged_github_pull_request_panel();
-            panel.merge_confirmation = true;
             panel.merging = true;
+            panel.loading_phase = 4;
             app.github_panel = Some(panel);
         } else if self.capturing("github-draft-pr") {
             app.github_auth = github::AuthStatus::Authenticated {
