@@ -71,6 +71,13 @@ Open Settings, then use the Agent lifecycle card:
 The Codex, Claude Code, and Oh My Pi command fields are persistent settings.
 The same launch actions are available from Ctrl+P on Windows/Linux and Cmd+P on macOS.
 
+Adding or re-adding user-level Codex hooks also marks the shared
+`~/.muxtrix/worktrees` parent as trusted in `~/.codex/config.toml`. Codex can
+then trust every linked checkout Muxtrix creates without accumulating a
+separate project entry for each worktree. Existing configuration, comments,
+and file permissions are preserved. When Windows Muxtrix manages agents in
+WSL2, the trust entry uses the Linux-side home path that Codex sees.
+
 ## CLI controls
 
 The CLI supports user and project scope:
