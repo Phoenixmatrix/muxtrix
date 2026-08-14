@@ -9,9 +9,9 @@ use serde_json::json;
 use muxtrix_control::AgentState;
 
 use super::{
-    ActiveView, Agent, AgentPaneStatus, GitHubDiffSource, GitHubDiffState, GitHubPanelState,
-    GitHubPanelTab, HookScope, HookStatus, Message, Muxtrix, PaneRepository, TerminalMouseButton,
-    WorktreeManagerEntry, WorktreeManagerMode, WorktreeManagerState, github,
+    ActiveView, Agent, AgentPaneStatus, CommandAction, GitHubDiffSource, GitHubDiffState,
+    GitHubPanelState, GitHubPanelTab, HookScope, HookStatus, Message, Muxtrix, PaneRepository,
+    TerminalMouseButton, WorktreeManagerEntry, WorktreeManagerMode, WorktreeManagerState, github,
 };
 use crate::settings::FleetView;
 
@@ -164,9 +164,9 @@ enum Stage {
 
 enum TickAction {
     Wait,
+    ScrollSettingsToEnd,
     ScrollGitHubToEnd,
     ScrollGitHubPullRequestsToEnd,
-    ScrollSettingsToEnd,
     Capture,
 }
 
@@ -599,6 +599,9 @@ impl Scenario {
                 if self.capturing("github-scrolled") && self.settle_ticks == 2 {
                     return Ok(TickAction::ScrollGitHubToEnd);
                 }
+                if self.capturing("worktree-agent-settings") && self.settle_ticks == 2 {
+                    return Ok(TickAction::ScrollSettingsToEnd);
+                }
                 if self.capturing("github-pull-requests-scrolled") && self.settle_ticks == 2 {
                     return Ok(TickAction::ScrollGitHubPullRequestsToEnd);
                 }
@@ -745,6 +748,46 @@ impl Scenario {
                     muxtrix: Ok(installed.clone()),
                     muxtrixctl: Ok(installed),
                 });
+        } else if self.capturing("worktree-agent-settings") {
+            drop(app.open_settings());
+            app.settings.default_agent = Some(Agent::Codex);
+            app.settings_draft.default_agent = Some(Agent::Codex);
+            app.hook_statuses = Agent::ALL
+                .into_iter()
+                .map(|agent| HookStatus {
+                    agent,
+                    scope: HookScope::User,
+                    target: format!("/home/user/.config/{agent}/muxtrix-hooks").into(),
+                    installed: true,
+                    managed_entries: match agent {
+                        Agent::Codex => 8,
+                        Agent::Claude => 9,
+                        Agent::Pi => 4,
+                    },
+                    backup_available: true,
+                    unreachable_entries: 0,
+                })
+                .collect();
+        } else if self.capturing("worktree-agent-setup") {
+            app.default_agent_prompt = true;
+            app.pending_default_agent_command = Some(CommandAction::NewWorktreeWithAgent(
+                super::commands::WorktreeKind::Pane(SplitAxis::Horizontal),
+            ));
+        } else if self.capturing("worktree-agent-palette") {
+            app.settings.default_agent = Some(Agent::Codex);
+            app.settings_draft.default_agent = Some(Agent::Codex);
+            app.hook_statuses = vec![HookStatus {
+                agent: Agent::Codex,
+                scope: HookScope::User,
+                target: "/home/user/.codex/config.toml".into(),
+                installed: true,
+                managed_entries: 8,
+                backup_available: true,
+                unreachable_entries: 0,
+            }];
+            app.palette.visible = true;
+            app.palette.query = "with agent".into();
+            app.palette.selected = 0;
         } else if self.capturing("hook-repair") {
             // Hooks whose muxtrixctl was removed under them: they still
             // read as Muxtrix's own by their text, so the row has to
@@ -1001,7 +1044,7 @@ impl Scenario {
                 entries: vec![
                     WorktreeManagerEntry {
                         path: "/home/user/dev/muxtrix".into(),
-                        branch: Some("main".into()),
+                        branch: Some("release".into()),
                         unpushed_commits: 0,
                         deletion_blocker: Some("Primary worktree".into()),
                         used_by: None,
@@ -1020,8 +1063,8 @@ impl Scenario {
                         ),
                     },
                     WorktreeManagerEntry {
-                        path: "/home/user/.muxtrix/worktrees/muxtrix/feature-ui".into(),
-                        branch: Some("feature-ui".into()),
+                        path: "/home/user/.muxtrix/worktrees/muxtrix/main".into(),
+                        branch: Some("main".into()),
                         unpushed_commits: 1,
                         deletion_blocker: None,
                         used_by: None,
@@ -1278,6 +1321,55 @@ impl Scenario {
                 },
             );
             app.settings.fleet_view = FleetView::Repos;
+        } else if self.capturing("fleet-tabs-duplicates") {
+            // Tabs view should spend the pane row on pane-specific activity
+            // when the worktree/repository line already names the checkout.
+            // The renamed tab bands stay visible as the grouping context.
+            let second = self.second_pane()?;
+            let tab_pane = self
+                .tab_pane
+                .ok_or_else(|| "new-tab pane was not recorded".to_owned())?;
+            let original_tab = self
+                .original_tab
+                .ok_or_else(|| "original tab was not recorded".to_owned())?;
+            for tab in &mut app.active_workspace_mut()?.tabs {
+                if tab.id == original_tab {
+                    tab.name = "backend-review".into();
+                } else if tab.panes.contains_key(&tab_pane) {
+                    tab.name = "feature-ui".into();
+                }
+            }
+            let stage_pane =
+                |app: &mut Muxtrix, pane_id: PaneId, worktree: &str| -> Result<(), String> {
+                    let directory = app
+                        .pane_working_directory(pane_id)
+                        .ok_or_else(|| format!("pane {pane_id:?} has no working directory"))?;
+                    app.pane_repositories.insert(
+                        pane_id,
+                        PaneRepository {
+                            directory,
+                            name: Some("muxtrix".into()),
+                            worktree_name: Some(worktree.into()),
+                        },
+                    );
+                    let pane = app
+                        .session
+                        .workspaces
+                        .iter_mut()
+                        .find_map(|workspace| workspace.pane_mut(pane_id))
+                        .ok_or_else(|| format!("pane {pane_id:?} is missing"))?;
+                    let surface = pane
+                        .surfaces
+                        .iter_mut()
+                        .find(|surface| surface.id == pane.active_surface_id)
+                        .ok_or_else(|| format!("pane {pane_id:?} has no active surface"))?;
+                    surface.title = worktree.into();
+                    Ok(())
+                };
+            stage_pane(app, self.initial_pane, "muxtrix")?;
+            stage_pane(app, second, "feature-ui")?;
+            stage_pane(app, tab_pane, "feature-ui")?;
+            app.settings.fleet_view = FleetView::Tabs;
         } else if self.capturing("fleet-tabs-collapsed") {
             app.sidebar_collapsed = true;
         } else if self.capturing("fleet-agents-collapsed") {
@@ -1512,8 +1604,8 @@ impl Scenario {
                 login: "phoenixmatrix".into(),
             };
             let mut panel = staged_github_pull_request_panel();
-            panel.merge_confirmation = true;
             panel.merging = true;
+            panel.loading_phase = 4;
             app.github_panel = Some(panel);
         } else if self.capturing("github-draft-pr") {
             app.github_auth = github::AuthStatus::Authenticated {
@@ -1771,6 +1863,12 @@ impl Muxtrix {
                 self.e2e = Some(scenario);
                 Task::none()
             }
+            Ok(TickAction::ScrollSettingsToEnd) => {
+                self.e2e = Some(scenario);
+                iced::widget::operation::snap_to_end(iced::widget::Id::new(
+                    super::SETTINGS_SCROLL_ID,
+                ))
+            }
             Ok(TickAction::ScrollGitHubToEnd) => {
                 self.e2e = Some(scenario);
                 iced::widget::operation::snap_to_end(iced::widget::Id::new(
@@ -1781,12 +1879,6 @@ impl Muxtrix {
                 self.e2e = Some(scenario);
                 iced::widget::operation::snap_to_end(iced::widget::Id::new(
                     super::GITHUB_PULL_REQUEST_SCROLL_ID,
-                ))
-            }
-            Ok(TickAction::ScrollSettingsToEnd) => {
-                self.e2e = Some(scenario);
-                iced::widget::operation::snap_to_end(iced::widget::Id::new(
-                    super::SETTINGS_PREFERENCES_SCROLL_ID,
                 ))
             }
             Ok(TickAction::Capture) => {

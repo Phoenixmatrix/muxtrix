@@ -29,8 +29,17 @@ pub(crate) struct Identification {
     pub(crate) agent: &'static str,
     pub(crate) classification: Option<Classification>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PiTitle<'a> {
+    state: Option<ScreenState>,
+    label: &'a str,
+    rule: &'static str,
+}
 
-pub(crate) fn supports(agent: &str) -> bool {
+/// Codex and Claude approval hooks are advisory because their harnesses may
+/// auto-resolve them. Pi's approval events are exact, so only those two agents
+/// require a visible blocker before entering Waiting.
+pub(crate) fn requires_screen_confirmed_wait(agent: &str) -> bool {
     matches!(
         agent.to_ascii_lowercase().as_str(),
         "codex" | "claude" | "claude-code"
@@ -102,6 +111,11 @@ pub(crate) fn is_view_chrome_title(agent: &str, title: &str) -> bool {
 /// window chrome, where publishing every spinner frame creates visual jitter.
 pub(crate) fn stable_title(agent: &str, title: &str) -> String {
     let agent = agent.to_ascii_lowercase();
+    if matches!(agent.as_str(), "pi" | "omp" | "oh-my-pi")
+        && let Some(title) = parse_pi_title(title)
+    {
+        return title.label.to_owned();
+    }
     title
         .split_whitespace()
         .enumerate()
@@ -119,6 +133,12 @@ pub(crate) fn stable_title(agent: &str, title: &str) -> String {
 
 pub(crate) fn classify(agent: &str, snapshot: &GridSnapshot) -> Option<Classification> {
     let title = snapshot.title.as_deref().unwrap_or_default();
+    if ["pi", "omp", "oh-my-pi"]
+        .iter()
+        .any(|candidate| agent.eq_ignore_ascii_case(candidate))
+    {
+        return classify_pi(title);
+    }
     let rows = snapshot
         .rows
         .iter()
@@ -132,6 +152,9 @@ pub(crate) fn classify(agent: &str, snapshot: &GridSnapshot) -> Option<Classific
 /// nonempty titles and ambiguous spinner glyphs are deliberately insufficient.
 pub(crate) fn identify(snapshot: &GridSnapshot) -> Option<Identification> {
     let title = snapshot.title.as_deref().unwrap_or_default();
+    if let Some(identification) = pi_identification(title) {
+        return Some(identification);
+    }
     let rows = snapshot
         .rows
         .iter()
@@ -155,13 +178,21 @@ fn identify_text(title: &str, rows: &[String]) -> Option<Identification> {
             classification: Some(classification),
         });
     }
-    if has_pi_signature(title) {
-        return Some(Identification {
-            agent: "pi",
-            classification: None,
-        });
+    if let Some(identification) = pi_identification(title) {
+        return Some(identification);
     }
     None
+}
+
+fn pi_identification(title: &str) -> Option<Identification> {
+    let title = parse_pi_title(title)?;
+    Some(Identification {
+        agent: "pi",
+        classification: title.state.map(|state| Classification {
+            state,
+            rule: title.rule,
+        }),
+    })
 }
 
 fn has_claude_signature(title: &str, rows: &[String]) -> bool {
@@ -205,11 +236,6 @@ fn has_codex_signature(title: &str, rows: &[String]) -> bool {
             })
 }
 
-fn has_pi_signature(title: &str) -> bool {
-    let title = title.trim();
-    title == "π" || title.starts_with("π:")
-}
-
 fn has_recent_codex_prompt(rows: &[String]) -> bool {
     rows.iter().rev().take(8).any(|row| {
         let row = row.trim();
@@ -222,9 +248,58 @@ fn classify_text(agent: &str, title: &str, rows: &[String]) -> Option<Classifica
     match agent.as_str() {
         "codex" => classify_codex(title, rows),
         "claude" | "claude-code" => classify_claude(title, rows),
-        "pi" | "omp" | "oh-my-pi" => None,
+        "pi" | "omp" | "oh-my-pi" => classify_pi(title),
         _ => None,
     }
+}
+
+fn classify_pi(title: &str) -> Option<Classification> {
+    let title = parse_pi_title(title)?;
+    title.state.map(|state| Classification {
+        state,
+        rule: title.rule,
+    })
+}
+
+/// OMP 17.3.4 publishes a documented state separator in every authoritative
+/// terminal title: `>` idle, `!` attention, a Braille frame while working, and
+/// a static `:` while working under ConPTY. `π: label` has no spaces and means
+/// title-state reporting is disabled, so it identifies Pi without inventing a
+/// lifecycle state.
+fn parse_pi_title(title: &str) -> Option<PiTitle<'_>> {
+    let title = title.trim();
+    if title == "π" {
+        return Some(PiTitle {
+            state: None,
+            label: "",
+            rule: "pi.osc_title_disabled",
+        });
+    }
+    if let Some(label) = title.strip_prefix("π:") {
+        return Some(PiTitle {
+            state: None,
+            label: label.trim(),
+            rule: "pi.osc_title_disabled",
+        });
+    }
+    let state_title = title.strip_prefix("π ")?;
+    let (separator, label) = state_title
+        .split_once(' ')
+        .map_or((state_title, ""), |(separator, label)| {
+            (separator, label.trim())
+        });
+    let (state, rule) = match separator {
+        ">" => (ScreenState::Idle, "pi.osc_title_idle"),
+        "!" => (ScreenState::Waiting, "pi.osc_title_attention"),
+        ":" => (ScreenState::Running, "pi.osc_title_working"),
+        spinner if is_codex_spinner(spinner) => (ScreenState::Running, "pi.osc_title_spinner"),
+        _ => return None,
+    };
+    Some(PiTitle {
+        state: Some(state),
+        label,
+        rule,
+    })
 }
 
 fn classify_codex(title: &str, rows: &[String]) -> Option<Classification> {
@@ -544,6 +619,30 @@ mod tests {
     }
 
     #[test]
+    fn pi_title_state_distinguishes_idle_working_and_attention() {
+        assert_eq!(
+            classify_text("pi", "π > Fix Pi state", &[]),
+            classification(ScreenState::Idle, "pi.osc_title_idle")
+        );
+        assert_eq!(
+            classify_text("omp", "π ! Fix Pi state", &[]),
+            classification(ScreenState::Waiting, "pi.osc_title_attention")
+        );
+        assert_eq!(
+            classify_text("oh-my-pi", "π : Fix Pi state", &[]),
+            classification(ScreenState::Running, "pi.osc_title_working")
+        );
+        for spinner in ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] {
+            assert_eq!(
+                classify_text("pi", &format!("π {spinner} Fix Pi state"), &[]),
+                classification(ScreenState::Running, "pi.osc_title_spinner")
+            );
+        }
+        assert_eq!(classify_text("pi", "π: Fix Pi state", &[]), None);
+        assert_eq!(classify_text("pi", "π ? Fix Pi state", &[]), None);
+    }
+
+    #[test]
     fn animated_progress_glyphs_do_not_change_harness_titles() {
         for title in [
             "⠋ Fix window titles",
@@ -569,6 +668,16 @@ mod tests {
             stable_title("shell", "⠋ package update"),
             "⠋ package update"
         );
+        for title in [
+            "π > Fix Pi state",
+            "π ! Fix Pi state",
+            "π : Fix Pi state",
+            "π ⠋ Fix Pi state",
+            "π ⠏ Fix Pi state",
+            "π: Fix Pi state",
+        ] {
+            assert_eq!(stable_title("pi", title), "Fix Pi state");
+        }
     }
 
     /// Verbatim tail of a Claude Code 2.1.229 conversation frame.
@@ -679,6 +788,13 @@ mod tests {
             Some(Identification {
                 agent: "pi",
                 classification: None,
+            })
+        );
+        assert_eq!(
+            identify_text("π > status support", &[]),
+            Some(Identification {
+                agent: "pi",
+                classification: classification(ScreenState::Idle, "pi.osc_title_idle"),
             })
         );
     }

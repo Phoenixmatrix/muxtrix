@@ -679,6 +679,42 @@ add({
   check: "Settings must not stretch its measure to the full desktop width.",
 });
 add({
+  slug: "worktree-agent-settings",
+  title: "Settings · worktree agent",
+  group: "Settings",
+  capture: "worktree-agent-settings",
+  viewport: "1280x900",
+  check:
+    "Configured default picker and state-specific integration actions should share one clean alignment lane.",
+});
+add({
+  slug: "worktree-agent-settings-compact",
+  title: "Settings · worktree agent · compact",
+  group: "Settings",
+  capture: "worktree-agent-settings",
+  viewport: "720x640",
+  check:
+    "At minimum width, labels, command fields, status copy and hook actions must not overlap or clip.",
+});
+add({
+  slug: "worktree-agent-setup",
+  title: "Worktree agent setup gate",
+  group: "Settings",
+  capture: "worktree-agent-setup",
+  viewport: "820x560",
+  check:
+    "The unconfigured command gate should explain the requirement and make cancel versus configure unmistakable.",
+});
+add({
+  slug: "worktree-agent-palette",
+  title: "Command palette · configured worktree agent",
+  group: "Settings",
+  capture: "worktree-agent-palette",
+  viewport: "1024x680",
+  check:
+    "Configured worktree commands should name Codex directly in both title and description.",
+});
+add({
   slug: "theme-gallery",
   title: "Theme gallery",
   group: "Settings",

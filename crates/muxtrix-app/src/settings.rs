@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use iced::{Font, font};
+use muxtrix_control::Agent;
 use serde::{Deserialize, Serialize};
 
 use crate::metrics;
@@ -18,6 +19,9 @@ const POINTS_TO_PIXELS: f32 = 1.0;
 /// expressed against this reference, not against the current setting, so every
 /// size moves together when the setting changes.
 const UI_TYPE_SCALE_REFERENCE: f32 = 14.0;
+pub(crate) const DEFAULT_TERMINAL_SCROLLBACK_LINES: usize = 10_000;
+const MIN_TERMINAL_SCROLLBACK_LINES: usize = 1_000;
+const MAX_TERMINAL_SCROLLBACK_LINES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -550,8 +554,10 @@ pub(crate) struct AppSettings {
     pub(crate) terminal_font_weight: FontWeight,
     pub(crate) terminal_font_size: f32,
     pub(crate) terminal_line_height: f32,
+    pub(crate) terminal_scrollback_lines: usize,
     pub(crate) windows_shell_backend: WindowsShellBackend,
     pub(crate) wsl_distribution: String,
+    pub(crate) default_agent: Option<Agent>,
     pub(crate) codex_command: String,
     pub(crate) claude_command: String,
     pub(crate) pi_command: String,
@@ -571,8 +577,10 @@ impl Default for AppSettings {
             terminal_font_weight: FontWeight::Normal,
             terminal_font_size: 14.0,
             terminal_line_height: 1.15,
+            terminal_scrollback_lines: DEFAULT_TERMINAL_SCROLLBACK_LINES,
             windows_shell_backend: WindowsShellBackend::Native,
             wsl_distribution: String::new(),
+            default_agent: None,
             codex_command: "codex".into(),
             claude_command: "claude".into(),
             pi_command: "omp".into(),
@@ -670,6 +678,9 @@ impl AppSettings {
         self.ui_font_size = self.ui_font_size.clamp(12.0, 20.0);
         self.terminal_font_size = self.terminal_font_size.clamp(10.0, 28.0);
         self.terminal_line_height = self.terminal_line_height.clamp(1.0, 1.6);
+        self.terminal_scrollback_lines = self
+            .terminal_scrollback_lines
+            .clamp(MIN_TERMINAL_SCROLLBACK_LINES, MAX_TERMINAL_SCROLLBACK_LINES);
         if self.codex_command.trim().is_empty() {
             self.codex_command = "codex".into();
         }
@@ -798,8 +809,10 @@ mod tests {
             terminal_font_weight: FontWeight::Semibold,
             terminal_font_size: 2.0,
             terminal_line_height: 4.0,
+            terminal_scrollback_lines: usize::MAX,
             windows_shell_backend: WindowsShellBackend::Wsl,
             wsl_distribution: "Ubuntu-24.04".into(),
+            default_agent: Some(Agent::Claude),
             codex_command: String::new(),
             claude_command: "claude --model opus".into(),
             pi_command: String::new(),
@@ -822,9 +835,14 @@ mod tests {
         assert!(restored.show_status_bar);
         assert_eq!(restored.terminal_font_size, 10.0);
         assert_eq!(restored.terminal_line_height, 1.6);
+        assert_eq!(
+            restored.terminal_scrollback_lines,
+            MAX_TERMINAL_SCROLLBACK_LINES
+        );
         assert_eq!(restored.terminal_font, TerminalFont::named("Cascadia Mono"));
         assert_eq!(restored.terminal_font_weight, FontWeight::Semibold);
         assert_eq!(restored.windows_shell_backend, WindowsShellBackend::Wsl);
+        assert_eq!(restored.default_agent, Some(Agent::Claude));
         assert_eq!(
             restored.terminal_font_pixels(),
             if cfg!(target_os = "macos") {
@@ -892,8 +910,36 @@ mod tests {
         assert_eq!(restored.terminal_theme, TerminalThemeId::MuxtrixDark);
         assert_eq!(restored.appearance, Appearance::System);
         assert!(!restored.show_status_bar);
+        assert_eq!(restored.default_agent, None);
+        assert_eq!(
+            restored.terminal_scrollback_lines,
+            DEFAULT_TERMINAL_SCROLLBACK_LINES
+        );
         assert_eq!(restored.codex_command, "codex");
         assert_eq!(restored.pi_command, "omp");
+    }
+
+    #[test]
+    fn scrollback_history_is_bounded_before_use() {
+        let too_small = AppSettings {
+            terminal_scrollback_lines: 0,
+            ..AppSettings::default()
+        }
+        .sanitized();
+        let too_large = AppSettings {
+            terminal_scrollback_lines: usize::MAX,
+            ..AppSettings::default()
+        }
+        .sanitized();
+
+        assert_eq!(
+            too_small.terminal_scrollback_lines,
+            MIN_TERMINAL_SCROLLBACK_LINES
+        );
+        assert_eq!(
+            too_large.terminal_scrollback_lines,
+            MAX_TERMINAL_SCROLLBACK_LINES
+        );
     }
 
     #[test]

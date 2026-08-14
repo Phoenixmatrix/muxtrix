@@ -2,6 +2,11 @@
 
 - Always use pnpm over npm.
 
+# Change delivery
+
+- When you make a codebase change and complete the requested task, always open
+  a pull request containing that change.
+
 # Development safety
 
 - Keep automated checks headless. Do not run the GUI unless the host user

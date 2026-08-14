@@ -77,7 +77,7 @@ truthful local/GitHub data.
 | Pane controls | Split right, split down, maximize/restore, overflow | Code-native controls with accessible labels |
 | Terminal field | Existing Ghostty snapshot projection remains dominant and readable | Existing GPU-backed Iced rich text |
 | Focus and attention | Blue focus perimeter; amber waiting state on pane and fleet row | Semantic color tokens and borders |
-| Settings | Full-window Preferences/Worktrees navigation, grouped native preferences, and asynchronous ruled worktree inventory | Semantic Iced form and list controls |
+| Settings | Full-window Preferences/Worktrees navigation, grouped native preferences, configured-agent default selection, and asynchronous ruled worktree inventory | Semantic Iced form and list controls |
 | Optional status bar | Hidden by default; enabled from Settings | Semantic Iced widgets |
 | Command palette | Search field and ruled command rows in the same system | Semantic Iced overlay |
 | GitHub review panel | 372 px ruled dock on wide windows, opaque overlay on compact windows, auth/readiness/checks/virtualized files/guarded merge | Semantic Iced widgets plus Git and GitHub CLI state |

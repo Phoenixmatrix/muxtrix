@@ -160,10 +160,12 @@ truncates sooner rather than demanding a wider rail.
 Expanded fleet entries are 52 px two-line rows. The first line carries the
 pane's truthful state pip and linked-worktree name, falling back to repository
 name and then the live directory. The second line aligns under that identity
-and carries the pane title plus a trailing textual state; unread count sits
-immediately before state when present. Both flexible text lanes are shaped in
-the configured interface face and ellipsized to the measured width left after
-fixed trailing content claims its space. Direct pane navigation remains
+and carries the pane title plus a trailing textual state; when an automatic
+pane title repeats the first-line worktree/repository/directory identity, the
+row spends that lane on truthful activity or command copy instead. Unread count
+sits immediately before state when present. Both flexible text lanes are shaped
+in the configured interface face and ellipsized to the measured width left
+after fixed trailing content claims its space. Direct pane navigation remains
 keyboard-only: expanded rows never print Ctrl/Cmd+1 through 9 hints. Tabs and
 repositories group under recessed uppercase bands that carry an amber rollup
 dot when any pane inside needs a person. Repos uses only its repository bands,
@@ -231,7 +233,7 @@ The collapsed fleet rail keeps pane identity as well as state: each ruled row
 shows its numeric pane identity and signal without shortcut notation, while its
 tooltip exposes the full title, state, and latest truthful activity.
 
-Only installed monospaced families appear in Terminal typography. Never offer
+Only installed monospaced families appear in Terminal text and history. Never offer
 a named font that would silently fall back to proportional text; unavailable
 saved choices recover to System monospace and surface a global warning.
 
