@@ -772,6 +772,7 @@ impl Scenario {
                 || self.capturing("github-no-pr")
                 || self.capturing("github-scrolled")
                 || self.capturing("github-pull-requests")
+                || self.capturing("github-merged-pr")
                 || self.capturing("github-pull-request-search")
                 || self.capturing("github-pull-requests-scrolled")
                 || self.capturing("github-diff")
@@ -787,6 +788,7 @@ impl Scenario {
                 panel.active_tab = GitHubPanelTab::PullRequests;
                 panel.pull_requests = Some(Vec::new());
             } else if self.capturing("github-pull-requests")
+                || self.capturing("github-merged-pr")
                 || self.capturing("github-pull-request-search")
                 || self.capturing("github-pull-requests-scrolled")
             {
@@ -797,6 +799,14 @@ impl Scenario {
                     // final matching row must remain visible, never a blank
                     // viewport while the widget catches up to the new offset.
                     panel.pull_request_scroll_offset = 9_999.0;
+                }
+                if self.capturing("github-merged-pr")
+                    && let Some(pull_request) = panel
+                        .pull_requests
+                        .as_mut()
+                        .and_then(|pull_requests| pull_requests.first_mut())
+                {
+                    pull_request.status = github::PullRequestSummaryStatus::Merged;
                 }
             } else if !self.capturing("github-panel") {
                 panel.active_tab = GitHubPanelTab::PullRequests;
@@ -1864,7 +1874,11 @@ fn staged_github_panel() -> GitHubPanelState {
                 format!("maintenance-{index}")
             },
             base: "main".into(),
-            draft: index % 9 == 4,
+            status: if index % 9 == 4 {
+                github::PullRequestSummaryStatus::Draft
+            } else {
+                github::PullRequestSummaryStatus::Open
+            },
         })
         .collect();
 

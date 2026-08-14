@@ -465,6 +465,13 @@ add({
   check: "The Pull requests tab presents a searchable, compact open-PR inventory with stable title, author, branch, and state lanes.",
 });
 add({
+  slug: "github-merged-pr",
+  title: "Pull requests · optimistic merged state",
+  group: "GitHub",
+  capture: "github-merged-pr",
+  check: "A just-merged PR is labelled Merged immediately while the list refresh catches up.",
+});
+add({
   slug: "github-pull-request-search",
   title: "Pull requests · filtered",
   group: "GitHub",

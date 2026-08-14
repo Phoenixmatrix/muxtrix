@@ -97,6 +97,23 @@ pub(crate) struct PullRequest {
     pub(crate) checks: CheckSummary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PullRequestSummaryStatus {
+    Open,
+    Draft,
+    Merged,
+}
+
+impl PullRequestSummaryStatus {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Draft => "Draft",
+            Self::Merged => "Merged",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PullRequestSummary {
     pub(crate) number: u64,
@@ -105,7 +122,7 @@ pub(crate) struct PullRequestSummary {
     pub(crate) author: String,
     pub(crate) head: String,
     pub(crate) base: String,
-    pub(crate) draft: bool,
+    pub(crate) status: PullRequestSummaryStatus,
 }
 
 impl PullRequestSummary {
@@ -116,6 +133,7 @@ impl PullRequestSummary {
             || self.author.to_ascii_lowercase().contains(&query)
             || self.head.to_ascii_lowercase().contains(&query)
             || self.base.to_ascii_lowercase().contains(&query)
+            || self.status.label().to_ascii_lowercase().contains(&query)
             || self
                 .number
                 .to_string()
@@ -1042,7 +1060,11 @@ fn parse_pull_request_summaries(bytes: &[u8]) -> Result<Vec<PullRequestSummary>,
                 .map_or_else(|| "Unknown author".into(), |author| author.login),
             head: pull_request.head_ref_name,
             base: pull_request.base_ref_name,
-            draft: pull_request.is_draft,
+            status: if pull_request.is_draft {
+                PullRequestSummaryStatus::Draft
+            } else {
+                PullRequestSummaryStatus::Open
+            },
         })
         .collect())
 }
@@ -1266,7 +1288,7 @@ mod tests {
             author: "phoenixmatrix".into(),
             head: "github-support".into(),
             base: "main".into(),
-            draft: false,
+            status: PullRequestSummaryStatus::Open,
         };
 
         assert!(pull_request.matches("review panel"));
@@ -1286,6 +1308,7 @@ mod tests {
         assert_eq!(pull_requests.len(), 1);
         assert_eq!(pull_requests[0].number, 17);
         assert_eq!(pull_requests[0].author, "octocat");
+        assert_eq!(pull_requests[0].status, PullRequestSummaryStatus::Open);
         assert!(pull_requests[0].matches("diff-wrap"));
     }
 
