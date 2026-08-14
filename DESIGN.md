@@ -357,8 +357,12 @@ Local refreshes when the panel opens, when Refresh is used, and once after pane,
 tab, or workspace focus moves to another local pane. Focus queues one
 asynchronous Git read; it does not introduce a repeating timer. A repository
 change replaces both tab caches, while movement within one repository updates
-only local state. Pull requests load only when their tab is first opened or
-explicitly refreshed.
+only local state. Pull requests load when their tab is first opened, when
+explicitly refreshed, or when a supported harness reports that the focused
+pane's agent completed a turn. Turn completion invalidates a hidden cached
+list; when Pull requests is visible, it replaces that list immediately behind
+the existing loading state. Compaction and handoff maintenance do not count as
+turn completion.
 
 The pull-request list fetches lightweight summaries, then searches title,
 number, author, head, and base locally. Continuous 58 px rows keep title and

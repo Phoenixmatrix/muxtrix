@@ -220,6 +220,7 @@ struct Muxtrix {
     github_panel: Option<GitHubPanelState>,
     github_diff: Option<GitHubDiffState>,
     github_pane_refresh_pending: bool,
+    github_pull_requests_refresh_pending: bool,
     github_context_generation: u64,
     sidebar_collapsed: bool,
     maximized_pane: Option<PaneId>,
@@ -894,6 +895,10 @@ fn should_accept_agent_state(
     )
 }
 
+fn agent_event_completes_turn(state: AgentState, event: Option<&str>) -> bool {
+    state == AgentState::Completed && matches!(event, Some("Stop" | "agent_end"))
+}
+
 #[derive(Debug, Clone)]
 struct IntegrationDiscovery {
     wsl_distributions: Vec<WslDistributionChoice>,
@@ -1170,6 +1175,7 @@ enum Message {
     GitHubAuthFinished(u64, Result<github::AuthStatus, String>),
     CloseGitHubPanel,
     RefreshGitHubPanel,
+    RefreshGitHubPullRequestsAfterAgentTurn,
     RefreshGitHubFocusedPane,
     GitHubFocusedPaneLoaded(
         u64,
@@ -1890,6 +1896,7 @@ impl Muxtrix {
             github_panel: None,
             github_diff: None,
             github_pane_refresh_pending: false,
+            github_pull_requests_refresh_pending: false,
             github_context_generation: 0,
             sidebar_collapsed: false,
             maximized_pane: None,
@@ -1992,6 +1999,12 @@ impl Muxtrix {
             subscriptions.push(
                 iced::time::every(std::time::Duration::from_millis(1))
                     .map(|_| Message::RefreshGitHubFocusedPane),
+            );
+        }
+        if self.github_pull_requests_refresh_pending {
+            subscriptions.push(
+                iced::time::every(std::time::Duration::from_millis(1))
+                    .map(|_| Message::RefreshGitHubPullRequestsAfterAgentTurn),
             );
         }
         #[cfg(feature = "e2e")]
@@ -2678,6 +2691,10 @@ impl Muxtrix {
                 return Task::none();
             }
             Message::RefreshGitHubPanel => return self.refresh_github_panel(),
+            Message::RefreshGitHubPullRequestsAfterAgentTurn => {
+                self.github_pull_requests_refresh_pending = false;
+                return self.refresh_github_pull_requests();
+            }
             Message::RefreshGitHubFocusedPane => {
                 self.github_pane_refresh_pending = false;
                 return self.refresh_github_focused_pane();
@@ -5591,6 +5608,30 @@ impl Muxtrix {
         )
     }
 
+    fn queue_github_pull_request_refresh(&mut self, pane_id: PaneId) {
+        if self.control_pane_id(None).ok() != Some(pane_id) {
+            return;
+        }
+        let authenticated = matches!(self.github_auth, github::AuthStatus::Authenticated { .. });
+        let Some(panel) = self.github_panel.as_mut() else {
+            return;
+        };
+        let pull_requests_visible = panel.active_tab == GitHubPanelTab::PullRequests;
+        if panel.pull_requests.is_none() && !pull_requests_visible {
+            return;
+        }
+
+        // A completed turn may have created its pull request. Discard the
+        // cached list even while another tab is open; selecting Pull requests
+        // will then load current data instead of presenting the stale cache.
+        panel.pull_requests = None;
+        panel.pull_requests_error = None;
+        if pull_requests_visible && authenticated {
+            panel.pull_requests_loading = true;
+            self.github_pull_requests_refresh_pending = true;
+        }
+    }
+
     fn refresh_github_panel(&mut self) -> Task<Message> {
         let Some(panel) = self.github_panel.as_ref() else {
             return Task::none();
@@ -7291,6 +7332,9 @@ impl Muxtrix {
                             // a request for the user. It also resolves any
                             // attention left by an earlier waiting state.
                             self.clear_pane_attention(pane_id);
+                            if agent_event_completes_turn(state, event.as_deref()) {
+                                self.queue_github_pull_request_refresh(pane_id);
+                            }
                         }
                         AgentState::Idle | AgentState::Running | AgentState::Stopped => {}
                     }
@@ -19579,6 +19623,111 @@ mod tests {
             .expect("original pane should focus");
 
         assert!(app.github_pane_refresh_pending);
+    }
+
+    #[test]
+    fn harness_turn_completion_events_exclude_pi_maintenance() {
+        assert!(agent_event_completes_turn(
+            AgentState::Completed,
+            Some("Stop")
+        ));
+        assert!(agent_event_completes_turn(
+            AgentState::Completed,
+            Some("agent_end")
+        ));
+        assert!(!agent_event_completes_turn(
+            AgentState::Completed,
+            Some("session_compact")
+        ));
+        assert!(!agent_event_completes_turn(
+            AgentState::Completed,
+            Some("auto_compaction_end")
+        ));
+        assert!(!agent_event_completes_turn(
+            AgentState::Running,
+            Some("agent_end")
+        ));
+    }
+
+    #[test]
+    fn completed_agent_turn_queues_visible_pull_request_refresh() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.github_auth = github::AuthStatus::Authenticated {
+            login: "octocat".into(),
+        };
+        let mut panel = GitHubPanelState::loading(github::Repository {
+            root: std::env::temp_dir(),
+            name: "muxtrix".into(),
+            owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
+            branch: "mk-152".into(),
+            wsl_distribution: String::new(),
+        });
+        panel.active_tab = GitHubPanelTab::PullRequests;
+        panel.loading = false;
+        panel.pull_requests = Some(Vec::new());
+        app.github_panel = Some(panel);
+
+        let response = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Completed,
+            event: Some("Stop".into()),
+            title: "Codex · Stop".into(),
+            body: "Agent completed a turn".into(),
+            pane_id: Some(pane_id.as_uuid().to_string()),
+            session_id: Some("mk-152-session".into()),
+            cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+        });
+
+        assert!(response.ok);
+        let panel = app.github_panel.as_ref().expect("panel should remain open");
+        assert!(panel.pull_requests.is_none());
+        assert!(panel.pull_requests_loading);
+        assert!(app.github_pull_requests_refresh_pending);
+
+        drop(app.update(Message::RefreshGitHubPullRequestsAfterAgentTurn));
+        assert!(!app.github_pull_requests_refresh_pending);
+        assert_eq!(
+            app.github_panel
+                .as_ref()
+                .map(|panel| panel.pull_request_generation),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn completed_agent_turn_invalidates_hidden_pull_request_cache() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let mut panel = GitHubPanelState::loading(github::Repository {
+            root: std::env::temp_dir(),
+            name: "muxtrix".into(),
+            owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
+            branch: "mk-152".into(),
+            wsl_distribution: String::new(),
+        });
+        panel.loading = false;
+        panel.pull_requests = Some(Vec::new());
+        app.github_panel = Some(panel);
+
+        let response = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "pi".into(),
+            state: AgentState::Completed,
+            event: Some("agent_end".into()),
+            title: "Oh My Pi".into(),
+            body: "Agent completed a turn".into(),
+            pane_id: Some(pane_id.as_uuid().to_string()),
+            session_id: Some("mk-152-session".into()),
+            cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+        });
+
+        assert!(response.ok);
+        let panel = app.github_panel.as_ref().expect("panel should remain open");
+        assert!(panel.pull_requests.is_none());
+        assert!(!panel.pull_requests_loading);
+        assert!(!app.github_pull_requests_refresh_pending);
     }
 
     #[test]
