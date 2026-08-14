@@ -5,7 +5,7 @@ use std::process::{Command, Output, Stdio};
 
 use serde::Deserialize;
 
-use crate::process::console_command;
+use crate::{process::console_command, settings::normalize_github_host};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuthStatus {
@@ -20,6 +20,7 @@ pub(crate) struct Repository {
     pub(crate) root: PathBuf,
     pub(crate) name: String,
     pub(crate) owner_and_name: Option<String>,
+    pub(crate) host: String,
     pub(crate) branch: String,
     pub(crate) wsl_distribution: String,
 }
@@ -205,7 +206,10 @@ pub(crate) struct PanelData {
 pub(crate) fn repository_from(
     directory: &Path,
     wsl_distribution: &str,
+    github_host: &str,
 ) -> Result<Repository, String> {
+    let github_host = normalize_github_host(github_host)
+        .map_err(|error| format!("GitHub host is invalid: {error}"))?;
     let root_output = git(
         directory,
         wsl_distribution,
@@ -241,14 +245,25 @@ pub(crate) fn repository_from(
     Ok(Repository {
         root,
         name,
-        owner_and_name: remote.as_deref().and_then(parse_github_remote),
+        owner_and_name: remote
+            .as_deref()
+            .and_then(|remote| parse_github_remote(remote, &github_host)),
+        host: github_host,
         branch,
         wsl_distribution: wsl_distribution.to_owned(),
     })
 }
 
-pub(crate) fn auth_status() -> AuthStatus {
-    let output = match console_command("gh")
+pub(crate) fn auth_status(github_host: &str) -> AuthStatus {
+    let github_host = match normalize_github_host(github_host) {
+        Ok(host) => host,
+        Err(error) => {
+            return AuthStatus::Unavailable {
+                reason: format!("GitHub host is invalid: {error}"),
+            };
+        }
+    };
+    let output = match github_command(&github_host)
         .args(["api", "user", "--jq", ".login"])
         .output()
     {
@@ -267,11 +282,7 @@ pub(crate) fn auth_status() -> AuthStatus {
     if output.status.success() {
         let login = stdout_line(&output);
         return AuthStatus::Authenticated {
-            login: if login.is_empty() {
-                "GitHub".into()
-            } else {
-                login
-            },
+            login: if login.is_empty() { github_host } else { login },
         };
     }
     let failure = output_failure(&output);
@@ -291,13 +302,15 @@ pub(crate) fn auth_status() -> AuthStatus {
     }
 }
 
-pub(crate) fn authenticate() -> Result<AuthStatus, String> {
-    let output = console_command("gh")
+pub(crate) fn authenticate(github_host: &str) -> Result<AuthStatus, String> {
+    let github_host = normalize_github_host(github_host)
+        .map_err(|error| format!("GitHub host is invalid: {error}"))?;
+    let output = github_command(&github_host)
         .args([
             "auth",
             "login",
             "--hostname",
-            "github.com",
+            &github_host,
             "--git-protocol",
             "https",
             "--web",
@@ -316,9 +329,11 @@ pub(crate) fn authenticate() -> Result<AuthStatus, String> {
             "GitHub authentication did not finish. Try again when you are ready.",
         ));
     }
-    match auth_status() {
+    match auth_status(&github_host) {
         status @ AuthStatus::Authenticated { .. } => Ok(status),
-        _ => Err("GitHub did not report an authenticated account after login.".into()),
+        _ => Err(format!(
+            "{github_host} did not report an authenticated account after login."
+        )),
     }
 }
 
@@ -358,7 +373,7 @@ pub(crate) fn list_pull_requests(
     repository: &Repository,
 ) -> Result<Vec<PullRequestSummary>, String> {
     let owner_and_name = github_repository(repository)?;
-    let output = console_command("gh")
+    let output = github_command(&repository.host)
         .args([
             "pr",
             "list",
@@ -388,7 +403,7 @@ pub(crate) fn load_pull_request_details(
 ) -> Result<PullRequestDetails, String> {
     let owner_and_name = github_repository(repository)?;
     let pull_request = load_pull_request(repository, number)?;
-    let mut files = load_pull_request_files(owner_and_name, number)?;
+    let mut files = load_pull_request_files(&repository.host, owner_and_name, number)?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(PullRequestDetails {
         pull_request,
@@ -535,6 +550,7 @@ fn reconstruct_pull_request_diff(
         Vec::new()
     } else {
         match load_remote_file(
+            &repository.host,
             github_repository(repository)?,
             &pull_request.base_oid,
             previous_path,
@@ -548,6 +564,7 @@ fn reconstruct_pull_request_diff(
         Vec::new()
     } else {
         match load_remote_file(
+            &repository.host,
             if pull_request.head_repository.is_empty() {
                 github_repository(repository)?
             } else {
@@ -575,6 +592,7 @@ fn reconstruct_pull_request_diff(
 }
 
 fn load_remote_file(
+    github_host: &str,
     owner_and_name: &str,
     oid: &str,
     path: &str,
@@ -585,7 +603,7 @@ fn load_remote_file(
         percent_encode_github_path(path),
         percent_encode_github_path(oid),
     );
-    let mut command = console_command("gh");
+    let mut command = github_command(github_host);
     command
         .args([
             "api",
@@ -898,9 +916,13 @@ fn parse_hunk_starts(line: &str) -> Option<(usize, usize)> {
     Some((start(old)?, start(new)?))
 }
 
-fn load_pull_request_files(owner_and_name: &str, number: u64) -> Result<Vec<FileChange>, String> {
+fn load_pull_request_files(
+    github_host: &str,
+    owner_and_name: &str,
+    number: u64,
+) -> Result<Vec<FileChange>, String> {
     let endpoint = format!("repos/{owner_and_name}/pulls/{number}/files");
-    let output = console_command("gh")
+    let output = github_command(github_host)
         .args(["api", &endpoint, "--paginate", "--slurp"])
         .output()
         .map_err(|error| format!("GitHub changed files could not be read: {error}"))?;
@@ -920,7 +942,7 @@ pub(crate) fn merge(
 ) -> Result<String, String> {
     let owner_and_name = github_repository(repository)?;
     let number = number.to_string();
-    let output = console_command("gh")
+    let output = github_command(&repository.host)
         .args([
             "pr",
             "merge",
@@ -1114,6 +1136,12 @@ fn parse_pull_request(bytes: &[u8]) -> Result<PullRequest, String> {
     })
 }
 
+fn github_command(github_host: &str) -> Command {
+    let mut command = console_command("gh");
+    command.env("GH_HOST", github_host);
+    command
+}
+
 fn git(directory: &Path, wsl_distribution: &str, arguments: &[&str]) -> Result<Output, String> {
     super::git_in(directory, wsl_distribution, arguments)
         .map_err(|error| format!("Git could not start: {error}"))
@@ -1128,7 +1156,7 @@ fn github_repository(repository: &Repository) -> Result<&str, String> {
 
 fn pull_request_view_command(repository: &Repository, number: u64) -> Result<Command, String> {
     let owner_and_name = github_repository(repository)?;
-    let mut command = console_command("gh");
+    let mut command = github_command(&repository.host);
     command.args([
         "pr",
         "view",
@@ -1198,16 +1226,19 @@ fn apply_numstat(files: &mut [FileChange], numstat: &str) {
     }
 }
 
-fn parse_github_remote(remote: &str) -> Option<String> {
+fn parse_github_remote(remote: &str, github_host: &str) -> Option<String> {
     let trimmed = remote.trim().trim_end_matches(".git");
-    let repository = if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix("ssh://git@github.com/") {
-        rest
+    let (remote_host, repository) = if let Some((_, url)) = trimmed.split_once("://") {
+        let (authority, repository) = url.split_once('/')?;
+        (authority.rsplit('@').next()?, repository)
     } else {
-        trimmed.strip_prefix("https://github.com/")?
+        let (authority, repository) = trimmed.split_once(':')?;
+        (authority.rsplit('@').next()?, repository)
     };
-    (repository.split('/').count() == 2).then(|| repository.to_owned())
+    (remote_host.eq_ignore_ascii_case(github_host)
+        && repository.split('/').count() == 2
+        && repository.split('/').all(|segment| !segment.is_empty()))
+    .then(|| repository.to_owned())
 }
 
 fn stdout_line(output: &Output) -> String {
@@ -1242,16 +1273,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn github_remote_parser_accepts_https_and_ssh() {
+    fn github_remote_parser_accepts_configured_public_and_enterprise_hosts() {
         assert_eq!(
-            parse_github_remote("https://github.com/Phoenixmatrix/muxtrix.git"),
+            parse_github_remote("https://github.com/Phoenixmatrix/muxtrix.git", "github.com"),
             Some("Phoenixmatrix/muxtrix".into())
         );
         assert_eq!(
-            parse_github_remote("git@github.com:Phoenixmatrix/muxtrix.git"),
+            parse_github_remote(
+                "git@github.example.com:Phoenixmatrix/muxtrix.git",
+                "github.example.com"
+            ),
             Some("Phoenixmatrix/muxtrix".into())
         );
-        assert_eq!(parse_github_remote("git@example.com:a/b.git"), None);
+        assert_eq!(
+            parse_github_remote(
+                "ssh://git@github.example.com/Phoenixmatrix/muxtrix.git",
+                "github.example.com"
+            ),
+            Some("Phoenixmatrix/muxtrix".into())
+        );
+        assert_eq!(
+            parse_github_remote("git@github.com:a/b.git", "github.example.com"),
+            None
+        );
     }
 
     #[test]
@@ -1260,6 +1304,7 @@ mod tests {
             root: "/home/user/dev/muxtrix".into(),
             name: "muxtrix".into(),
             owner_and_name: Some("Phoenixmatrix/muxtrix".into()),
+            host: "github.example.com".into(),
             branch: "wsl-fix".into(),
             wsl_distribution: "Ubuntu-24.04".into(),
         };
@@ -1277,6 +1322,10 @@ mod tests {
                 .any(|arguments| { arguments == ["--repo", "Phoenixmatrix/muxtrix"] })
         );
         assert!(arguments.iter().any(|argument| argument == "42"));
+        assert!(command.get_envs().any(|(name, value)| {
+            name == "GH_HOST"
+                && value.is_some_and(|value| value == std::ffi::OsStr::new("github.example.com"))
+        }));
     }
 
     #[test]
@@ -1381,6 +1430,7 @@ mod tests {
             root: "/unused".into(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "diff-viewer".into(),
             wsl_distribution: String::new(),
         };

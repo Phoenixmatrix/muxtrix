@@ -165,6 +165,7 @@ enum Stage {
 enum TickAction {
     Wait,
     ScrollSettingsToEnd,
+    ScrollSettingsToGitHub,
     ScrollGitHubToEnd,
     ScrollGitHubPullRequestsToEnd,
     Capture,
@@ -602,6 +603,12 @@ impl Scenario {
                 if self.capturing("worktree-agent-settings") && self.settle_ticks == 2 {
                     return Ok(TickAction::ScrollSettingsToEnd);
                 }
+                if (self.capturing("settings-github-enterprise")
+                    || self.capturing("settings-github-invalid"))
+                    && self.settle_ticks == 2
+                {
+                    return Ok(TickAction::ScrollSettingsToGitHub);
+                }
                 if self.capturing("github-pull-requests-scrolled") && self.settle_ticks == 2 {
                     return Ok(TickAction::ScrollGitHubPullRequestsToEnd);
                 }
@@ -740,6 +747,12 @@ impl Scenario {
                 .map_err(|error| error.to_string())?;
         } else if self.capturing("settings") {
             drop(app.open_settings());
+        } else if self.capturing("settings-github-enterprise") {
+            drop(app.open_settings());
+            app.settings_draft.github_host = "github.corp.example.com".into();
+        } else if self.capturing("settings-github-invalid") {
+            drop(app.open_settings());
+            app.settings_draft.github_host = "github.corp.example.com/api/v3".into();
         } else if self.capturing("settings-version-mismatch") {
             drop(app.open_settings());
             let installed = next_patch_version(env!("CARGO_PKG_VERSION"));
@@ -1912,6 +1925,13 @@ impl Muxtrix {
                     super::SETTINGS_SCROLL_ID,
                 ))
             }
+            Ok(TickAction::ScrollSettingsToGitHub) => {
+                self.e2e = Some(scenario);
+                iced::widget::operation::snap_to(
+                    iced::widget::Id::new(super::SETTINGS_SCROLL_ID),
+                    iced::widget::operation::RelativeOffset { x: 0.0, y: 0.65 },
+                )
+            }
             Ok(TickAction::ScrollGitHubToEnd) => {
                 self.e2e = Some(scenario);
                 iced::widget::operation::snap_to_end(iced::widget::Id::new(
@@ -1963,6 +1983,7 @@ fn staged_repository() -> github::Repository {
         root: "/home/user/.muxtrix/worktrees/muxtrix/github-support".into(),
         name: "muxtrix".into(),
         owner_and_name: Some("Phoenixmatrix/muxtrix".into()),
+        host: "github.com".into(),
         branch: "github-support".into(),
         wsl_distribution: "Ubuntu-24.04".into(),
     }

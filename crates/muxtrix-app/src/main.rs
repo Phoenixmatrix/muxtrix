@@ -216,6 +216,7 @@ struct Muxtrix {
     global_alerts: Vec<GlobalAlert>,
     github_auth: github::AuthStatus,
     github_auth_busy: bool,
+    github_auth_generation: u64,
     github_panel: Option<GitHubPanelState>,
     github_diff: Option<GitHubDiffState>,
     github_pane_refresh_pending: bool,
@@ -266,10 +267,10 @@ struct Muxtrix {
     /// newer frame arrives; this preserves the hook/frame race guard without
     /// making Running sticky forever.
     agent_running_frame_revisions: BTreeMap<PaneId, u64>,
-    /// Panes whose agent status came from process-tree detection rather than
-    /// lifecycle hooks, with the instant detection first saw them. Hook
-    /// events take ownership; detected entries self-clean when the process
-    /// disappears.
+    /// Panes where process-tree detection has observed a live agent, with the
+    /// instant it last saw that process. Lifecycle hooks enrich the same
+    /// status but do not disable exit observation; the entry self-cleans after
+    /// the harness process remains absent.
     detected_agents: BTreeMap<PaneId, std::time::Instant>,
     /// Panes currently showing Claude Code's Agents view. Their rows project
     /// `agents_roster` instead of one conversation's lifecycle.
@@ -1166,8 +1167,8 @@ enum Message {
     InstalledVersionsLoaded(Result<InstalledVersions, String>),
     GitHubStatusPressed,
     BeginGitHubAuth,
-    GitHubAuthChecked(github::AuthStatus),
-    GitHubAuthFinished(Result<github::AuthStatus, String>),
+    GitHubAuthChecked(u64, github::AuthStatus),
+    GitHubAuthFinished(u64, Result<github::AuthStatus, String>),
     CloseGitHubPanel,
     RefreshGitHubPanel,
     RefreshGitHubFocusedPane,
@@ -1236,6 +1237,7 @@ enum Message {
     SetFleetView(FleetView),
     SetFleetScope(FleetScope),
     SettingsDefaultAgent(DefaultAgentChoice),
+    SettingsGitHubHost(String),
     SettingsCodexCommand(String),
     SettingsClaudeCommand(String),
     SettingsPiCommand(String),
@@ -1410,11 +1412,18 @@ impl Muxtrix {
     fn boot() -> (Self, Task<Message>) {
         let mut app = Self::new();
         let discovery = app.refresh_integrations();
-        let github_auth = perform_blocking(github::auth_status, |result| {
-            Message::GitHubAuthChecked(result.unwrap_or(github::AuthStatus::Unavailable {
-                reason: "GitHub authentication could not be checked.".into(),
-            }))
-        });
+        let github_host = app.settings.github_host.clone();
+        let github_auth = perform_blocking(
+            move || github::auth_status(&github_host),
+            |result| {
+                Message::GitHubAuthChecked(
+                    0,
+                    result.unwrap_or(github::AuthStatus::Unavailable {
+                        reason: "GitHub authentication could not be checked.".into(),
+                    }),
+                )
+            },
+        );
         (app, Task::batch([discovery, github_auth]))
     }
 
@@ -1879,6 +1888,7 @@ impl Muxtrix {
             global_alerts,
             github_auth: github::AuthStatus::Checking,
             github_auth_busy: false,
+            github_auth_generation: 0,
             github_panel: None,
             github_diff: None,
             github_pane_refresh_pending: false,
@@ -2628,16 +2638,21 @@ impl Muxtrix {
                 return self.open_github_panel();
             }
             Message::BeginGitHubAuth => return self.begin_github_auth(),
-            Message::GitHubAuthChecked(status) => {
-                self.github_auth = status;
+            Message::GitHubAuthChecked(generation, status) => {
+                if generation == self.github_auth_generation {
+                    self.github_auth = status;
+                }
                 return Task::none();
             }
-            Message::GitHubAuthFinished(result) => {
+            Message::GitHubAuthFinished(generation, result) => {
+                if generation != self.github_auth_generation {
+                    return Task::none();
+                }
                 self.github_auth_busy = false;
                 match result {
                     Ok(status) => {
                         self.github_auth = status;
-                        self.status = "Connected to GitHub".into();
+                        self.status = format!("Connected to {}", self.settings.github_host);
                         if self
                             .github_panel
                             .as_ref()
@@ -3242,6 +3257,10 @@ impl Muxtrix {
             Message::SetFleetScope(scope) => {
                 self.set_fleet_scope(scope);
                 return self.refresh_pane_repositories();
+            }
+            Message::SettingsGitHubHost(host) => {
+                self.settings_draft.github_host = host;
+                return Task::none();
             }
             Message::SettingsCodexCommand(command) => {
                 self.settings_draft.codex_command = command;
@@ -5562,8 +5581,11 @@ impl Muxtrix {
             self.show_toast("The focused pane has no working directory");
             return Task::none();
         };
-        let repository = match github::repository_from(&directory, &self.settings.wsl_distribution)
-        {
+        let repository = match github::repository_from(
+            &directory,
+            &self.settings.wsl_distribution,
+            &self.settings.github_host,
+        ) {
             Ok(repository) => repository,
             Err(error) => {
                 self.status = error.clone();
@@ -5590,10 +5612,16 @@ impl Muxtrix {
             return Task::none();
         }
         self.github_auth_busy = true;
-        self.status = "Finish connecting GitHub in your browser".into();
-        perform_blocking(github::authenticate, |result| {
-            Message::GitHubAuthFinished(result.and_then(std::convert::identity))
-        })
+        self.github_auth_generation = self.github_auth_generation.wrapping_add(1);
+        let generation = self.github_auth_generation;
+        let github_host = self.settings.github_host.clone();
+        self.status = format!("Finish connecting {github_host} in your browser");
+        perform_blocking(
+            move || github::authenticate(&github_host),
+            move |result| {
+                Message::GitHubAuthFinished(generation, result.and_then(std::convert::identity))
+            },
+        )
     }
 
     fn refresh_github_panel(&mut self) -> Task<Message> {
@@ -5705,6 +5733,7 @@ impl Muxtrix {
             return Task::none();
         };
         let wsl_distribution = self.settings.wsl_distribution.clone();
+        let github_host = self.settings.github_host.clone();
         self.github_context_generation = self.github_context_generation.wrapping_add(1);
         let generation = self.github_context_generation;
         if let Some(panel) = self.github_panel.as_mut() {
@@ -5717,7 +5746,8 @@ impl Muxtrix {
         }
         perform_blocking(
             move || {
-                let repository = github::repository_from(&directory, &wsl_distribution)?;
+                let repository =
+                    github::repository_from(&directory, &wsl_distribution, &github_host)?;
                 let data = github::load_local(&repository)?;
                 Ok((repository, data))
             },
@@ -6310,6 +6340,15 @@ impl Muxtrix {
     }
 
     fn save_settings(&mut self) -> Task<Message> {
+        let github_host = match settings::normalize_github_host(&self.settings_draft.github_host) {
+            Ok(host) => host,
+            Err(error) => {
+                self.status = format!("Could not save settings: {error}");
+                return Task::none();
+            }
+        };
+        self.settings_draft.github_host = github_host;
+        let github_host_changed = self.settings_draft.github_host != self.settings.github_host;
         self.settings = self.settings_draft.clone();
         let terminal_theme = self.settings.terminal_theme.preset().terminal_theme();
         let mut theme_error = None;
@@ -6346,11 +6385,31 @@ impl Muxtrix {
             ),
             (Err(error), _) => format!("Could not save settings: {error}"),
         };
-        let resize_task = self.window_resize_increment_task();
-        if saved && self.pending_default_agent_command.is_some() {
-            return Task::batch([resize_task, self.resume_pending_default_agent_command()]);
+        let mut tasks = vec![self.window_resize_increment_task()];
+        if github_host_changed {
+            self.github_auth_generation = self.github_auth_generation.wrapping_add(1);
+            let generation = self.github_auth_generation;
+            let github_host = self.settings.github_host.clone();
+            self.github_auth_busy = false;
+            self.github_auth = github::AuthStatus::Checking;
+            self.github_panel = None;
+            self.github_diff = None;
+            tasks.push(perform_blocking(
+                move || github::auth_status(&github_host),
+                move |result| {
+                    Message::GitHubAuthChecked(
+                        generation,
+                        result.unwrap_or(github::AuthStatus::Unavailable {
+                            reason: "GitHub authentication could not be checked.".into(),
+                        }),
+                    )
+                },
+            ));
         }
-        resize_task
+        if saved && self.pending_default_agent_command.is_some() {
+            tasks.push(self.resume_pending_default_agent_command());
+        }
+        Task::batch(tasks)
     }
 
     fn send_terminal_input(&mut self, bytes: Vec<u8>) -> Result<(), String> {
@@ -6380,44 +6439,46 @@ impl Muxtrix {
 
     /// Detection beneath the hooks: an agent process running inside a pane is
     /// an agent even before (or without) any lifecycle hook firing. Hook
-    /// events overwrite and take ownership; a detected entry is removed once
-    /// its process disappears.
+    /// events enrich that status, while process observation remains in place
+    /// so returning to the shell clears stale lifecycle metadata.
     fn detect_agent_processes(&mut self) {
         let pane_ids: Vec<PaneId> = self.terminals.keys().copied().collect();
         for pane_id in pane_ids {
-            if !self.agent_statuses.contains_key(&pane_id) {
-                if let Some(agent) = self.pane_agent_process(pane_id) {
-                    let display_name = self.agent_worktree_name(pane_id);
-                    self.agent_statuses.insert(
-                        pane_id,
-                        AgentPaneStatus {
-                            agent,
-                            display_name,
-                            state: AgentState::Running,
-                            activity: None,
-                            session_id: None,
-                            cwd: None,
-                            git_branch: None,
-                        },
-                    );
-                    self.agent_running_frame_revisions.insert(
-                        pane_id,
-                        self.terminals
-                            .get(&pane_id)
-                            .map_or(0, |runtime| runtime.snapshot_revision),
-                    );
+            match self.pane_agent_process(pane_id) {
+                Some(agent) => {
                     self.detected_agents
                         .insert(pane_id, std::time::Instant::now());
+                    if !self.agent_statuses.contains_key(&pane_id) {
+                        let display_name = self.agent_worktree_name(pane_id);
+                        self.agent_statuses.insert(
+                            pane_id,
+                            AgentPaneStatus {
+                                agent,
+                                display_name,
+                                state: AgentState::Running,
+                                activity: None,
+                                session_id: None,
+                                cwd: None,
+                                git_branch: None,
+                            },
+                        );
+                        self.agent_running_frame_revisions.insert(
+                            pane_id,
+                            self.terminals
+                                .get(&pane_id)
+                                .map_or(0, |runtime| runtime.snapshot_revision),
+                        );
+                    }
                 }
-            } else if self
-                .detected_agents
-                .get(&pane_id)
-                .is_some_and(|first_seen| first_seen.elapsed() > std::time::Duration::from_secs(2))
-                && self.pane_agent_process(pane_id).is_none()
-            {
-                self.agent_statuses.remove(&pane_id);
-                self.agent_running_frame_revisions.remove(&pane_id);
-                self.detected_agents.remove(&pane_id);
+                None if self.detected_agents.get(&pane_id).is_some_and(|last_seen| {
+                    last_seen.elapsed() > std::time::Duration::from_secs(2)
+                }) =>
+                {
+                    self.agent_statuses.remove(&pane_id);
+                    self.agent_running_frame_revisions.remove(&pane_id);
+                    self.detected_agents.remove(&pane_id);
+                }
+                None => {}
             }
         }
     }
@@ -7205,7 +7266,6 @@ impl Muxtrix {
                         .terminals
                         .get(&pane_id)
                         .map_or(0, |runtime| runtime.snapshot_revision);
-                    self.detected_agents.remove(&pane_id);
                     if advisory_wait || post_tool_cannot_clear_wait {
                         if let Some(current) = self.agent_statuses.get_mut(&pane_id) {
                             if session_id.is_some() {
@@ -7242,6 +7302,7 @@ impl Muxtrix {
                         self.agent_statuses.remove(&pane_id);
                         self.agent_running_frame_revisions.remove(&pane_id);
                         self.terminal_command_buffers.remove(&pane_id);
+                        self.detected_agents.remove(&pane_id);
                     } else {
                         self.agent_statuses.insert(
                             pane_id,
@@ -12512,7 +12573,7 @@ impl Muxtrix {
                     weight: font::Weight::Bold,
                     ..Font::DEFAULT
                 }),
-            text("Tune the interface, terminal, and agent integrations.")
+            text("Tune the interface, terminal, and developer integrations.")
                 .size(self.settings_draft.ui_pixels(11.0))
                 .color(tokens.muted),
         ]
@@ -12747,6 +12808,37 @@ impl Muxtrix {
             ],
             &self.settings_draft,
         );
+        let github_host_validation =
+            settings::normalize_github_host(&self.settings_draft.github_host);
+        let github_host_valid = github_host_validation.is_ok();
+        let mut github_host_control = column![
+            text_input("github.com", &self.settings_draft.github_host)
+                .on_input(Message::SettingsGitHubHost)
+                .line_height(Pixels(30.0))
+                .padding([0, 9])
+                .size(self.settings_draft.ui_pixels(11.0))
+                .width(320)
+        ]
+        .spacing(4);
+        if let Err(error) = github_host_validation {
+            github_host_control = github_host_control.push(
+                text(error)
+                    .size(self.settings_draft.ui_pixels(9.0))
+                    .color(tokens.danger)
+                    .width(320),
+            );
+        }
+        let github = settings_section(
+            "GitHub",
+            "Public GitHub and Enterprise Server",
+            column![settings_row(
+                "GitHub host",
+                "Use github.com or your Enterprise Server hostname; no API path",
+                github_host_control,
+                &self.settings_draft,
+            )],
+            &self.settings_draft,
+        );
 
         let integrations = settings_section(
             "Agent lifecycle hooks",
@@ -12835,6 +12927,7 @@ impl Muxtrix {
             &self.settings_draft,
         ));
         let content = content
+            .push(github)
             .push(integrations)
             .push(versions)
             .spacing(22)
@@ -12866,7 +12959,8 @@ impl Muxtrix {
                     } else {
                         "Apply changes"
                     },
-                    (changed || can_continue_pending_command).then_some(Message::SaveSettings),
+                    ((changed || can_continue_pending_command) && github_host_valid)
+                        .then_some(Message::SaveSettings),
                     SettingsButtonKind::Primary,
                     &self.settings_draft,
                 ),
@@ -19563,12 +19657,54 @@ mod tests {
     }
 
     #[test]
+    fn stale_github_authentication_results_cannot_replace_the_configured_host_state() {
+        let mut app = Muxtrix::new();
+        app.github_auth_generation = 2;
+        app.github_auth = github::AuthStatus::Checking;
+
+        drop(app.update(Message::GitHubAuthChecked(
+            1,
+            github::AuthStatus::Authenticated {
+                login: "stale-account".into(),
+            },
+        )));
+        assert_eq!(app.github_auth, github::AuthStatus::Checking);
+
+        drop(app.update(Message::GitHubAuthChecked(
+            2,
+            github::AuthStatus::Authenticated {
+                login: "enterprise-account".into(),
+            },
+        )));
+        assert_eq!(
+            app.github_auth,
+            github::AuthStatus::Authenticated {
+                login: "enterprise-account".into()
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_github_host_keeps_the_settings_draft_open() {
+        let mut app = Muxtrix::new();
+        app.active_view = ActiveView::Settings;
+        app.settings_draft.github_host = "github.example.com/api/v3".into();
+
+        drop(app.save_settings());
+
+        assert_eq!(app.active_view, ActiveView::Settings);
+        assert_eq!(app.settings_draft.github_host, "github.example.com/api/v3");
+        assert!(app.status.contains("GitHub host must be a hostname"));
+    }
+
+    #[test]
     fn selecting_a_github_file_opens_the_diff_and_back_restores_the_workspace() {
         let mut app = Muxtrix::new();
         let mut panel = GitHubPanelState::loading(github::Repository {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "diff-viewer".into(),
             wsl_distribution: String::new(),
         });
@@ -19617,6 +19753,7 @@ mod tests {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "main".into(),
             wsl_distribution: String::new(),
         }));
@@ -19635,6 +19772,7 @@ mod tests {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "main".into(),
             wsl_distribution: String::new(),
         });
@@ -19676,6 +19814,7 @@ mod tests {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "main".into(),
             wsl_distribution: String::new(),
         };
@@ -19771,6 +19910,7 @@ mod tests {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "main".into(),
             wsl_distribution: String::new(),
         };
@@ -19826,6 +19966,7 @@ mod tests {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "main".into(),
             wsl_distribution: String::new(),
         }));
@@ -19852,6 +19993,7 @@ mod tests {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "main".into(),
             wsl_distribution: String::new(),
         });
@@ -22120,7 +22262,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn running_agent_processes_are_detected_without_hooks() {
+    fn agent_status_returns_to_shell_after_hooked_process_exits() {
         let mut app = Muxtrix::new();
         // Any process whose comm matches the configured agent executable
         // counts; `sleep` stands in for the codex binary here.
@@ -22160,8 +22302,28 @@ mod tests {
         assert_eq!(status.state, AgentState::Running);
         assert!(app.detected_agents.contains_key(&pane_id));
 
-        // A hook event takes ownership: the detection record clears so the
-        // status is no longer subject to process-scan removal.
+        // Once a lifecycle hook arrives, process observation must remain in
+        // place so leaving the harness can restore truthful shell state even
+        // when its final hook is missing.
+        let hooked = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Running,
+            event: Some("UserPromptSubmit".into()),
+            title: "Codex · UserPromptSubmit".into(),
+            body: "Working".into(),
+            pane_id: Some(pane_id.as_uuid().to_string()),
+            session_id: Some("thread-1".into()),
+            cwd: None,
+        });
+        assert!(hooked.ok);
+        // Model a hook arriving before the periodic process scan saw the
+        // harness: an existing hook-owned status must still join observation.
+        app.detected_agents.remove(&pane_id);
+        app.detect_agent_processes();
+        assert!(
+            app.detected_agents.contains_key(&pane_id),
+            "hook-owned statuses must retain process-exit observation"
+        );
         app.detected_agents.insert(
             pane_id,
             std::time::Instant::now() - std::time::Duration::from_secs(3),
@@ -22179,6 +22341,7 @@ mod tests {
             !app.agent_statuses.contains_key(&pane_id),
             "a detected status must self-clean when its process exits"
         );
+        assert_eq!(app.pane_state_label(pane_id), "Shell");
     }
 
     #[test]
