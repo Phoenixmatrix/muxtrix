@@ -221,7 +221,17 @@ impl HookManager {
         let target = self.target(agent, scope);
         let value = read_json_or_empty(&target)?;
         let managed_entries = count_managed(&value);
-        let unreachable_entries = count_unreachable_managed(&value);
+        // A named executable can belong to another environment. The Windows
+        // app, for example, installs `/mnt/c/.../muxtrixctl.exe` into WSL hook
+        // files; that path is valid where the hooks run but cannot be statted
+        // by Windows. The caller already vouched for named paths, so applying
+        // host filesystem reachability checks here would make every successful
+        // repair immediately read as broken again.
+        let unreachable_entries = if self.executable_is_named {
+            0
+        } else {
+            count_unreachable_managed(&value)
+        };
         Ok(HookStatus {
             agent,
             scope,
@@ -1901,12 +1911,15 @@ mod tests {
 
         // A caller that names the path vouches for it; provisioning another
         // environment's hooks must still work.
+        let externally_named = barren
+            .with_named_executable()
+            .apply(Agent::Claude, HookScope::User, HookAction::ReAdd)
+            .expect("a named cross-environment executable should install");
         assert!(
-            barren
-                .with_named_executable()
-                .apply(Agent::Claude, HookScope::User, HookAction::ReAdd)
-                .is_ok()
+            externally_named.status.installed,
+            "a path the caller vouched for must stay installed after repair"
         );
+        assert_eq!(externally_named.status.unreachable_entries, 0);
         let _ = std::fs::remove_dir_all(root);
     }
 
