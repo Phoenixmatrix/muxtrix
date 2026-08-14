@@ -427,6 +427,11 @@ Below 80 columns, lines remain intact behind horizontal scrolling because
 wrapping would fragment the code. Both modes retain bounded vertical
 virtualization, and resizing across the threshold anchors the same logical line.
 
+Draft state is a reversible secondary action in pull-request detail. A draft
+offers `Mark ready`; a reviewable pull request offers `Convert to draft`.
+Updating state keeps the detail visible, disables conflicting actions, and
+updates both readiness and the list status without requiring a manual refresh.
+
 Merge is a guarded inline action, not a modal interruption. Enable it only when
 GitHub reports a clean, mergeable pull request whose checks and review
 requirements are satisfied. The confirmation stays inside the pull-request

@@ -943,6 +943,33 @@ pub(crate) fn merge(
     }
 }
 
+pub(crate) fn set_draft(
+    repository: &Repository,
+    number: u64,
+    draft: bool,
+) -> Result<String, String> {
+    let mut command = pull_request_ready_command(repository, number, draft)?;
+    let output = command
+        .output()
+        .map_err(|error| format!("GitHub could not update the pull request: {error}"))?;
+    if output.status.success() {
+        Ok(if draft {
+            format!("Converted pull request #{number} to draft")
+        } else {
+            format!("Marked pull request #{number} ready for review")
+        })
+    } else {
+        Err(nonempty_failure(
+            &output,
+            if draft {
+                "GitHub could not convert this pull request to draft."
+            } else {
+                "GitHub could not mark this pull request ready for review."
+            },
+        ))
+    }
+}
+
 fn load_pull_request(repository: &Repository, number: u64) -> Result<PullRequest, String> {
     let output = pull_request_view_command(repository, number)?
         .output()
@@ -1126,6 +1153,20 @@ fn github_repository(repository: &Repository) -> Result<&str, String> {
         .ok_or_else(|| "The origin remote is not a GitHub repository.".into())
 }
 
+fn pull_request_ready_command(
+    repository: &Repository,
+    number: u64,
+    draft: bool,
+) -> Result<Command, String> {
+    let owner_and_name = github_repository(repository)?;
+    let mut command = console_command("gh");
+    command.args(["pr", "ready", &number.to_string(), "--repo", owner_and_name]);
+    if draft {
+        command.arg("--undo");
+    }
+    Ok(command)
+}
+
 fn pull_request_view_command(repository: &Repository, number: u64) -> Result<Command, String> {
     let owner_and_name = github_repository(repository)?;
     let mut command = console_command("gh");
@@ -1277,6 +1318,43 @@ mod tests {
                 .any(|arguments| { arguments == ["--repo", "Phoenixmatrix/muxtrix"] })
         );
         assert!(arguments.iter().any(|argument| argument == "42"));
+    }
+
+    #[test]
+    fn pull_request_draft_command_uses_ready_and_undo() {
+        let repository = Repository {
+            root: "/home/user/dev/muxtrix".into(),
+            name: "muxtrix".into(),
+            owner_and_name: Some("Phoenixmatrix/muxtrix".into()),
+            branch: "draft-toggle".into(),
+            wsl_distribution: String::new(),
+        };
+        let ready = pull_request_ready_command(&repository, 42, false)
+            .expect("ready-for-review command should build")
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let draft = pull_request_ready_command(&repository, 42, true)
+            .expect("draft command should build")
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ready,
+            ["pr", "ready", "42", "--repo", "Phoenixmatrix/muxtrix"]
+        );
+        assert_eq!(
+            draft,
+            [
+                "pr",
+                "ready",
+                "42",
+                "--repo",
+                "Phoenixmatrix/muxtrix",
+                "--undo"
+            ]
+        );
     }
 
     #[test]

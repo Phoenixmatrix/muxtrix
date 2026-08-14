@@ -505,6 +505,8 @@ struct GitHubPanelState {
     selected_pull_request_file_scroll_offset: f32,
     file_keyboard_cursor: Option<usize>,
     merge_confirmation: bool,
+    pull_request_action_error: Option<String>,
+    draft_state_updating: bool,
     merging: bool,
     file_scroll_offset: f32,
     request_generation: u64,
@@ -535,6 +537,8 @@ impl GitHubPanelState {
             selected_pull_request_error: None,
             selected_pull_request_file_scroll_offset: 0.0,
             file_keyboard_cursor: None,
+            pull_request_action_error: None,
+            draft_state_updating: false,
             merge_confirmation: false,
             merging: false,
             file_scroll_offset: 0.0,
@@ -546,7 +550,7 @@ impl GitHubPanelState {
     }
 
     fn active_loading(&self) -> bool {
-        if self.context_loading || self.merging {
+        if self.context_loading || self.merging || self.draft_state_updating {
             return true;
         }
         match self.active_tab {
@@ -564,6 +568,8 @@ impl GitHubPanelState {
         self.selected_pull_request_loading = false;
         self.selected_pull_request_error = None;
         self.selected_pull_request_file_scroll_offset = 0.0;
+        self.pull_request_action_error = None;
+        self.draft_state_updating = false;
         self.file_keyboard_cursor = None;
         self.keyboard_focus = Some(GitHubPanelKeyboardFocus::PullRequestList);
         self.merge_confirmation = false;
@@ -581,6 +587,28 @@ impl GitHubPanelState {
         };
         pull_request.status = github::PullRequestSummaryStatus::Merged;
     }
+
+    fn mark_pull_request_draft(&mut self, number: u64, draft: bool) {
+        if let Some(details) = self
+            .selected_pull_request
+            .as_mut()
+            .filter(|details| details.pull_request.number == number)
+        {
+            details.pull_request.draft = draft;
+        }
+        let Some(pull_request) = self.pull_requests.as_mut().and_then(|pull_requests| {
+            pull_requests
+                .iter_mut()
+                .find(|pull_request| pull_request.number == number)
+        }) else {
+            return;
+        };
+        pull_request.status = if draft {
+            github::PullRequestSummaryStatus::Draft
+        } else {
+            github::PullRequestSummaryStatus::Open
+        };
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -595,6 +623,8 @@ enum GitHubPanelKeyboardFocus {
     Search,
     PullRequestList,
     Back,
+    DraftAction,
+    MergeAction,
     Files,
 }
 
@@ -1186,6 +1216,8 @@ enum Message {
     ),
     GitHubDiffScrolled(f32),
     OpenGitHubPullRequest(String),
+    ToggleGitHubPullRequestDraft,
+    GitHubPullRequestDraftChanged(std::path::PathBuf, u64, bool, Result<String, String>),
     RequestGitHubMerge,
     CancelGitHubMerge,
     ConfirmGitHubMerge,
@@ -2979,9 +3011,43 @@ impl Muxtrix {
                     move |result| Message::TerminalLinkOpened(url.clone(), result),
                 );
             }
+            Message::ToggleGitHubPullRequestDraft => {
+                return self.toggle_github_pull_request_draft();
+            }
+            Message::GitHubPullRequestDraftChanged(root, number, draft, result) => {
+                let Some(panel) = self
+                    .github_panel
+                    .as_mut()
+                    .filter(|panel| panel.repository.root == root)
+                else {
+                    return Task::none();
+                };
+                panel.draft_state_updating = false;
+                match result {
+                    Ok(status) => {
+                        panel.mark_pull_request_draft(number, draft);
+                        panel.pull_request_action_error = None;
+                        self.status = status;
+                    }
+                    Err(error) => {
+                        if panel.selected_pull_request_number == Some(number) {
+                            panel.pull_request_action_error = Some(error.clone());
+                        }
+                        self.status = error;
+                    }
+                }
+                return Task::none();
+            }
             Message::RequestGitHubMerge => {
-                if let Some(panel) = self.github_panel.as_mut() {
+                if let Some(panel) = self.github_panel.as_mut()
+                    && !panel.merging
+                    && !panel.draft_state_updating
+                    && panel.selected_pull_request.as_ref().is_some_and(|details| {
+                        details.pull_request.readiness() == github::MergeReadiness::Ready
+                    })
+                {
                     panel.merge_confirmation = true;
+                    panel.pull_request_action_error = None;
                 }
                 return Task::none();
             }
@@ -5287,6 +5353,12 @@ impl Muxtrix {
             return None;
         }
         if matches!(key, Key::Named(Named::Escape)) {
+            if panel.merge_confirmation {
+                return Some(self.update(Message::CancelGitHubMerge));
+            }
+            if panel.merging || panel.draft_state_updating {
+                return Some(Task::none());
+            }
             if panel.selected_pull_request_number.is_some() {
                 return Some(self.update(Message::CloseGitHubPullRequest));
             }
@@ -5322,6 +5394,20 @@ impl Muxtrix {
             && matches!(key, Key::Named(Named::Enter | Named::Space))
         {
             return Some(self.update(Message::CloseGitHubPullRequest));
+        }
+        if focus == GitHubPanelKeyboardFocus::DraftAction
+            && matches!(key, Key::Named(Named::Enter | Named::Space))
+        {
+            return Some(self.update(Message::ToggleGitHubPullRequestDraft));
+        }
+        if focus == GitHubPanelKeyboardFocus::MergeAction
+            && matches!(key, Key::Named(Named::Enter | Named::Space))
+        {
+            return Some(self.update(if panel.merge_confirmation {
+                Message::ConfirmGitHubMerge
+            } else {
+                Message::RequestGitHubMerge
+            }));
         }
 
         let direction = match key {
@@ -5600,6 +5686,8 @@ impl Muxtrix {
         panel.selected_pull_request = None;
         panel.selected_pull_request_loading = true;
         panel.selected_pull_request_error = None;
+        panel.pull_request_action_error = None;
+        panel.draft_state_updating = false;
         panel.selected_pull_request_file_scroll_offset = 0.0;
         panel.file_keyboard_cursor = None;
         panel.keyboard_focus = Some(GitHubPanelKeyboardFocus::Back);
@@ -5758,6 +5846,41 @@ impl Muxtrix {
         diff.wrap_columns = wrap_columns;
     }
 
+    fn toggle_github_pull_request_draft(&mut self) -> Task<Message> {
+        let Some(panel) = self.github_panel.as_mut() else {
+            return Task::none();
+        };
+        if panel.draft_state_updating || panel.merging {
+            return Task::none();
+        }
+        let Some(pull_request) = panel
+            .selected_pull_request
+            .as_ref()
+            .map(|details| &details.pull_request)
+        else {
+            return Task::none();
+        };
+        let number = pull_request.number;
+        let draft = !pull_request.draft;
+        panel.draft_state_updating = true;
+        panel.pull_request_action_error = None;
+        panel.merge_confirmation = false;
+        panel.loading_phase = 0;
+        let repository = panel.repository.clone();
+        let root = repository.root.clone();
+        perform_blocking(
+            move || github::set_draft(&repository, number, draft),
+            move |result| {
+                Message::GitHubPullRequestDraftChanged(
+                    root,
+                    number,
+                    draft,
+                    result.and_then(std::convert::identity),
+                )
+            },
+        )
+    }
+
     fn confirm_github_merge(&mut self) -> Task<Message> {
         let Some(panel) = self.github_panel.as_mut() else {
             return Task::none();
@@ -5785,6 +5908,7 @@ impl Muxtrix {
         panel.merging = true;
         panel.merge_confirmation = false;
         panel.selected_pull_request_error = None;
+        panel.pull_request_action_error = None;
         panel.loading_phase = 0;
         let repository = panel.repository.clone();
         let root = repository.root.clone();
@@ -9224,7 +9348,9 @@ impl Muxtrix {
                 .center_y(Fill),
             )
             .on_press_maybe(
-                (!panel.selected_pull_request_loading && !panel.merging)
+                (!panel.selected_pull_request_loading
+                    && !panel.merging
+                    && !panel.draft_state_updating)
                     .then_some(Message::CloseGitHubPullRequest),
             )
             .height(36)
@@ -9562,9 +9688,43 @@ impl Muxtrix {
                 "Waiting for GitHub to finish the merge",
                 tokens.accent,
             )
+        } else if panel.draft_state_updating {
+            (
+                "Updating pull request",
+                if pull_request.draft {
+                    "Marking it ready for review on GitHub"
+                } else {
+                    "Converting it to a draft on GitHub"
+                },
+                tokens.accent,
+            )
         } else {
             github_readiness_copy(readiness.clone(), tokens)
         };
+        let busy = panel.merging || panel.draft_state_updating;
+        let draft_label = if panel.draft_state_updating {
+            "Updating…"
+        } else if pull_request.draft {
+            "Mark ready"
+        } else {
+            "Convert to draft"
+        };
+        let draft_action = button(centered_button_label(
+            draft_label,
+            self.settings.ui_pixels(8.5),
+        ))
+        .on_press_maybe(
+            (!busy && !panel.merge_confirmation).then_some(Message::ToggleGitHubPullRequestDraft),
+        )
+        .height(30)
+        .padding([0, 12])
+        .style(move |_, status| {
+            github_action_button_style(
+                tokens,
+                panel.keyboard_focus == Some(GitHubPanelKeyboardFocus::DraftAction),
+                status,
+            )
+        });
         let merge_label: Element<'_, Message> = if panel.merging {
             centered_button_content(
                 row![
@@ -9580,9 +9740,14 @@ impl Muxtrix {
         let mut merge = button(merge_label)
             .height(30)
             .padding([0, 12])
-            .style(move |_, status| github_merge_button_style(tokens, status));
-        if readiness == github::MergeReadiness::Ready && !panel.merging && !panel.merge_confirmation
-        {
+            .style(move |_, status| {
+                github_merge_button_style(
+                    tokens,
+                    panel.keyboard_focus == Some(GitHubPanelKeyboardFocus::MergeAction),
+                    status,
+                )
+            });
+        if readiness == github::MergeReadiness::Ready && !busy && !panel.merge_confirmation {
             merge = merge.on_press(Message::RequestGitHubMerge);
         }
         let readiness_row = row![
@@ -9601,10 +9766,12 @@ impl Muxtrix {
             ]
             .spacing(1)
             .width(Fill),
-            merge,
         ]
         .spacing(9)
         .align_y(Alignment::Center);
+        let actions = row![draft_action, container("").width(Fill), merge]
+            .spacing(8)
+            .align_y(Alignment::Center);
 
         let title = button(
             column![
@@ -9776,7 +9943,13 @@ impl Muxtrix {
                         .on_press(Message::ConfirmGitHubMerge)
                         .height(30)
                         .padding([0, 12])
-                        .style(move |_, status| github_merge_button_style(tokens, status)),
+                        .style(move |_, status| {
+                            github_merge_button_style(
+                                tokens,
+                                panel.keyboard_focus == Some(GitHubPanelKeyboardFocus::MergeAction),
+                                status,
+                            )
+                        }),
                     ]
                     .spacing(8),
                 ]
@@ -9803,11 +9976,55 @@ impl Muxtrix {
         } else {
             container("").height(0).into()
         };
+        let action_error: Element<'_, Message> =
+            if let Some(error) = panel.pull_request_action_error.as_deref() {
+                container(
+                    row![
+                        signal_dot(tokens.danger, 6.0),
+                        text(error)
+                            .size(self.settings.ui_pixels(8.0))
+                            .color(tokens.danger),
+                    ]
+                    .spacing(7)
+                    .align_y(Alignment::Center),
+                )
+                .padding([7, 9])
+                .width(Fill)
+                .style(move |_| {
+                    container::Style::default()
+                        .background(Color {
+                            a: 0.06,
+                            ..tokens.danger
+                        })
+                        .border(Border {
+                            color: Color {
+                                a: 0.32,
+                                ..tokens.danger
+                            },
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        })
+                })
+                .into()
+            } else {
+                container("").height(0).into()
+            };
 
-        container(column![readiness_row, title, stats, merge_progress, confirmation].spacing(10))
-            .padding(12)
-            .width(Fill)
-            .into()
+        container(
+            column![
+                readiness_row,
+                actions,
+                action_error,
+                title,
+                stats,
+                merge_progress,
+                confirmation
+            ]
+            .spacing(10),
+        )
+        .padding(12)
+        .width(Fill)
+        .into()
     }
 
     fn github_file_list<'a>(
@@ -13916,7 +14133,7 @@ fn github_pull_request_viewport_height(window_size: Size) -> f32 {
 }
 
 fn github_file_viewport_height(window_size: Size, pull_request_detail: bool) -> f32 {
-    (window_size.height - if pull_request_detail { 340.0 } else { 142.0 }).max(140.0)
+    (window_size.height - if pull_request_detail { 380.0 } else { 142.0 }).max(140.0)
 }
 
 fn github_scroll_to(id: &'static str, offset: f32) -> Task<Message> {
@@ -13931,24 +14148,52 @@ fn github_keyboard_focus_step(
     current: GitHubPanelKeyboardFocus,
     forward: bool,
 ) -> GitHubPanelKeyboardFocus {
-    let order: &[GitHubPanelKeyboardFocus] = match (
-        panel.active_tab,
-        panel.selected_pull_request_number.is_some(),
-    ) {
-        (GitHubPanelTab::Local, _) => &[
+    let selected = panel.selected_pull_request_number.is_some();
+    let pull_request = panel
+        .selected_pull_request
+        .as_ref()
+        .map(|details| &details.pull_request);
+    let merge_ready = pull_request
+        .is_some_and(|pull_request| pull_request.readiness() == github::MergeReadiness::Ready);
+    let order: &[GitHubPanelKeyboardFocus] = if panel.active_tab == GitHubPanelTab::Local {
+        &[
             GitHubPanelKeyboardFocus::Tabs,
             GitHubPanelKeyboardFocus::Files,
-        ],
-        (GitHubPanelTab::PullRequests, false) => &[
+        ]
+    } else if !selected {
+        &[
             GitHubPanelKeyboardFocus::Tabs,
             GitHubPanelKeyboardFocus::Search,
             GitHubPanelKeyboardFocus::PullRequestList,
-        ],
-        (GitHubPanelTab::PullRequests, true) => &[
+        ]
+    } else if pull_request.is_none() {
+        &[
             GitHubPanelKeyboardFocus::Tabs,
             GitHubPanelKeyboardFocus::Back,
             GitHubPanelKeyboardFocus::Files,
-        ],
+        ]
+    } else if panel.merge_confirmation {
+        &[
+            GitHubPanelKeyboardFocus::Tabs,
+            GitHubPanelKeyboardFocus::Back,
+            GitHubPanelKeyboardFocus::MergeAction,
+            GitHubPanelKeyboardFocus::Files,
+        ]
+    } else if merge_ready {
+        &[
+            GitHubPanelKeyboardFocus::Tabs,
+            GitHubPanelKeyboardFocus::Back,
+            GitHubPanelKeyboardFocus::DraftAction,
+            GitHubPanelKeyboardFocus::MergeAction,
+            GitHubPanelKeyboardFocus::Files,
+        ]
+    } else {
+        &[
+            GitHubPanelKeyboardFocus::Tabs,
+            GitHubPanelKeyboardFocus::Back,
+            GitHubPanelKeyboardFocus::DraftAction,
+            GitHubPanelKeyboardFocus::Files,
+        ]
     };
     let index = order
         .iter()
@@ -16074,7 +16319,23 @@ fn github_readiness_copy(
     }
 }
 
-fn github_merge_button_style(tokens: DesignTokens, status: button::Status) -> button::Style {
+fn github_action_button_style(
+    tokens: DesignTokens,
+    keyboard_selected: bool,
+    status: button::Status,
+) -> button::Style {
+    let mut style = settings_button_style(tokens, SettingsButtonKind::Secondary, status);
+    if keyboard_selected && !matches!(status, button::Status::Disabled) {
+        style.border.color = tokens.accent;
+    }
+    style
+}
+
+fn github_merge_button_style(
+    tokens: DesignTokens,
+    keyboard_selected: bool,
+    status: button::Status,
+) -> button::Style {
     if matches!(status, button::Status::Disabled) {
         return button::Style {
             background: Some(tokens.panel.into()),
@@ -16098,7 +16359,11 @@ fn github_merge_button_style(tokens: DesignTokens, status: button::Status) -> bu
         ),
         text_color: tokens.app,
         border: Border {
-            color: tokens.success,
+            color: if keyboard_selected {
+                tokens.accent
+            } else {
+                tokens.success
+            },
             width: 1.0,
             radius: 6.0.into(),
         },
@@ -19174,6 +19439,107 @@ mod tests {
                 .as_ref()
                 .and_then(|panel| panel.selected_pull_request_number),
             Some(42)
+        );
+    }
+
+    #[test]
+    fn draft_update_keeps_detail_and_summary_in_sync() {
+        let mut app = Muxtrix::new();
+        let repository = github::Repository {
+            root: std::env::temp_dir(),
+            name: "muxtrix".into(),
+            owner_and_name: Some("example/muxtrix".into()),
+            branch: "draft-toggle".into(),
+            wsl_distribution: String::new(),
+        };
+        let mut panel = GitHubPanelState::loading(repository.clone());
+        panel.active_tab = GitHubPanelTab::PullRequests;
+        panel.loading = false;
+        panel.pull_requests = Some(vec![github::PullRequestSummary {
+            number: 42,
+            title: "Draft completion flow".into(),
+            url: "https://github.com/example/muxtrix/pull/42".into(),
+            author: "octocat".into(),
+            head: "draft-toggle".into(),
+            base: "main".into(),
+            status: github::PullRequestSummaryStatus::Draft,
+        }]);
+        panel.selected_pull_request_number = Some(42);
+        panel.selected_pull_request = Some(github::PullRequestDetails {
+            pull_request: github::PullRequest {
+                number: 42,
+                title: "Draft completion flow".into(),
+                url: "https://github.com/example/muxtrix/pull/42".into(),
+                author: "octocat".into(),
+                head: "draft-toggle".into(),
+                head_oid: "deadbeef".into(),
+                head_repository: "example/muxtrix".into(),
+                base: "main".into(),
+                base_oid: "feedface".into(),
+                additions: 1,
+                deletions: 0,
+                changed_files: 0,
+                draft: true,
+                mergeable: "MERGEABLE".into(),
+                merge_state: "CLEAN".into(),
+                review_decision: "APPROVED".into(),
+                checks: github::CheckSummary {
+                    passed: 1,
+                    pending: 0,
+                    failed: 0,
+                },
+            },
+            files: Vec::new(),
+        });
+        panel.draft_state_updating = true;
+        panel.keyboard_focus = Some(GitHubPanelKeyboardFocus::Back);
+        assert_eq!(
+            github_keyboard_focus_step(&panel, GitHubPanelKeyboardFocus::Back, true),
+            GitHubPanelKeyboardFocus::DraftAction
+        );
+        assert_eq!(
+            github_keyboard_focus_step(&panel, GitHubPanelKeyboardFocus::DraftAction, true),
+            GitHubPanelKeyboardFocus::Files,
+            "draft pull requests must not expose the disabled merge action"
+        );
+        app.github_panel = Some(panel);
+        drop(app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::empty())));
+        assert_eq!(
+            app.github_panel
+                .as_ref()
+                .and_then(|panel| panel.selected_pull_request_number),
+            Some(42),
+            "an in-flight draft update must keep its detail context"
+        );
+
+        drop(app.update(Message::GitHubPullRequestDraftChanged(
+            repository.root,
+            42,
+            false,
+            Ok("Marked pull request #42 ready for review".into()),
+        )));
+
+        let panel = app.github_panel.as_ref().expect("panel should remain open");
+        assert!(!panel.draft_state_updating);
+        assert!(
+            !panel
+                .selected_pull_request
+                .as_ref()
+                .expect("detail should remain visible")
+                .pull_request
+                .draft
+        );
+        assert_eq!(
+            panel
+                .pull_requests
+                .as_ref()
+                .expect("summary should remain loaded")[0]
+                .status,
+            github::PullRequestSummaryStatus::Open
+        );
+        assert_eq!(
+            github_keyboard_focus_step(&panel, GitHubPanelKeyboardFocus::DraftAction, true),
+            GitHubPanelKeyboardFocus::MergeAction
         );
     }
 
