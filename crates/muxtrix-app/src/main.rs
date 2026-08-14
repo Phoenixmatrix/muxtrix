@@ -7056,16 +7056,17 @@ impl Muxtrix {
                     ) {
                         return ControlResponse::success("stale agent lifecycle state ignored");
                     }
-                    // PermissionRequest runs before Codex's automatic reviewer,
-                    // and Claude notifications are similarly not proof that a
-                    // person is required. Supported full-screen agents may
+                    // Codex PermissionRequest runs before its automatic
+                    // reviewer, and Claude notifications are similarly not
+                    // proof that a person is required. Those two agents may
                     // enter Waiting only from positive evidence in a live
                     // terminal frame. PostToolUse is also too late and can be
                     // unrelated under parallel tool use, so it cannot clear a
-                    // screen-confirmed prompt.
-                    let screen_managed = agent_screen::supports(&agent);
-                    let advisory_wait = screen_managed && state == AgentState::Waiting;
-                    let post_tool_cannot_clear_wait = screen_managed
+                    // screen-confirmed prompt. Pi approval events are exact.
+                    let screen_confirmed_wait =
+                        agent_screen::requires_screen_confirmed_wait(&agent);
+                    let advisory_wait = screen_confirmed_wait && state == AgentState::Waiting;
+                    let post_tool_cannot_clear_wait = screen_confirmed_wait
                         && state == AgentState::Running
                         && event.as_deref() == Some("PostToolUse")
                         && self
@@ -18098,12 +18099,6 @@ fn harness_terminal_title(title: &str, agent: &str) -> Option<String> {
         return None;
     }
     let title = agent_screen::stable_title(agent, title);
-    let pi_title = (agent == "pi" || agent == "omp" || agent == "oh-my-pi")
-        .then(|| title.strip_prefix("π:").map(str::trim))
-        .flatten();
-    if let Some(title) = pi_title {
-        return (!title.is_empty()).then(|| title.to_owned());
-    }
     if title.is_empty()
         || title.eq_ignore_ascii_case(agent)
         || title.eq_ignore_ascii_case(agent_display_name(agent))
@@ -24357,6 +24352,44 @@ mod tests {
             Some("Agent is working")
         );
         assert_eq!(app.agent_running_frame_revisions.get(&pane_id), Some(&2));
+    }
+
+    #[test]
+    fn newer_pi_idle_title_clears_a_stale_running_lifecycle() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "pi".into(),
+                display_name: None,
+                state: AgentState::Running,
+                activity: Some("Agent is running".into()),
+                session_id: Some("session-1".into()),
+                cwd: None,
+                git_branch: None,
+            },
+        );
+        app.agent_running_frame_revisions.insert(pane_id, 10);
+
+        let idle = agent_screen::Classification {
+            state: agent_screen::ScreenState::Idle,
+            rule: "pi.osc_title_idle",
+        };
+        app.apply_agent_screen_classification(pane_id, "pi", 10, idle);
+        assert_eq!(
+            app.agent_statuses[&pane_id].state,
+            AgentState::Running,
+            "the frame painted before the running event remains race-guarded"
+        );
+
+        app.apply_agent_screen_classification(pane_id, "pi", 11, idle);
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Idle);
+        assert_eq!(
+            app.agent_statuses[&pane_id].activity.as_deref(),
+            Some("Ready for input")
+        );
+        assert!(!app.agent_running_frame_revisions.contains_key(&pane_id));
     }
 
     #[test]

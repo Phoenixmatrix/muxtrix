@@ -130,27 +130,32 @@ from the current terminal screen and OSC title. Only a recognized, visible
 approval or answer surface can create `Needs input`; only newer screen evidence
 can clear it. `Done` preserves the previous completion while the composer is
 idle, but a positively recognized working frame starts the next turn even when
-its `UserPromptSubmit` hook was delayed or unavailable. Codex and Claude Code
-installations require no repair for this screen-authority change; Pi
-installations missing maintenance events are repaired through hook status/re-add.
-See [Agent state detection](AGENT_STATE_DETECTION.md) for the research,
-precedence rules, tradeoffs, and limitations.
+its prompt hook was delayed or unavailable.
+
+Oh My Pi keeps its exact approval and coarse lifecycle events. Its documented
+OSC title state (`π >` idle, `π ⠋` working, `π !` attention, with all spinner
+frames accepted) supplies the live correction layer, so a scheduled
+continuation cannot leave the fleet green after Pi has painted an idle title.
+Outdated managed Pi extensions migrate automatically when Muxtrix synchronizes
+hook status; re-add remains the explicit repair path. See
+[Agent state detection](AGENT_STATE_DETECTION.md) for precedence and limits.
 
 Typing a configured `codex`, `claude`, or `omp` launch command assigns that
 pane's agent before any managed hook or extension callback can arrive, which
 makes the fleet identity useful before the first callback. It is deliberately
 pane-local. Linux process-tree detection can also identify configured agent
 executables while hooks are absent; hooks take ownership of identity and coarse
-lifecycle metadata once the agent starts. The live screen remains the
-interactive-state authority for Codex and Claude. Oh My Pi's approval extension
-events are exact observability events, so they can report `Needs input` without
-screen parsing.
+lifecycle metadata once the agent starts. The live screen or OSC title remains
+the interactive-state authority. Oh My Pi's approval extension events are exact
+observability events, so they can report `Needs input` immediately without
+waiting for the matching title paint.
 
 Agent pane names follow the same pane-local rule. A user rename wins first,
 then a meaningful terminal title emitted by the harness (including a named
-Claude Code session, Codex thread, or Oh My Pi `π: <title>`), then the
-linked-worktree directory name, and finally `Codex`, `Claude Code`, or
-`Oh My Pi`. Brand-only terminal titles do not replace the worktree fallback.
+Claude Code session, Codex thread, or the label after Oh My Pi's `π <state>`
+prefix), then the linked-worktree directory name, and finally `Codex`,
+`Claude Code`, or `Oh My Pi`. Brand-only terminal titles do not replace the
+worktree fallback. Animated Pi state separators never become pane identity.
 Long names stay on one line and are ellipsized before the separate lifecycle-state column.
 
 Codex reviews newly discovered hook commands by exact command hash. After an
@@ -158,7 +163,8 @@ install or re-add, use Codex `/hooks` to review or trust the generated commands
 when prompted. Claude Code exposes its active configuration through `/hooks`.
 Oh My Pi auto-discovers the managed extension from its native extension
 directory and reports session start/switch/branch, prompt execution, completion,
-shutdown, and tool-approval request/resolution events.
+shutdown, and tool-approval request/resolution events to Muxtrix. The extension
+does not write a Muxtrix status into Pi's own footer.
 
 ## Windows Muxtrix with agents in WSL2
 

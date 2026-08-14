@@ -3,22 +3,22 @@
 ## Decision
 
 For Codex and Claude Code, the live terminal screen is authoritative for
-`Running`, `Idle`, and `Needs input`. Oh My Pi supplies lifecycle state through
-its managed extension; Muxtrix also recognizes its `π` terminal title as pane
-identity. Oh My Pi approval events are observability-only signals emitted after
-the agent has decided a tool really needs approval, so they may create and clear
-`Needs input`. Other lifecycle hooks still identify the agent, session, working
-directory, prompt submission, completion, and shutdown, but a permission or
-notification hook is not allowed to create human attention.
+`Running`, `Idle`, and `Needs input`. Oh My Pi supplies coarse lifecycle state
+and exact approval transitions through its managed extension, while OMP's
+documented state-bearing OSC title supplies the live correction layer. `π >`
+means idle, `π !` means attention, and `π` followed by a supported Braille
+spinner means working; ConPTY uses the static working form `π :`.
 
-The invariant is intentionally strict:
+Other lifecycle hooks still identify the agent, session, working directory,
+prompt submission, completion, and shutdown. Codex or Claude permission and
+notification hooks are not allowed to create human attention because their
+harnesses may resolve those requests automatically. Pi's approval event is
+emitted only after OMP has decided that a person is required, so it is itself
+positive evidence and may create or clear `Needs input`.
 
-> `Needs input` requires positive, currently visible approval, question, or
-> permission UI in that pane.
-
-An unrecognized screen preserves the last trusted state. This favors a missed
-new prompt over repeatedly telling the user that an automatic reviewer needs
-them.
+An unrecognized screen or title preserves the last trusted state. This favors a
+missed new prompt over inventing activity or repeatedly telling the user that
+an automatic reviewer needs them.
 
 ## Why the hook-only model was wrong
 
@@ -55,13 +55,12 @@ model: session-integration hooks are separated from state authority, and
 ## Implemented model
 
 On each terminal poll, the application evaluates each pane's latest Ghostty
-grid snapshot. Retained frames are re-evaluated so an identity hook arriving
-just after a stable prompt paint cannot miss it on the next poll. The screen
-classifier runs for panes already identified as Codex or Claude Code. Oh My Pi
-has no screen-state classifier yet; ordinary Pi frames preserve the last hook or
-process state, while its managed extension reports exact lifecycle,
-session switch/branch, approval-request transitions, and context
-compaction/handoff maintenance.
+grid snapshot and OSC title. Retained frames are re-evaluated so an identity
+hook arriving just after a stable prompt paint cannot miss it on the next poll.
+Codex and Claude Code use their live screen and title; Oh My Pi uses its
+state-bearing title while retaining exact lifecycle, session switch/branch,
+approval-request, and context compaction/handoff events from the managed
+extension.
 
 - Codex `Action Required` OSC titles and strong live confirmation/answer forms
   create `Needs input`.
@@ -70,6 +69,10 @@ compaction/handoff maintenance.
 - Claude spinner titles and its active `/btw` overlay create `Running`.
 - Claude confirmation/navigation forms and dynamic-workflow prompts create
   `Needs input`; its idle OSC title creates `Idle`.
+- Oh My Pi's `π >` title creates `Idle`, `π !` creates `Needs input`, and its
+  ten supported Braille separators create `Running`. `π :` is the static
+  ConPTY working form. A state-disabled `π: <label>` title identifies Pi but
+  does not invent a state.
 - A Claude frame showing the Agents view returns no classification at all, and
   is evaluated before every rule below it. The roster draws its own composer and
   its own spinner-free title, either of which a later rule would otherwise read
@@ -92,15 +95,16 @@ compaction/handoff maintenance.
   even if `UserPromptSubmit` was lost, so `Done` cannot become a permanent latch
   when hook delivery is unavailable.
 
-The typed control event now carries the original hook event name. This is a
-backward-compatible optional field. Muxtrix treats supported-agent waiting
-hooks as metadata only. A `PostToolUse` can update metadata or ordinary running
-state, but cannot clear a screen-confirmed wait. Completion, failure, stop, and
-new prompt lifecycle events retain their coarse roles.
+The typed control event carries the original hook event name. Codex and Claude
+waiting hooks remain metadata only, and `PostToolUse` cannot clear their
+screen-confirmed wait. Pi approval events remain exact state transitions.
+Completion, failure, stop, and new-prompt lifecycle events retain their coarse
+roles for every supported harness.
 
-Codex and Claude Code keep their existing hook set and wire state names. Pi
-installations whose managed extension lacks maintenance events are repairable
-through the normal hook status/re-add flow.
+The managed Pi extension is versioned. Existing modules without the current
+behavior marker are migrated during normal Muxtrix hook synchronization, while
+the explicit hook re-add path remains available. Migration preserves the
+original uninstall backup and removes the old Pi-footer status writes.
 
 ## Recovery across session reattach
 
@@ -114,10 +118,11 @@ the new application instance.
 Layouts created before durable identity was added remain recoverable. Once the
 replayed grid arrives, Muxtrix accepts only agent-specific signatures: Codex's
 composer, working footer, approval forms, or branded title; Claude Code's
-prompt box, Agents view, or branded title; and Oh My Pi's `π`/`π: <title>`
-terminal title. A generic title or spinner is not enough to invent an agent.
-The recovered identity is written into the next layout update, so this fallback
-is normally needed only once.
+prompt box, Agents view, or branded title; and Oh My Pi's exact brand-only,
+state-disabled (`π: <label>`), idle (`π > <label>`), attention (`π ! <label>`),
+or branded spinner title. A generic title or unbranded spinner is not enough to
+invent an agent. The recovered identity is written into the next layout update,
+so this fallback is normally needed only once.
 
 Process-tree detection remains useful for locally launched Linux panes and
 hooks still supply session IDs, cwd, and turn boundaries. Neither is the
