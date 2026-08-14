@@ -648,6 +648,13 @@ add({
   check: "Section rhythm, control alignment, and the live terminal preview.",
 });
 add({
+  slug: "settings-version-mismatch",
+  title: "Settings · installed update",
+  group: "Settings",
+  capture: "settings-version-mismatch",
+  check: "Running and installed versions remain scannable, with a truthful restart notice when they differ.",
+});
+add({
   slug: "settings-compact",
   title: "Settings · 820×560",
   group: "Settings",

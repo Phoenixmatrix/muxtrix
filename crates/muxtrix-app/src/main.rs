@@ -93,6 +93,10 @@ pub fn main() -> iced::Result {
     // Session daemon mode: no window, no GPU — just PTYs on a socket. It
     // lives inside this binary so packages ship no extra executable.
     let arguments: Vec<String> = std::env::args().collect();
+    if matches!(arguments.as_slice(), [_, flag] if flag == "--version" || flag == "-V") {
+        println!("muxtrix {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if arguments.iter().any(|argument| argument == "--sessiond") {
         run_session_daemon(&arguments);
         return Ok(());
@@ -176,6 +180,8 @@ struct Muxtrix {
     palette: CommandPalette,
     settings: AppSettings,
     settings_draft: AppSettings,
+    installed_versions: InstalledVersionsState,
+    installed_muxtrix_path: Result<std::path::PathBuf, String>,
     installed_fonts: InstalledFontCatalog,
     available_terminal_fonts: Vec<TerminalFont>,
     available_terminal_font_weights: Vec<FontWeight>,
@@ -481,6 +487,21 @@ enum ActiveView {
 enum SettingsPage {
     Preferences,
     Worktrees,
+}
+
+#[derive(Debug, Clone)]
+struct InstalledVersions {
+    muxtrix: Result<String, String>,
+    muxtrixctl: Result<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+enum InstalledVersionsState {
+    #[default]
+    Unchecked,
+    Checking,
+    Ready(InstalledVersions),
+    Unavailable,
 }
 
 #[derive(Debug, Clone)]
@@ -1141,6 +1162,7 @@ enum Message {
     TabDragOver(WorkspaceId, usize),
     OpenSettings,
     OpenSettingsPage(SettingsPage),
+    InstalledVersionsLoaded(Result<InstalledVersions, String>),
     GitHubStatusPressed,
     BeginGitHubAuth,
     GitHubAuthChecked(github::AuthStatus),
@@ -1687,6 +1709,10 @@ impl Muxtrix {
 
     fn new() -> Self {
         let (mut settings, mut settings_warning) = AppSettings::load();
+        // Preserve the path used to launch this process. Package managers can
+        // replace the executable while the window stays open; `current_exe`
+        // may continue to identify the old inode after that replacement.
+        let installed_muxtrix_path = startup_muxtrix_path();
         let installed_fonts = InstalledFontCatalog::discover();
         // Cell width must come from the measured face before any pane is sized.
         installed_fonts.install_metrics();
@@ -1822,6 +1848,8 @@ impl Muxtrix {
             palette: CommandPalette::default(),
             settings_draft: settings.clone(),
             settings,
+            installed_versions: InstalledVersionsState::default(),
+            installed_muxtrix_path,
             installed_fonts,
             available_terminal_fonts,
             available_terminal_font_weights,
@@ -2586,8 +2614,12 @@ impl Muxtrix {
                 }
                 return Task::none();
             }
-            Message::OpenSettings => {
-                self.open_settings();
+            Message::OpenSettings => return self.open_settings(),
+            Message::InstalledVersionsLoaded(result) => {
+                self.installed_versions = match result {
+                    Ok(versions) => InstalledVersionsState::Ready(versions),
+                    Err(_) => InstalledVersionsState::Unavailable,
+                };
                 return Task::none();
             }
             Message::GitHubStatusPressed => {
@@ -3270,11 +3302,12 @@ impl Muxtrix {
             }
             Message::OpenDefaultAgentSettings => {
                 self.default_agent_prompt = false;
-                self.open_settings();
-                return iced::widget::operation::snap_to(
+                let version_task = self.open_settings();
+                let scroll_task = iced::widget::operation::snap_to(
                     iced::widget::Id::new(SETTINGS_SCROLL_ID),
                     iced::widget::operation::RelativeOffset { x: 0.0, y: 1.0 },
                 );
+                return Task::batch([version_task, scroll_task]);
             }
             #[cfg(feature = "e2e")]
             Message::E2eTick => return self.drive_e2e(),
@@ -3806,9 +3839,12 @@ impl Muxtrix {
         else {
             return Task::none();
         };
-        self.open_settings();
+        let version_task = self.open_settings();
         self.settings_page = SettingsPage::Worktrees;
-        self.open_worktree_list(WorktreeManagerMode::Manage, pane_id)
+        Task::batch([
+            version_task,
+            self.open_worktree_list(WorktreeManagerMode::Manage, pane_id),
+        ])
     }
 
     fn open_worktree_switcher(&mut self, pane_id: PaneId) -> Task<Message> {
@@ -4867,8 +4903,7 @@ impl Muxtrix {
             return self.toggle_command_palette();
         }
         if modifiers.command() && character_key_is(modified_key.as_ref(), ",") {
-            self.open_settings();
-            return Task::none();
+            return self.open_settings();
         }
         if modifiers.command()
             && let Key::Character(character) = modified_key.as_ref()
@@ -5999,7 +6034,7 @@ impl Muxtrix {
                 return self.refresh_pane_repositories();
             }
             CommandAction::OpenGitHubPanel => return self.open_github_panel(),
-            CommandAction::OpenSettings => self.open_settings(),
+            CommandAction::OpenSettings => return self.open_settings(),
             CommandAction::LaunchAgent(agent) => {
                 self.active_view = ActiveView::Workspace;
                 self.status = match self.launch_agent(agent) {
@@ -6086,7 +6121,7 @@ impl Muxtrix {
         agent
     }
 
-    fn open_settings(&mut self) {
+    fn open_settings(&mut self) -> Task<Message> {
         self.settings_draft = self.settings.clone();
         self.workspace_name_draft = self
             .active_workspace()
@@ -6113,6 +6148,12 @@ impl Muxtrix {
         self.settings_page = SettingsPage::Preferences;
         self.active_view = ActiveView::Settings;
         self.close_command_palette();
+        self.installed_versions = InstalledVersionsState::Checking;
+        let installed_muxtrix_path = self.installed_muxtrix_path.clone();
+        perform_blocking(
+            move || probe_installed_versions(installed_muxtrix_path),
+            Message::InstalledVersionsLoaded,
+        )
     }
 
     fn refresh_integrations(&mut self) -> Task<Message> {
@@ -12578,6 +12619,7 @@ impl Muxtrix {
             ],
             &self.settings_draft,
         );
+        let versions = self.version_settings_section();
 
         let content = column![title, interface, terminal_appearance, terminal];
         #[cfg(target_os = "windows")]
@@ -12624,7 +12666,11 @@ impl Muxtrix {
             ],
             &self.settings_draft,
         ));
-        let content = content.push(integrations).spacing(22).max_width(860);
+        let content = content
+            .push(integrations)
+            .push(versions)
+            .spacing(22)
+            .max_width(860);
         let font_restart = if self.settings_draft.ui_font != self.settings.ui_font
             || self.settings_draft.ui_font_weight != self.settings.ui_font_weight
         {
@@ -12684,6 +12730,89 @@ impl Muxtrix {
                 .color(tokens.text)
         })
         .into()
+    }
+
+    fn version_settings_section(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings_draft.appearance);
+        let fallback = match &self.installed_versions {
+            InstalledVersionsState::Unchecked => "Running",
+            InstalledVersionsState::Checking => "Running · checking installed build…",
+            InstalledVersionsState::Unavailable => "Running · installed check unavailable",
+            InstalledVersionsState::Ready(_) => "Running",
+        };
+        let (installed_muxtrix, installed_muxtrixctl) = match &self.installed_versions {
+            InstalledVersionsState::Ready(versions) => {
+                (Some(&versions.muxtrix), Some(&versions.muxtrixctl))
+            }
+            _ => (None, None),
+        };
+        let mut rows = column![];
+        if let Some(copy) = installed_version_restart_copy(&self.installed_versions) {
+            rows = rows
+                .push(
+                    container(
+                        row![
+                            container(signal_dot(tokens.warning, 8.0))
+                                .height(self.settings_draft.ui_pixels(13.0))
+                                .align_y(iced::alignment::Vertical::Center),
+                            column![
+                                text("Restart to use the installed build")
+                                    .size(self.settings_draft.ui_pixels(10.5))
+                                    .font(Font {
+                                        weight: font::Weight::Semibold,
+                                        ..Font::DEFAULT
+                                    })
+                                    .color(tokens.text),
+                                text(copy)
+                                    .size(self.settings_draft.ui_pixels(9.0))
+                                    .color(tokens.warning),
+                            ]
+                            .spacing(2),
+                        ]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([11, 14])
+                    .width(Fill)
+                    .style(move |_| {
+                        container::Style::default().background(Color {
+                            a: 0.07,
+                            ..tokens.warning
+                        })
+                    }),
+                )
+                .push(settings_divider(tokens));
+        }
+        rows = rows
+            .push(settings_row(
+                "Muxtrix",
+                "Desktop application",
+                settings_version_value(
+                    env!("CARGO_PKG_VERSION"),
+                    installed_muxtrix,
+                    fallback,
+                    &self.settings_draft,
+                ),
+                &self.settings_draft,
+            ))
+            .push(settings_divider(tokens))
+            .push(settings_row(
+                "Muxtrix Control",
+                "Local control service and muxtrixctl command",
+                settings_version_value(
+                    muxtrix_control::VERSION,
+                    installed_muxtrixctl,
+                    fallback,
+                    &self.settings_draft,
+                ),
+                &self.settings_draft,
+            ));
+        settings_section(
+            "Versions",
+            "Builds active in this window and installed on disk",
+            rows,
+            &self.settings_draft,
+        )
     }
 
     fn agent_hook_row(&self, agent: Agent) -> Element<'_, Message> {
@@ -16638,6 +16767,61 @@ fn settings_divider(tokens: DesignTokens) -> Element<'static, Message> {
         .into()
 }
 
+fn installed_version_restart_copy(state: &InstalledVersionsState) -> Option<String> {
+    let InstalledVersionsState::Ready(versions) = state else {
+        return None;
+    };
+    if let Ok(installed) = &versions.muxtrix
+        && installed != env!("CARGO_PKG_VERSION")
+    {
+        return Some(format!(
+            "Muxtrix v{installed} is installed; this window is still running v{}.",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    if let Ok(installed) = &versions.muxtrixctl
+        && installed != muxtrix_control::VERSION
+    {
+        return Some(format!(
+            "muxtrixctl v{installed} is installed; this window's control service is still running v{}.",
+            muxtrix_control::VERSION
+        ));
+    }
+    None
+}
+
+fn settings_version_value(
+    running: &'static str,
+    installed: Option<&Result<String, String>>,
+    fallback: &'static str,
+    settings: &AppSettings,
+) -> Element<'static, Message> {
+    let tokens = DesignTokens::for_appearance(settings.appearance);
+    let (detail, detail_color) = match installed {
+        Some(Ok(version)) if version == running => {
+            ("Running · matches installed".to_owned(), tokens.muted)
+        }
+        Some(Ok(version)) => (format!("Running · v{version} installed"), tokens.warning),
+        Some(Err(_)) => (
+            "Running · installed binary unavailable".into(),
+            tokens.faint,
+        ),
+        None => (fallback.to_owned(), tokens.muted),
+    };
+    column![
+        text(format!("v{running}"))
+            .font(settings.terminal_font.iced())
+            .size(settings.ui_pixels(10.0))
+            .color(tokens.text),
+        text(detail)
+            .size(settings.ui_pixels(8.5))
+            .color(detail_color),
+    ]
+    .spacing(2)
+    .align_x(Alignment::End)
+    .into()
+}
+
 fn settings_row<'a>(
     label: &'static str,
     description: &'static str,
@@ -18206,12 +18390,110 @@ fn start_control_server(_notifier: EventNotifier) -> (Option<ControlServer>, Opt
 
 fn muxtrixctl_path() -> Result<std::path::PathBuf, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    Ok(muxtrixctl_path_beside(&executable))
+}
+
+fn muxtrixctl_path_beside(executable: &std::path::Path) -> std::path::PathBuf {
     let file_name = if cfg!(windows) {
         "muxtrixctl.exe"
     } else {
         "muxtrixctl"
     };
-    Ok(executable.with_file_name(file_name))
+    executable.with_file_name(file_name)
+}
+
+fn startup_muxtrix_path() -> Result<std::path::PathBuf, String> {
+    let invoked = std::env::args_os()
+        .next()
+        .ok_or_else(|| "the startup executable path is unavailable".to_owned())?;
+    let current_directory = std::env::current_dir().map_err(|error| error.to_string())?;
+    let search_path = std::env::var_os("PATH");
+    resolve_startup_executable(&invoked, &current_directory, search_path.as_deref())
+}
+
+fn resolve_startup_executable(
+    invoked: &std::ffi::OsStr,
+    current_directory: &std::path::Path,
+    search_path: Option<&std::ffi::OsStr>,
+) -> Result<std::path::PathBuf, String> {
+    let invoked = std::path::PathBuf::from(invoked);
+    if invoked.is_absolute() {
+        return Ok(invoked);
+    }
+    if invoked.components().count() > 1 {
+        return Ok(current_directory.join(invoked));
+    }
+    if let Some(search_path) = search_path {
+        for directory in std::env::split_paths(search_path) {
+            let candidate = directory.join(&invoked);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(format!(
+        "{} was not found on the startup PATH",
+        invoked.display()
+    ))
+}
+
+fn probe_installed_versions(
+    installed_muxtrix_path: Result<std::path::PathBuf, String>,
+) -> InstalledVersions {
+    let muxtrix_path = match installed_muxtrix_path {
+        Ok(path) => path,
+        Err(error) => {
+            return InstalledVersions {
+                muxtrix: Err(error.clone()),
+                muxtrixctl: Err(error),
+            };
+        }
+    };
+    // Release packages install both binaries from one workspace version.
+    // Probe the CLI for that package version: an older CLI rejects the flag
+    // and exits, while launching an older GUI binary could open another window
+    // and leave this background check blocked.
+    let installed = probe_binary_version(&muxtrixctl_path_beside(&muxtrix_path), "muxtrixctl");
+    InstalledVersions {
+        muxtrix: installed.clone(),
+        muxtrixctl: installed,
+    }
+}
+
+fn probe_binary_version(path: &std::path::Path, binary_name: &str) -> Result<String, String> {
+    let output = Command::new(path)
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("could not run {}: {error}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} --version exited with {}",
+            path.display(),
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("{} returned invalid text: {error}", path.display()))?;
+    parse_binary_version(&stdout, binary_name)
+}
+
+fn parse_binary_version(output: &str, binary_name: &str) -> Result<String, String> {
+    let mut fields = output.split_whitespace();
+    if fields.next() != Some(binary_name) {
+        return Err(format!(
+            "{binary_name} returned an unexpected version response"
+        ));
+    }
+    let version = fields
+        .next()
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| format!("{binary_name} did not report a version"))?;
+    if fields.next().is_some() {
+        return Err(format!(
+            "{binary_name} returned an unexpected version response"
+        ));
+    }
+    Ok(version.to_owned())
 }
 
 fn perform_blocking<T>(
@@ -18968,6 +19250,51 @@ mod tests {
         assert!(settings_have_changes(&saved, &draft));
         draft.show_status_bar = saved.show_status_bar;
         assert!(!settings_have_changes(&saved, &draft));
+    }
+
+    #[test]
+    fn binary_version_response_requires_the_expected_name_and_one_version() {
+        assert_eq!(
+            parse_binary_version("muxtrix 1.2.3\n", "muxtrix"),
+            Ok("1.2.3".into())
+        );
+        assert!(parse_binary_version("muxtrixctl 1.2.3", "muxtrix").is_err());
+        assert!(parse_binary_version("muxtrix 1.2.3 extra", "muxtrix").is_err());
+    }
+
+    #[test]
+    fn startup_path_preserves_the_invocation_location_without_canonicalizing() {
+        let current_directory = std::path::Path::new("launch-root");
+        let resolved = resolve_startup_executable(
+            std::ffi::OsStr::new("installed/bin/muxtrix"),
+            current_directory,
+            None,
+        )
+        .expect("relative invocation path should resolve from the startup directory");
+        assert_eq!(
+            resolved,
+            current_directory.join("installed/bin/muxtrix"),
+            "the saved path must keep pointing at the package-managed entry after its target changes"
+        );
+    }
+
+    #[test]
+    fn installed_version_mismatch_requests_a_restart() {
+        let matching = InstalledVersionsState::Ready(InstalledVersions {
+            muxtrix: Ok(env!("CARGO_PKG_VERSION").into()),
+            muxtrixctl: Ok(muxtrix_control::VERSION.into()),
+        });
+        assert_eq!(installed_version_restart_copy(&matching), None);
+
+        let installed = format!("{}-installed", env!("CARGO_PKG_VERSION"));
+        let mismatch = InstalledVersionsState::Ready(InstalledVersions {
+            muxtrix: Ok(installed.clone()),
+            muxtrixctl: Ok(muxtrix_control::VERSION.into()),
+        });
+        let notice =
+            installed_version_restart_copy(&mismatch).expect("mismatch should request a restart");
+        assert!(notice.contains(&installed));
+        assert!(notice.contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

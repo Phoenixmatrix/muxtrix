@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 pub use hooks::{Agent, HookAction, HookManager, HookScope, HookStatus, ManagedHookResult};
 pub use transport::{ControlNotifier, ControlServer, Endpoint, IncomingRequest, send_request};
 
+/// Version of the control service and its `muxtrixctl` client.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum ControlRequest {
