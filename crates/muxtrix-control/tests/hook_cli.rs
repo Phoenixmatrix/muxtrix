@@ -31,6 +31,7 @@ fn cli_add_remove_and_readd_are_clean_and_idempotent() -> Result<(), Box<dyn std
         String::from_utf8_lossy(&added.stderr)
     );
     let codex = home.join(".codex/hooks.json");
+    let codex_config = home.join(".codex/config.toml");
     let claude = home.join(".claude/settings.json");
     let pi = home.join(".omp/agent/extensions/muxtrix-lifecycle.ts");
     assert_eq!(managed_markers(&codex)?, 8);
@@ -39,6 +40,9 @@ fn cli_add_remove_and_readd_are_clean_and_idempotent() -> Result<(), Box<dyn std
     assert!(std::fs::read_to_string(&codex)?.contains(bridge_command));
     assert!(std::fs::read_to_string(&claude)?.contains(bridge_command));
     assert!(std::fs::read_to_string(&pi)?.contains(bridge_command));
+    let codex_config = std::fs::read_to_string(codex_config)?;
+    assert!(codex_config.contains("trust_level = \"trusted\""));
+    assert!(codex_config.contains(home.join(".muxtrix/worktrees").to_string_lossy().as_ref()));
 
     let duplicate = run("add")?;
     assert!(duplicate.status.success());

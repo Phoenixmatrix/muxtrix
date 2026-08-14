@@ -6,8 +6,10 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+use toml_edit::{DocumentMut, Item, Table, value};
 
 const MANAGED_MARKER: &str = "muxtrix-hook-v1";
+const WORKTREE_HOME_FOLDER: &str = ".muxtrix/worktrees";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -119,6 +121,7 @@ pub struct HookManager {
     state_dir: PathBuf,
     executable: PathBuf,
     executable_is_named: bool,
+    worktree_root: PathBuf,
 }
 
 impl HookManager {
@@ -128,12 +131,14 @@ impl HookManager {
             .ok_or(HookError::HomeMissing)?;
         let project = std::env::current_dir()?;
         let state_dir = hook_state_dir(&home);
+        let worktree_root = home.join(WORKTREE_HOME_FOLDER);
         Ok(Self {
             home,
             project,
             state_dir,
             executable: executable.into(),
             executable_is_named: false,
+            worktree_root,
         })
     }
 
@@ -144,8 +149,10 @@ impl HookManager {
         state_dir: impl Into<PathBuf>,
         executable: impl Into<PathBuf>,
     ) -> Self {
+        let home = home.into();
         Self {
-            home: home.into(),
+            worktree_root: home.join(WORKTREE_HOME_FOLDER),
+            home,
             project: project.into(),
             state_dir: state_dir.into(),
             executable: executable.into(),
@@ -168,6 +175,17 @@ impl HookManager {
     #[must_use]
     pub fn project(mut self, project: impl Into<PathBuf>) -> Self {
         self.project = project.into();
+        self
+    }
+
+    /// Sets the path Codex sees for Muxtrix's shared worktree directory.
+    ///
+    /// This differs from `home` when a native Windows Muxtrix process edits a
+    /// WSL user's configuration over UNC: the file is reached through the UNC
+    /// home, while Codex itself must be given the Linux path it runs under.
+    #[must_use]
+    pub fn worktree_root(mut self, worktree_root: impl Into<PathBuf>) -> Self {
+        self.worktree_root = worktree_root.into();
         self
     }
 
@@ -227,7 +245,13 @@ impl HookManager {
     /// that alone must never demand a manual repair.
     pub fn synced_status(&self, agent: Agent, scope: HookScope) -> Result<HookStatus, HookError> {
         let status = self.status(agent, scope)?;
-        if status.installed || status.managed_entries == 0 {
+        if status.installed {
+            if agent == Agent::Codex && scope == HookScope::User {
+                self.ensure_codex_worktree_trust()?;
+            }
+            return Ok(status);
+        }
+        if status.managed_entries == 0 {
             return Ok(status);
         }
         // Claiming the user's hooks for an executable that is not on disk
@@ -272,14 +296,26 @@ impl HookManager {
         }
         let target = self.target(agent, scope);
         let mut value = read_json_or_empty(&target)?;
+        let trust_changed = if agent == Agent::Codex && scope == HookScope::User {
+            self.ensure_codex_worktree_trust()?
+        } else {
+            false
+        };
         let managed_entries = count_managed(&value);
         if managed_entries == hook_events(agent).len()
             && count_expected_managed(&value, agent, &self.executable) == managed_entries
         {
             return Ok(ManagedHookResult {
                 status: self.status(agent, scope)?,
-                changed: false,
-                message: format!("{} {} lifecycle hooks are already installed", scope, agent),
+                changed: trust_changed,
+                message: if trust_changed {
+                    format!(
+                        "{} {} lifecycle hooks are already installed; trusted Muxtrix worktrees",
+                        scope, agent
+                    )
+                } else {
+                    format!("{} {} lifecycle hooks are already installed", scope, agent)
+                },
             });
         }
 
@@ -290,8 +326,59 @@ impl HookManager {
         Ok(ManagedHookResult {
             status: self.status(agent, scope)?,
             changed: true,
-            message: format!("Added reversible {} {} lifecycle hooks", scope, agent),
+            message: if trust_changed {
+                format!(
+                    "Added reversible {} {} lifecycle hooks and trusted Muxtrix worktrees",
+                    scope, agent
+                )
+            } else {
+                format!("Added reversible {} {} lifecycle hooks", scope, agent)
+            },
         })
+    }
+
+    /// Trusts the common parent of every worktree Muxtrix creates instead of
+    /// making Codex accumulate one project entry per linked checkout.
+    fn ensure_codex_worktree_trust(&self) -> Result<bool, HookError> {
+        let target = self.home.join(".codex").join("config.toml");
+        let contents = match std::fs::read_to_string(&target) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let mut document = contents.parse::<DocumentMut>()?;
+        let worktree_root = self
+            .worktree_root
+            .to_str()
+            .ok_or_else(|| HookError::NonUtf8WorktreeRoot(self.worktree_root.clone()))?;
+
+        let already_trusted = document
+            .get("projects")
+            .and_then(Item::as_table_like)
+            .and_then(|projects| projects.get(worktree_root))
+            .and_then(Item::as_table_like)
+            .and_then(|project| project.get("trust_level"))
+            .and_then(Item::as_str)
+            == Some("trusted");
+        if already_trusted {
+            return Ok(false);
+        }
+
+        let projects = document
+            .entry("projects")
+            .or_insert(Item::Table(Table::new()))
+            .as_table_like_mut()
+            .ok_or_else(|| HookError::CodexProjectsNotTable(target.clone()))?;
+        let project = projects
+            .entry(worktree_root)
+            .or_insert(Item::Table(Table::new()))
+            .as_table_like_mut()
+            .ok_or_else(|| {
+                HookError::CodexProjectNotTable(target.clone(), self.worktree_root.clone())
+            })?;
+        project.insert("trust_level", value("trusted"));
+        write_toml_atomic(&target, &document)?;
+        Ok(true)
     }
 
     fn remove(&self, agent: Agent, scope: HookScope) -> Result<ManagedHookResult, HookError> {
@@ -1100,6 +1187,29 @@ fn write_text_atomic(path: &Path, text: &str) -> Result<(), HookError> {
     Ok(())
 }
 
+fn write_toml_atomic(path: &Path, document: &DocumentMut) -> Result<(), HookError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| HookError::PathHasNoParent(path.to_path_buf()))?;
+    std::fs::create_dir_all(parent)?;
+    let existing_permissions = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let temporary = path.with_extension("toml.muxtrix-tmp");
+    std::fs::write(&temporary, document.to_string())?;
+    if let Some(permissions) = existing_permissions {
+        std::fs::set_permissions(&temporary, permissions)?;
+    } else {
+        set_file_private(&temporary)?;
+    }
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn set_file_private(path: &Path) -> Result<(), std::io::Error> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1155,12 +1265,20 @@ pub enum HookError {
     EventNotArray(String),
     #[error("hook path has no parent: {0:?}")]
     PathHasNoParent(PathBuf),
+    #[error("Muxtrix's worktree root is not valid UTF-8: {0:?}")]
+    NonUtf8WorktreeRoot(PathBuf),
+    #[error("Codex projects configuration must be a table: {0:?}")]
+    CodexProjectsNotTable(PathBuf),
+    #[error("Codex project configuration for {1:?} must be a table: {0:?}")]
+    CodexProjectNotTable(PathBuf, PathBuf),
     #[error("muxtrixctl is not at {0:?}, so the hooks it installs could not run")]
     ExecutableMissing(PathBuf),
     #[error("hook file I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("hook JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Codex TOML failed: {0}")]
+    Toml(#[from] toml_edit::TomlError),
 }
 
 #[cfg(test)]
@@ -1292,6 +1410,131 @@ mod tests {
             .expect("Pi extension should remove");
         assert!(removed.changed);
         assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_user_hooks_trust_the_shared_worktree_parent_without_reformatting_config() {
+        let (root, manager) = fixture();
+        let target = root.join("home/.codex/config.toml");
+        std::fs::create_dir_all(target.parent().expect("config should have a parent"))
+            .expect("fixture directory should exist");
+        std::fs::write(
+            &target,
+            "# keep this comment\nmodel = \"gpt-5.6\"\n\n[projects.\"/tmp/other\"]\ntrust_level = \"untrusted\"\n",
+        )
+        .expect("fixture config should write");
+
+        let added = manager
+            .apply(Agent::Codex, HookScope::User, HookAction::Add)
+            .expect("hooks and worktree trust should install");
+        assert!(added.changed);
+        assert!(added.message.contains("trusted Muxtrix worktrees"));
+
+        let contents = std::fs::read_to_string(&target).expect("Codex config should exist");
+        assert!(contents.contains("# keep this comment"));
+        let document = contents
+            .parse::<DocumentMut>()
+            .expect("Codex config should remain valid TOML");
+        let projects = document["projects"]
+            .as_table_like()
+            .expect("projects should remain a table");
+        assert_eq!(
+            projects
+                .get("/tmp/other")
+                .and_then(Item::as_table_like)
+                .and_then(|project| project.get("trust_level"))
+                .and_then(Item::as_str),
+            Some("untrusted")
+        );
+        let worktree_root = root.join("home/.muxtrix/worktrees");
+        assert_eq!(
+            projects
+                .get(worktree_root.to_string_lossy().as_ref())
+                .and_then(Item::as_table_like)
+                .and_then(|project| project.get("trust_level"))
+                .and_then(Item::as_str),
+            Some("trusted")
+        );
+
+        let before = std::fs::read(&target).expect("Codex config should read");
+        let duplicate = manager
+            .apply(Agent::Codex, HookScope::User, HookAction::Add)
+            .expect("repeated setup should work");
+        assert!(!duplicate.changed);
+        assert_eq!(
+            std::fs::read(&target).expect("Codex config should still read"),
+            before,
+            "idempotent setup must not rewrite the config"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_codex_hooks_gain_worktree_trust_during_synced_discovery() {
+        let (root, manager) = fixture();
+        manager
+            .apply(Agent::Codex, HookScope::User, HookAction::Add)
+            .expect("hooks should install");
+        let config = root.join("home/.codex/config.toml");
+        std::fs::remove_file(&config).expect("trust config should be removed for the fixture");
+
+        let status = manager
+            .synced_status(Agent::Codex, HookScope::User)
+            .expect("existing hooks should migrate trust");
+        assert!(status.installed);
+        let contents = std::fs::read_to_string(config).expect("trust config should be restored");
+        assert!(contents.contains("trust_level = \"trusted\""));
+        assert!(
+            contents.contains(
+                root.join("home/.muxtrix/worktrees")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_trust_uses_the_agent_visible_worktree_path() {
+        let (root, manager) = fixture();
+        let visible_root = Path::new("/home/user/.muxtrix/worktrees");
+        manager
+            .worktree_root(visible_root)
+            .apply(Agent::Codex, HookScope::User, HookAction::Add)
+            .expect("hooks and WSL-visible trust should install");
+
+        let contents = std::fs::read_to_string(root.join("home/.codex/config.toml"))
+            .expect("Codex config should exist");
+        let document = contents
+            .parse::<DocumentMut>()
+            .expect("Codex config should be valid");
+        assert_eq!(
+            document["projects"][visible_root.to_string_lossy().as_ref()]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_codex_toml_is_never_overwritten_and_prevents_hook_installation() {
+        let (root, manager) = fixture();
+        let config = root.join("home/.codex/config.toml");
+        std::fs::create_dir_all(config.parent().expect("config should have a parent"))
+            .expect("fixture directory should exist");
+        let invalid = b"[projects\n";
+        std::fs::write(&config, invalid).expect("invalid fixture should write");
+
+        assert!(matches!(
+            manager.apply(Agent::Codex, HookScope::User, HookAction::Add),
+            Err(HookError::Toml(_))
+        ));
+        assert_eq!(
+            std::fs::read(config).expect("invalid config should remain"),
+            invalid
+        );
+        assert!(!root.join("home/.codex/hooks.json").exists());
+        assert!(!root.join("state").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1689,11 +1932,15 @@ mod tests {
 
         let (root, manager) = fixture();
         let target = root.join("home/.codex/hooks.json");
+        let config = root.join("home/.codex/config.toml");
         std::fs::create_dir_all(target.parent().expect("target should have parent"))
             .expect("fixture directory should exist");
         std::fs::write(&target, b"{}").expect("fixture should write");
+        std::fs::write(&config, b"").expect("Codex config fixture should write");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640))
             .expect("permissions should set");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640))
+            .expect("Codex config permissions should set");
 
         manager
             .apply(Agent::Codex, HookScope::User, HookAction::Add)
@@ -1706,12 +1953,28 @@ mod tests {
                 & 0o777,
             0o640
         );
+        assert_eq!(
+            std::fs::metadata(&config)
+                .expect("Codex config should exist")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
         manager
             .apply(Agent::Codex, HookScope::User, HookAction::Remove)
             .expect("hooks should uninstall");
         assert_eq!(
             std::fs::metadata(&target)
                 .expect("metadata should exist")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert_eq!(
+            std::fs::metadata(&config)
+                .expect("Codex config should remain")
                 .permissions()
                 .mode()
                 & 0o777,

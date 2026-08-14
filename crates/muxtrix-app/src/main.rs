@@ -17699,6 +17699,7 @@ fn wsl_hook_manager(settings: &AppSettings) -> Result<HookManager, String> {
             .join("hooks")
             .join(format!("wsl-{state_name}")),
         executable: PathBuf::from(linux_executable),
+        worktree_root: PathBuf::from(linux_home).join(WORKTREE_HOME_FOLDER),
     };
     contexts
         .lock()
@@ -17713,6 +17714,7 @@ struct WslHookContext {
     home: PathBuf,
     state_dir: PathBuf,
     executable: PathBuf,
+    worktree_root: PathBuf,
 }
 
 #[cfg(target_os = "windows")]
@@ -17723,6 +17725,7 @@ impl WslHookContext {
         // process cannot stat it, and `wslpath` has already vouched for it.
         HookManager::with_paths(&self.home, &self.home, &self.state_dir, &self.executable)
             .with_named_executable()
+            .worktree_root(&self.worktree_root)
     }
 }
 
