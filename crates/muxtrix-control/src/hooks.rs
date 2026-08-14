@@ -752,6 +752,10 @@ fn hook_events(agent: Agent) -> &'static [(&'static str, &'static str)] {
             ("agent_start", "running"),
             ("tool_approval_requested", "waiting"),
             ("tool_approval_resolved", "running"),
+            ("session.compacting", "running"),
+            ("session_compact", "completed"),
+            ("auto_compaction_start", "running"),
+            ("auto_compaction_end", "completed"),
             ("agent_end", "completed"),
             ("session_shutdown", "stopped"),
         ],
@@ -1031,6 +1035,20 @@ function bodyFor(event, payload, fallback) {{
     if (event === "tool_approval_requested" && payload?.toolName) {{
         return `Approval needed: ${{payload.toolName}}`;
     }}
+    if (event === "session.compacting") {{
+        return "Compacting context";
+    }}
+    if (event === "session_compact") {{
+        return "Context compacted";
+    }}
+    if (event === "auto_compaction_start") {{
+        if (payload?.action === "handoff") return "Preparing handoff";
+        return "Compacting context";
+    }}
+    if (event === "auto_compaction_end") {{
+        if (payload?.action === "handoff") return "Handoff ready";
+        return "Context compacted";
+    }}
     return fallback;
 }}
 
@@ -1038,7 +1056,12 @@ export default function muxtrixLifecycle(pi) {{
     const pendingApprovals = new Set();
     function onLifecycle(event, state, message, beforeSend) {{
         pi.on(event, async (payload, ctx) => {{
-            if (event === "agent_end" && payload?.willContinue) return;
+            if (event === "agent_end" && payload?.willContinue) {{
+                const body = bodyFor(event, payload, "Agent is running");
+                ctx?.ui?.setStatus?.("muxtrix", `Muxtrix: ${{body}}`);
+                await sendLifecycle(event, "running", body, payload);
+                return;
+            }}
             if (beforeSend && beforeSend(payload) === false) return;
             const body = bodyFor(event, payload, message);
             ctx?.ui?.setStatus?.("muxtrix", `Muxtrix: ${{body}}`);
@@ -1071,6 +1094,12 @@ fn pi_extension_registrations(agent: &str) -> String {
         pendingApprovals.delete(payload?.toolCallId ?? \"unknown\");
         return pendingApprovals.size === 0;
     }});",
+                    default_body(agent, state)
+                )
+            }
+            ("auto_compaction_end", "completed") => {
+                format!(
+                    "    onLifecycle(\"{event}\", \"{state}\", \"{}\", (payload) => !payload?.skipped && !payload?.willRetry);",
                     default_body(agent, state)
                 )
             }
@@ -1326,6 +1355,10 @@ mod tests {
         assert!(pi_events.contains(&("agent_start", "running")));
         assert!(pi_events.contains(&("tool_approval_requested", "waiting")));
         assert!(pi_events.contains(&("tool_approval_resolved", "running")));
+        assert!(pi_events.contains(&("session.compacting", "running")));
+        assert!(pi_events.contains(&("session_compact", "completed")));
+        assert!(pi_events.contains(&("auto_compaction_start", "running")));
+        assert!(pi_events.contains(&("auto_compaction_end", "completed")));
     }
 
     #[test]
@@ -1404,6 +1437,10 @@ mod tests {
         assert!(source.contains("pendingApprovals.add"));
         assert!(source.contains("pendingApprovals.size === 0"));
         assert!(source.contains("Approval needed: ${payload.toolName}"));
+        assert!(source.contains("Preparing handoff"));
+        assert!(source.contains("onLifecycle(\"auto_compaction_start\", \"running\""));
+        assert!(source.contains("!payload?.skipped && !payload?.willRetry"));
+        assert!(source.contains("sendLifecycle(event, \"running\""));
 
         let removed = manager
             .apply(Agent::Pi, HookScope::User, HookAction::Remove)

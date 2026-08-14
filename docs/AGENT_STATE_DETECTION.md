@@ -59,8 +59,9 @@ grid snapshot. Retained frames are re-evaluated so an identity hook arriving
 just after a stable prompt paint cannot miss it on the next poll. The screen
 classifier runs for panes already identified as Codex or Claude Code. Oh My Pi
 has no screen-state classifier yet; ordinary Pi frames preserve the last hook or
-process state, while its managed extension reports exact lifecycle, session
-switch/branch, and approval-request transitions.
+process state, while its managed extension reports exact lifecycle,
+session switch/branch, approval-request transitions, and context
+compaction/handoff maintenance.
 
 - Codex `Action Required` OSC titles and strong live confirmation/answer forms
   create `Needs input`.
@@ -97,8 +98,9 @@ hooks as metadata only. A `PostToolUse` can update metadata or ordinary running
 state, but cannot clear a screen-confirmed wait. Completion, failure, stop, and
 new prompt lifecycle events retain their coarse roles.
 
-The installed hook set and its wire state names did not change, so existing
-integrations do not require a repair solely for this change.
+Codex and Claude Code keep their existing hook set and wire state names. Pi
+installations whose managed extension lacks maintenance events are repairable
+through the normal hook status/re-add flow.
 
 ## Recovery across session reattach
 
