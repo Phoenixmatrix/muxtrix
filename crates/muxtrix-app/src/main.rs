@@ -267,10 +267,10 @@ struct Muxtrix {
     /// newer frame arrives; this preserves the hook/frame race guard without
     /// making Running sticky forever.
     agent_running_frame_revisions: BTreeMap<PaneId, u64>,
-    /// Panes whose agent status came from process-tree detection rather than
-    /// lifecycle hooks, with the instant detection first saw them. Hook
-    /// events take ownership; detected entries self-clean when the process
-    /// disappears.
+    /// Panes where process-tree detection has observed a live agent, with the
+    /// instant it last saw that process. Lifecycle hooks enrich the same
+    /// status but do not disable exit observation; the entry self-cleans after
+    /// the harness process remains absent.
     detected_agents: BTreeMap<PaneId, std::time::Instant>,
     /// Panes currently showing Claude Code's Agents view. Their rows project
     /// `agents_roster` instead of one conversation's lifecycle.
@@ -6397,44 +6397,46 @@ impl Muxtrix {
 
     /// Detection beneath the hooks: an agent process running inside a pane is
     /// an agent even before (or without) any lifecycle hook firing. Hook
-    /// events overwrite and take ownership; a detected entry is removed once
-    /// its process disappears.
+    /// events enrich that status, while process observation remains in place
+    /// so returning to the shell clears stale lifecycle metadata.
     fn detect_agent_processes(&mut self) {
         let pane_ids: Vec<PaneId> = self.terminals.keys().copied().collect();
         for pane_id in pane_ids {
-            if !self.agent_statuses.contains_key(&pane_id) {
-                if let Some(agent) = self.pane_agent_process(pane_id) {
-                    let display_name = self.agent_worktree_name(pane_id);
-                    self.agent_statuses.insert(
-                        pane_id,
-                        AgentPaneStatus {
-                            agent,
-                            display_name,
-                            state: AgentState::Running,
-                            activity: None,
-                            session_id: None,
-                            cwd: None,
-                            git_branch: None,
-                        },
-                    );
-                    self.agent_running_frame_revisions.insert(
-                        pane_id,
-                        self.terminals
-                            .get(&pane_id)
-                            .map_or(0, |runtime| runtime.snapshot_revision),
-                    );
+            match self.pane_agent_process(pane_id) {
+                Some(agent) => {
                     self.detected_agents
                         .insert(pane_id, std::time::Instant::now());
+                    if !self.agent_statuses.contains_key(&pane_id) {
+                        let display_name = self.agent_worktree_name(pane_id);
+                        self.agent_statuses.insert(
+                            pane_id,
+                            AgentPaneStatus {
+                                agent,
+                                display_name,
+                                state: AgentState::Running,
+                                activity: None,
+                                session_id: None,
+                                cwd: None,
+                                git_branch: None,
+                            },
+                        );
+                        self.agent_running_frame_revisions.insert(
+                            pane_id,
+                            self.terminals
+                                .get(&pane_id)
+                                .map_or(0, |runtime| runtime.snapshot_revision),
+                        );
+                    }
                 }
-            } else if self
-                .detected_agents
-                .get(&pane_id)
-                .is_some_and(|first_seen| first_seen.elapsed() > std::time::Duration::from_secs(2))
-                && self.pane_agent_process(pane_id).is_none()
-            {
-                self.agent_statuses.remove(&pane_id);
-                self.agent_running_frame_revisions.remove(&pane_id);
-                self.detected_agents.remove(&pane_id);
+                None if self.detected_agents.get(&pane_id).is_some_and(|last_seen| {
+                    last_seen.elapsed() > std::time::Duration::from_secs(2)
+                }) =>
+                {
+                    self.agent_statuses.remove(&pane_id);
+                    self.agent_running_frame_revisions.remove(&pane_id);
+                    self.detected_agents.remove(&pane_id);
+                }
+                None => {}
             }
         }
     }
@@ -7223,7 +7225,6 @@ impl Muxtrix {
                         .terminals
                         .get(&pane_id)
                         .map_or(0, |runtime| runtime.snapshot_revision);
-                    self.detected_agents.remove(&pane_id);
                     if advisory_wait || post_tool_cannot_clear_wait {
                         if let Some(current) = self.agent_statuses.get_mut(&pane_id) {
                             if session_id.is_some() {
@@ -7260,6 +7261,7 @@ impl Muxtrix {
                         self.agent_statuses.remove(&pane_id);
                         self.agent_running_frame_revisions.remove(&pane_id);
                         self.terminal_command_buffers.remove(&pane_id);
+                        self.detected_agents.remove(&pane_id);
                     } else {
                         self.agent_statuses.insert(
                             pane_id,
@@ -22076,7 +22078,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn running_agent_processes_are_detected_without_hooks() {
+    fn agent_status_returns_to_shell_after_hooked_process_exits() {
         let mut app = Muxtrix::new();
         // Any process whose comm matches the configured agent executable
         // counts; `sleep` stands in for the codex binary here.
@@ -22116,8 +22118,28 @@ mod tests {
         assert_eq!(status.state, AgentState::Running);
         assert!(app.detected_agents.contains_key(&pane_id));
 
-        // A hook event takes ownership: the detection record clears so the
-        // status is no longer subject to process-scan removal.
+        // Once a lifecycle hook arrives, process observation must remain in
+        // place so leaving the harness can restore truthful shell state even
+        // when its final hook is missing.
+        let hooked = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Running,
+            event: Some("UserPromptSubmit".into()),
+            title: "Codex · UserPromptSubmit".into(),
+            body: "Working".into(),
+            pane_id: Some(pane_id.as_uuid().to_string()),
+            session_id: Some("thread-1".into()),
+            cwd: None,
+        });
+        assert!(hooked.ok);
+        // Model a hook arriving before the periodic process scan saw the
+        // harness: an existing hook-owned status must still join observation.
+        app.detected_agents.remove(&pane_id);
+        app.detect_agent_processes();
+        assert!(
+            app.detected_agents.contains_key(&pane_id),
+            "hook-owned statuses must retain process-exit observation"
+        );
         app.detected_agents.insert(
             pane_id,
             std::time::Instant::now() - std::time::Duration::from_secs(3),
@@ -22135,6 +22157,7 @@ mod tests {
             !app.agent_statuses.contains_key(&pane_id),
             "a detected status must self-clean when its process exits"
         );
+        assert_eq!(app.pane_state_label(pane_id), "Shell");
     }
 
     #[test]
