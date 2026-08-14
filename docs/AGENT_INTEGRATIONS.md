@@ -69,7 +69,18 @@ Open Settings, then use the Agent lifecycle card:
 - **Launch** opens an independent pane and starts the configured agent command.
 
 The Codex, Claude Code, and Oh My Pi command fields are persistent settings.
-The same launch actions are available from Ctrl+P on Windows/Linux and Cmd+P on macOS.
+Once an agent's user-level integration is installed, it can also be selected as
+the **Default worktree agent** in the same card. The command palette then offers
+matching worktree actions that open a pane right or down, restart the current
+pane in a new worktree, or restart it in an existing registered worktree, and
+start that agent as soon as the terminal is ready. The default stops being
+eligible if its hooks are removed or need repair. Selecting one of these
+commands without an eligible default explains the requirement and links
+directly to the agent settings. Muxtrix keeps that exact command pending while
+Settings is open; choosing **Apply and continue** resumes it after setup.
+
+The launch and worktree-agent actions are available from Ctrl+P on Windows/Linux
+and Cmd+P on macOS.
 
 Adding or re-adding user-level Codex hooks also marks the shared
 `~/.muxtrix/worktrees` parent as trusted in `~/.codex/config.toml`. Codex can

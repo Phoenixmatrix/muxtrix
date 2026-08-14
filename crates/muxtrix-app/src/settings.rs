@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use iced::{Font, font};
+use muxtrix_control::Agent;
 use serde::{Deserialize, Serialize};
 
 use crate::metrics;
@@ -552,6 +553,7 @@ pub(crate) struct AppSettings {
     pub(crate) terminal_line_height: f32,
     pub(crate) windows_shell_backend: WindowsShellBackend,
     pub(crate) wsl_distribution: String,
+    pub(crate) default_agent: Option<Agent>,
     pub(crate) codex_command: String,
     pub(crate) claude_command: String,
     pub(crate) pi_command: String,
@@ -573,6 +575,7 @@ impl Default for AppSettings {
             terminal_line_height: 1.15,
             windows_shell_backend: WindowsShellBackend::Native,
             wsl_distribution: String::new(),
+            default_agent: None,
             codex_command: "codex".into(),
             claude_command: "claude".into(),
             pi_command: "omp".into(),
@@ -800,6 +803,7 @@ mod tests {
             terminal_line_height: 4.0,
             windows_shell_backend: WindowsShellBackend::Wsl,
             wsl_distribution: "Ubuntu-24.04".into(),
+            default_agent: Some(Agent::Claude),
             codex_command: String::new(),
             claude_command: "claude --model opus".into(),
             pi_command: String::new(),
@@ -825,6 +829,7 @@ mod tests {
         assert_eq!(restored.terminal_font, TerminalFont::named("Cascadia Mono"));
         assert_eq!(restored.terminal_font_weight, FontWeight::Semibold);
         assert_eq!(restored.windows_shell_backend, WindowsShellBackend::Wsl);
+        assert_eq!(restored.default_agent, Some(Agent::Claude));
         assert_eq!(
             restored.terminal_font_pixels(),
             if cfg!(target_os = "macos") {
@@ -892,6 +897,7 @@ mod tests {
         assert_eq!(restored.terminal_theme, TerminalThemeId::MuxtrixDark);
         assert_eq!(restored.appearance, Appearance::System);
         assert!(!restored.show_status_bar);
+        assert_eq!(restored.default_agent, None);
         assert_eq!(restored.codex_command, "codex");
         assert_eq!(restored.pi_command, "omp");
     }

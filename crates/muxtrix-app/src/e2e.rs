@@ -9,9 +9,9 @@ use serde_json::json;
 use muxtrix_control::AgentState;
 
 use super::{
-    ActiveView, Agent, AgentPaneStatus, GitHubDiffSource, GitHubDiffState, GitHubPanelState,
-    GitHubPanelTab, HookScope, HookStatus, Message, Muxtrix, PaneRepository, TerminalMouseButton,
-    WorktreeManagerEntry, WorktreeManagerMode, WorktreeManagerState, github,
+    ActiveView, Agent, AgentPaneStatus, CommandAction, GitHubDiffSource, GitHubDiffState,
+    GitHubPanelState, GitHubPanelTab, HookScope, HookStatus, Message, Muxtrix, PaneRepository,
+    TerminalMouseButton, WorktreeManagerEntry, WorktreeManagerMode, WorktreeManagerState, github,
 };
 use crate::settings::FleetView;
 
@@ -164,6 +164,7 @@ enum Stage {
 
 enum TickAction {
     Wait,
+    ScrollSettingsToEnd,
     ScrollGitHubToEnd,
     ScrollGitHubPullRequestsToEnd,
     Capture,
@@ -598,6 +599,9 @@ impl Scenario {
                 if self.capturing("github-scrolled") && self.settle_ticks == 2 {
                     return Ok(TickAction::ScrollGitHubToEnd);
                 }
+                if self.capturing("worktree-agent-settings") && self.settle_ticks == 2 {
+                    return Ok(TickAction::ScrollSettingsToEnd);
+                }
                 if self.capturing("github-pull-requests-scrolled") && self.settle_ticks == 2 {
                     return Ok(TickAction::ScrollGitHubPullRequestsToEnd);
                 }
@@ -732,6 +736,46 @@ impl Scenario {
                 .map_err(|error| error.to_string())?;
         } else if self.capturing("settings") {
             app.open_settings();
+        } else if self.capturing("worktree-agent-settings") {
+            app.open_settings();
+            app.settings.default_agent = Some(Agent::Codex);
+            app.settings_draft.default_agent = Some(Agent::Codex);
+            app.hook_statuses = Agent::ALL
+                .into_iter()
+                .map(|agent| HookStatus {
+                    agent,
+                    scope: HookScope::User,
+                    target: format!("/home/user/.config/{agent}/muxtrix-hooks").into(),
+                    installed: true,
+                    managed_entries: match agent {
+                        Agent::Codex => 8,
+                        Agent::Claude => 9,
+                        Agent::Pi => 4,
+                    },
+                    backup_available: true,
+                    unreachable_entries: 0,
+                })
+                .collect();
+        } else if self.capturing("worktree-agent-setup") {
+            app.default_agent_prompt = true;
+            app.pending_default_agent_command = Some(CommandAction::NewWorktreeWithAgent(
+                super::commands::WorktreeKind::Pane(SplitAxis::Horizontal),
+            ));
+        } else if self.capturing("worktree-agent-palette") {
+            app.settings.default_agent = Some(Agent::Codex);
+            app.settings_draft.default_agent = Some(Agent::Codex);
+            app.hook_statuses = vec![HookStatus {
+                agent: Agent::Codex,
+                scope: HookScope::User,
+                target: "/home/user/.codex/config.toml".into(),
+                installed: true,
+                managed_entries: 8,
+                backup_available: true,
+                unreachable_entries: 0,
+            }];
+            app.palette.visible = true;
+            app.palette.query = "with agent".into();
+            app.palette.selected = 0;
         } else if self.capturing("hook-repair") {
             // Hooks whose muxtrixctl was removed under them: they still
             // read as Muxtrix's own by their text, so the row has to
@@ -1747,6 +1791,12 @@ impl Muxtrix {
             Ok(TickAction::Wait) => {
                 self.e2e = Some(scenario);
                 Task::none()
+            }
+            Ok(TickAction::ScrollSettingsToEnd) => {
+                self.e2e = Some(scenario);
+                iced::widget::operation::snap_to_end(iced::widget::Id::new(
+                    super::SETTINGS_SCROLL_ID,
+                ))
             }
             Ok(TickAction::ScrollGitHubToEnd) => {
                 self.e2e = Some(scenario);

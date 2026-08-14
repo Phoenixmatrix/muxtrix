@@ -116,7 +116,11 @@ light and square heavy boxes with pixel-connectivity assertions, plus double,
 dashed, diagonal, junction, horizontal-rule, and full-block fixtures. The
 worktree flow exposes
 `worktree-dialog`, `worktree-manager`, `worktree-switcher`, and
-`worktree-restart-confirmation` captures. The repository flow exposes
+`worktree-restart-confirmation` captures. Its agent extension adds
+`worktree-agent-settings` for the installed-agent default picker,
+`worktree-agent-setup` for the unconfigured command gate, and
+`worktree-agent-palette` for agent-specific command copy. The capture gallery
+includes both full and minimum-width integration settings frames. The repository flow exposes
 `github-panel` for local changes; `github-pull-requests`,
 `github-pull-request-search`, and `github-pull-requests-scrolled` for the
 searchable, virtualized remote inventory; and `github-blocked`,

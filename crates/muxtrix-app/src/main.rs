@@ -185,6 +185,8 @@ struct Muxtrix {
     workspace_name_draft: String,
     rename_prompt: Option<RenameTarget>,
     rename_draft: String,
+    default_agent_prompt: bool,
+    pending_default_agent_command: Option<CommandAction>,
     worktree_prompt: Option<WorktreePrompt>,
     worktree_name_draft: String,
     worktree_manager: Option<WorktreeManagerState>,
@@ -656,7 +658,9 @@ struct WorktreePrompt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorktreePromptTarget {
     Open(commands::WorktreeKind),
+    OpenWithAgent(commands::WorktreeKind, Agent),
     RestartPane(PaneId),
+    RestartPaneWithAgent(PaneId, Agent),
 }
 
 /// A rail entry the prefix-key navigation cursor can rest on.
@@ -697,6 +701,7 @@ struct WorktreeManagerDiscovery {
 enum WorktreeManagerMode {
     Manage,
     RestartPane(PaneId),
+    RestartPaneWithAgent(PaneId, Agent),
 }
 
 struct SessionPickerState {
@@ -976,6 +981,23 @@ impl std::fmt::Display for WslDistributionChoice {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultAgentChoice {
+    None,
+    Agent(Agent),
+}
+
+impl std::fmt::Display for DefaultAgentChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::None => "Not configured",
+            Self::Agent(Agent::Codex) => "Codex",
+            Self::Agent(Agent::Claude) => "Claude Code",
+            Self::Agent(Agent::Pi) => "Oh My Pi",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaletteMove {
     Next,
     Previous,
@@ -1159,6 +1181,7 @@ enum Message {
     SettingsLineHeight(f32),
     SettingsUiFontSize(f32),
     SetFleetView(FleetView),
+    SettingsDefaultAgent(DefaultAgentChoice),
     SettingsCodexCommand(String),
     SettingsClaudeCommand(String),
     SettingsPiCommand(String),
@@ -1170,6 +1193,8 @@ enum Message {
     RefreshWslDistributions,
     SaveSettings,
     CancelSettings,
+    CloseDefaultAgentPrompt,
+    OpenDefaultAgentSettings,
     OpenThemeGallery,
     CloseThemeGallery,
     GalleryThemeChosen(TerminalThemeId),
@@ -1235,6 +1260,7 @@ const GITHUB_FILE_OVERSCAN: usize = 5;
 const FONT_FAMILY_MENU_MAX_HEIGHT: f32 = 320.0;
 const SPLIT_HANDLE_SIZE: f32 = 8.0;
 const PALETTE_INPUT_ID: &str = "muxtrix-command-palette-input";
+const SETTINGS_SCROLL_ID: &str = "muxtrix-settings-scroll";
 const PALETTE_SCROLL_ID: &str = "muxtrix-command-palette-scroll";
 const GITHUB_FILE_SCROLL_ID: &str = "muxtrix-github-file-scroll";
 const GITHUB_PULL_REQUEST_SCROLL_ID: &str = "muxtrix-github-pull-request-scroll";
@@ -1619,6 +1645,12 @@ impl Muxtrix {
             runtime.launch_state = TerminalLaunchState::Failed(error.clone());
             runtime.session = None;
         }
+        self.pending_terminal_input.remove(&pane_id);
+        self.agent_running_frame_revisions.remove(&pane_id);
+        if let Some(agent) = self.agent_statuses.get_mut(&pane_id) {
+            agent.state = AgentState::Failed;
+            agent.activity = Some("Terminal failed before the agent could start".into());
+        }
         self.status = format!("Terminal unavailable: {error}");
     }
 
@@ -1767,6 +1799,8 @@ impl Muxtrix {
             workspace_name_draft,
             rename_prompt: None,
             rename_draft: String::new(),
+            default_agent_prompt: false,
+            pending_default_agent_command: None,
             worktree_prompt: None,
             worktree_name_draft: String::new(),
             worktree_manager: None,
@@ -2312,12 +2346,33 @@ impl Muxtrix {
                             WorktreePromptTarget::Open(commands::WorktreeKind::Pane(_)) => {
                                 format!("Opened worktree {} in a new pane", path.display())
                             }
+                            WorktreePromptTarget::OpenWithAgent(
+                                commands::WorktreeKind::Pane(_),
+                                agent,
+                            ) => format!(
+                                "Opened worktree {} in a new pane and launched {}",
+                                path.display(),
+                                agent_display_name(&agent.to_string())
+                            ),
                             WorktreePromptTarget::Open(commands::WorktreeKind::Tab) => {
                                 format!("Opened worktree {} in a new tab", path.display())
                             }
+                            WorktreePromptTarget::OpenWithAgent(
+                                commands::WorktreeKind::Tab,
+                                agent,
+                            ) => format!(
+                                "Opened worktree {} in a new tab and launched {}",
+                                path.display(),
+                                agent_display_name(&agent.to_string())
+                            ),
                             WorktreePromptTarget::RestartPane(_) => {
                                 format!("Restarted pane in new worktree {}", path.display())
                             }
+                            WorktreePromptTarget::RestartPaneWithAgent(_, agent) => format!(
+                                "Restarted pane in new worktree {} and launched {}",
+                                path.display(),
+                                agent_display_name(&agent.to_string())
+                            ),
                         };
                     }
                     Err(error) => {
@@ -2436,7 +2491,11 @@ impl Muxtrix {
             }
             Message::WorktreeManagerRestart(index) => {
                 if let Some(manager) = self.worktree_manager.as_mut()
-                    && matches!(manager.mode, WorktreeManagerMode::RestartPane(_))
+                    && matches!(
+                        manager.mode,
+                        WorktreeManagerMode::RestartPane(_)
+                            | WorktreeManagerMode::RestartPaneWithAgent(_, _)
+                    )
                     && index < manager.entries.len()
                 {
                     manager.restart_target = Some(index);
@@ -3099,6 +3158,13 @@ impl Muxtrix {
                 self.settings_draft.ui_font_size = size;
                 return Task::none();
             }
+            Message::SettingsDefaultAgent(choice) => {
+                self.settings_draft.default_agent = match choice {
+                    DefaultAgentChoice::None => None,
+                    DefaultAgentChoice::Agent(agent) => Some(agent),
+                };
+                return Task::none();
+            }
             Message::SetFleetView(view) => {
                 self.set_fleet_view(view);
                 return self.refresh_pane_repositories();
@@ -3156,9 +3222,23 @@ impl Muxtrix {
             }
             Message::CancelSettings => {
                 self.settings_draft = self.settings.clone();
+                self.pending_default_agent_command = None;
                 self.active_view = ActiveView::Workspace;
                 self.status = "Settings changes discarded".into();
                 return Task::none();
+            }
+            Message::CloseDefaultAgentPrompt => {
+                self.default_agent_prompt = false;
+                self.pending_default_agent_command = None;
+                return Task::none();
+            }
+            Message::OpenDefaultAgentSettings => {
+                self.default_agent_prompt = false;
+                self.open_settings();
+                return iced::widget::operation::snap_to(
+                    iced::widget::Id::new(SETTINGS_SCROLL_ID),
+                    iced::widget::operation::RelativeOffset { x: 0.0, y: 1.0 },
+                );
             }
             #[cfg(feature = "e2e")]
             Message::E2eTick => return self.drive_e2e(),
@@ -3629,17 +3709,23 @@ impl Muxtrix {
     fn open_worktree_prompt(&mut self, target: WorktreePromptTarget) -> Task<Message> {
         self.active_view = ActiveView::Workspace;
         let pane_id = match target {
-            WorktreePromptTarget::Open(_) => self
+            WorktreePromptTarget::Open(_) | WorktreePromptTarget::OpenWithAgent(_, _) => self
                 .active_workspace()
                 .ok()
                 .and_then(Workspace::active_tab)
                 .map(|tab| tab.focused_pane_id),
-            WorktreePromptTarget::RestartPane(pane_id) => Some(pane_id),
+            WorktreePromptTarget::RestartPane(pane_id)
+            | WorktreePromptTarget::RestartPaneWithAgent(pane_id, _) => Some(pane_id),
         };
         let probed_directory = pane_id
             .and_then(|pane_id| match target {
-                WorktreePromptTarget::Open(_) => self.pane_working_directory(pane_id),
-                WorktreePromptTarget::RestartPane(_) => self.pane_terminal_directory(pane_id),
+                WorktreePromptTarget::Open(_) | WorktreePromptTarget::OpenWithAgent(_, _) => {
+                    self.pane_working_directory(pane_id)
+                }
+                WorktreePromptTarget::RestartPane(_)
+                | WorktreePromptTarget::RestartPaneWithAgent(_, _) => {
+                    self.pane_terminal_directory(pane_id)
+                }
             })
             .filter(|directory| reported_path_is_concrete(directory));
         let wsl_distribution = self.settings.wsl_distribution.clone();
@@ -3698,7 +3784,10 @@ impl Muxtrix {
     }
 
     fn open_worktree_list(&mut self, mode: WorktreeManagerMode, pane_id: PaneId) -> Task<Message> {
-        if matches!(mode, WorktreeManagerMode::RestartPane(_)) {
+        if matches!(
+            mode,
+            WorktreeManagerMode::RestartPane(_) | WorktreeManagerMode::RestartPaneWithAgent(_, _)
+        ) {
             self.active_view = ActiveView::Workspace;
         }
         let probed_directory = self
@@ -3817,17 +3906,19 @@ impl Muxtrix {
 
     fn confirm_worktree_restart(&mut self) {
         let target = self.worktree_manager.as_ref().and_then(|manager| {
-            let WorktreeManagerMode::RestartPane(pane_id) = manager.mode else {
-                return None;
+            let (pane_id, agent) = match manager.mode {
+                WorktreeManagerMode::RestartPane(pane_id) => (pane_id, None),
+                WorktreeManagerMode::RestartPaneWithAgent(pane_id, agent) => (pane_id, Some(agent)),
+                WorktreeManagerMode::Manage => return None,
             };
             let index = manager.restart_target?;
             manager
                 .entries
                 .get(index)
                 .cloned()
-                .map(|entry| (pane_id, entry))
+                .map(|entry| (pane_id, agent, entry))
         });
-        let Some((pane_id, entry)) = target else {
+        let Some((pane_id, agent, entry)) = target else {
             return;
         };
         let name = entry.branch.clone().unwrap_or_else(|| {
@@ -3836,10 +3927,21 @@ impl Muxtrix {
                 |name| name.to_string_lossy().into_owned(),
             )
         });
-        match self.restart_pane_in_directory(pane_id, entry.path.clone()) {
+        match self
+            .restart_pane_in_directory(pane_id, entry.path.clone())
+            .and_then(|()| agent.map_or(Ok(()), |agent| self.start_agent_in_pane(agent, pane_id)))
+        {
             Ok(()) => {
                 self.worktree_manager = None;
-                self.status = format!("Restarted pane in {name}");
+                self.status = agent.map_or_else(
+                    || format!("Restarted pane in {name}"),
+                    |agent| {
+                        format!(
+                            "Restarted pane in {name} and launched {}",
+                            agent_display_name(&agent.to_string())
+                        )
+                    },
+                );
             }
             Err(error) => {
                 if let Some(manager) = self.worktree_manager.as_mut() {
@@ -4169,9 +4271,17 @@ impl Muxtrix {
         directory: std::path::PathBuf,
     ) -> Result<(), String> {
         match target {
-            WorktreePromptTarget::Open(kind) => self.open_worktree(kind, directory),
+            WorktreePromptTarget::Open(kind) => self.open_worktree(kind, directory).map(|_| ()),
+            WorktreePromptTarget::OpenWithAgent(kind, agent) => {
+                let pane_id = self.open_worktree(kind, directory)?;
+                self.start_agent_in_pane(agent, pane_id)
+            }
             WorktreePromptTarget::RestartPane(pane_id) => {
                 self.restart_pane_in_directory(pane_id, directory)
+            }
+            WorktreePromptTarget::RestartPaneWithAgent(pane_id, agent) => {
+                self.restart_pane_in_directory(pane_id, directory)?;
+                self.start_agent_in_pane(agent, pane_id)
             }
         }
     }
@@ -4181,7 +4291,7 @@ impl Muxtrix {
         &mut self,
         kind: commands::WorktreeKind,
         directory: std::path::PathBuf,
-    ) -> Result<(), String> {
+    ) -> Result<PaneId, String> {
         if self.maximized_pane.is_some() && matches!(kind, commands::WorktreeKind::Pane(_)) {
             return Err("Restore panes before opening a worktree beside them".into());
         }
@@ -4227,7 +4337,8 @@ impl Muxtrix {
                 pane_id
             }
         };
-        self.request_terminal_launch(profile, pane_id, title)
+        self.request_terminal_launch(profile, pane_id, title)?;
+        Ok(pane_id)
     }
 
     /// Moves pane focus in `direction`, spilling across tabs at the layout
@@ -4740,6 +4851,7 @@ impl Muxtrix {
             && !self.workspace_create_visible
             && self.close_workspace_prompt.is_none()
             && self.rename_prompt.is_none()
+            && !self.default_agent_prompt
             && self.worktree_prompt.is_none()
             && let Ok(workspace) = self.active_workspace()
             && let Some(tab) = workspace.active_tab()
@@ -4773,6 +4885,7 @@ impl Muxtrix {
             && !self.workspace_create_visible
             && self.close_workspace_prompt.is_none()
             && self.rename_prompt.is_none()
+            && !self.default_agent_prompt
             && self.worktree_prompt.is_none()
         {
             if character_key_is(modified_key.as_ref(), "e") {
@@ -4904,6 +5017,14 @@ impl Muxtrix {
             return Task::none();
         }
 
+        if self.default_agent_prompt {
+            if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
+                self.default_agent_prompt = false;
+                self.pending_default_agent_command = None;
+            }
+            return Task::none();
+        }
+
         if let Some(picker) = &mut self.session_picker {
             let entry_count = picker.entries.len();
             let selected = picker.selected;
@@ -4939,9 +5060,12 @@ impl Muxtrix {
         }
 
         let worktree_manager_is_active = self.worktree_manager.as_ref().is_some_and(|manager| {
-            matches!(manager.mode, WorktreeManagerMode::RestartPane(_))
-                || (self.active_view == ActiveView::Settings
-                    && self.settings_page == SettingsPage::Worktrees)
+            matches!(
+                manager.mode,
+                WorktreeManagerMode::RestartPane(_)
+                    | WorktreeManagerMode::RestartPaneWithAgent(_, _)
+            ) || (self.active_view == ActiveView::Settings
+                && self.settings_page == SettingsPage::Worktrees)
         });
         if worktree_manager_is_active && let Some(manager) = &mut self.worktree_manager {
             let entry_count = manager.entries.len();
@@ -4966,7 +5090,11 @@ impl Muxtrix {
                 }
                 Key::Named(Named::Enter)
                     if entry_count > 0
-                        && matches!(manager.mode, WorktreeManagerMode::RestartPane(_)) =>
+                        && matches!(
+                            manager.mode,
+                            WorktreeManagerMode::RestartPane(_)
+                                | WorktreeManagerMode::RestartPaneWithAgent(_, _)
+                        ) =>
                 {
                     manager.restart_target = Some(manager.selected);
                 }
@@ -5089,6 +5217,7 @@ impl Muxtrix {
             || self.workspace_create_visible
             || self.close_workspace_prompt.is_some()
             || self.rename_prompt.is_some()
+            || self.default_agent_prompt
             || self.worktree_prompt.is_some()
         {
             return None;
@@ -5755,6 +5884,13 @@ impl Muxtrix {
             CommandAction::NewWorktree(kind) => {
                 return self.open_worktree_prompt(WorktreePromptTarget::Open(kind));
             }
+            CommandAction::NewWorktreeWithAgent(kind) => {
+                let action = CommandAction::NewWorktreeWithAgent(kind);
+                let Some(agent) = self.default_agent_for_worktree_command(action) else {
+                    return Task::none();
+                };
+                return self.open_worktree_prompt(WorktreePromptTarget::OpenWithAgent(kind, agent));
+            }
             CommandAction::RestartPaneInWorktree => {
                 if let Ok(workspace) = self.active_workspace()
                     && let Some(tab) = workspace.active_tab()
@@ -5769,6 +5905,35 @@ impl Muxtrix {
                     && let Some(tab) = workspace.active_tab()
                 {
                     return self.open_worktree_switcher(tab.focused_pane_id);
+                }
+            }
+            CommandAction::RestartPaneInWorktreeWithAgent => {
+                let action = CommandAction::RestartPaneInWorktreeWithAgent;
+                let Some(agent) = self.default_agent_for_worktree_command(action) else {
+                    return Task::none();
+                };
+                if let Ok(workspace) = self.active_workspace()
+                    && let Some(tab) = workspace.active_tab()
+                {
+                    return self.open_worktree_prompt(WorktreePromptTarget::RestartPaneWithAgent(
+                        tab.focused_pane_id,
+                        agent,
+                    ));
+                }
+            }
+            CommandAction::RestartPaneInExistingWorktreeWithAgent => {
+                let action = CommandAction::RestartPaneInExistingWorktreeWithAgent;
+                let Some(agent) = self.default_agent_for_worktree_command(action) else {
+                    return Task::none();
+                };
+                if let Ok(workspace) = self.active_workspace()
+                    && let Some(tab) = workspace.active_tab()
+                {
+                    let pane_id = tab.focused_pane_id;
+                    return self.open_worktree_list(
+                        WorktreeManagerMode::RestartPaneWithAgent(pane_id, agent),
+                        pane_id,
+                    );
                 }
             }
             CommandAction::ManageWorktrees => return self.open_worktree_manager(),
@@ -5804,17 +5969,18 @@ impl Muxtrix {
     }
 
     fn launch_agent(&mut self, agent: Agent) -> Result<(), String> {
-        let command = match agent {
-            Agent::Codex => self.settings.codex_command.clone(),
-            Agent::Claude => self.settings.claude_command.clone(),
-            Agent::Pi => self.settings.pi_command.clone(),
-        };
+        self.agent_launch_command(agent)?;
         self.split_terminal(SplitAxis::Horizontal)?;
         let pane_id = self
             .active_workspace()?
             .active_tab()
             .ok_or_else(|| "active tab is missing".to_owned())?
             .focused_pane_id;
+        self.start_agent_in_pane(agent, pane_id)
+    }
+
+    fn start_agent_in_pane(&mut self, agent: Agent, pane_id: PaneId) -> Result<(), String> {
+        let command = self.agent_launch_command(agent)?;
         let input = format!("{command}\r").into_bytes();
         if self
             .terminals
@@ -5849,6 +6015,31 @@ impl Muxtrix {
                 .map_or(0, |runtime| runtime.snapshot_revision),
         );
         Ok(())
+    }
+
+    fn agent_launch_command(&self, agent: Agent) -> Result<String, String> {
+        let command = agent_command_setting(&self.settings, agent).trim();
+        if command.is_empty() {
+            return Err(format!(
+                "Set a launch command for {} in Settings first",
+                agent_display_name(&agent.to_string())
+            ));
+        }
+        Ok(command.to_owned())
+    }
+
+    fn default_agent_for_worktree_command(&mut self, action: CommandAction) -> Option<Agent> {
+        let agent = self.configured_default_agent();
+        if agent.is_some() {
+            self.pending_default_agent_command = None;
+        } else {
+            self.active_view = ActiveView::Workspace;
+            self.default_agent_prompt = true;
+            self.pending_default_agent_command = Some(action);
+            self.status =
+                "Choose a configured default agent before opening a worktree with an agent".into();
+        }
+        agent
     }
 
     fn open_settings(&mut self) {
@@ -5956,6 +6147,41 @@ impl Muxtrix {
         }
     }
 
+    fn agent_is_configured_for(&self, agent: Agent, settings: &AppSettings) -> bool {
+        !agent_command_setting(settings, agent).trim().is_empty()
+            && self.hook_statuses.iter().any(|status| {
+                status.agent == agent && status.scope == HookScope::User && status.installed
+            })
+    }
+
+    fn agent_is_configured(&self, agent: Agent) -> bool {
+        self.agent_is_configured_for(agent, &self.settings)
+    }
+
+    fn configured_default_agent(&self) -> Option<Agent> {
+        let agent = self.settings.default_agent?;
+        // The initial discovery starts with the app itself. Keep a previously
+        // verified choice usable during that brief refresh; once statuses land,
+        // external removal or semantic drift closes the gate immediately.
+        if self.integration_refreshing && self.hook_statuses.is_empty() {
+            return Some(agent);
+        }
+        self.agent_is_configured(agent).then_some(agent)
+    }
+
+    fn resume_pending_default_agent_command(&mut self) -> Task<Message> {
+        let Some(action) = self.pending_default_agent_command.take() else {
+            return Task::none();
+        };
+        if self.configured_default_agent().is_some() {
+            return self.run_command(action);
+        }
+        self.pending_default_agent_command = Some(action);
+        self.default_agent_prompt = true;
+        self.status = "Choose a configured default agent to continue the worktree command".into();
+        Task::none()
+    }
+
     fn save_settings(&mut self) -> Task<Message> {
         self.settings = self.settings_draft.clone();
         let terminal_theme = self.settings.terminal_theme.preset().terminal_theme();
@@ -5983,7 +6209,9 @@ impl Muxtrix {
                 return Task::none();
             }
         }
-        self.status = match (self.settings.save(), theme_error) {
+        let save_result = self.settings.save();
+        let saved = save_result.is_ok();
+        self.status = match (save_result, theme_error) {
             (Ok(path), None) => format!("Settings saved to {}", path.display()),
             (Ok(path), Some(error)) => format!(
                 "Settings saved to {}, but a terminal could not update its theme: {error}",
@@ -5991,7 +6219,11 @@ impl Muxtrix {
             ),
             (Err(error), _) => format!("Could not save settings: {error}"),
         };
-        self.window_resize_increment_task()
+        let resize_task = self.window_resize_increment_task();
+        if saved && self.pending_default_agent_command.is_some() {
+            return Task::batch([resize_task, self.resume_pending_default_agent_command()]);
+        }
+        resize_task
     }
 
     fn send_terminal_input(&mut self, bytes: Vec<u8>) -> Result<(), String> {
@@ -7228,6 +7460,13 @@ impl Muxtrix {
                     .center_x(Fill)
                     .center_y(Fill),
             ))
+        } else if self.default_agent_prompt {
+            Some((
+                Message::CloseDefaultAgentPrompt,
+                container(opaque(self.default_agent_dialog()))
+                    .center_x(Fill)
+                    .center_y(Fill),
+            ))
         } else if self.session_picker.is_some() {
             Some((
                 Message::CloseSessionPicker,
@@ -7235,11 +7474,13 @@ impl Muxtrix {
                     .center_x(Fill)
                     .center_y(Fill),
             ))
-        } else if self
-            .worktree_manager
-            .as_ref()
-            .is_some_and(|manager| matches!(manager.mode, WorktreeManagerMode::RestartPane(_)))
-        {
+        } else if self.worktree_manager.as_ref().is_some_and(|manager| {
+            matches!(
+                manager.mode,
+                WorktreeManagerMode::RestartPane(_)
+                    | WorktreeManagerMode::RestartPaneWithAgent(_, _)
+            )
+        }) {
             Some((
                 Message::CloseWorktreeManager,
                 container(opaque(self.worktree_manager_dialog()))
@@ -7382,6 +7623,72 @@ impl Muxtrix {
         .into()
     }
 
+    fn default_agent_dialog(&self) -> Element<'_, Message> {
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        let configured_agents = Agent::ALL
+            .into_iter()
+            .filter(|agent| self.agent_is_configured(*agent))
+            .count();
+        let (title, body, action_label) = match self.settings.default_agent {
+            Some(agent) if !self.agent_is_configured(agent) => {
+                let name = agent_display_name(&agent.to_string()).to_owned();
+                (
+                    "Repair your default agent",
+                    format!(
+                        "{name} is selected, but its lifecycle hooks or launch command are not ready. Repair that integration or choose another default, then apply to continue your worktree command."
+                    ),
+                    "Repair agent settings",
+                )
+            }
+            _ if configured_agents > 0 => (
+                "Choose an agent for worktrees",
+                "One or more agent integrations are ready. Choose which agent Muxtrix should start by default, then apply to continue your worktree command."
+                    .to_owned(),
+                "Choose default in Settings",
+            ),
+            _ => (
+                "Set up a worktree agent",
+                "Before Muxtrix can start an agent in a worktree, add its lifecycle integration and choose it as the default. Apply when ready to continue your worktree command."
+                    .to_owned(),
+                "Configure an agent",
+            ),
+        };
+        container(
+            column![
+                text(title).size(self.settings.ui_pixels(18.0)).font(Font {
+                    weight: font::Weight::Bold,
+                    ..Font::DEFAULT
+                }),
+                text(body)
+                    .size(self.settings.ui_pixels(10.0))
+                    .color(tokens.muted)
+                    .width(420),
+                row![
+                    container("").width(Fill),
+                    settings_action_button(
+                        "Cancel command",
+                        Message::CloseDefaultAgentPrompt,
+                        SettingsButtonKind::Secondary,
+                        &self.settings,
+                    ),
+                    settings_action_button(
+                        action_label,
+                        Message::OpenDefaultAgentSettings,
+                        SettingsButtonKind::Primary,
+                        &self.settings,
+                    ),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(14),
+        )
+        .padding(20)
+        .width(480)
+        .style(move |_| modal_surface(tokens))
+        .into()
+    }
+
     fn rename_dialog(&self) -> Element<'_, Message> {
         let tokens = DesignTokens::for_appearance(self.settings.appearance);
         let (title, hint) = match self.rename_prompt {
@@ -7448,11 +7755,25 @@ impl Muxtrix {
                 WorktreePromptTarget::Open(commands::WorktreeKind::Pane(SplitAxis::Horizontal)) => {
                     "New worktree pane right"
                 }
+                WorktreePromptTarget::OpenWithAgent(
+                    commands::WorktreeKind::Pane(SplitAxis::Horizontal),
+                    _,
+                ) => "New worktree with agent pane right",
                 WorktreePromptTarget::Open(commands::WorktreeKind::Pane(SplitAxis::Vertical)) => {
                     "New worktree pane down"
                 }
+                WorktreePromptTarget::OpenWithAgent(
+                    commands::WorktreeKind::Pane(SplitAxis::Vertical),
+                    _,
+                ) => "New worktree with agent pane down",
                 WorktreePromptTarget::Open(commands::WorktreeKind::Tab) => "New worktree tab",
+                WorktreePromptTarget::OpenWithAgent(commands::WorktreeKind::Tab, _) => {
+                    "New worktree tab with agent"
+                }
                 WorktreePromptTarget::RestartPane(_) => "Restart in new worktree",
+                WorktreePromptTarget::RestartPaneWithAgent(_, _) => {
+                    "Restart with agent in new worktree"
+                }
             }
         };
         let mut body = column![text(title).size(self.settings.ui_pixels(18.0)).font(Font {
@@ -7924,6 +8245,10 @@ impl Muxtrix {
             .restart_target
             .and_then(|index| manager.entries.get(index))
         {
+            let restart_agent = match manager.mode {
+                WorktreeManagerMode::RestartPaneWithAgent(_, agent) => Some(agent),
+                WorktreeManagerMode::Manage | WorktreeManagerMode::RestartPane(_) => None,
+            };
             let name = entry.branch.as_deref().unwrap_or_else(|| {
                 entry
                     .path
@@ -7932,13 +8257,23 @@ impl Muxtrix {
                     .unwrap_or("selected worktree")
             });
             let body = column![
-                text("Restart pane?")
+                text(if restart_agent.is_some() {
+                    "Restart pane and launch agent?"
+                } else {
+                    "Restart pane?"
+                })
                     .size(self.settings.ui_pixels(18.0))
                     .font(Font {
                         weight: font::Weight::Bold,
                         ..Font::DEFAULT
                     }),
-                text(format!("Open a fresh terminal in {name}?"))
+                text(restart_agent.map_or_else(
+                    || format!("Open a fresh terminal in {name}?"),
+                    |agent| format!(
+                        "Open a fresh terminal in {name} and launch {}?",
+                        agent_display_name(&agent.to_string())
+                    ),
+                ))
                     .size(self.settings.ui_pixels(10.5))
                     .color(tokens.text),
                 text("The current process and terminal history will close. The pane stays in its present tab and position.")
@@ -7972,7 +8307,11 @@ impl Muxtrix {
                         &self.settings,
                     ),
                     settings_action_button(
-                        "Restart pane",
+                        if restart_agent.is_some() {
+                            "Restart and launch"
+                        } else {
+                            "Restart pane"
+                        },
                         Message::ConfirmWorktreeManagerRestart,
                         SettingsButtonKind::Danger,
                         &self.settings,
@@ -7989,10 +8328,21 @@ impl Muxtrix {
                 .into();
         }
 
-        let restart_mode = matches!(manager.mode, WorktreeManagerMode::RestartPane(_));
+        let restart_mode = matches!(
+            manager.mode,
+            WorktreeManagerMode::RestartPane(_) | WorktreeManagerMode::RestartPaneWithAgent(_, _)
+        );
+        let restart_with_agent = matches!(
+            manager.mode,
+            WorktreeManagerMode::RestartPaneWithAgent(_, _)
+        );
         let unused_count = unused_worktree_paths(&manager.entries).len();
         let title = text(if restart_mode {
-            "Restart pane in worktree"
+            if restart_with_agent {
+                "Restart pane with agent in worktree"
+            } else {
+                "Restart pane in worktree"
+            }
         } else {
             "Worktrees"
         })
@@ -11771,6 +12121,11 @@ impl Muxtrix {
 
     fn preferences_settings_view(&self, changed: bool) -> Element<'_, Message> {
         let tokens = DesignTokens::for_appearance(self.settings_draft.appearance);
+        let can_continue_pending_command = self.pending_default_agent_command.is_some()
+            && self
+                .settings_draft
+                .default_agent
+                .is_some_and(|agent| self.agent_is_configured_for(agent, &self.settings_draft));
         let title = column![
             text("Preferences")
                 .size(self.settings_draft.ui_pixels(22.0))
@@ -12003,6 +12358,18 @@ impl Muxtrix {
             "Agent lifecycle hooks",
             "Reversible Codex, Claude Code, and Oh My Pi integration",
             column![
+                settings_row(
+                    "Default worktree agent",
+                    "Used when a worktree command opens or restarts a pane with an agent",
+                    pick_list(
+                        self.default_agent_choices(),
+                        Some(self.default_agent_choice()),
+                        Message::SettingsDefaultAgent,
+                    )
+                    .width(220),
+                    &self.settings_draft,
+                ),
+                settings_divider(tokens),
                 self.agent_hook_row(Agent::Codex),
                 settings_divider(tokens),
                 self.agent_hook_row(Agent::Claude),
@@ -12010,7 +12377,7 @@ impl Muxtrix {
                 self.agent_hook_row(Agent::Pi),
                 settings_divider(tokens),
                 row![
-                    text("Muxtrix only changes its tagged entries; project-level controls remain available in muxtrixctl.")
+                    text("Hook actions apply immediately. Muxtrix only changes its tagged entries; project-level controls remain available in muxtrixctl.")
                         .size(self.settings_draft.ui_pixels(10.0))
                         .color(tokens.muted)
                         .width(Fill),
@@ -12083,7 +12450,7 @@ impl Muxtrix {
         let footer = container(
             row![
                 text(format!(
-                    "{font_restart}Terminal appearance applies now; shell changes affect new panes"
+                    "{font_restart}Preferences apply when saved; shell changes affect new panes; hook actions apply immediately"
                 ))
                 .size(self.settings_draft.ui_pixels(9.0))
                 .color(tokens.faint)
@@ -12095,8 +12462,12 @@ impl Muxtrix {
                     &self.settings_draft,
                 ),
                 settings_action_button_maybe(
-                    "Apply changes",
-                    changed.then_some(Message::SaveSettings),
+                    if can_continue_pending_command {
+                        "Apply and continue"
+                    } else {
+                        "Apply changes"
+                    },
+                    (changed || can_continue_pending_command).then_some(Message::SaveSettings),
                     SettingsButtonKind::Primary,
                     &self.settings_draft,
                 ),
@@ -12114,6 +12485,7 @@ impl Muxtrix {
                         .padding([24.0, SETTINGS_PAGE_PADDING_X])
                         .center_x(Fill)
                 )
+                .id(iced::widget::Id::new(SETTINGS_SCROLL_ID))
                 .height(Fill),
                 footer,
             ]
@@ -12178,6 +12550,53 @@ impl Muxtrix {
         .line_height(Pixels(30.0))
         .padding([0, 9])
         .size(self.settings_draft.ui_pixels(11.0));
+        let mut actions = row![].spacing(8).align_y(Alignment::Center);
+        if self.integration_refreshing {
+            actions = actions.push(
+                text("Updating…")
+                    .size(self.settings_draft.ui_pixels(9.0))
+                    .color(tokens.muted),
+            );
+        } else if installed {
+            actions = actions
+                .push(settings_action_button(
+                    "Launch",
+                    Message::RunCommand(CommandAction::LaunchAgent(agent)),
+                    SettingsButtonKind::Secondary,
+                    &self.settings_draft,
+                ))
+                .push(settings_hook_button(
+                    "Remove hooks",
+                    agent,
+                    HookAction::Remove,
+                    SettingsButtonKind::Danger,
+                    &self.settings_draft,
+                ));
+        } else if repair_needed {
+            actions = actions
+                .push(settings_hook_button(
+                    "Repair hooks",
+                    agent,
+                    HookAction::ReAdd,
+                    SettingsButtonKind::Secondary,
+                    &self.settings_draft,
+                ))
+                .push(settings_hook_button(
+                    "Remove hooks",
+                    agent,
+                    HookAction::Remove,
+                    SettingsButtonKind::Danger,
+                    &self.settings_draft,
+                ));
+        } else {
+            actions = actions.push(settings_hook_button(
+                "Add integration",
+                agent,
+                HookAction::Add,
+                SettingsButtonKind::Secondary,
+                &self.settings_draft,
+            ));
+        }
         container(
             column![
                 row![
@@ -12204,37 +12623,7 @@ impl Muxtrix {
                     ]
                     .spacing(2)
                     .width(Fill),
-                    settings_action_button(
-                        "Launch",
-                        Message::RunCommand(CommandAction::LaunchAgent(agent)),
-                        SettingsButtonKind::Secondary,
-                        &self.settings_draft,
-                    ),
-                    settings_hook_button(
-                        if repair_needed { "Repair" } else { "Add" },
-                        agent,
-                        if repair_needed {
-                            HookAction::ReAdd
-                        } else {
-                            HookAction::Add
-                        },
-                        SettingsButtonKind::Secondary,
-                        &self.settings_draft,
-                    ),
-                    settings_hook_button(
-                        "Remove",
-                        agent,
-                        HookAction::Remove,
-                        SettingsButtonKind::Danger,
-                        &self.settings_draft
-                    ),
-                    settings_hook_button(
-                        "Re-add",
-                        agent,
-                        HookAction::ReAdd,
-                        SettingsButtonKind::Secondary,
-                        &self.settings_draft
-                    ),
+                    actions,
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -12244,6 +12633,24 @@ impl Muxtrix {
         )
         .padding(14)
         .into()
+    }
+
+    fn default_agent_choices(&self) -> Vec<DefaultAgentChoice> {
+        std::iter::once(DefaultAgentChoice::None)
+            .chain(
+                Agent::ALL
+                    .into_iter()
+                    .filter(|agent| self.agent_is_configured_for(*agent, &self.settings_draft))
+                    .map(DefaultAgentChoice::Agent),
+            )
+            .collect()
+    }
+
+    fn default_agent_choice(&self) -> DefaultAgentChoice {
+        self.settings_draft
+            .default_agent
+            .filter(|agent| self.agent_is_configured_for(*agent, &self.settings_draft))
+            .map_or(DefaultAgentChoice::None, DefaultAgentChoice::Agent)
     }
 
     fn command_palette(&self) -> Element<'_, Message> {
@@ -12266,15 +12673,40 @@ impl Muxtrix {
                             .into()
                     };
                     let title_color = if enabled { tokens.text } else { tokens.faint };
-                    let subtitle = if enabled {
-                        command.subtitle
+                    let configured_agent = self
+                        .configured_default_agent()
+                        .map(|agent| agent_display_name(&agent.to_string()).to_owned());
+                    let title = if command.action.requires_default_agent() {
+                        configured_agent.as_ref().map_or_else(
+                            || command.title.to_owned(),
+                            |agent| {
+                                command
+                                    .title
+                                    .replace("with agent", &format!("with {agent}"))
+                            },
+                        )
                     } else {
-                        "Restore panes to use this command"
+                        command.title.to_owned()
+                    };
+                    let subtitle = if enabled {
+                        if command.action.requires_default_agent() && configured_agent.is_none() {
+                            "Choose a configured default agent in Settings to use this command"
+                                .to_owned()
+                        } else if command.action.requires_default_agent() {
+                            command.subtitle.replace(
+                                "the default agent",
+                                configured_agent.as_deref().unwrap_or("your agent"),
+                            )
+                        } else {
+                            command.subtitle.to_owned()
+                        }
+                    } else {
+                        "Restore panes to use this command".to_owned()
                     };
                     let mut command_button = button(
                         row![
                             column![
-                                text(command.title)
+                                text(title)
                                     .size(self.settings.ui_pixels(11.0))
                                     .font(Font {
                                         weight: self.default_family_weight(FontWeight::Medium),
@@ -14343,7 +14775,8 @@ fn discover_worktree_manager(
         .enumerate()
         .filter(|(_, (path, _))| match mode {
             WorktreeManagerMode::Manage => true,
-            WorktreeManagerMode::RestartPane(_) => probed_directory
+            WorktreeManagerMode::RestartPane(_)
+            | WorktreeManagerMode::RestartPaneWithAgent(_, _) => probed_directory
                 .as_deref()
                 .is_none_or(|directory| !directory.starts_with(path)),
         })
@@ -17505,6 +17938,14 @@ fn agent_display_name(agent: &str) -> &str {
         "claude" | "claude-code" => "Claude Code",
         "pi" | "omp" | "oh-my-pi" => "Oh My Pi",
         _ => agent,
+    }
+}
+
+fn agent_command_setting(settings: &AppSettings, agent: Agent) -> &str {
+    match agent {
+        Agent::Codex => &settings.codex_command,
+        Agent::Claude => &settings.claude_command,
+        Agent::Pi => &settings.pi_command,
     }
 }
 
@@ -22518,6 +22959,199 @@ mod tests {
         assert!(
             app.worktree_prompt.is_some(),
             "confirm must be inert without a repository"
+        );
+    }
+
+    #[test]
+    fn worktree_agent_commands_require_an_installed_default_agent() {
+        let mut app = Muxtrix::new();
+
+        let _ = app.run_command(CommandAction::NewWorktreeWithAgent(
+            commands::WorktreeKind::Pane(SplitAxis::Horizontal),
+        ));
+        assert!(app.default_agent_prompt);
+        assert!(app.worktree_prompt.is_none());
+
+        app.default_agent_prompt = false;
+        app.settings.default_agent = Some(Agent::Codex);
+        let _ = app.run_command(CommandAction::RestartPaneInWorktreeWithAgent);
+        assert!(
+            app.default_agent_prompt,
+            "a saved choice whose hooks are not installed must remain gated"
+        );
+
+        app.default_agent_prompt = false;
+        app.hook_statuses.push(HookStatus {
+            agent: Agent::Codex,
+            scope: HookScope::User,
+            target: "/tmp/codex-hooks.json".into(),
+            installed: true,
+            managed_entries: 8,
+            backup_available: false,
+            unreachable_entries: 0,
+        });
+        let pane_id = active_pane_id(&app);
+        let _ = app.run_command(CommandAction::RestartPaneInWorktreeWithAgent);
+        assert_eq!(
+            app.worktree_prompt
+                .as_ref()
+                .expect("configured command should open worktree prompt")
+                .target,
+            WorktreePromptTarget::RestartPaneWithAgent(pane_id, Agent::Codex)
+        );
+        assert!(!app.default_agent_prompt);
+    }
+
+    #[test]
+    fn configured_default_agent_resumes_the_pending_worktree_command() {
+        let mut app = Muxtrix::new();
+        let action = CommandAction::NewWorktreeWithAgent(commands::WorktreeKind::Pane(
+            SplitAxis::Horizontal,
+        ));
+
+        let _ = app.run_command(action);
+        assert_eq!(app.pending_default_agent_command, Some(action));
+
+        let _ = app.update(Message::OpenDefaultAgentSettings);
+        assert_eq!(app.pending_default_agent_command, Some(action));
+        assert_eq!(app.active_view, ActiveView::Settings);
+
+        app.settings.default_agent = Some(Agent::Codex);
+        app.settings_draft.default_agent = Some(Agent::Codex);
+        app.hook_statuses.push(HookStatus {
+            agent: Agent::Codex,
+            scope: HookScope::User,
+            target: "/tmp/codex-hooks.json".into(),
+            installed: true,
+            managed_entries: 8,
+            backup_available: false,
+            unreachable_entries: 0,
+        });
+
+        let _ = app.resume_pending_default_agent_command();
+        assert!(app.pending_default_agent_command.is_none());
+        assert_eq!(app.active_view, ActiveView::Workspace);
+        assert!(matches!(
+            app.worktree_prompt.as_ref().map(|prompt| prompt.target),
+            Some(WorktreePromptTarget::OpenWithAgent(
+                commands::WorktreeKind::Pane(SplitAxis::Horizontal),
+                Agent::Codex
+            ))
+        ));
+    }
+
+    #[test]
+    fn dismissing_default_agent_setup_cancels_the_pending_command() {
+        let mut app = Muxtrix::new();
+        let action = CommandAction::RestartPaneInExistingWorktreeWithAgent;
+
+        let _ = app.run_command(action);
+        assert_eq!(app.pending_default_agent_command, Some(action));
+        let _ = app.update(Message::CloseDefaultAgentPrompt);
+
+        assert!(!app.default_agent_prompt);
+        assert!(app.pending_default_agent_command.is_none());
+        assert!(app.worktree_manager.is_none());
+    }
+
+    #[test]
+    fn blank_agent_command_cannot_pass_the_configuration_gate_or_open_a_pane() {
+        let mut app = Muxtrix::new();
+        app.settings.default_agent = Some(Agent::Codex);
+        app.settings.codex_command = "   ".into();
+        app.hook_statuses.push(HookStatus {
+            agent: Agent::Codex,
+            scope: HookScope::User,
+            target: "/tmp/codex-hooks.json".into(),
+            installed: true,
+            managed_entries: 8,
+            backup_available: false,
+            unreachable_entries: 0,
+        });
+        let terminal_count = app.terminals.len();
+
+        let _ = app.run_command(CommandAction::RestartPaneInWorktreeWithAgent);
+        assert!(app.default_agent_prompt);
+        assert!(app.worktree_prompt.is_none());
+
+        let error = app
+            .launch_agent(Agent::Codex)
+            .expect_err("a blank launch command must fail before splitting");
+        assert!(error.contains("Set a launch command"));
+        assert_eq!(app.terminals.len(), terminal_count);
+    }
+
+    #[test]
+    fn terminal_launch_failure_marks_a_queued_agent_as_failed() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.start_agent_in_pane(Agent::Codex, pane_id)
+            .expect("agent start should queue for the initial terminal");
+
+        app.mark_terminal_launch_failed(pane_id, "host unavailable".into());
+
+        assert!(!app.pending_terminal_input.contains_key(&pane_id));
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Failed);
+        assert_eq!(
+            app.agent_statuses[&pane_id].activity.as_deref(),
+            Some("Terminal failed before the agent could start")
+        );
+    }
+
+    #[test]
+    fn created_worktree_with_agent_starts_the_agent_in_the_new_pane() {
+        let mut app = Muxtrix::new();
+        app.settings.codex_command = "true".into();
+        let previous = active_pane_id(&app);
+
+        app.open_created_worktree(
+            WorktreePromptTarget::OpenWithAgent(
+                commands::WorktreeKind::Pane(SplitAxis::Vertical),
+                Agent::Codex,
+            ),
+            std::env::temp_dir(),
+        )
+        .expect("worktree pane and agent should launch");
+
+        let pane_id = active_pane_id(&app);
+        assert_ne!(pane_id, previous);
+        assert_eq!(app.agent_statuses[&pane_id].agent, "codex");
+        assert!(matches!(
+            app.agent_statuses[&pane_id].state,
+            AgentState::Idle | AgentState::Running
+        ));
+        assert!(matches!(
+            active_tab(&app).root,
+            PaneTree::Split {
+                axis: SplitAxis::Vertical,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn existing_worktree_agent_command_keeps_the_current_pane_target() {
+        let mut app = Muxtrix::new();
+        app.settings.default_agent = Some(Agent::Claude);
+        app.hook_statuses.push(HookStatus {
+            agent: Agent::Claude,
+            scope: HookScope::User,
+            target: "/tmp/claude-settings.json".into(),
+            installed: true,
+            managed_entries: 9,
+            backup_available: false,
+            unreachable_entries: 0,
+        });
+        let pane_id = active_pane_id(&app);
+
+        let _ = app.run_command(CommandAction::RestartPaneInExistingWorktreeWithAgent);
+
+        assert_eq!(
+            app.worktree_manager
+                .as_ref()
+                .expect("existing worktree picker should open")
+                .mode,
+            WorktreeManagerMode::RestartPaneWithAgent(pane_id, Agent::Claude)
         );
     }
 
