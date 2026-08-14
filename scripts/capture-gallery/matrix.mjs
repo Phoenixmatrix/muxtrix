@@ -160,7 +160,7 @@ add({
   group: "Fleet",
   capture: "fleet-all-workspaces",
   check:
-    "Workspace bands separate every pane while the selected scope and projection remain unmistakable.",
+    "Workspace bands separate every pane while the projection control remains uncluttered.",
 });
 add({
   slug: "fleet-agents",
@@ -332,6 +332,13 @@ add({
   group: "Dialogs",
   capture: "palette-query",
   check: "Filtering to 'work' — matching rows only, selection on a real result.",
+});
+add({
+  slug: "palette-fleet-workspaces",
+  title: "Command palette · Fleet workspace toggle",
+  group: "Dialogs",
+  capture: "palette-fleet-workspaces",
+  check: "The Fleet workspace setting is available as one explicit toggle command.",
 });
 add({
   slug: "palette-empty",

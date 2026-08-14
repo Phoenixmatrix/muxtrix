@@ -1562,6 +1562,10 @@ impl Scenario {
             app.palette.visible = true;
             app.palette.query = "work".into();
             app.palette.selected = 1;
+        } else if self.capturing("palette-fleet-workspaces") {
+            app.palette.visible = true;
+            app.palette.query = "toggle all workspaces".into();
+            app.palette.selected = 0;
         } else if self.capturing("palette-empty-query") {
             app.palette.visible = true;
             app.palette.query = "zzzz-no-such-command".into();
