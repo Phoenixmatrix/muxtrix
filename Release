@@ -1,17 +1,17 @@
 Architectures: amd64
-Date: Fri, 14 Aug 2026 21:24:17 +0000
+Date: Fri, 14 Aug 2026 22:06:46 +0000
 Description: Muxtrix Debian packages
 Label: Muxtrix
 Origin: Muxtrix
 MD5Sum:
- c9f0b63bb99578bbfcc7f791d20b1e25             3339 Packages
- 81a2602a6278796431f2cd7d1985dbb3              918 Packages.gz
+ 40c807d6a05a83e826379d175efbccf1             4007 Packages
+ 7a8cdc932f013bacc7e824feddd2747e             1029 Packages.gz
 SHA1:
- ef0caee25bb13bfb8f52d093d50aa7cc7c08fbcc             3339 Packages
- ca3584b0d5a551084b0355ba4170bc4344e8eab4              918 Packages.gz
+ 2d9d8ae4414457566b1bad073c80a0f8f36ae724             4007 Packages
+ 10c2191dac462700aecea504223d55fdfa5efd51             1029 Packages.gz
 SHA256:
- 444aca1d6c0cb137e576f208603bf23bb6edb3b812ffca157cce96a55fbfc454             3339 Packages
- d53b5fcf52cff75a97871921805ce4e33e7c652c4e6ae98f17637c32f39d3e4e              918 Packages.gz
+ 9a8659e3e5bf9018e4f86a0586cc4fcbbbb00df92556acf2d842604eef680a8f             4007 Packages
+ ae9e0e0b0f29cf95fbb9b95b38028773170dbcfc1faea03616b645bfe1f31a97             1029 Packages.gz
 SHA512:
- 4e2fcf1214618c80737c735172bf53edb00a071c0224c064ea2fdf984d596e867b20d6ca8044c5ad4fb8540e627ca70a5c3a095d00374ced5be4697b329a0182             3339 Packages
- 9de2de71a155aa6dd90ef2d2faf89fc01951464ecb9ea38a86433a3a2d7401cd86a343f77b11c828ef4bb39d3f10d77e77ca9a905c986c5e1a39dda9c954a9a6              918 Packages.gz
+ 0f801cff7b07b8e126236648bd42a231dfb3aa9ebe37cf75dda5e98e043f895a1cc3e68f0fb4c73990984c53dc3d5c7a30318958c2c33093aca85dcca0687fe5             4007 Packages
+ 8d56e7172caf580882d93547e49c69f74403b19991e42014cee496a57b0b4902a17cae43b809afae50c6d5320cec45eaa98c9d5d63447829b2c3829f67ecc723             1029 Packages.gz

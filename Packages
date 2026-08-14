@@ -87,3 +87,21 @@ Homepage: https://github.com/Phoenixmatrix/muxtrix
 Description: Native GPU terminal workspace for supervising coding agents
  Native GPU terminal workspace for supervising coding agents, with worktrees,
  fleet supervision, and Ghostty-compatible theming.
+
+Package: muxtrix
+Version: 0.1.53-1
+Architecture: amd64
+Maintainer: Francois Ward <fward@hey.com>
+Installed-Size: 25068
+Depends: hicolor-icon-theme, libc6 (>= 2.34)
+Filename: pool/muxtrix_0.1.53_amd64.deb
+Size: 7053328
+MD5sum: d9f5db4cea0cedeaa6408a0bf4d1fecf
+SHA1: c119c5d409bc75cc66ab582e5a57223d5a32e2c0
+SHA256: 6e34989437063556a80193b0bae0c516b529ca824406d828e9de1c0794705ca7
+Section: utils
+Priority: optional
+Homepage: https://github.com/Phoenixmatrix/muxtrix
+Description: Native GPU terminal workspace for supervising coding agents
+ Native GPU terminal workspace for supervising coding agents, with worktrees,
+ fleet supervision, and Ghostty-compatible theming.
