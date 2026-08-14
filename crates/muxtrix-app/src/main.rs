@@ -553,6 +553,30 @@ impl GitHubPanelState {
             GitHubPanelTab::PullRequests => self.pull_requests_loading,
         }
     }
+
+    fn close_selected_pull_request(&mut self) {
+        self.selected_pull_request_number = None;
+        self.selected_pull_request = None;
+        self.selected_pull_request_loading = false;
+        self.selected_pull_request_error = None;
+        self.selected_pull_request_file_scroll_offset = 0.0;
+        self.file_keyboard_cursor = None;
+        self.keyboard_focus = Some(GitHubPanelKeyboardFocus::PullRequestList);
+        self.merge_confirmation = false;
+    }
+
+    fn mark_pull_request_merged(&mut self, number: u64) {
+        let Some(pull_requests) = self.pull_requests.as_mut() else {
+            return;
+        };
+        let Some(pull_request) = pull_requests
+            .iter_mut()
+            .find(|pull_request| pull_request.number == number)
+        else {
+            return;
+        };
+        pull_request.status = github::PullRequestSummaryStatus::Merged;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1113,7 +1137,7 @@ enum Message {
     RequestGitHubMerge,
     CancelGitHubMerge,
     ConfirmGitHubMerge,
-    GitHubMergeFinished(std::path::PathBuf, Result<String, String>),
+    GitHubMergeFinished(std::path::PathBuf, u64, Result<String, String>),
     ToggleSidebar,
     ToggleMaximize(PaneId),
     ToggleMaximizeFromPaneMenu(PaneId),
@@ -1250,6 +1274,8 @@ struct DesignTokens {
     success: Color,
     warning: Color,
     danger: Color,
+    github_open: Color,
+    github_merged: Color,
 }
 
 impl DesignTokens {
@@ -1271,6 +1297,8 @@ impl DesignTokens {
                 success: Color::from_rgb8(42, 145, 78),
                 warning: Color::from_rgb8(196, 126, 0),
                 danger: Color::from_rgb8(194, 54, 59),
+                github_open: Color::from_rgb8(31, 136, 61),
+                github_merged: Color::from_rgb8(130, 80, 223),
             },
             // The "Muxtrix Polished" world: chrome sits on a slate rail,
             // terminal panes are darker cards floating on the app field, and
@@ -1291,6 +1319,8 @@ impl DesignTokens {
                 success: Color::from_rgb8(85, 199, 126),
                 warning: Color::from_rgb8(242, 177, 78),
                 danger: Color::from_rgb8(240, 122, 110),
+                github_open: Color::from_rgb8(63, 185, 80),
+                github_merged: Color::from_rgb8(163, 113, 247),
             },
         }
     }
@@ -2717,14 +2747,7 @@ impl Muxtrix {
             }
             Message::CloseGitHubPullRequest => {
                 if let Some(panel) = self.github_panel.as_mut() {
-                    panel.selected_pull_request_number = None;
-                    panel.selected_pull_request = None;
-                    panel.selected_pull_request_loading = false;
-                    panel.selected_pull_request_error = None;
-                    panel.selected_pull_request_file_scroll_offset = 0.0;
-                    panel.file_keyboard_cursor = None;
-                    panel.keyboard_focus = Some(GitHubPanelKeyboardFocus::PullRequestList);
-                    panel.merge_confirmation = false;
+                    panel.close_selected_pull_request();
                 }
                 if self
                     .github_diff
@@ -2877,7 +2900,7 @@ impl Muxtrix {
                 return Task::none();
             }
             Message::ConfirmGitHubMerge => return self.confirm_github_merge(),
-            Message::GitHubMergeFinished(root, result) => {
+            Message::GitHubMergeFinished(root, number, result) => {
                 let Some(panel) = self
                     .github_panel
                     .as_mut()
@@ -2889,11 +2912,21 @@ impl Muxtrix {
                 panel.merge_confirmation = false;
                 match result {
                     Ok(status) => {
+                        panel.mark_pull_request_merged(number);
+                        panel.close_selected_pull_request();
+                        if self.github_diff.as_ref().is_some_and(|diff| {
+                            diff.source == GitHubDiffSource::PullRequest(number)
+                        }) {
+                            self.github_diff = None;
+                            self.active_view = ActiveView::Workspace;
+                        }
                         self.status = status;
-                        return self.refresh_github_panel();
+                        return self.refresh_github_pull_requests();
                     }
                     Err(error) => {
-                        panel.selected_pull_request_error = Some(error.clone());
+                        if panel.selected_pull_request_number == Some(number) {
+                            panel.selected_pull_request_error = Some(error.clone());
+                        }
                         self.status = error;
                     }
                 }
@@ -5584,7 +5617,7 @@ impl Muxtrix {
         perform_blocking(
             move || github::merge(&repository, number, &head_oid),
             move |result| {
-                Message::GitHubMergeFinished(root, result.and_then(std::convert::identity))
+                Message::GitHubMergeFinished(root, number, result.and_then(std::convert::identity))
             },
         )
     }
@@ -5803,11 +5836,17 @@ impl Muxtrix {
                 activity: Some(format!("Starting {}", agent_display_name(&agent_name))),
                 agent: agent_name,
                 display_name,
-                state: AgentState::Idle,
+                state: AgentState::Running,
                 session_id: None,
                 cwd: None,
                 git_branch: None,
             },
+        );
+        self.agent_running_frame_revisions.insert(
+            pane_id,
+            self.terminals
+                .get(&pane_id)
+                .map_or(0, |runtime| runtime.snapshot_revision),
         );
         Ok(())
     }
@@ -5995,12 +6034,18 @@ impl Muxtrix {
                         AgentPaneStatus {
                             agent,
                             display_name,
-                            state: AgentState::Idle,
+                            state: AgentState::Running,
                             activity: None,
                             session_id: None,
                             cwd: None,
                             git_branch: None,
                         },
+                    );
+                    self.agent_running_frame_revisions.insert(
+                        pane_id,
+                        self.terminals
+                            .get(&pane_id)
+                            .map_or(0, |runtime| runtime.snapshot_revision),
                     );
                     self.detected_agents
                         .insert(pane_id, std::time::Instant::now());
@@ -6135,11 +6180,17 @@ impl Muxtrix {
                 activity: Some(format!("Starting {}", agent_display_name(&agent_name))),
                 agent: agent_name,
                 display_name,
-                state: AgentState::Idle,
+                state: AgentState::Running,
                 session_id: None,
                 cwd: None,
                 git_branch: None,
             },
+        );
+        self.agent_running_frame_revisions.insert(
+            pane_id,
+            self.terminals
+                .get(&pane_id)
+                .map_or(0, |runtime| runtime.snapshot_revision),
         );
     }
 
@@ -8892,9 +8943,17 @@ impl Muxtrix {
             .spacing(5),
         )
         .padding([8, 10]);
+        let summary_label = if pull_requests
+            .iter()
+            .any(|pull_request| pull_request.status == github::PullRequestSummaryStatus::Merged)
+        {
+            "PULL REQUESTS"
+        } else {
+            "OPEN PULL REQUESTS"
+        };
         let summary = container(
             row![
-                text("OPEN PULL REQUESTS")
+                text(summary_label)
                     .size(self.settings.ui_pixels(8.0))
                     .font(Font {
                         weight: font::Weight::Bold,
@@ -8981,11 +9040,12 @@ impl Muxtrix {
         keyboard_selected: bool,
         tokens: DesignTokens,
     ) -> Element<'a, Message> {
-        let state: Element<'_, Message> = if pull_request.draft {
-            status_pill("Draft", tokens.muted, &self.settings)
-        } else {
-            status_pill("Open", tokens.success, &self.settings)
+        let (status_label, status_color) = match pull_request.status {
+            github::PullRequestSummaryStatus::Open => ("Open", tokens.github_open),
+            github::PullRequestSummaryStatus::Draft => ("Draft", tokens.muted),
+            github::PullRequestSummaryStatus::Merged => ("Merged", tokens.github_merged),
         };
+        let state: Element<'_, Message> = status_pill(status_label, status_color, &self.settings);
         button(
             row![
                 icon(IconKind::GitHub, tokens.faint, 13.0),
@@ -18457,7 +18517,7 @@ mod tests {
             author: "octocat".into(),
             head: "keyboard-ledger".into(),
             base: "main".into(),
-            draft: false,
+            status: github::PullRequestSummaryStatus::Open,
         }]);
         app.github_panel = Some(panel);
 
@@ -18476,6 +18536,97 @@ mod tests {
                 .and_then(|panel| panel.selected_pull_request_number),
             Some(42)
         );
+    }
+
+    #[test]
+    fn merged_pull_request_returns_to_list_and_refreshes_optimistically() {
+        let mut app = Muxtrix::new();
+        let repository = github::Repository {
+            root: std::env::temp_dir(),
+            name: "muxtrix".into(),
+            owner_and_name: Some("example/muxtrix".into()),
+            branch: "main".into(),
+            wsl_distribution: String::new(),
+        };
+        let mut panel = GitHubPanelState::loading(repository.clone());
+        panel.active_tab = GitHubPanelTab::PullRequests;
+        panel.loading = false;
+        panel.pull_requests = Some(vec![github::PullRequestSummary {
+            number: 42,
+            title: "Merge completion flow".into(),
+            url: "https://github.com/example/muxtrix/pull/42".into(),
+            author: "octocat".into(),
+            head: "merge-flow".into(),
+            base: "main".into(),
+            status: github::PullRequestSummaryStatus::Open,
+        }]);
+        panel.selected_pull_request_number = Some(42);
+        panel.selected_pull_request = Some(github::PullRequestDetails {
+            pull_request: github::PullRequest {
+                number: 42,
+                title: "Merge completion flow".into(),
+                url: "https://github.com/example/muxtrix/pull/42".into(),
+                author: "octocat".into(),
+                head: "merge-flow".into(),
+                head_oid: "deadbeef".into(),
+                head_repository: "example/muxtrix".into(),
+                base: "main".into(),
+                base_oid: "feedface".into(),
+                additions: 1,
+                deletions: 0,
+                changed_files: 0,
+                draft: false,
+                mergeable: "MERGEABLE".into(),
+                merge_state: "CLEAN".into(),
+                review_decision: "APPROVED".into(),
+                checks: github::CheckSummary {
+                    passed: 1,
+                    pending: 0,
+                    failed: 0,
+                },
+            },
+            files: Vec::new(),
+        });
+        panel.merging = true;
+        app.github_auth = github::AuthStatus::Authenticated {
+            login: "octocat".into(),
+        };
+        app.github_panel = Some(panel);
+        app.github_diff = Some(GitHubDiffState {
+            source: GitHubDiffSource::PullRequest(42),
+            path: "src/main.rs".into(),
+            status: "Modified".into(),
+            additions: 1,
+            deletions: 0,
+            document: None,
+            loading: false,
+            error: None,
+            generation: 0,
+            scroll_offset: 0.0,
+            wrap_columns: None,
+            line_starts: Vec::new(),
+        });
+        app.active_view = ActiveView::GitHubDiff;
+
+        drop(app.update(Message::GitHubMergeFinished(
+            repository.root.clone(),
+            42,
+            Ok("Merged pull request #42".into()),
+        )));
+
+        let panel = app.github_panel.as_ref().expect("panel should remain open");
+        assert_eq!(panel.selected_pull_request_number, None);
+        assert_eq!(
+            panel.keyboard_focus,
+            Some(GitHubPanelKeyboardFocus::PullRequestList)
+        );
+        assert_eq!(
+            panel.pull_requests.as_ref().unwrap()[0].status,
+            github::PullRequestSummaryStatus::Merged
+        );
+        assert!(panel.pull_requests_loading);
+        assert!(app.github_diff.is_none());
+        assert_eq!(app.active_view, ActiveView::Workspace);
     }
 
     #[test]
@@ -20790,7 +20941,7 @@ mod tests {
             .get(&pane_id)
             .expect("a running agent process should be detected without hooks");
         assert_eq!(status.agent, "codex");
-        assert_eq!(status.state, AgentState::Idle);
+        assert_eq!(status.state, AgentState::Running);
         assert!(app.detected_agents.contains_key(&pane_id));
 
         // A hook event takes ownership: the detection record clears so the
@@ -22578,7 +22729,8 @@ mod tests {
         let pane_id = active_pane_id(&app);
         app.observe_terminal_command(pane_id, b"codex --resume\r");
         assert_eq!(app.agent_statuses[&pane_id].agent, "codex");
-        assert_eq!(app.pane_state_label(pane_id), "Idle");
+        assert_eq!(app.pane_state_label(pane_id), "Running");
+        assert_eq!(app.pane_signal_kind(pane_id, false), PaneSignalKind::Active);
 
         assert_eq!(
             agent_command("/home/user/bin/claude --continue", &app.settings),
@@ -22586,6 +22738,32 @@ mod tests {
         );
         assert_eq!(agent_command("omp", &app.settings), Some(Agent::Pi));
         assert_eq!(agent_command("cargo test", &app.settings), None);
+    }
+
+    #[test]
+    fn pi_session_start_cannot_relabel_a_launched_agent_idle() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let pane = Some(pane_id.as_uuid().to_string());
+
+        app.observe_terminal_command(pane_id, b"omp\r");
+        assert_eq!(app.agent_statuses[&pane_id].agent, "pi");
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+
+        let start = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "pi".into(),
+            state: AgentState::Idle,
+            event: Some("session_start".into()),
+            title: "Oh My Pi".into(),
+            body: "Ready for input".into(),
+            pane_id: pane,
+            session_id: Some("pi-session-1".into()),
+            cwd: None,
+        });
+
+        assert!(start.ok);
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+        assert_eq!(app.pane_state_label(pane_id), "Running");
     }
 
     #[test]
