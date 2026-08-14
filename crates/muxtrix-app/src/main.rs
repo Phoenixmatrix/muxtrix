@@ -7985,6 +7985,19 @@ impl Muxtrix {
         if can_create {
             confirm = confirm.on_press(Message::ConfirmWorktree);
         }
+        let worktree_path_size = self.settings.ui_pixels(9.0);
+        let worktree_path_prefix = "Created under ";
+        let created_under = prompt
+            .base_directory
+            .as_deref()
+            .map_or_else(String::new, |base| {
+                let line_budget = (424.0 / (worktree_path_size * 0.62)) as usize;
+                let path_budget = line_budget.saturating_sub(worktree_path_prefix.chars().count());
+                format!(
+                    "{worktree_path_prefix}{}",
+                    ellipsize_start(&base.display().to_string(), path_budget)
+                )
+            });
         body = body
             .push(
                 text(format!("Branch and worktree from {}", repo_root.display()))
@@ -7992,16 +8005,11 @@ impl Muxtrix {
                     .color(tokens.muted),
             )
             .push(
-                text(
-                    prompt
-                        .base_directory
-                        .as_deref()
-                        .map_or_else(String::new, |base| {
-                            format!("Created under {}", base.display())
-                        }),
-                )
-                .size(self.settings.ui_pixels(9.0))
-                .color(tokens.faint),
+                text(created_under)
+                    .width(Fill)
+                    .size(worktree_path_size)
+                    .color(tokens.faint)
+                    .wrapping(iced::widget::text::Wrapping::None),
             )
             .push(
                 text_input("Worktree name", &self.worktree_name_draft)
@@ -14965,8 +14973,15 @@ fn git_repository_root(
 /// primary checkout's `.git` directory.
 fn git_repository_name(directory: &std::path::Path, wsl_distribution: &str) -> Option<String> {
     let root = git_repository_root(directory, wsl_distribution)?;
+    git_repository_name_from_root(&root, wsl_distribution)
+}
+
+fn git_repository_name_from_root(
+    repo_root: &std::path::Path,
+    wsl_distribution: &str,
+) -> Option<String> {
     let common = git_in(
-        directory,
+        repo_root,
         wsl_distribution,
         &["rev-parse", "--git-common-dir"],
     )
@@ -14981,11 +14996,11 @@ fn git_repository_name(directory: &std::path::Path, wsl_distribution: &str) -> O
             if reported_path_is_concrete(&common) {
                 common
             } else {
-                root.join(common)
+                repo_root.join(common)
             }
         })
         .and_then(|common| common.parent().and_then(path_leaf_name))
-        .or_else(|| path_leaf_name(&root))
+        .or_else(|| path_leaf_name(repo_root))
 }
 
 /// The leaf name of a linked worktree, excluding the repository's primary
@@ -15049,12 +15064,14 @@ fn linked_worktree_name_from_convention(directory: &std::path::Path) -> Option<S
 }
 
 /// Where a repository's worktrees live: `<home>/.muxtrix/worktrees/<repo>`,
-/// with `<home>` on whichever side of the WSL boundary the repository is.
+/// with `<repo>` taken from the primary checkout so creating a worktree from a
+/// linked checkout stays in the same repository namespace. `<home>` is on
+/// whichever side of the WSL boundary owns the repository.
 fn worktree_base_directory(
     repo_root: &std::path::Path,
     wsl_distribution: &str,
 ) -> Option<std::path::PathBuf> {
-    let repo_name = repo_root.file_name()?.to_string_lossy().into_owned();
+    let repo_name = git_repository_name_from_root(repo_root, wsl_distribution)?;
     #[cfg(target_os = "windows")]
     if path_is_wsl_side(repo_root) {
         let home = wsl_home_directory(wsl_distribution)?;
@@ -15062,7 +15079,6 @@ fn worktree_base_directory(
             "{home}/{WORKTREE_HOME_FOLDER}/{repo_name}"
         )));
     }
-    let _ = wsl_distribution;
     Some(home_directory()?.join(WORKTREE_HOME_FOLDER).join(repo_name))
 }
 
@@ -22936,6 +22952,18 @@ mod tests {
             git_repository_name(&linked, "").as_deref(),
             Some("muxtrix-source"),
             "linked checkout names must not split one repository into separate groups"
+        );
+        let primary_base =
+            worktree_base_directory(&repo, "").expect("primary worktree base directory");
+        let linked_base =
+            worktree_base_directory(&linked, "").expect("linked worktree base directory");
+        assert_eq!(
+            linked_base, primary_base,
+            "all worktrees from one repository must share its namespace"
+        );
+        assert_eq!(
+            linked_base.file_name().and_then(|name| name.to_str()),
+            Some("muxtrix-source")
         );
         let _ = std::fs::remove_dir_all(&scratch);
     }
