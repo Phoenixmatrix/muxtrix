@@ -728,8 +728,7 @@ struct WorktreeManagerEntry {
     /// remote. This is local-only status: opening the manager never fetches.
     unpushed_commits: usize,
     /// Why deletion is forbidden. The primary worktree is always protected;
-    /// the GitHub default branch is protected too, with main/master as the
-    /// conservative fallback when the remote HEAD is unavailable.
+    /// removing a linked worktree leaves its branch intact.
     deletion_blocker: Option<String>,
     /// Title of a pane currently working inside this worktree, if any —
     /// such worktrees cannot be deleted.
@@ -14902,7 +14901,6 @@ fn discover_worktree_manager(
     };
     let worktrees = git_worktrees(&repo_root, wsl_distribution)
         .ok_or_else(|| format!("Git could not list worktrees for {}", repo_root.display()))?;
-    let default_branch = github_default_branch(&repo_root, wsl_distribution);
     let entries = worktrees
         .iter()
         .enumerate()
@@ -14915,11 +14913,7 @@ fn discover_worktree_manager(
         })
         .map(|(index, (path, branch))| WorktreeManagerEntry {
             used_by: None,
-            deletion_blocker: worktree_deletion_blocker(
-                index == 0,
-                branch.as_deref(),
-                default_branch.as_deref(),
-            ),
+            deletion_blocker: worktree_deletion_blocker(index == 0),
             unpushed_commits: unpushed_commit_count(path, wsl_distribution),
             path: path.clone(),
             branch: branch.clone(),
@@ -15111,21 +15105,8 @@ fn resolve_regular_creation_directory(
     )
 }
 
-fn worktree_deletion_blocker(
-    is_primary: bool,
-    branch: Option<&str>,
-    github_default_branch: Option<&str>,
-) -> Option<String> {
-    if is_primary {
-        return Some("Primary worktree".into());
-    }
-    if github_default_branch.is_some_and(|default| branch == Some(default)) {
-        return Some("GitHub default branch".into());
-    }
-    if github_default_branch.is_none() && matches!(branch, Some("main" | "master")) {
-        return Some("Fallback default branch".into());
-    }
-    None
+fn worktree_deletion_blocker(is_primary: bool) -> Option<String> {
+    is_primary.then(|| "Primary worktree".into())
 }
 
 /// The first `worktree-N` not already taken.
@@ -22805,22 +22786,12 @@ mod tests {
     }
 
     #[test]
-    fn primary_and_default_worktrees_are_never_deletable() {
+    fn only_the_primary_worktree_is_protected_from_deletion() {
         assert_eq!(
-            worktree_deletion_blocker(true, Some("release"), Some("trunk")).as_deref(),
+            worktree_deletion_blocker(true).as_deref(),
             Some("Primary worktree")
         );
-        assert_eq!(
-            worktree_deletion_blocker(false, Some("trunk"), Some("trunk")).as_deref(),
-            Some("GitHub default branch")
-        );
-        assert!(worktree_deletion_blocker(false, Some("main"), Some("trunk")).is_none());
-        for fallback in ["main", "master"] {
-            assert_eq!(
-                worktree_deletion_blocker(false, Some(fallback), None).as_deref(),
-                Some("Fallback default branch")
-            );
-        }
+        assert!(worktree_deletion_blocker(false).is_none());
     }
 
     #[test]
@@ -23082,7 +23053,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_worktree_removal_removes_every_requested_checkout() {
+    fn removing_linked_default_branch_worktree_preserves_its_branch() {
         let scratch = std::env::temp_dir().join(format!(
             "muxtrix-bulk-worktree-test-{}-{:?}",
             std::process::id(),
@@ -23111,19 +23082,22 @@ mod tests {
         std::fs::write(repo.join("file"), "one").expect("file");
         git(&["add", "."]);
         git(&["commit", "-qm", "first"]);
-        let first = scratch.join("worktrees").join("first");
-        let second = scratch.join("worktrees").join("second");
-        create_git_worktree(&repo, &first, "first", "").expect("first worktree");
-        create_git_worktree(&repo, &second, "second", "").expect("second worktree");
+        git(&["branch", "-m", "release"]);
+        let default = scratch.join("worktrees").join("main");
+        let feature = scratch.join("worktrees").join("feature");
+        create_git_worktree(&repo, &default, "main", "").expect("default worktree");
+        create_git_worktree(&repo, &feature, "feature", "").expect("feature worktree");
 
         let (removed, result) =
-            remove_git_worktrees(&repo, vec![first.clone(), second.clone()], "");
+            remove_git_worktrees(&repo, vec![default.clone(), feature.clone()], "");
 
         assert!(result.is_ok(), "{result:?}");
-        assert_eq!(removed, vec![first.clone(), second.clone()]);
-        assert!(!first.exists());
-        assert!(!second.exists());
+        assert_eq!(removed, vec![default.clone(), feature.clone()]);
+        assert!(!default.exists());
+        assert!(!feature.exists());
         assert!(repo.exists());
+        git(&["show-ref", "--verify", "refs/heads/main"]);
+        git(&["show-ref", "--verify", "refs/heads/feature"]);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 

@@ -1032,7 +1032,7 @@ impl Scenario {
                 entries: vec![
                     WorktreeManagerEntry {
                         path: "/home/user/dev/muxtrix".into(),
-                        branch: Some("main".into()),
+                        branch: Some("release".into()),
                         unpushed_commits: 0,
                         deletion_blocker: Some("Primary worktree".into()),
                         used_by: None,
@@ -1051,8 +1051,8 @@ impl Scenario {
                         ),
                     },
                     WorktreeManagerEntry {
-                        path: "/home/user/.muxtrix/worktrees/muxtrix/feature-ui".into(),
-                        branch: Some("feature-ui".into()),
+                        path: "/home/user/.muxtrix/worktrees/muxtrix/main".into(),
+                        branch: Some("main".into()),
                         unpushed_commits: 1,
                         deletion_blocker: None,
                         used_by: None,
