@@ -1375,6 +1375,7 @@ mod tests {
             root: "/home/user/dev/muxtrix".into(),
             name: "muxtrix".into(),
             owner_and_name: Some("Phoenixmatrix/muxtrix".into()),
+            host: "github.com".into(),
             branch: "draft-toggle".into(),
             wsl_distribution: String::new(),
         };
