@@ -9,6 +9,7 @@ use thiserror::Error;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 const MANAGED_MARKER: &str = "muxtrix-hook-v1";
+const PI_EXTENSION_VERSION: u32 = 3;
 const WORKTREE_HOME_FOLDER: &str = ".muxtrix/worktrees";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,6 +452,7 @@ impl HookManager {
             target,
             installed: managed_entries == hook_events(agent).len()
                 && count_expected_managed_text(&text, agent, &self.executable) == managed_entries
+                && extension_version_is_current(&text, agent)
                 && unreachable_entries == 0,
             managed_entries,
             backup_available: self.backup_path(agent, scope).exists(),
@@ -468,6 +470,7 @@ impl HookManager {
         let managed_entries = count_managed_text(&text, agent);
         if managed_entries == hook_events(agent).len()
             && count_expected_managed_text(&text, agent, &self.executable) == managed_entries
+            && extension_version_is_current(&text, agent)
         {
             return Ok(ManagedHookResult {
                 status: self.status(agent, scope)?,
@@ -949,6 +952,13 @@ fn count_semantic_managed_text(text: &str, agent: Agent) -> usize {
     count_managed_text(text, agent)
 }
 
+fn extension_version_is_current(text: &str, agent: Agent) -> bool {
+    agent != Agent::Pi
+        || text.contains(&format!(
+            "const MUXTRIX_EXTENSION_VERSION = {PI_EXTENSION_VERSION};"
+        ))
+}
+
 fn count_unreachable_managed_text(text: &str, agent: Agent) -> usize {
     let Some(executable) = managed_text_executable(text) else {
         return 0;
@@ -998,6 +1008,7 @@ import {{ spawn }} from "node:child_process";
 
 const MUXTRIXCTL = {executable};
 const MANAGED_BY = "{MANAGED_MARKER}";
+const MUXTRIX_EXTENSION_VERSION = {PI_EXTENSION_VERSION};
 
 
 function sendLifecycle(event, state, message, payload) {{
@@ -1054,17 +1065,20 @@ function bodyFor(event, payload, fallback) {{
 
 export default function muxtrixLifecycle(pi) {{
     const pendingApprovals = new Set();
+    let staleFooterCleared = false;
     function onLifecycle(event, state, message, beforeSend) {{
         pi.on(event, async (payload, ctx) => {{
+            if (!staleFooterCleared) {{
+                ctx?.ui?.setStatus?.("muxtrix", undefined);
+                staleFooterCleared = true;
+            }}
             if (event === "agent_end" && payload?.willContinue) {{
                 const body = bodyFor(event, payload, "Agent is running");
-                ctx?.ui?.setStatus?.("muxtrix", `Muxtrix: ${{body}}`);
                 await sendLifecycle(event, "running", body, payload);
                 return;
             }}
             if (beforeSend && beforeSend(payload) === false) return;
             const body = bodyFor(event, payload, message);
-            ctx?.ui?.setStatus?.("muxtrix", `Muxtrix: ${{body}}`);
             await sendLifecycle(event, state, body, payload);
         }});
     }}
@@ -1441,6 +1455,11 @@ mod tests {
         assert!(source.contains("onLifecycle(\"auto_compaction_start\", \"running\""));
         assert!(source.contains("!payload?.skipped && !payload?.willRetry"));
         assert!(source.contains("sendLifecycle(event, \"running\""));
+        assert!(source.contains("setStatus?.(\"muxtrix\", undefined)"));
+        assert!(!source.contains("`Muxtrix: ${body}`"));
+        assert!(source.contains(&format!(
+            "const MUXTRIX_EXTENSION_VERSION = {PI_EXTENSION_VERSION};"
+        )));
 
         let removed = manager
             .apply(Agent::Pi, HookScope::User, HookAction::Remove)
@@ -1771,6 +1790,43 @@ mod tests {
             .expect("migrated extension should remove");
         assert!(removed.changed);
         assert!(!target.exists(), "remove must not restore stale extension");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn synced_status_migrates_outdated_pi_extension_behavior() {
+        let (root, manager) = fixture();
+        manager
+            .apply(Agent::Pi, HookScope::User, HookAction::Add)
+            .expect("current extension should install");
+
+        let target = root.join("home/.omp/agent/extensions/muxtrix-lifecycle.ts");
+        let current = std::fs::read_to_string(&target).expect("extension should exist");
+        let stale = current
+            .replace(
+                &format!("const MUXTRIX_EXTENSION_VERSION = {PI_EXTENSION_VERSION};\n"),
+                "",
+            )
+            .replace(
+                "await sendLifecycle(event, state, body, payload);",
+                "ctx?.ui?.setStatus?.(\"muxtrix\", `Muxtrix: ${body}`);\n            await sendLifecycle(event, state, body, payload);",
+            );
+        std::fs::write(&target, stale).expect("stale extension should be written");
+        assert!(
+            !manager
+                .status(Agent::Pi, HookScope::User)
+                .expect("status should load")
+                .installed
+        );
+
+        let synced = manager
+            .synced_status(Agent::Pi, HookScope::User)
+            .expect("outdated extension should migrate");
+        assert!(synced.installed);
+        let migrated = std::fs::read_to_string(&target).expect("migrated extension should exist");
+        assert!(extension_version_is_current(&migrated, Agent::Pi));
+        assert!(migrated.contains("setStatus?.(\"muxtrix\", undefined)"));
+        assert!(!migrated.contains("`Muxtrix: ${body}`"));
         let _ = std::fs::remove_dir_all(root);
     }
 
