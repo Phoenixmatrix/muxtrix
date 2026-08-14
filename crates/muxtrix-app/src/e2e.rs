@@ -1187,7 +1187,8 @@ impl Scenario {
             if let Some(prompt) = app.worktree_prompt.as_mut() {
                 prompt.repo_root = Some("/home/user/dev/muxtrix".into());
                 prompt.failure = None;
-                prompt.base_directory = Some("/home/user/.muxtrix/worktrees/muxtrix".into());
+                prompt.base_directory =
+                    Some("/home/user/an-extraordinarily-long-home-directory-name/.muxtrix/worktrees/muxtrix".into());
             }
         } else if self.capturing("close-workspace") {
             app.close_workspace_prompt = Some(app.session.active_workspace_id);
