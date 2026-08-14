@@ -61,7 +61,7 @@ use process::console_command;
 #[cfg(any(target_os = "windows", test))]
 use settings::WindowsShellBackend;
 use settings::{
-    AppSettings, Appearance, DEFAULT_TERMINAL_SCROLLBACK_LINES, FleetView, FontWeight,
+    AppSettings, Appearance, DEFAULT_TERMINAL_SCROLLBACK_LINES, FleetScope, FleetView, FontWeight,
     InstalledFontCatalog, TerminalFont, UiFont, font_with_style,
 };
 use themes::{TerminalThemeId, TerminalThemePreset};
@@ -690,6 +690,7 @@ enum WorktreePromptTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RailTarget {
     Workspace(WorkspaceId),
+    FleetWorkspace(WorkspaceId),
     FleetTab(WorkspaceId, TabId),
     FleetGroup(WorkspaceId, PaneId),
     FleetPane(WorkspaceId, PaneId),
@@ -1233,6 +1234,7 @@ enum Message {
     SettingsScrollbackLimit(ScrollbackLimitChoice),
     SettingsUiFontSize(f32),
     SetFleetView(FleetView),
+    SetFleetScope(FleetScope),
     SettingsDefaultAgent(DefaultAgentChoice),
     SettingsCodexCommand(String),
     SettingsClaudeCommand(String),
@@ -3237,6 +3239,10 @@ impl Muxtrix {
                 self.set_fleet_view(view);
                 return self.refresh_pane_repositories();
             }
+            Message::SetFleetScope(scope) => {
+                self.set_fleet_scope(scope);
+                return self.refresh_pane_repositories();
+            }
             Message::SettingsCodexCommand(command) => {
                 self.settings_draft.codex_command = command;
                 return Task::none();
@@ -4079,28 +4085,57 @@ impl Muxtrix {
             .map(|workspace| RailTarget::Workspace(workspace.id))
             .collect();
 
+        if self.sidebar_is_compact() {
+            targets.extend(
+                self.fleet_entries()
+                    .into_iter()
+                    .map(|(workspace_id, pane_id)| RailTarget::FleetPane(workspace_id, pane_id)),
+            );
+            return targets;
+        }
+
+        let show_workspace_groups = self.settings.fleet_scope == FleetScope::AllWorkspaces;
         match self.effective_fleet_view() {
             FleetView::Agents => {
-                targets.extend(
-                    self.fleet_entries()
-                        .into_iter()
-                        .map(|(workspace_id, pane_id)| {
-                            RailTarget::FleetPane(workspace_id, pane_id)
-                        }),
-                );
-            }
-            FleetView::Repos => {
-                for group in self.fleet_repository_groups() {
-                    if let Some((workspace_id, first_pane)) = group.entries.first().copied() {
-                        targets.push(RailTarget::FleetGroup(workspace_id, first_pane));
+                let entries = self.fleet_entries();
+                for workspace in self.fleet_workspaces() {
+                    let mut workspace_entries = entries
+                        .iter()
+                        .copied()
+                        .filter(|(workspace_id, _)| *workspace_id == workspace.id)
+                        .peekable();
+                    if workspace_entries.peek().is_none() {
+                        continue;
                     }
-                    targets.extend(group.entries.into_iter().map(|(workspace_id, pane_id)| {
+                    if show_workspace_groups {
+                        targets.push(RailTarget::FleetWorkspace(workspace.id));
+                    }
+                    targets.extend(workspace_entries.map(|(workspace_id, pane_id)| {
                         RailTarget::FleetPane(workspace_id, pane_id)
                     }));
                 }
             }
+            FleetView::Repos => {
+                for workspace in self.fleet_workspaces() {
+                    let groups = self.fleet_repository_groups_for(workspace);
+                    if show_workspace_groups && !groups.is_empty() {
+                        targets.push(RailTarget::FleetWorkspace(workspace.id));
+                    }
+                    for group in groups {
+                        if let Some((workspace_id, first_pane)) = group.entries.first().copied() {
+                            targets.push(RailTarget::FleetGroup(workspace_id, first_pane));
+                        }
+                        targets.extend(group.entries.into_iter().map(|(workspace_id, pane_id)| {
+                            RailTarget::FleetPane(workspace_id, pane_id)
+                        }));
+                    }
+                }
+            }
             FleetView::Tabs => {
-                if let Ok(workspace) = self.active_workspace() {
+                for workspace in self.fleet_workspaces() {
+                    if show_workspace_groups {
+                        targets.push(RailTarget::FleetWorkspace(workspace.id));
+                    }
                     for tab in &workspace.tabs {
                         // Single-tab workspaces do not render a tab band in the
                         // fleet, so keyboard navigation must not land on one.
@@ -4873,15 +4908,13 @@ impl Muxtrix {
                                 self.status = error;
                             }
                         }
-                        RailTarget::FleetGroup(workspace_id, pane_id) => {
-                            if let Err(error) = self
-                                .switch_workspace(workspace_id)
-                                .and_then(|()| self.focus_pane(pane_id))
-                            {
+                        RailTarget::FleetWorkspace(workspace_id) => {
+                            if let Err(error) = self.switch_workspace(workspace_id) {
                                 self.status = error;
                             }
                         }
-                        RailTarget::FleetPane(workspace_id, pane_id) => {
+                        RailTarget::FleetGroup(workspace_id, pane_id)
+                        | RailTarget::FleetPane(workspace_id, pane_id) => {
                             if let Err(error) = self
                                 .switch_workspace(workspace_id)
                                 .and_then(|()| self.focus_pane(pane_id))
@@ -6020,6 +6053,15 @@ impl Muxtrix {
                 self.open_session_picker(false);
                 return Task::none();
             }
+            CommandAction::FleetCurrentWorkspace => {
+                self.set_fleet_scope(FleetScope::CurrentWorkspace);
+                self.status = "Fleet shows the current workspace".into();
+            }
+            CommandAction::FleetAllWorkspaces => {
+                self.set_fleet_scope(FleetScope::AllWorkspaces);
+                self.status = "Fleet shows all workspaces".into();
+                return self.refresh_pane_repositories();
+            }
             CommandAction::FleetTabs => {
                 self.set_fleet_view(FleetView::Tabs);
                 self.status = "Fleet lists every pane".into();
@@ -7019,10 +7061,9 @@ impl Muxtrix {
             .retain(|pane_id, _| live_panes.contains(pane_id));
 
         let pane_ids = self
-            .active_workspace()
+            .fleet_entries_in_tab_order()
             .into_iter()
-            .flat_map(|workspace| workspace.tabs.iter())
-            .flat_map(|tab| pane_ids_in_layout(&tab.root))
+            .map(|(_, pane_id)| pane_id)
             .collect::<Vec<_>>();
         let mut probes = Vec::new();
         for pane_id in pane_ids {
@@ -10410,13 +10451,25 @@ impl Muxtrix {
         // One entry order feeds row rendering and the keyboard handler so the
         // visible order and direct-navigation targets can never disagree.
         let entry_order = self.fleet_entries();
+        let show_workspace_groups = self.settings.fleet_scope == FleetScope::AllWorkspaces;
         match self.settings.fleet_view {
             FleetView::Tabs => {
-                if let Ok(workspace) = self.active_workspace() {
+                for workspace in self.fleet_workspaces() {
+                    if show_workspace_groups {
+                        rail = rail.push(self.fleet_workspace_group(
+                            workspace,
+                            matches!(
+                                self.workspace_signal_kind(workspace),
+                                PaneSignalKind::Warning | PaneSignalKind::Danger
+                            ),
+                            tokens,
+                        ));
+                    }
                     for tab in &workspace.tabs {
                         if workspace.tabs.len() > 1 {
                             rail = rail.push(fleet_group_label(
                                 tab.name.clone(),
+                                FleetGroupLevel::Nested,
                                 matches!(
                                     self.tab_signal_kind(tab),
                                     PaneSignalKind::Warning | PaneSignalKind::Danger
@@ -10452,17 +10505,54 @@ impl Muxtrix {
                         .padding([8, 8]),
                     );
                 }
-                if let Ok(workspace) = self.active_workspace() {
-                    for (workspace_id, pane_id) in entry_order.iter().copied() {
-                        if workspace.id == workspace_id {
-                            rail = rail.push(self.fleet_row(workspace, pane_id, tokens));
-                        }
+                for workspace in self.fleet_workspaces() {
+                    let has_entries = entry_order
+                        .iter()
+                        .any(|(workspace_id, _)| *workspace_id == workspace.id);
+                    if !has_entries {
+                        continue;
+                    }
+                    if show_workspace_groups {
+                        let warning = entry_order.iter().any(|(workspace_id, pane_id)| {
+                            *workspace_id == workspace.id
+                                && workspace.pane(*pane_id).is_some_and(|pane| {
+                                    matches!(
+                                        self.pane_signal_kind(
+                                            *pane_id,
+                                            self.pane_needs_attention(
+                                                *pane_id,
+                                                pane.attention.unread_count,
+                                            ),
+                                        ),
+                                        PaneSignalKind::Warning | PaneSignalKind::Danger
+                                    )
+                                })
+                        });
+                        rail = rail.push(self.fleet_workspace_group(workspace, warning, tokens));
+                    }
+                    for (_, pane_id) in entry_order
+                        .iter()
+                        .copied()
+                        .filter(|(workspace_id, _)| *workspace_id == workspace.id)
+                    {
+                        rail = rail.push(self.fleet_row(workspace, pane_id, tokens));
                     }
                 }
             }
             FleetView::Repos => {
-                if let Ok(workspace) = self.active_workspace() {
-                    for group in self.fleet_repository_groups() {
+                for workspace in self.fleet_workspaces() {
+                    let groups = self.fleet_repository_groups_for(workspace);
+                    if show_workspace_groups && !groups.is_empty() {
+                        rail = rail.push(self.fleet_workspace_group(
+                            workspace,
+                            matches!(
+                                self.workspace_signal_kind(workspace),
+                                PaneSignalKind::Warning | PaneSignalKind::Danger
+                            ),
+                            tokens,
+                        ));
+                    }
+                    for group in groups {
                         let Some((workspace_id, first_pane)) = group.entries.first().copied()
                         else {
                             continue;
@@ -10483,6 +10573,7 @@ impl Muxtrix {
                         });
                         rail = rail.push(fleet_group_label(
                             group.name,
+                            FleetGroupLevel::Nested,
                             warning,
                             self.rail_nav == Some(RailTarget::FleetGroup(workspace_id, first_pane)),
                             Some(Message::FocusFleetPane(workspace_id, first_pane)),
@@ -10633,9 +10724,46 @@ impl Muxtrix {
             .into()
     }
 
-    /// The Tabs/Agents/Repos projection toggle above the fleet rows.
+    fn fleet_workspace_group<'a>(
+        &'a self,
+        workspace: &Workspace,
+        warning: bool,
+        tokens: DesignTokens,
+    ) -> Element<'a, Message> {
+        fleet_group_label(
+            workspace.name.clone(),
+            FleetGroupLevel::Workspace,
+            warning,
+            self.rail_nav == Some(RailTarget::FleetWorkspace(workspace.id)),
+            Some(Message::SwitchWorkspace(workspace.id)),
+            &self.settings,
+            tokens,
+        )
+    }
+
+    /// The workspace scope and Tabs/Agents/Repos projection controls.
     fn fleet_header(&self, tokens: DesignTokens) -> Element<'_, Message> {
-        let segment = |view: FleetView| -> Element<'_, Message> {
+        let scope_segment =
+            |scope: FleetScope, label: &'static str, hint: &'static str| -> Element<'_, Message> {
+                let selected = self.settings.fleet_scope == scope;
+                app_tooltip(
+                    button(centered_button_content(
+                        text(label)
+                            .size(self.settings.ui_pixels(9.0))
+                            .color(if selected { tokens.text } else { tokens.muted })
+                            .wrapping(iced::widget::text::Wrapping::None),
+                    ))
+                    .on_press(Message::SetFleetScope(scope))
+                    .height(24)
+                    .padding([0, 4])
+                    .style(move |_, status| fleet_toggle_style(tokens, selected, status)),
+                    hint,
+                    tooltip::Position::Bottom,
+                    tokens,
+                    self.settings.ui_pixels(9.0),
+                )
+            };
+        let view_segment = |view: FleetView| -> Element<'_, Message> {
             let selected = self.settings.fleet_view == view;
             button(centered_button_content(
                 text(view.to_string())
@@ -10645,40 +10773,50 @@ impl Muxtrix {
             ))
             .on_press(Message::SetFleetView(view))
             .height(24)
-            .padding([0, 11])
+            .padding([0, 6])
             .style(move |_, status| fleet_toggle_style(tokens, selected, status))
             .into()
         };
+        let toggle_well = move |content| {
+            container(content).padding(2).style(move |_| {
+                container::Style::default()
+                    .background(tokens.app)
+                    .border(Border {
+                        color: tokens.line,
+                        width: 1.0,
+                        radius: 7.0.into(),
+                    })
+            })
+        };
         container(
             row![
-                iced::widget::Space::new().width(Fill),
-                // The recessed well the thumb sits in: app-dark fill under
-                // the raised segment gives the toggle its tactile depth.
-                container(
+                toggle_well(
                     row![
-                        segment(FleetView::Tabs),
-                        segment(FleetView::Agents),
-                        segment(FleetView::Repos)
+                        scope_segment(
+                            FleetScope::CurrentWorkspace,
+                            "This",
+                            "Show this workspace only"
+                        ),
+                        scope_segment(FleetScope::AllWorkspaces, "All", "Show all workspaces")
                     ]
                     .spacing(2)
-                )
-                .padding(2)
-                .style(move |_| {
-                    container::Style::default()
-                        .background(tokens.app)
-                        .border(Border {
-                            color: tokens.line,
-                            width: 1.0,
-                            radius: 7.0.into(),
-                        })
-                }),
+                ),
+                iced::widget::Space::new().width(Fill),
+                toggle_well(
+                    row![
+                        view_segment(FleetView::Tabs),
+                        view_segment(FleetView::Agents),
+                        view_segment(FleetView::Repos)
+                    ]
+                    .spacing(2)
+                ),
             ]
-            .spacing(8)
+            .spacing(4)
             .align_y(Alignment::Center),
         )
         .height(36)
         .align_y(iced::alignment::Vertical::Center)
-        .padding([0, 8])
+        .padding([0, 6])
         .into()
     }
 
@@ -10689,6 +10827,16 @@ impl Muxtrix {
         self.settings_draft.fleet_view = view;
         // Unit tests run without a config-path override and must never touch
         // the user's real settings file.
+        #[cfg(not(test))]
+        {
+            let _ = self.settings.save();
+        }
+    }
+
+    /// Applies and persists which workspaces feed the fleet.
+    fn set_fleet_scope(&mut self, scope: FleetScope) {
+        self.settings.fleet_scope = scope;
+        self.settings_draft.fleet_scope = scope;
         #[cfg(not(test))]
         {
             let _ = self.settings.save();
@@ -11410,9 +11558,16 @@ impl Muxtrix {
             .unwrap_or_default()
     }
 
+    fn fleet_workspaces(&self) -> impl Iterator<Item = &Workspace> {
+        let active_workspace_id = self.session.active_workspace_id;
+        let scope = self.settings.fleet_scope;
+        self.session.workspaces.iter().filter(move |workspace| {
+            scope == FleetScope::AllWorkspaces || workspace.id == active_workspace_id
+        })
+    }
+
     fn fleet_entries_in_tab_order(&self) -> Vec<(WorkspaceId, PaneId)> {
-        self.active_workspace()
-            .into_iter()
+        self.fleet_workspaces()
             .flat_map(|workspace| {
                 workspace.tabs.iter().flat_map(move |tab| {
                     pane_ids_in_layout(&tab.root)
@@ -11423,10 +11578,15 @@ impl Muxtrix {
             .collect()
     }
 
-    fn fleet_repository_groups(&self) -> Vec<FleetRepositoryGroup> {
+    fn fleet_repository_groups_for(&self, workspace: &Workspace) -> Vec<FleetRepositoryGroup> {
         let mut groups: Vec<FleetRepositoryGroup> = Vec::new();
         let mut no_repo = Vec::new();
-        for entry @ (_, pane_id) in self.fleet_entries_in_tab_order() {
+        for pane_id in workspace
+            .tabs
+            .iter()
+            .flat_map(|tab| pane_ids_in_layout(&tab.root))
+        {
+            let entry = (workspace.id, pane_id);
             let current_directory = self.pane_working_directory(pane_id);
             let repository_name = self
                 .pane_repositories
@@ -11454,6 +11614,14 @@ impl Muxtrix {
                 name: NO_REPO_GROUP.into(),
                 entries: no_repo,
             });
+        }
+        groups
+    }
+
+    fn fleet_repository_groups(&self) -> Vec<FleetRepositoryGroup> {
+        let mut groups = Vec::new();
+        for workspace in self.fleet_workspaces() {
+            groups.extend(self.fleet_repository_groups_for(workspace));
         }
         groups
     }
@@ -15640,29 +15808,43 @@ fn section_label(
     .into()
 }
 
-/// A recessed group band in the fleet: uppercase label on the app-dark fill,
-/// with an amber rollup dot when any pane in the group needs a person.
-/// Clicking a band focuses the group's first pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FleetGroupLevel {
+    Workspace,
+    Nested,
+}
+
+/// A fleet group band with an amber rollup dot when any pane inside needs a
+/// person. Workspace bands carry stronger type and the rail surface; nested
+/// tab and repository bands stay smaller and recessed on the app surface.
 fn fleet_group_label(
     label: String,
+    level: FleetGroupLevel,
     warning: bool,
     targeted: bool,
     on_press: Option<Message>,
     settings: &AppSettings,
     tokens: DesignTokens,
 ) -> Element<'static, Message> {
+    let workspace = level == FleetGroupLevel::Workspace;
     let content = row![
         text(ellipsize(
             &label.to_uppercase(),
-            settings.ui_char_budget(26)
+            settings.ui_char_budget(if workspace { 24 } else { 26 })
         ))
-        .size(settings.ui_pixels(8.0))
+        .size(settings.ui_pixels(if workspace { 9.0 } else { 8.0 }))
         .font(Font {
-            weight: font::Weight::Semibold,
+            weight: if workspace {
+                font::Weight::Bold
+            } else {
+                font::Weight::Semibold
+            },
             ..Font::DEFAULT
         })
         .color(if targeted {
             tokens.accent
+        } else if workspace {
+            tokens.muted
         } else {
             tokens.faint
         })
@@ -15677,8 +15859,8 @@ fn fleet_group_label(
     .spacing(8)
     .align_y(Alignment::Center);
     let mut band = button(centered_button_content(content))
-        .height(30)
-        .padding([0, 16])
+        .height(if workspace { 32 } else { 30 })
+        .padding([0, if workspace { 12 } else { 16 }])
         .width(Fill)
         .style(move |_, status| {
             let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
@@ -15693,6 +15875,8 @@ fn fleet_group_label(
                         a: 0.04,
                         ..tokens.text
                     }
+                } else if workspace {
+                    tokens.rail
                 } else {
                     tokens.app
                 })),
@@ -22756,6 +22940,61 @@ mod tests {
     }
 
     #[test]
+    fn all_workspace_repos_keep_identical_repository_names_in_workspace_groups() {
+        let mut app = Muxtrix::new();
+        let first_workspace = app.session.active_workspace_id;
+        let first_pane = active_pane_id(&app);
+        create_test_workspace(&mut app);
+        let second_workspace = app.session.active_workspace_id;
+        let second_pane = active_pane_id(&app);
+
+        for pane_id in [first_pane, second_pane] {
+            let directory = app
+                .pane_working_directory(pane_id)
+                .expect("test pane should have a working directory");
+            app.pane_repositories.insert(
+                pane_id,
+                PaneRepository {
+                    directory,
+                    name: Some("muxtrix".into()),
+                    worktree_name: None,
+                },
+            );
+        }
+        app.set_fleet_scope(FleetScope::AllWorkspaces);
+        app.set_fleet_view(FleetView::Repos);
+
+        assert_eq!(
+            app.fleet_repository_groups(),
+            vec![
+                FleetRepositoryGroup {
+                    name: "muxtrix".into(),
+                    entries: vec![(first_workspace, first_pane)],
+                },
+                FleetRepositoryGroup {
+                    name: "muxtrix".into(),
+                    entries: vec![(second_workspace, second_pane)],
+                },
+            ],
+            "repository bands must not merge across workspace boundaries"
+        );
+        assert_eq!(
+            app.rail_targets()
+                .into_iter()
+                .filter(|target| !matches!(target, RailTarget::Workspace(_)))
+                .collect::<Vec<_>>(),
+            vec![
+                RailTarget::FleetWorkspace(first_workspace),
+                RailTarget::FleetGroup(first_workspace, first_pane),
+                RailTarget::FleetPane(first_workspace, first_pane),
+                RailTarget::FleetWorkspace(second_workspace),
+                RailTarget::FleetGroup(second_workspace, second_pane),
+                RailTarget::FleetPane(second_workspace, second_pane),
+            ]
+        );
+    }
+
+    #[test]
     fn linked_worktrees_keep_the_primary_repository_group_name() {
         let scratch = std::env::temp_dir().join(format!(
             "muxtrix-repository-name-test-{}-{:?}",
@@ -25234,7 +25473,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_views_only_project_the_active_workspace() {
+    fn fleet_scope_switches_between_current_and_grouped_workspaces() {
         let mut app = Muxtrix::new();
         let first = active_pane_id(&app);
         let first_workspace = app.session.active_workspace_id;
@@ -25243,20 +25482,41 @@ mod tests {
         create_test_workspace(&mut app);
         let second = active_pane_id(&app);
         let second_workspace = app.session.active_workspace_id;
-        assert_eq!(app.settings.fleet_view, FleetView::Tabs);
+        app.agent_statuses.insert(second, agent_status("codex"));
+
+        assert_eq!(app.settings.fleet_scope, FleetScope::CurrentWorkspace);
+        let _ = app.update(Message::SetFleetView(FleetView::Agents));
         assert_eq!(app.fleet_entries(), vec![(second_workspace, second)]);
 
-        app.agent_statuses.insert(second, agent_status("codex"));
-        let _ = app.update(Message::SetFleetView(FleetView::Agents));
+        let _ = app.update(Message::SetFleetScope(FleetScope::AllWorkspaces));
+        assert_eq!(app.settings_draft.fleet_scope, FleetScope::AllWorkspaces);
         assert_eq!(
             app.fleet_entries(),
-            vec![(second_workspace, second)],
-            "agents from inactive workspaces must stay out of the rail"
+            vec![(first_workspace, first), (second_workspace, second)]
+        );
+        assert_eq!(
+            app.rail_targets()
+                .into_iter()
+                .filter(|target| !matches!(target, RailTarget::Workspace(_)))
+                .collect::<Vec<_>>(),
+            vec![
+                RailTarget::FleetWorkspace(first_workspace),
+                RailTarget::FleetPane(first_workspace, first),
+                RailTarget::FleetWorkspace(second_workspace),
+                RailTarget::FleetPane(second_workspace, second),
+            ],
+            "all-workspaces mode groups the visible agent panes by workspace"
         );
 
-        let _ = app.update(Message::SwitchWorkspace(first_workspace));
-        assert_eq!(app.fleet_entries(), vec![(first_workspace, first)]);
         let _ = app.update(Message::SetFleetView(FleetView::Tabs));
+        let _ = app.update(Message::SwitchWorkspace(first_workspace));
+        assert_eq!(
+            app.fleet_entries(),
+            vec![(first_workspace, first), (second_workspace, second)],
+            "switching the active workspace must not narrow all-workspaces mode"
+        );
+
+        let _ = app.update(Message::SetFleetScope(FleetScope::CurrentWorkspace));
         assert_eq!(app.fleet_entries(), vec![(first_workspace, first)]);
     }
 
@@ -25466,13 +25726,27 @@ mod tests {
         let _ = app.update(Message::SetFleetView(FleetView::Agents));
         assert_eq!(app.fleet_entries().len(), 1);
 
-        // The collapsed rail has no reachable toggle, so it must always be
-        // able to navigate to every pane.
+        create_test_workspace(&mut app);
+        app.set_fleet_scope(FleetScope::AllWorkspaces);
+
+        // The collapsed rail has no reachable projection toggle, so it lists
+        // every pane in the selected scope without hidden group targets.
         app.sidebar_collapsed = true;
-        assert_eq!(app.fleet_entries().len(), 2);
+        assert_eq!(app.fleet_entries().len(), 3);
+        let fleet_targets = app
+            .rail_targets()
+            .into_iter()
+            .filter(|target| !matches!(target, RailTarget::Workspace(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(fleet_targets.len(), 3);
+        assert!(
+            fleet_targets
+                .iter()
+                .all(|target| matches!(target, RailTarget::FleetPane(_, _)))
+        );
 
         app.set_fleet_view(FleetView::Repos);
-        assert_eq!(app.fleet_entries().len(), 2);
+        assert_eq!(app.fleet_entries().len(), 3);
     }
 
     #[test]

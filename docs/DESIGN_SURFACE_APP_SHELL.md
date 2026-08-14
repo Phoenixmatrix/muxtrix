@@ -69,7 +69,7 @@ truthful local/GitHub data.
 | Native top command bar | Muxtrix, command access, Settings | Semantic Iced widgets |
 | Workspace inventory | Ruled workspace rows above Fleet with rolled state, counts, real context, inline rename, and nested draggable tabs | Semantic Iced widgets and domain/runtime state |
 | Workspace tab strip | Scrollable ordered tabs with signal, name, pane count, close, drag/drop, and one-pane add action | Semantic Iced widgets and domain/runtime state |
-| Fleet projection | Selected-workspace panes only; Tabs preserves tab bands, Agents is a flat filter in tab/pane order, and Repos groups every pane under repository-only bands with a `No Repo` fallback | Semantic Iced widgets, cached Git metadata, and domain/runtime state |
+| Fleet projection | Persisted This/All workspace scope beside Tabs/Agents/Repos; All inserts workspace bands in session order, Tabs preserves nested tab bands, Agents filters within each workspace, and Repos groups within each workspace with a `No Repo` fallback | Semantic Iced widgets, cached Git metadata, and domain/runtime state |
 | Conditional global Attention | Ruled rows only for non-pane messages; omitted when empty | Semantic Iced widgets and state |
 | Collapsible fleet rail | Rich 3-4 line task rows with title, identity/state, latest activity, context | Semantic Iced widgets and domain/runtime state |
 | Collapse control | Subtle double chevrons at lower-right; compact rail retains state signals | Semantic Iced button |

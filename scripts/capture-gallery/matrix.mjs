@@ -155,6 +155,14 @@ add({
   check: "Default projection: tab bands with their panes nested underneath.",
 });
 add({
+  slug: "fleet-all-workspaces",
+  title: "Fleet · All workspaces",
+  group: "Fleet",
+  capture: "fleet-all-workspaces",
+  check:
+    "Workspace bands separate every pane while the selected scope and projection remain unmistakable.",
+});
+add({
   slug: "fleet-agents",
   title: "Fleet · Agents",
   group: "Fleet",
