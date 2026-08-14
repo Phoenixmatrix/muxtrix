@@ -31,8 +31,11 @@ pub(crate) enum CommandAction {
     RenameTab,
     RenamePane,
     NewWorktree(WorktreeKind),
+    NewWorktreeWithAgent(WorktreeKind),
     RestartPaneInWorktree,
     RestartPaneInExistingWorktree,
+    RestartPaneInWorktreeWithAgent,
+    RestartPaneInExistingWorktreeWithAgent,
     ManageWorktrees,
     ManageSessions,
     FleetTabs,
@@ -57,7 +60,17 @@ impl CommandAction {
                 | Self::PreviousPaneLayout
                 | Self::NextPaneLayout
                 | Self::NewWorktree(WorktreeKind::Pane(_))
+                | Self::NewWorktreeWithAgent(WorktreeKind::Pane(_))
                 | Self::LaunchAgent(_)
+        )
+    }
+
+    pub(crate) fn requires_default_agent(self) -> bool {
+        matches!(
+            self,
+            Self::NewWorktreeWithAgent(_)
+                | Self::RestartPaneInWorktreeWithAgent
+                | Self::RestartPaneInExistingWorktreeWithAgent
         )
     }
 }
@@ -77,7 +90,7 @@ pub(crate) struct Command {
     pub(crate) action: CommandAction,
 }
 
-const COMMANDS: [Command; 32] = [
+const COMMANDS: [Command; 36] = [
     Command {
         title: "Split pane right",
         subtitle: "Open an independent terminal beside the focused pane",
@@ -205,6 +218,20 @@ const COMMANDS: [Command; 32] = [
         action: CommandAction::NewWorktree(WorktreeKind::Pane(SplitAxis::Vertical)),
     },
     Command {
+        title: "New worktree with agent pane right",
+        subtitle: "Create a git worktree beside the focused pane and start the default agent",
+        keywords: "git branch worktree agent checkout pane split horizontal right beside",
+        shortcut: "",
+        action: CommandAction::NewWorktreeWithAgent(WorktreeKind::Pane(SplitAxis::Horizontal)),
+    },
+    Command {
+        title: "New worktree with agent pane down",
+        subtitle: "Create a git worktree below the focused pane and start the default agent",
+        keywords: "git branch worktree agent checkout pane split vertical down below",
+        shortcut: "",
+        action: CommandAction::NewWorktreeWithAgent(WorktreeKind::Pane(SplitAxis::Vertical)),
+    },
+    Command {
         title: "New worktree tab",
         subtitle: "Create a git worktree from the focused pane's repository and open it in a tab",
         keywords: "git branch worktree checkout tab",
@@ -224,6 +251,20 @@ const COMMANDS: [Command; 32] = [
         keywords: "git worktree existing reuse select switch change current pane restart replace terminal cwd directory",
         shortcut: "",
         action: CommandAction::RestartPaneInExistingWorktree,
+    },
+    Command {
+        title: "Restart pane in new worktree with agent…",
+        subtitle: "Create a Git worktree, restart this pane there, and start the default agent",
+        keywords: "git branch worktree agent new create current pane restart replace terminal cwd directory",
+        shortcut: "",
+        action: CommandAction::RestartPaneInWorktreeWithAgent,
+    },
+    Command {
+        title: "Restart pane in existing worktree with agent…",
+        subtitle: "Choose a registered Git worktree, restart this pane there, and start the default agent",
+        keywords: "git worktree agent existing reuse select switch current pane restart replace terminal cwd directory",
+        shortcut: "",
+        action: CommandAction::RestartPaneInExistingWorktreeWithAgent,
     },
     Command {
         title: "Manage worktrees",
@@ -376,31 +417,54 @@ mod tests {
     #[test]
     fn worktree_pane_commands_offer_both_split_directions() {
         let commands = filtered("worktree pane right");
-        assert_eq!(commands.len(), 1);
-        assert_eq!(
-            commands[0].action,
-            CommandAction::NewWorktree(WorktreeKind::Pane(SplitAxis::Horizontal))
-        );
+        assert!(commands.iter().any(|command| {
+            command.action == CommandAction::NewWorktree(WorktreeKind::Pane(SplitAxis::Horizontal))
+        }));
 
         let commands = filtered("worktree pane down");
-        assert_eq!(commands.len(), 1);
-        assert_eq!(
-            commands[0].action,
-            CommandAction::NewWorktree(WorktreeKind::Pane(SplitAxis::Vertical))
-        );
+        assert!(commands.iter().any(|command| {
+            command.action == CommandAction::NewWorktree(WorktreeKind::Pane(SplitAxis::Vertical))
+        }));
     }
 
     #[test]
     fn pane_worktree_restart_commands_distinguish_create_from_reuse() {
         let commands = filtered("create restart pane worktree");
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].action, CommandAction::RestartPaneInWorktree);
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.action == CommandAction::RestartPaneInWorktree)
+        );
 
         let commands = filtered("reuse existing pane worktree");
-        assert_eq!(commands.len(), 1);
+        assert!(
+            commands
+                .iter()
+                .any(|command| { command.action == CommandAction::RestartPaneInExistingWorktree })
+        );
+    }
+
+    #[test]
+    fn worktree_agent_commands_cover_both_splits_and_current_pane_reuse() {
+        let right = filtered("worktree agent pane right");
+        assert_eq!(right.len(), 1);
         assert_eq!(
-            commands[0].action,
-            CommandAction::RestartPaneInExistingWorktree
+            right[0].action,
+            CommandAction::NewWorktreeWithAgent(WorktreeKind::Pane(SplitAxis::Horizontal))
+        );
+
+        let down = filtered("worktree agent pane down");
+        assert_eq!(down.len(), 1);
+        assert_eq!(
+            down[0].action,
+            CommandAction::NewWorktreeWithAgent(WorktreeKind::Pane(SplitAxis::Vertical))
+        );
+
+        let current = filtered("existing worktree agent current pane");
+        assert_eq!(current.len(), 1);
+        assert_eq!(
+            current[0].action,
+            CommandAction::RestartPaneInExistingWorktreeWithAgent
         );
     }
 
@@ -413,6 +477,10 @@ mod tests {
         assert!(CommandAction::NextPaneLayout.requires_tiled_panes());
         assert!(
             CommandAction::NewWorktree(WorktreeKind::Pane(SplitAxis::Vertical))
+                .requires_tiled_panes()
+        );
+        assert!(
+            CommandAction::NewWorktreeWithAgent(WorktreeKind::Pane(SplitAxis::Vertical))
                 .requires_tiled_panes()
         );
         assert!(CommandAction::LaunchAgent(Agent::Codex).requires_tiled_panes());
