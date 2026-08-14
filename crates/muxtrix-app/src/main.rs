@@ -1272,8 +1272,8 @@ enum Message {
     SettingsLineHeight(f32),
     SettingsScrollbackLimit(ScrollbackLimitChoice),
     SettingsUiFontSize(f32),
+    SettingsShowAllWorkspaces(bool),
     SetFleetView(FleetView),
-    SetFleetScope(FleetScope),
     SettingsDefaultAgent(DefaultAgentChoice),
     SettingsGitHubHost(String),
     SettingsCodexCommand(String),
@@ -3326,6 +3326,14 @@ impl Muxtrix {
                 self.settings_draft.ui_font_size = size;
                 return Task::none();
             }
+            Message::SettingsShowAllWorkspaces(show_all) => {
+                self.settings_draft.fleet_scope = if show_all {
+                    FleetScope::AllWorkspaces
+                } else {
+                    FleetScope::CurrentWorkspace
+                };
+                return Task::none();
+            }
             Message::SettingsDefaultAgent(choice) => {
                 self.settings_draft.default_agent = match choice {
                     DefaultAgentChoice::None => None,
@@ -3335,10 +3343,6 @@ impl Muxtrix {
             }
             Message::SetFleetView(view) => {
                 self.set_fleet_view(view);
-                return self.refresh_pane_repositories();
-            }
-            Message::SetFleetScope(scope) => {
-                self.set_fleet_scope(scope);
                 return self.refresh_pane_repositories();
             }
             Message::SettingsGitHubHost(host) => {
@@ -6248,13 +6252,18 @@ impl Muxtrix {
                 self.open_session_picker(false);
                 return Task::none();
             }
-            CommandAction::FleetCurrentWorkspace => {
-                self.set_fleet_scope(FleetScope::CurrentWorkspace);
-                self.status = "Fleet shows the current workspace".into();
-            }
-            CommandAction::FleetAllWorkspaces => {
-                self.set_fleet_scope(FleetScope::AllWorkspaces);
-                self.status = "Fleet shows all workspaces".into();
+            CommandAction::FleetToggleAllWorkspaces => {
+                let scope = if self.settings.fleet_scope == FleetScope::AllWorkspaces {
+                    FleetScope::CurrentWorkspace
+                } else {
+                    FleetScope::AllWorkspaces
+                };
+                self.set_fleet_scope(scope);
+                self.status = match scope {
+                    FleetScope::CurrentWorkspace => "Fleet shows only the current workspace",
+                    FleetScope::AllWorkspaces => "Fleet shows all workspaces",
+                }
+                .into();
                 return self.refresh_pane_repositories();
             }
             CommandAction::FleetTabs => {
@@ -6514,6 +6523,7 @@ impl Muxtrix {
         };
         self.settings_draft.github_host = github_host;
         let github_host_changed = self.settings_draft.github_host != self.settings.github_host;
+        let fleet_scope_changed = self.settings_draft.fleet_scope != self.settings.fleet_scope;
         self.settings = self.settings_draft.clone();
         let terminal_theme = self.settings.terminal_theme.preset().terminal_theme();
         let mut theme_error = None;
@@ -6570,6 +6580,9 @@ impl Muxtrix {
                     )
                 },
             ));
+        }
+        if fleet_scope_changed {
+            tasks.push(self.refresh_pane_repositories());
         }
         if saved && self.pending_default_agent_command.is_some() {
             tasks.push(self.resume_pending_default_agent_command());
@@ -11071,28 +11084,8 @@ impl Muxtrix {
         )
     }
 
-    /// The workspace scope and Tabs/Agents/Repos projection controls.
+    /// The Tabs/Agents/Repos projection control.
     fn fleet_header(&self, tokens: DesignTokens) -> Element<'_, Message> {
-        let scope_segment =
-            |scope: FleetScope, label: &'static str, hint: &'static str| -> Element<'_, Message> {
-                let selected = self.settings.fleet_scope == scope;
-                app_tooltip(
-                    button(centered_button_content(
-                        text(label)
-                            .size(self.settings.ui_pixels(9.0))
-                            .color(if selected { tokens.text } else { tokens.muted })
-                            .wrapping(iced::widget::text::Wrapping::None),
-                    ))
-                    .on_press(Message::SetFleetScope(scope))
-                    .height(24)
-                    .padding([0, 4])
-                    .style(move |_, status| fleet_toggle_style(tokens, selected, status)),
-                    hint,
-                    tooltip::Position::Bottom,
-                    tokens,
-                    self.settings.ui_pixels(9.0),
-                )
-            };
         let view_segment = |view: FleetView| -> Element<'_, Message> {
             let selected = self.settings.fleet_view == view;
             button(centered_button_content(
@@ -11120,17 +11113,6 @@ impl Muxtrix {
         };
         container(
             row![
-                toggle_well(
-                    row![
-                        scope_segment(
-                            FleetScope::CurrentWorkspace,
-                            "This",
-                            "Show this workspace only"
-                        ),
-                        scope_segment(FleetScope::AllWorkspaces, "All", "Show all workspaces")
-                    ]
-                    .spacing(2)
-                ),
                 iced::widget::Space::new().width(Fill),
                 toggle_well(
                     row![
@@ -12937,6 +12919,15 @@ impl Muxtrix {
                     "Show process messages and pane count at the bottom",
                     toggler(self.settings_draft.show_status_bar)
                         .on_toggle(Message::SettingsShowStatusBar)
+                        .size(18),
+                    &self.settings_draft
+                ),
+                settings_divider(tokens),
+                settings_row(
+                    "Show all workspaces in Fleet",
+                    "Include panes from every workspace; when off, show only the current workspace",
+                    toggler(self.settings_draft.fleet_scope == FleetScope::AllWorkspaces)
+                        .on_toggle(Message::SettingsShowAllWorkspaces)
                         .size(18),
                     &self.settings_draft
                 ),
@@ -19877,6 +19868,21 @@ mod tests {
     }
 
     #[test]
+    fn workspace_visibility_setting_is_drafted_until_applied() {
+        let mut app = Muxtrix::new();
+
+        let _ = app.update(Message::SettingsShowAllWorkspaces(true));
+
+        assert_eq!(app.settings.fleet_scope, FleetScope::CurrentWorkspace);
+        assert_eq!(app.settings_draft.fleet_scope, FleetScope::AllWorkspaces);
+        assert!(settings_have_changes(&app.settings, &app.settings_draft));
+
+        let _ = app.update(Message::CancelSettings);
+        assert_eq!(app.settings_draft.fleet_scope, FleetScope::CurrentWorkspace);
+        assert!(!settings_have_changes(&app.settings, &app.settings_draft));
+    }
+
+    #[test]
     fn binary_version_response_requires_the_expected_name_and_one_version() {
         assert_eq!(
             parse_binary_version("muxtrix 1.2.3\n", "muxtrix"),
@@ -26252,7 +26258,7 @@ mod tests {
         let _ = app.update(Message::SetFleetView(FleetView::Agents));
         assert_eq!(app.fleet_entries(), vec![(second_workspace, second)]);
 
-        let _ = app.update(Message::SetFleetScope(FleetScope::AllWorkspaces));
+        app.set_fleet_scope(FleetScope::AllWorkspaces);
         assert_eq!(app.settings_draft.fleet_scope, FleetScope::AllWorkspaces);
         assert_eq!(
             app.fleet_entries(),
@@ -26280,8 +26286,23 @@ mod tests {
             "switching the active workspace must not narrow all-workspaces mode"
         );
 
-        let _ = app.update(Message::SetFleetScope(FleetScope::CurrentWorkspace));
+        app.set_fleet_scope(FleetScope::CurrentWorkspace);
         assert_eq!(app.fleet_entries(), vec![(first_workspace, first)]);
+    }
+
+    #[test]
+    fn fleet_palette_command_toggles_workspace_visibility() {
+        let mut app = Muxtrix::new();
+
+        drop(app.run_command(CommandAction::FleetToggleAllWorkspaces));
+        assert_eq!(app.settings.fleet_scope, FleetScope::AllWorkspaces);
+        assert_eq!(app.settings_draft.fleet_scope, FleetScope::AllWorkspaces);
+        assert_eq!(app.status, "Fleet shows all workspaces");
+
+        drop(app.run_command(CommandAction::FleetToggleAllWorkspaces));
+        assert_eq!(app.settings.fleet_scope, FleetScope::CurrentWorkspace);
+        assert_eq!(app.settings_draft.fleet_scope, FleetScope::CurrentWorkspace);
+        assert_eq!(app.status, "Fleet shows only the current workspace");
     }
 
     fn agent_status(agent: &str) -> AgentPaneStatus {
