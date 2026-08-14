@@ -18621,7 +18621,11 @@ mod tests {
             Some(GitHubPanelKeyboardFocus::PullRequestList)
         );
         assert_eq!(
-            panel.pull_requests.as_ref().unwrap()[0].status,
+            panel
+                .pull_requests
+                .as_ref()
+                .expect("pull requests should be loaded")[0]
+                .status,
             github::PullRequestSummaryStatus::Merged
         );
         assert!(panel.pull_requests_loading);
