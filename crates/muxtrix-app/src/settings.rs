@@ -22,6 +22,7 @@ const UI_TYPE_SCALE_REFERENCE: f32 = 14.0;
 pub(crate) const DEFAULT_TERMINAL_SCROLLBACK_LINES: usize = 10_000;
 const MIN_TERMINAL_SCROLLBACK_LINES: usize = 1_000;
 const MAX_TERMINAL_SCROLLBACK_LINES: usize = 100_000;
+pub(crate) const DEFAULT_GITHUB_HOST: &str = "github.com";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -540,6 +541,59 @@ pub(crate) fn intern_font_family(family: &str) -> &'static str {
     interned
 }
 
+/// Canonical GitHub CLI hostname. The CLI owns API-path discovery for GitHub
+/// Enterprise Server, so Muxtrix stores a host rather than an API base URL.
+pub(crate) fn normalize_github_host(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(DEFAULT_GITHUB_HOST.into());
+    }
+    let lowercase = value.to_ascii_lowercase();
+    let without_scheme = if lowercase.starts_with("https://") {
+        &value["https://".len()..]
+    } else if lowercase.starts_with("http://") {
+        &value["http://".len()..]
+    } else {
+        value
+    };
+    let host = without_scheme
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches('.');
+    let (hostname, port) = host
+        .rsplit_once(':')
+        .map_or((host, None), |(hostname, port)| (hostname, Some(port)));
+    let valid_port = port.is_none_or(|port| {
+        !port.is_empty()
+            && port.chars().all(|character| character.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|port| port > 0)
+    });
+    let valid_hostname = !hostname.is_empty()
+        && hostname.len() <= 253
+        && !hostname.contains(':')
+        && hostname.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+                && label
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_alphanumeric())
+                && label
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| character.is_ascii_alphanumeric())
+        });
+    if !valid_hostname || !valid_port {
+        return Err(
+            "GitHub host must be a hostname such as github.com or github.example.com".into(),
+        );
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct AppSettings {
@@ -557,6 +611,7 @@ pub(crate) struct AppSettings {
     pub(crate) terminal_scrollback_lines: usize,
     pub(crate) windows_shell_backend: WindowsShellBackend,
     pub(crate) wsl_distribution: String,
+    pub(crate) github_host: String,
     pub(crate) default_agent: Option<Agent>,
     pub(crate) codex_command: String,
     pub(crate) claude_command: String,
@@ -580,6 +635,7 @@ impl Default for AppSettings {
             terminal_scrollback_lines: DEFAULT_TERMINAL_SCROLLBACK_LINES,
             windows_shell_backend: WindowsShellBackend::Native,
             wsl_distribution: String::new(),
+            github_host: DEFAULT_GITHUB_HOST.into(),
             default_agent: None,
             codex_command: "codex".into(),
             claude_command: "claude".into(),
@@ -681,6 +737,11 @@ impl AppSettings {
         self.terminal_scrollback_lines = self
             .terminal_scrollback_lines
             .clamp(MIN_TERMINAL_SCROLLBACK_LINES, MAX_TERMINAL_SCROLLBACK_LINES);
+        if self.github_host.trim().is_empty() {
+            self.github_host = DEFAULT_GITHUB_HOST.into();
+        } else if let Ok(host) = normalize_github_host(&self.github_host) {
+            self.github_host = host;
+        }
         if self.codex_command.trim().is_empty() {
             self.codex_command = "codex".into();
         }
@@ -788,6 +849,28 @@ mod tests {
         );
         assert_eq!(nearest_weight(&[], FontWeight::Medium), FontWeight::Medium);
     }
+    #[test]
+    fn github_host_accepts_enterprise_hostname_and_web_url() {
+        assert_eq!(
+            normalize_github_host("github.example.com"),
+            Ok("github.example.com".into())
+        );
+        assert_eq!(
+            normalize_github_host(" HTTPS://GitHub.Example.com/ "),
+            Ok("github.example.com".into())
+        );
+        assert_eq!(
+            normalize_github_host("github.example.com:8443"),
+            Ok("github.example.com:8443".into())
+        );
+        assert_eq!(normalize_github_host(""), Ok(DEFAULT_GITHUB_HOST.into()));
+        assert!(normalize_github_host("https://github.example.com/api/v3").is_err());
+        assert!(normalize_github_host("github example.com").is_err());
+        assert!(normalize_github_host("github..example.com").is_err());
+        assert!(normalize_github_host("-github.example.com").is_err());
+        assert!(normalize_github_host("github.example.com:0").is_err());
+        assert!(normalize_github_host(&format!("{}.example.com", "a".repeat(254))).is_err());
+    }
 
     #[test]
     fn settings_round_trip_and_clamp_unsafe_metrics() {
@@ -812,6 +895,7 @@ mod tests {
             terminal_scrollback_lines: usize::MAX,
             windows_shell_backend: WindowsShellBackend::Wsl,
             wsl_distribution: "Ubuntu-24.04".into(),
+            github_host: "https://GitHub.Example.com/".into(),
             default_agent: Some(Agent::Claude),
             codex_command: String::new(),
             claude_command: "claude --model opus".into(),
@@ -842,6 +926,7 @@ mod tests {
         assert_eq!(restored.terminal_font, TerminalFont::named("Cascadia Mono"));
         assert_eq!(restored.terminal_font_weight, FontWeight::Semibold);
         assert_eq!(restored.windows_shell_backend, WindowsShellBackend::Wsl);
+        assert_eq!(restored.github_host, "github.example.com");
         assert_eq!(restored.default_agent, Some(Agent::Claude));
         assert_eq!(
             restored.terminal_font_pixels(),
@@ -915,6 +1000,7 @@ mod tests {
             restored.terminal_scrollback_lines,
             DEFAULT_TERMINAL_SCROLLBACK_LINES
         );
+        assert_eq!(restored.github_host, DEFAULT_GITHUB_HOST);
         assert_eq!(restored.codex_command, "codex");
         assert_eq!(restored.pi_command, "omp");
     }

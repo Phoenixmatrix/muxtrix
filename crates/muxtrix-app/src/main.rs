@@ -216,6 +216,7 @@ struct Muxtrix {
     global_alerts: Vec<GlobalAlert>,
     github_auth: github::AuthStatus,
     github_auth_busy: bool,
+    github_auth_generation: u64,
     github_panel: Option<GitHubPanelState>,
     github_diff: Option<GitHubDiffState>,
     github_pane_refresh_pending: bool,
@@ -1165,8 +1166,8 @@ enum Message {
     InstalledVersionsLoaded(Result<InstalledVersions, String>),
     GitHubStatusPressed,
     BeginGitHubAuth,
-    GitHubAuthChecked(github::AuthStatus),
-    GitHubAuthFinished(Result<github::AuthStatus, String>),
+    GitHubAuthChecked(u64, github::AuthStatus),
+    GitHubAuthFinished(u64, Result<github::AuthStatus, String>),
     CloseGitHubPanel,
     RefreshGitHubPanel,
     RefreshGitHubFocusedPane,
@@ -1234,6 +1235,7 @@ enum Message {
     SettingsUiFontSize(f32),
     SetFleetView(FleetView),
     SettingsDefaultAgent(DefaultAgentChoice),
+    SettingsGitHubHost(String),
     SettingsCodexCommand(String),
     SettingsClaudeCommand(String),
     SettingsPiCommand(String),
@@ -1408,11 +1410,18 @@ impl Muxtrix {
     fn boot() -> (Self, Task<Message>) {
         let mut app = Self::new();
         let discovery = app.refresh_integrations();
-        let github_auth = perform_blocking(github::auth_status, |result| {
-            Message::GitHubAuthChecked(result.unwrap_or(github::AuthStatus::Unavailable {
-                reason: "GitHub authentication could not be checked.".into(),
-            }))
-        });
+        let github_host = app.settings.github_host.clone();
+        let github_auth = perform_blocking(
+            move || github::auth_status(&github_host),
+            |result| {
+                Message::GitHubAuthChecked(
+                    0,
+                    result.unwrap_or(github::AuthStatus::Unavailable {
+                        reason: "GitHub authentication could not be checked.".into(),
+                    }),
+                )
+            },
+        );
         (app, Task::batch([discovery, github_auth]))
     }
 
@@ -1877,6 +1886,7 @@ impl Muxtrix {
             global_alerts,
             github_auth: github::AuthStatus::Checking,
             github_auth_busy: false,
+            github_auth_generation: 0,
             github_panel: None,
             github_diff: None,
             github_pane_refresh_pending: false,
@@ -2626,16 +2636,21 @@ impl Muxtrix {
                 return self.open_github_panel();
             }
             Message::BeginGitHubAuth => return self.begin_github_auth(),
-            Message::GitHubAuthChecked(status) => {
-                self.github_auth = status;
+            Message::GitHubAuthChecked(generation, status) => {
+                if generation == self.github_auth_generation {
+                    self.github_auth = status;
+                }
                 return Task::none();
             }
-            Message::GitHubAuthFinished(result) => {
+            Message::GitHubAuthFinished(generation, result) => {
+                if generation != self.github_auth_generation {
+                    return Task::none();
+                }
                 self.github_auth_busy = false;
                 match result {
                     Ok(status) => {
                         self.github_auth = status;
-                        self.status = "Connected to GitHub".into();
+                        self.status = format!("Connected to {}", self.settings.github_host);
                         if self
                             .github_panel
                             .as_ref()
@@ -3236,6 +3251,10 @@ impl Muxtrix {
             Message::SetFleetView(view) => {
                 self.set_fleet_view(view);
                 return self.refresh_pane_repositories();
+            }
+            Message::SettingsGitHubHost(host) => {
+                self.settings_draft.github_host = host;
+                return Task::none();
             }
             Message::SettingsCodexCommand(command) => {
                 self.settings_draft.codex_command = command;
@@ -5529,8 +5548,11 @@ impl Muxtrix {
             self.show_toast("The focused pane has no working directory");
             return Task::none();
         };
-        let repository = match github::repository_from(&directory, &self.settings.wsl_distribution)
-        {
+        let repository = match github::repository_from(
+            &directory,
+            &self.settings.wsl_distribution,
+            &self.settings.github_host,
+        ) {
             Ok(repository) => repository,
             Err(error) => {
                 self.status = error.clone();
@@ -5557,10 +5579,16 @@ impl Muxtrix {
             return Task::none();
         }
         self.github_auth_busy = true;
-        self.status = "Finish connecting GitHub in your browser".into();
-        perform_blocking(github::authenticate, |result| {
-            Message::GitHubAuthFinished(result.and_then(std::convert::identity))
-        })
+        self.github_auth_generation = self.github_auth_generation.wrapping_add(1);
+        let generation = self.github_auth_generation;
+        let github_host = self.settings.github_host.clone();
+        self.status = format!("Finish connecting {github_host} in your browser");
+        perform_blocking(
+            move || github::authenticate(&github_host),
+            move |result| {
+                Message::GitHubAuthFinished(generation, result.and_then(std::convert::identity))
+            },
+        )
     }
 
     fn refresh_github_panel(&mut self) -> Task<Message> {
@@ -5672,6 +5700,7 @@ impl Muxtrix {
             return Task::none();
         };
         let wsl_distribution = self.settings.wsl_distribution.clone();
+        let github_host = self.settings.github_host.clone();
         self.github_context_generation = self.github_context_generation.wrapping_add(1);
         let generation = self.github_context_generation;
         if let Some(panel) = self.github_panel.as_mut() {
@@ -5684,7 +5713,8 @@ impl Muxtrix {
         }
         perform_blocking(
             move || {
-                let repository = github::repository_from(&directory, &wsl_distribution)?;
+                let repository =
+                    github::repository_from(&directory, &wsl_distribution, &github_host)?;
                 let data = github::load_local(&repository)?;
                 Ok((repository, data))
             },
@@ -6268,6 +6298,15 @@ impl Muxtrix {
     }
 
     fn save_settings(&mut self) -> Task<Message> {
+        let github_host = match settings::normalize_github_host(&self.settings_draft.github_host) {
+            Ok(host) => host,
+            Err(error) => {
+                self.status = format!("Could not save settings: {error}");
+                return Task::none();
+            }
+        };
+        self.settings_draft.github_host = github_host;
+        let github_host_changed = self.settings_draft.github_host != self.settings.github_host;
         self.settings = self.settings_draft.clone();
         let terminal_theme = self.settings.terminal_theme.preset().terminal_theme();
         let mut theme_error = None;
@@ -6304,11 +6343,31 @@ impl Muxtrix {
             ),
             (Err(error), _) => format!("Could not save settings: {error}"),
         };
-        let resize_task = self.window_resize_increment_task();
-        if saved && self.pending_default_agent_command.is_some() {
-            return Task::batch([resize_task, self.resume_pending_default_agent_command()]);
+        let mut tasks = vec![self.window_resize_increment_task()];
+        if github_host_changed {
+            self.github_auth_generation = self.github_auth_generation.wrapping_add(1);
+            let generation = self.github_auth_generation;
+            let github_host = self.settings.github_host.clone();
+            self.github_auth_busy = false;
+            self.github_auth = github::AuthStatus::Checking;
+            self.github_panel = None;
+            self.github_diff = None;
+            tasks.push(perform_blocking(
+                move || github::auth_status(&github_host),
+                move |result| {
+                    Message::GitHubAuthChecked(
+                        generation,
+                        result.unwrap_or(github::AuthStatus::Unavailable {
+                            reason: "GitHub authentication could not be checked.".into(),
+                        }),
+                    )
+                },
+            ));
         }
-        resize_task
+        if saved && self.pending_default_agent_command.is_some() {
+            tasks.push(self.resume_pending_default_agent_command());
+        }
+        Task::batch(tasks)
     }
 
     fn send_terminal_input(&mut self, bytes: Vec<u8>) -> Result<(), String> {
@@ -12344,7 +12403,7 @@ impl Muxtrix {
                     weight: font::Weight::Bold,
                     ..Font::DEFAULT
                 }),
-            text("Tune the interface, terminal, and agent integrations.")
+            text("Tune the interface, terminal, and developer integrations.")
                 .size(self.settings_draft.ui_pixels(11.0))
                 .color(tokens.muted),
         ]
@@ -12579,6 +12638,37 @@ impl Muxtrix {
             ],
             &self.settings_draft,
         );
+        let github_host_validation =
+            settings::normalize_github_host(&self.settings_draft.github_host);
+        let github_host_valid = github_host_validation.is_ok();
+        let mut github_host_control = column![
+            text_input("github.com", &self.settings_draft.github_host)
+                .on_input(Message::SettingsGitHubHost)
+                .line_height(Pixels(30.0))
+                .padding([0, 9])
+                .size(self.settings_draft.ui_pixels(11.0))
+                .width(320)
+        ]
+        .spacing(4);
+        if let Err(error) = github_host_validation {
+            github_host_control = github_host_control.push(
+                text(error)
+                    .size(self.settings_draft.ui_pixels(9.0))
+                    .color(tokens.danger)
+                    .width(320),
+            );
+        }
+        let github = settings_section(
+            "GitHub",
+            "Public GitHub and Enterprise Server",
+            column![settings_row(
+                "GitHub host",
+                "Use github.com or your Enterprise Server hostname; no API path",
+                github_host_control,
+                &self.settings_draft,
+            )],
+            &self.settings_draft,
+        );
 
         let integrations = settings_section(
             "Agent lifecycle hooks",
@@ -12667,6 +12757,7 @@ impl Muxtrix {
             &self.settings_draft,
         ));
         let content = content
+            .push(github)
             .push(integrations)
             .push(versions)
             .spacing(22)
@@ -12698,7 +12789,8 @@ impl Muxtrix {
                     } else {
                         "Apply changes"
                     },
-                    (changed || can_continue_pending_command).then_some(Message::SaveSettings),
+                    ((changed || can_continue_pending_command) && github_host_valid)
+                        .then_some(Message::SaveSettings),
                     SettingsButtonKind::Primary,
                     &self.settings_draft,
                 ),
@@ -19379,12 +19471,54 @@ mod tests {
     }
 
     #[test]
+    fn stale_github_authentication_results_cannot_replace_the_configured_host_state() {
+        let mut app = Muxtrix::new();
+        app.github_auth_generation = 2;
+        app.github_auth = github::AuthStatus::Checking;
+
+        drop(app.update(Message::GitHubAuthChecked(
+            1,
+            github::AuthStatus::Authenticated {
+                login: "stale-account".into(),
+            },
+        )));
+        assert_eq!(app.github_auth, github::AuthStatus::Checking);
+
+        drop(app.update(Message::GitHubAuthChecked(
+            2,
+            github::AuthStatus::Authenticated {
+                login: "enterprise-account".into(),
+            },
+        )));
+        assert_eq!(
+            app.github_auth,
+            github::AuthStatus::Authenticated {
+                login: "enterprise-account".into()
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_github_host_keeps_the_settings_draft_open() {
+        let mut app = Muxtrix::new();
+        app.active_view = ActiveView::Settings;
+        app.settings_draft.github_host = "github.example.com/api/v3".into();
+
+        drop(app.save_settings());
+
+        assert_eq!(app.active_view, ActiveView::Settings);
+        assert_eq!(app.settings_draft.github_host, "github.example.com/api/v3");
+        assert!(app.status.contains("GitHub host must be a hostname"));
+    }
+
+    #[test]
     fn selecting_a_github_file_opens_the_diff_and_back_restores_the_workspace() {
         let mut app = Muxtrix::new();
         let mut panel = GitHubPanelState::loading(github::Repository {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "diff-viewer".into(),
             wsl_distribution: String::new(),
         });
@@ -19433,6 +19567,7 @@ mod tests {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "main".into(),
             wsl_distribution: String::new(),
         }));
@@ -19451,6 +19586,7 @@ mod tests {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "main".into(),
             wsl_distribution: String::new(),
         });
@@ -19492,6 +19628,7 @@ mod tests {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "main".into(),
             wsl_distribution: String::new(),
         };
@@ -19587,6 +19724,7 @@ mod tests {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "main".into(),
             wsl_distribution: String::new(),
         };
@@ -19642,6 +19780,7 @@ mod tests {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "main".into(),
             wsl_distribution: String::new(),
         }));
@@ -19668,6 +19807,7 @@ mod tests {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
             branch: "main".into(),
             wsl_distribution: String::new(),
         });
