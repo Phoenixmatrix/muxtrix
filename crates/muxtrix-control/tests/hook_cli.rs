@@ -32,15 +32,19 @@ fn cli_add_remove_and_readd_are_clean_and_idempotent() -> Result<(), Box<dyn std
     );
     let codex = home.join(".codex/hooks.json");
     let claude = home.join(".claude/settings.json");
+    let pi = home.join(".omp/agent/extensions/muxtrix-lifecycle.ts");
     assert_eq!(managed_markers(&codex)?, 8);
     assert_eq!(managed_markers(&claude)?, 9);
+    assert_eq!(managed_markers(&pi)?, 2);
     assert!(std::fs::read_to_string(&codex)?.contains(bridge_command));
     assert!(std::fs::read_to_string(&claude)?.contains(bridge_command));
+    assert!(std::fs::read_to_string(&pi)?.contains(bridge_command));
 
     let duplicate = run("add")?;
     assert!(duplicate.status.success());
     assert_eq!(managed_markers(&codex)?, 8);
     assert_eq!(managed_markers(&claude)?, 9);
+    assert_eq!(managed_markers(&pi)?, 2);
 
     let removed = run("remove")?;
     assert!(
@@ -50,14 +54,17 @@ fn cli_add_remove_and_readd_are_clean_and_idempotent() -> Result<(), Box<dyn std
     );
     assert!(!codex.exists());
     assert!(!claude.exists());
+    assert!(!pi.exists());
 
     let readded = run("re-add")?;
     assert!(readded.status.success());
     assert_eq!(managed_markers(&codex)?, 8);
     assert_eq!(managed_markers(&claude)?, 9);
+    assert_eq!(managed_markers(&pi)?, 2);
     assert!(run("remove")?.status.success());
     assert!(!codex.exists());
     assert!(!claude.exists());
+    assert!(!pi.exists());
 
     let _ = std::fs::remove_dir_all(root);
     Ok(())

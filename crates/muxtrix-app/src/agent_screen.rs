@@ -155,6 +155,12 @@ fn identify_text(title: &str, rows: &[String]) -> Option<Identification> {
             classification: Some(classification),
         });
     }
+    if has_pi_signature(title) {
+        return Some(Identification {
+            agent: "pi",
+            classification: None,
+        });
+    }
     None
 }
 
@@ -199,6 +205,11 @@ fn has_codex_signature(title: &str, rows: &[String]) -> bool {
             })
 }
 
+fn has_pi_signature(title: &str) -> bool {
+    let title = title.trim();
+    title == "π" || title.starts_with("π:")
+}
+
 fn has_recent_codex_prompt(rows: &[String]) -> bool {
     rows.iter().rev().take(8).any(|row| {
         let row = row.trim();
@@ -211,6 +222,7 @@ fn classify_text(agent: &str, title: &str, rows: &[String]) -> Option<Classifica
     match agent.as_str() {
         "codex" => classify_codex(title, rows),
         "claude" | "claude-code" => classify_claude(title, rows),
+        "pi" | "omp" | "oh-my-pi" => None,
         _ => None,
     }
 }
@@ -659,6 +671,13 @@ mod tests {
             identify_text("claude agents", &agents_view_frame()),
             Some(Identification {
                 agent: "claude",
+                classification: None,
+            })
+        );
+        assert_eq!(
+            identify_text("π: status support", &[]),
+            Some(Identification {
+                agent: "pi",
                 classification: None,
             })
         );

@@ -554,6 +554,7 @@ pub(crate) struct AppSettings {
     pub(crate) wsl_distribution: String,
     pub(crate) codex_command: String,
     pub(crate) claude_command: String,
+    pub(crate) pi_command: String,
 }
 
 impl Default for AppSettings {
@@ -574,6 +575,7 @@ impl Default for AppSettings {
             wsl_distribution: String::new(),
             codex_command: "codex".into(),
             claude_command: "claude".into(),
+            pi_command: "omp".into(),
         }
     }
 }
@@ -673,6 +675,9 @@ impl AppSettings {
         }
         if self.claude_command.trim().is_empty() {
             self.claude_command = "claude".into();
+        }
+        if self.pi_command.trim().is_empty() {
+            self.pi_command = "omp".into();
         }
         self
     }
@@ -797,6 +802,7 @@ mod tests {
             wsl_distribution: "Ubuntu-24.04".into(),
             codex_command: String::new(),
             claude_command: "claude --model opus".into(),
+            pi_command: String::new(),
         }
         .sanitized();
 
@@ -829,6 +835,7 @@ mod tests {
         );
         assert_eq!(restored.codex_command, "codex");
         assert_eq!(restored.claude_command, "claude --model opus");
+        assert_eq!(restored.pi_command, "omp");
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir(directory);
     }
@@ -886,6 +893,7 @@ mod tests {
         assert_eq!(restored.appearance, Appearance::System);
         assert!(!restored.show_status_bar);
         assert_eq!(restored.codex_command, "codex");
+        assert_eq!(restored.pi_command, "omp");
     }
 
     #[test]

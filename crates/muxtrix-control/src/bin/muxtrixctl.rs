@@ -66,7 +66,7 @@ fn run(arguments: &[String]) -> Result<(), String> {
             agent: Agent::from_str(
                 arguments
                     .get(1)
-                    .ok_or_else(|| "launch requires codex or claude".to_owned())?,
+                    .ok_or_else(|| "launch requires codex, claude, or pi".to_owned())?,
             )
             .map_err(|error| error.to_string())?,
         },
@@ -314,6 +314,7 @@ fn agent_display_name(agent: &str) -> &str {
     match agent {
         "codex" => "Codex",
         "claude" => "Claude Code",
+        "pi" | "omp" | "oh-my-pi" => "Oh My Pi",
         _ => agent,
     }
 }
@@ -323,7 +324,7 @@ fn usage() -> String {
 }
 
 fn hooks_usage() -> String {
-    "usage: muxtrixctl hooks <status|add|remove|re-add> [codex|claude|all] [--scope user|project] [--project PATH] [--hook-command PATH]".into()
+    "usage: muxtrixctl hooks <status|add|remove|re-add> [codex|claude|pi|all] [--scope user|project] [--project PATH] [--hook-command PATH]".into()
 }
 
 #[cfg(test)]

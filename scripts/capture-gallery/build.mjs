@@ -59,6 +59,7 @@ const DEFAULT_SETTINGS = {
   wsl_distribution: "",
   codex_command: "codex",
   claude_command: "claude",
+  pi_command: "omp",
 };
 
 await mkdir(out, { recursive: true });

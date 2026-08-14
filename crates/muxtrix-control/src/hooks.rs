@@ -14,16 +14,22 @@ const MANAGED_MARKER: &str = "muxtrix-hook-v1";
 pub enum Agent {
     Codex,
     Claude,
+    Pi,
 }
 
 impl Agent {
-    pub const ALL: [Self; 2] = [Self::Codex, Self::Claude];
+    pub const ALL: [Self; 3] = [Self::Codex, Self::Claude, Self::Pi];
 
     const fn slug(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Pi => "pi",
         }
+    }
+
+    const fn uses_extension_file(self) -> bool {
+        matches!(self, Self::Pi)
     }
 }
 
@@ -40,6 +46,7 @@ impl FromStr for Agent {
         match value.to_ascii_lowercase().as_str() {
             "codex" => Ok(Self::Codex),
             "claude" | "claude-code" => Ok(Self::Claude),
+            "pi" | "omp" | "oh-my-pi" | "oh_my_pi" => Ok(Self::Pi),
             _ => Err(HookError::UnknownAgent(value.into())),
         }
     }
@@ -189,6 +196,9 @@ impl HookManager {
     }
 
     pub fn status(&self, agent: Agent, scope: HookScope) -> Result<HookStatus, HookError> {
+        if agent.uses_extension_file() {
+            return self.extension_status(agent, scope);
+        }
         let target = self.target(agent, scope);
         let value = read_json_or_empty(&target)?;
         let managed_entries = count_managed(&value);
@@ -228,6 +238,18 @@ impl HookManager {
         if !self.executable_is_usable() {
             return Ok(status);
         }
+        if agent.uses_extension_file() {
+            let target = self.target(agent, scope);
+            let text = read_text_or_empty(&target)?;
+            if count_semantic_managed_text(&text, agent) != hook_events(agent).len() {
+                return Ok(status);
+            }
+            // Path-only migration must not replace the original backup/record.
+            // Otherwise uninstall would restore the stale managed extension the
+            // background migration just overwrote.
+            write_text_atomic(&target, &managed_extension_source(agent, &self.executable))?;
+            return self.status(agent, scope);
+        }
         let value = read_json_or_empty(&self.target(agent, scope))?;
         if count_semantic_managed(&value, agent) != hook_events(agent).len() {
             return Ok(status);
@@ -245,6 +267,9 @@ impl HookManager {
     }
 
     fn add(&self, agent: Agent, scope: HookScope) -> Result<ManagedHookResult, HookError> {
+        if agent.uses_extension_file() {
+            return self.add_extension(agent, scope);
+        }
         let target = self.target(agent, scope);
         let mut value = read_json_or_empty(&target)?;
         let managed_entries = count_managed(&value);
@@ -270,6 +295,9 @@ impl HookManager {
     }
 
     fn remove(&self, agent: Agent, scope: HookScope) -> Result<ManagedHookResult, HookError> {
+        if agent.uses_extension_file() {
+            return self.remove_extension(agent, scope);
+        }
         let target = self.target(agent, scope);
         let existed = target.exists();
         let mut value = read_json_or_empty(&target)?;
@@ -321,6 +349,112 @@ impl HookManager {
         })
     }
 
+    fn extension_status(&self, agent: Agent, scope: HookScope) -> Result<HookStatus, HookError> {
+        let target = self.target(agent, scope);
+        let text = read_text_or_empty(&target)?;
+        let managed_entries = count_managed_text(&text, agent);
+        let unreachable_entries = if self.executable_is_named {
+            0
+        } else {
+            count_unreachable_managed_text(&text, agent)
+        };
+        Ok(HookStatus {
+            agent,
+            scope,
+            target,
+            installed: managed_entries == hook_events(agent).len()
+                && count_expected_managed_text(&text, agent, &self.executable) == managed_entries
+                && unreachable_entries == 0,
+            managed_entries,
+            backup_available: self.backup_path(agent, scope).exists(),
+            unreachable_entries,
+        })
+    }
+
+    fn add_extension(
+        &self,
+        agent: Agent,
+        scope: HookScope,
+    ) -> Result<ManagedHookResult, HookError> {
+        let target = self.target(agent, scope);
+        let text = read_text_or_empty(&target)?;
+        let managed_entries = count_managed_text(&text, agent);
+        if managed_entries == hook_events(agent).len()
+            && count_expected_managed_text(&text, agent, &self.executable) == managed_entries
+        {
+            return Ok(ManagedHookResult {
+                status: self.status(agent, scope)?,
+                changed: false,
+                message: format!("{} {} lifecycle hooks are already installed", scope, agent),
+            });
+        }
+
+        self.create_backup(agent, scope, &target)?;
+        write_text_atomic(&target, &managed_extension_source(agent, &self.executable))?;
+        Ok(ManagedHookResult {
+            status: self.status(agent, scope)?,
+            changed: true,
+            message: format!("Added reversible {} {} lifecycle hooks", scope, agent),
+        })
+    }
+
+    fn remove_extension(
+        &self,
+        agent: Agent,
+        scope: HookScope,
+    ) -> Result<ManagedHookResult, HookError> {
+        let target = self.target(agent, scope);
+        let existed = target.exists();
+        let text = read_text_or_empty(&target)?;
+        let removed = count_managed_text(&text, agent);
+        let record = self.read_record(agent, scope)?;
+
+        if removed > 0 {
+            if let Some(record) = &record {
+                if record.target_existed {
+                    std::fs::write(&target, std::fs::read(self.backup_path(agent, scope))?)?;
+                    set_file_private(&target)?;
+                } else if target.exists() {
+                    std::fs::remove_file(&target)?;
+                    remove_empty_parents(&target, agent);
+                }
+            } else {
+                std::fs::remove_file(&target)?;
+                remove_empty_parents(&target, agent);
+            }
+        }
+        self.remove_backup(agent, scope)?;
+
+        let status = if target.exists() {
+            self.status(agent, scope)?
+        } else {
+            HookStatus {
+                agent,
+                scope,
+                target,
+                installed: false,
+                managed_entries: 0,
+                backup_available: false,
+                unreachable_entries: 0,
+            }
+        };
+        Ok(ManagedHookResult {
+            status,
+            changed: removed > 0 || (!existed && record.is_some()),
+            message: if removed > 0 {
+                format!(
+                    "Removed {} {} lifecycle hooks; unrelated configuration was preserved",
+                    scope, agent
+                )
+            } else {
+                format!(
+                    "No managed {} {} lifecycle hooks were installed",
+                    scope, agent
+                )
+            },
+        })
+    }
+
     fn target(&self, agent: Agent, scope: HookScope) -> PathBuf {
         match (agent, scope) {
             (Agent::Codex, HookScope::User) => self.home.join(".codex").join("hooks.json"),
@@ -329,6 +463,17 @@ impl HookManager {
             (Agent::Claude, HookScope::Project) => {
                 self.project.join(".claude").join("settings.local.json")
             }
+            (Agent::Pi, HookScope::User) => self
+                .home
+                .join(".omp")
+                .join("agent")
+                .join("extensions")
+                .join("muxtrix-lifecycle.ts"),
+            (Agent::Pi, HookScope::Project) => self
+                .project
+                .join(".omp")
+                .join("extensions")
+                .join("muxtrix-lifecycle.ts"),
         }
     }
 
@@ -433,6 +578,13 @@ fn hook_state_dir(home: &Path) -> PathBuf {
         .join("hooks")
 }
 
+fn read_text_or_empty(path: &Path) -> Result<String, HookError> {
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    std::fs::read_to_string(path).map_err(HookError::Io)
+}
+
 fn read_json_or_empty(path: &Path) -> Result<Value, HookError> {
     if !path.exists() {
         return Ok(Value::Object(Map::new()));
@@ -505,6 +657,16 @@ fn hook_events(agent: Agent) -> &'static [(&'static str, &'static str)] {
             ("SubagentStart", "running"),
             ("SubagentStop", "completed"),
             ("TeammateIdle", "waiting"),
+        ],
+        Agent::Pi => &[
+            ("session_start", "idle"),
+            ("session_switch", "idle"),
+            ("session_branch", "idle"),
+            ("agent_start", "running"),
+            ("tool_approval_requested", "waiting"),
+            ("tool_approval_resolved", "running"),
+            ("agent_end", "completed"),
+            ("session_shutdown", "stopped"),
         ],
     }
 }
@@ -674,6 +836,185 @@ fn count_semantic_managed(root: &Value, agent: Agent) -> usize {
         .count()
 }
 
+fn count_managed_text(text: &str, agent: Agent) -> usize {
+    hook_events(agent)
+        .iter()
+        .filter(|(event, state)| managed_text_has_event(text, agent, event, state))
+        .count()
+}
+
+fn count_expected_managed_text(text: &str, agent: Agent, executable: &Path) -> usize {
+    let executable = js_string_literal(&executable.to_string_lossy());
+    hook_events(agent)
+        .iter()
+        .filter(|(event, state)| {
+            text.contains(&format!("const MUXTRIXCTL = {executable};"))
+                && managed_text_has_event(text, agent, event, state)
+        })
+        .count()
+}
+
+fn count_semantic_managed_text(text: &str, agent: Agent) -> usize {
+    count_managed_text(text, agent)
+}
+
+fn count_unreachable_managed_text(text: &str, agent: Agent) -> usize {
+    let Some(executable) = managed_text_executable(text) else {
+        return 0;
+    };
+    if !Path::new(&executable).exists() {
+        count_managed_text(text, agent)
+    } else {
+        0
+    }
+}
+
+fn managed_text_has_event(text: &str, agent: Agent, event: &str, state: &str) -> bool {
+    text.contains(MANAGED_MARKER)
+        && text.contains(&format!("agent: \"{}\"", agent.slug()))
+        && text.contains(&format!("onLifecycle(\"{event}\", \"{state}\""))
+}
+
+fn managed_text_executable(text: &str) -> Option<String> {
+    let value = text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("const MUXTRIXCTL = ")
+            .and_then(|rest| rest.strip_suffix(';'))
+    })?;
+    serde_json::from_str::<String>(value).ok()
+}
+
+fn managed_extension_source(agent: Agent, executable: &Path) -> String {
+    let executable = js_string_literal(&executable.to_string_lossy());
+    let agent_slug = agent.slug();
+    let registrations = if agent == Agent::Pi {
+        pi_extension_registrations(agent_slug)
+    } else {
+        hook_events(agent)
+            .iter()
+            .map(|(event, state)| {
+                format!(
+                    "    onLifecycle(\"{event}\", \"{state}\", \"{}\");",
+                    default_body(agent_slug, state)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        r#"// Managed by Muxtrix ({MANAGED_MARKER}). Remove through `muxtrixctl hooks remove {agent_slug}`.
+import {{ spawn }} from "node:child_process";
+
+const MUXTRIXCTL = {executable};
+const MANAGED_BY = "{MANAGED_MARKER}";
+
+
+function sendLifecycle(event, state, message, payload) {{
+    const paneId = process.env.MUXTRIX_PANE_ID;
+    if (!paneId) return Promise.resolve();
+    const body = JSON.stringify({{
+        hook_event_name: event,
+        agent: "{agent_slug}",
+        title: "Oh My Pi",
+        message,
+        session_id: payload?.sessionId ?? payload?.session_id,
+        cwd: process.cwd(),
+    }});
+    return new Promise((resolve) => {{
+        const child = spawn(MUXTRIXCTL, [
+            "hook-event",
+            "--managed-by",
+            MANAGED_BY,
+            "--agent",
+            "{agent_slug}",
+            "--state",
+            state,
+        ], {{
+            env: process.env,
+            stdio: ["pipe", "ignore", "ignore"],
+            windowsHide: true,
+        }});
+        child.on("error", resolve);
+        child.on("close", resolve);
+        child.stdin.end(body);
+    }});
+}}
+
+function bodyFor(event, payload, fallback) {{
+    if (event === "tool_approval_requested" && payload?.toolName) {{
+        return `Approval needed: ${{payload.toolName}}`;
+    }}
+    return fallback;
+}}
+
+export default function muxtrixLifecycle(pi) {{
+    const pendingApprovals = new Set();
+    function onLifecycle(event, state, message, beforeSend) {{
+        pi.on(event, async (payload, ctx) => {{
+            if (event === "agent_end" && payload?.willContinue) return;
+            if (beforeSend && beforeSend(payload) === false) return;
+            const body = bodyFor(event, payload, message);
+            ctx?.ui?.setStatus?.("muxtrix", `Muxtrix: ${{body}}`);
+            await sendLifecycle(event, state, body, payload);
+        }});
+    }}
+
+{registrations}
+}}
+"#
+    )
+}
+
+fn pi_extension_registrations(agent: &str) -> String {
+    hook_events(Agent::Pi)
+        .iter()
+        .map(|(event, state)| match (*event, *state) {
+            ("tool_approval_requested", "waiting") => {
+                format!(
+                    "    onLifecycle(\"{event}\", \"{state}\", \"{}\", (payload) => {{
+        pendingApprovals.add(payload?.toolCallId ?? \"unknown\");
+        return true;
+    }});",
+                    default_body(agent, state)
+                )
+            }
+            ("tool_approval_resolved", "running") => {
+                format!(
+                    "    onLifecycle(\"{event}\", \"{state}\", \"{}\", (payload) => {{
+        pendingApprovals.delete(payload?.toolCallId ?? \"unknown\");
+        return pendingApprovals.size === 0;
+    }});",
+                    default_body(agent, state)
+                )
+            }
+            _ => {
+                format!(
+                    "    onLifecycle(\"{event}\", \"{state}\", \"{}\");",
+                    default_body(agent, state)
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn default_body(agent: &str, state: &str) -> &'static str {
+    let _ = agent;
+    match state {
+        "idle" => "Ready for input",
+        "running" => "Agent is running",
+        "waiting" => "Agent needs attention",
+        "completed" => "Agent completed a turn",
+        "failed" => "Agent reported an error",
+        "stopped" => "Agent session ended",
+        _ => "Agent lifecycle changed",
+    }
+}
+
+fn js_string_literal(value: &str) -> String {
+    serde_json::to_string(value).expect("string serialization should not fail")
+}
+
 fn remove_managed(root: &mut Value) -> usize {
     let Some(root) = root.as_object_mut() else {
         return 0;
@@ -736,6 +1077,28 @@ fn write_json_atomic(path: &Path, value: &Value) -> Result<(), HookError> {
     std::fs::rename(temporary, path)?;
     Ok(())
 }
+fn write_text_atomic(path: &Path, text: &str) -> Result<(), HookError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| HookError::PathHasNoParent(path.to_path_buf()))?;
+    std::fs::create_dir_all(parent)?;
+    let existing_permissions = std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let temporary = path.with_extension("ts.muxtrix-tmp");
+    std::fs::write(&temporary, text)?;
+    if let Some(permissions) = existing_permissions {
+        std::fs::set_permissions(&temporary, permissions)?;
+    } else {
+        set_file_private(&temporary)?;
+    }
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
 
 #[cfg(unix)]
 fn set_file_private(path: &Path) -> Result<(), std::io::Error> {
@@ -768,6 +1131,7 @@ fn remove_empty_parents(target: &Path, agent: Agent) {
         let expected = match agent {
             Agent::Codex => ".codex",
             Agent::Claude => ".claude",
+            Agent::Pi => "extensions",
         };
         if parent.file_name().is_some_and(|name| name == expected) {
             let _ = std::fs::remove_dir(parent);
@@ -832,11 +1196,18 @@ mod tests {
 
     #[test]
     fn session_start_is_idle_until_a_prompt_is_submitted() {
-        for agent in Agent::ALL {
+        for agent in [Agent::Codex, Agent::Claude] {
             let events = hook_events(agent);
             assert!(events.contains(&("SessionStart", "idle")));
             assert!(events.contains(&("UserPromptSubmit", "running")));
         }
+        let pi_events = hook_events(Agent::Pi);
+        assert!(pi_events.contains(&("session_start", "idle")));
+        assert!(pi_events.contains(&("session_switch", "idle")));
+        assert!(pi_events.contains(&("session_branch", "idle")));
+        assert!(pi_events.contains(&("agent_start", "running")));
+        assert!(pi_events.contains(&("tool_approval_requested", "waiting")));
+        assert!(pi_events.contains(&("tool_approval_resolved", "running")));
     }
 
     #[test]
@@ -892,6 +1263,35 @@ mod tests {
             .expect("hooks should re-add");
         assert!(readded.status.installed);
         assert_eq!(readded.status.managed_entries, 9);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_extension_hooks_install_as_autodiscovered_omp_extension() {
+        let (root, manager) = fixture();
+        let target = root.join("home/.omp/agent/extensions/muxtrix-lifecycle.ts");
+
+        let added = manager
+            .apply(Agent::Pi, HookScope::User, HookAction::Add)
+            .expect("Pi extension should install");
+        assert!(added.changed);
+        assert!(added.status.installed);
+        assert_eq!(added.status.managed_entries, hook_events(Agent::Pi).len());
+
+        let source = std::fs::read_to_string(&target).expect("extension should exist");
+        assert!(source.contains("pi.on(event"));
+        assert!(source.contains("agent: \"pi\""));
+        assert!(source.contains("muxtrixctl hooks remove pi"));
+        assert!(source.contains("payload?.willContinue"));
+        assert!(source.contains("pendingApprovals.add"));
+        assert!(source.contains("pendingApprovals.size === 0"));
+        assert!(source.contains("Approval needed: ${payload.toolName}"));
+
+        let removed = manager
+            .apply(Agent::Pi, HookScope::User, HookAction::Remove)
+            .expect("Pi extension should remove");
+        assert!(removed.changed);
+        assert!(!target.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1051,6 +1451,46 @@ mod tests {
             count_expected_managed(&value, Agent::Claude, &updated_path),
             hook_events(Agent::Claude).len()
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn synced_status_migrates_pi_extension_without_restoring_stale_uninstall() {
+        let (root, original) = fixture();
+        original
+            .apply(Agent::Pi, HookScope::User, HookAction::Add)
+            .expect("original extension should install");
+
+        let target = root.join("home/.omp/agent/extensions/muxtrix-lifecycle.ts");
+        let updated_path = stub_executable(root.join("bin-2").join("muxtrixctl"));
+        let updated = HookManager::with_paths(
+            root.join("home"),
+            root.join("project"),
+            root.join("state"),
+            &updated_path,
+        );
+        assert!(
+            !updated
+                .status(Agent::Pi, HookScope::User)
+                .expect("status should load")
+                .installed
+        );
+
+        let synced = updated
+            .synced_status(Agent::Pi, HookScope::User)
+            .expect("synced status should load");
+        assert!(synced.installed, "path-only staleness should self-migrate");
+        assert!(
+            std::fs::read_to_string(&target)
+                .expect("migrated extension should exist")
+                .contains(&updated_path.to_string_lossy().to_string())
+        );
+
+        let removed = updated
+            .apply(Agent::Pi, HookScope::User, HookAction::Remove)
+            .expect("migrated extension should remove");
+        assert!(removed.changed);
+        assert!(!target.exists(), "remove must not restore stale extension");
         let _ = std::fs::remove_dir_all(root);
     }
 

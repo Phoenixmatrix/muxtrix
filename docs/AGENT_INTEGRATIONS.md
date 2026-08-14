@@ -1,7 +1,7 @@
 # Agent integrations
 
-Muxtrix can launch Codex and Claude Code in independent terminal panes, track
-their lifecycle state, and surface waiting/completed events directly in the
+Muxtrix can launch Codex, Claude Code, and Oh My Pi in independent terminal
+panes, track their lifecycle state, and surface waiting/completed events directly in the
 originating fleet entry.
 Integration is opt-in and reversible.
 
@@ -49,11 +49,12 @@ a development checkout to Scoop, because the hook command must follow the active
 `muxtrixctl.exe` installation.
 
 Before the first edit Muxtrix keeps a private pre-change backup and installation
-record in its platform state directory. The backup is retained while the hooks
-are installed and removed after a clean uninstall. Cleanup is selective rather
-than a whole-file restore so later edits cannot be overwritten. If Muxtrix
-created an otherwise-empty hook file and parent directory, uninstall removes
-both. Invalid JSON is reported and never overwritten or backed up.
+record in its platform state directory. For Codex and Claude Code, cleanup is
+selective rather than a whole-file restore so later edits cannot be overwritten.
+For Oh My Pi, Muxtrix installs one auto-discovered extension module and removes
+or restores that file as a unit. If Muxtrix created the extension file and its
+parent directories, uninstall removes them. Invalid JSON in JSON-backed hook
+files is reported and never overwritten or backed up.
 
 Existing file permissions survive rewrites. New configuration and backup files
 are private to the current user on Unix.
@@ -67,8 +68,8 @@ Open Settings, then use the Agent lifecycle card:
 - **Re-add** refreshes the managed commands without disturbing other tools.
 - **Launch** opens an independent pane and starts the configured agent command.
 
-The Codex and Claude command fields are persistent settings. The same launch
-actions are available from Ctrl+P on Windows/Linux and Cmd+P on macOS.
+The Codex, Claude Code, and Oh My Pi command fields are persistent settings.
+The same launch actions are available from Ctrl+P on Windows/Linux and Cmd+P on macOS.
 
 ## CLI controls
 
@@ -78,6 +79,7 @@ The CLI supports user and project scope:
 muxtrixctl hooks status all
 muxtrixctl hooks add codex --scope user
 muxtrixctl hooks add claude --scope project --project /path/to/repository
+muxtrixctl hooks add pi --scope user
 muxtrixctl hooks remove all --scope user
 muxtrixctl hooks re-add codex --scope user
 ```
@@ -91,12 +93,15 @@ Targets are:
 | --- | --- | --- |
 | Codex | `~/.codex/hooks.json` | `<project>/.codex/hooks.json` |
 | Claude Code | `~/.claude/settings.json` | `<project>/.claude/settings.local.json` |
+| Oh My Pi | `~/.omp/agent/extensions/muxtrix-lifecycle.ts` | `<project>/.omp/extensions/muxtrix-lifecycle.ts` |
 
 Muxtrix subscribes to session start/end, prompt submission, permission, stop,
-and sub-agent events. Claude Code also contributes notification and
-teammate-idle events. Hooks identify the pane, session, working directory, and
-coarse turn boundaries. Completion and failure still create attention on the
-originating fleet entry.
+and sub-agent events for Codex and Claude Code. Claude Code also contributes
+notification and teammate-idle events. Oh My Pi does not use Codex/Claude-style
+JSON hook arrays; its managed module is a native `.omp` extension that listens
+to `session_start`, `agent_start`, `agent_end`, and `session_shutdown`. Hooks
+identify the pane, session, working directory, and coarse turn boundaries.
+Completion and failure still create attention on the originating fleet entry.
 
 For Codex and Claude Code, hooks are not the authority for live interactive
 state. Codex emits `PermissionRequest` before its automatic reviewer decides,
@@ -111,24 +116,29 @@ installations require no repair for this change.
 See [Agent state detection](AGENT_STATE_DETECTION.md) for the research,
 precedence rules, tradeoffs, and limitations.
 
-Typing a configured `codex` or `claude` launch command assigns that agent and a
-Starting/Idle state to only the submitting pane immediately. This makes the
-fleet identity useful before the first callback. It is deliberately pane-local;
-Muxtrix does not infer state from unrelated system processes. Hooks take
-ownership of identity and coarse lifecycle metadata once the agent starts;
-the live screen remains the interactive-state authority for Codex and Claude.
+Typing a configured `codex`, `claude`, or `omp` launch command assigns that
+pane's agent before any managed hook or extension callback can arrive, which
+makes the fleet identity useful before the first callback. It is deliberately
+pane-local. Linux process-tree detection can also identify configured agent
+executables while hooks are absent; hooks take ownership of identity and coarse
+lifecycle metadata once the agent starts. The live screen remains the
+interactive-state authority for Codex and Claude. Oh My Pi's approval extension
+events are exact observability events, so they can report `Needs input` without
+screen parsing.
 
 Agent pane names follow the same pane-local rule. A user rename wins first,
 then a meaningful terminal title emitted by the harness (including a named
-Claude Code session or Codex thread), then the linked-worktree directory name,
-and finally `Codex` or `Claude Code`. Brand-only terminal titles do not replace
-the worktree fallback. Long names stay on one line and are ellipsized before
-the separate lifecycle-state column.
+Claude Code session, Codex thread, or Oh My Pi `π: <title>`), then the
+linked-worktree directory name, and finally `Codex`, `Claude Code`, or
+`Oh My Pi`. Brand-only terminal titles do not replace the worktree fallback.
+Long names stay on one line and are ellipsized before the separate lifecycle-state column.
 
 Codex reviews newly discovered hook commands by exact command hash. After an
 install or re-add, use Codex `/hooks` to review or trust the generated commands
-when prompted. Claude Code exposes its active configuration through `/hooks` as
-well.
+when prompted. Claude Code exposes its active configuration through `/hooks`.
+Oh My Pi auto-discovers the managed extension from its native extension
+directory and reports session start/switch/branch, prompt execution, completion,
+shutdown, and tool-approval request/resolution events.
 
 ## Windows Muxtrix with agents in WSL2
 

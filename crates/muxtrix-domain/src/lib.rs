@@ -305,6 +305,7 @@ impl Pane {
 pub enum PaneAgent {
     Codex,
     ClaudeCode,
+    OhMyPi,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1027,14 +1028,14 @@ mod tests {
         workspace
             .pane_mut(pane_id)
             .expect("pane should exist")
-            .agent = Some(PaneAgent::ClaudeCode);
+            .agent = Some(PaneAgent::OhMyPi);
         let encoded = serde_json::to_string(&workspace)?;
         let decoded: Workspace = serde_json::from_str(&encoded)?;
         let pane = decoded
             .pane(pane_id)
             .expect("pane should survive the round trip");
         assert_eq!(pane.custom_name.as_deref(), Some("build watcher"));
-        assert_eq!(pane.agent, Some(PaneAgent::ClaudeCode));
+        assert_eq!(pane.agent, Some(PaneAgent::OhMyPi));
         Ok(())
     }
 

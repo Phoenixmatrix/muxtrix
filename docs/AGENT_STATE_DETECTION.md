@@ -3,9 +3,13 @@
 ## Decision
 
 For Codex and Claude Code, the live terminal screen is authoritative for
-`Running`, `Idle`, and `Needs input`. Lifecycle hooks still identify the agent,
-session, working directory, prompt submission, completion, and shutdown, but a
-permission or notification hook is not allowed to create human attention.
+`Running`, `Idle`, and `Needs input`. Oh My Pi supplies lifecycle state through
+its managed extension; Muxtrix also recognizes its `π` terminal title as pane
+identity. Oh My Pi approval events are observability-only signals emitted after
+the agent has decided a tool really needs approval, so they may create and clear
+`Needs input`. Other lifecycle hooks still identify the agent, session, working
+directory, prompt submission, completion, and shutdown, but a permission or
+notification hook is not allowed to create human attention.
 
 The invariant is intentionally strict:
 
@@ -52,9 +56,11 @@ model: session-integration hooks are separated from state authority, and
 
 On each terminal poll, the application evaluates each pane's latest Ghostty
 grid snapshot. Retained frames are re-evaluated so an identity hook arriving
-just after a stable prompt paint cannot miss it on the next poll. The classifier
-runs for panes already identified as Codex or Claude Code. Rules are ordered so
-stronger current evidence wins over transcript text:
+just after a stable prompt paint cannot miss it on the next poll. The screen
+classifier runs for panes already identified as Codex or Claude Code. Oh My Pi
+has no screen-state classifier yet; ordinary Pi frames preserve the last hook or
+process state, while its managed extension reports exact lifecycle, session
+switch/branch, and approval-request transitions.
 
 - Codex `Action Required` OSC titles and strong live confirmation/answer forms
   create `Needs input`.
@@ -105,10 +111,11 @@ the new application instance.
 
 Layouts created before durable identity was added remain recoverable. Once the
 replayed grid arrives, Muxtrix accepts only agent-specific signatures: Codex's
-composer, working footer, approval forms, or branded title; and Claude Code's
-prompt box, Agents view, or branded title. A generic title or spinner is not
-enough to invent an agent. The recovered identity is written into the next
-layout update, so this fallback is normally needed only once.
+composer, working footer, approval forms, or branded title; Claude Code's
+prompt box, Agents view, or branded title; and Oh My Pi's `π`/`π: <title>`
+terminal title. A generic title or spinner is not enough to invent an agent.
+The recovered identity is written into the next layout update, so this fallback
+is normally needed only once.
 
 Process-tree detection remains useful for locally launched Linux panes and
 hooks still supply session IDs, cwd, and turn boundaries. Neither is the

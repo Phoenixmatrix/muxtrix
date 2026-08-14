@@ -1137,6 +1137,7 @@ enum Message {
     SetFleetView(FleetView),
     SettingsCodexCommand(String),
     SettingsClaudeCommand(String),
+    SettingsPiCommand(String),
     #[cfg(target_os = "windows")]
     SettingsWindowsShellBackend(WindowsShellBackend),
     #[cfg(target_os = "windows")]
@@ -3075,6 +3076,10 @@ impl Muxtrix {
             }
             Message::SettingsClaudeCommand(command) => {
                 self.settings_draft.claude_command = command;
+                return Task::none();
+            }
+            Message::SettingsPiCommand(command) => {
+                self.settings_draft.pi_command = command;
                 return Task::none();
             }
             #[cfg(target_os = "windows")]
@@ -5769,6 +5774,7 @@ impl Muxtrix {
         let command = match agent {
             Agent::Codex => self.settings.codex_command.clone(),
             Agent::Claude => self.settings.claude_command.clone(),
+            Agent::Pi => self.settings.pi_command.clone(),
         };
         self.split_terminal(SplitAxis::Horizontal)?;
         let pane_id = self
@@ -6028,6 +6034,9 @@ impl Muxtrix {
         let claude = command_executable(&self.settings.claude_command)
             .unwrap_or("claude")
             .to_ascii_lowercase();
+        let pi = command_executable(&self.settings.pi_command)
+            .unwrap_or("omp")
+            .to_ascii_lowercase();
         let mut queue = std::collections::VecDeque::from([root]);
         let mut inspected = 0;
         while let Some(pid) = queue.pop_front() {
@@ -6044,6 +6053,9 @@ impl Muxtrix {
                 }
                 if comm == "claude" || comm == "claude-code" || comm == claude {
                     return Some("claude".into());
+                }
+                if comm == "omp" || comm == "pi" || comm == pi {
+                    return Some("pi".into());
                 }
             }
             if let Ok(children) =
@@ -11937,11 +11949,13 @@ impl Muxtrix {
 
         let integrations = settings_section(
             "Agent lifecycle hooks",
-            "Reversible Codex and Claude Code integration",
+            "Reversible Codex, Claude Code, and Oh My Pi integration",
             column![
                 self.agent_hook_row(Agent::Codex),
                 settings_divider(tokens),
                 self.agent_hook_row(Agent::Claude),
+                settings_divider(tokens),
+                self.agent_hook_row(Agent::Pi),
                 settings_divider(tokens),
                 row![
                     text("Muxtrix only changes its tagged entries; project-level controls remain available in muxtrixctl.")
@@ -12106,6 +12120,8 @@ impl Muxtrix {
                 .on_input(Message::SettingsCodexCommand),
             Agent::Claude => text_input("claude", &self.settings_draft.claude_command)
                 .on_input(Message::SettingsClaudeCommand),
+            Agent::Pi => text_input("omp", &self.settings_draft.pi_command)
+                .on_input(Message::SettingsPiCommand),
         }
         .line_height(Pixels(30.0))
         .padding([0, 9])
@@ -12117,6 +12133,7 @@ impl Muxtrix {
                         text(match agent {
                             Agent::Codex => "Codex",
                             Agent::Claude => "Claude Code",
+                            Agent::Pi => "Oh My Pi",
                         })
                         .size(self.settings_draft.ui_pixels(13.0))
                         .font(Font {
@@ -17373,6 +17390,7 @@ fn pane_agent(agent: &str) -> Option<PaneAgent> {
     match agent.to_ascii_lowercase().as_str() {
         "codex" => Some(PaneAgent::Codex),
         "claude" | "claude-code" => Some(PaneAgent::ClaudeCode),
+        "pi" | "omp" | "oh-my-pi" => Some(PaneAgent::OhMyPi),
         _ => None,
     }
 }
@@ -17381,6 +17399,7 @@ fn pane_agent_name(agent: PaneAgent) -> &'static str {
     match agent {
         PaneAgent::Codex => "codex",
         PaneAgent::ClaudeCode => "claude",
+        PaneAgent::OhMyPi => "pi",
     }
 }
 
@@ -17432,6 +17451,7 @@ fn agent_display_name(agent: &str) -> &str {
     match agent {
         "codex" => "Codex",
         "claude" | "claude-code" => "Claude Code",
+        "pi" | "omp" | "oh-my-pi" => "Oh My Pi",
         _ => agent,
     }
 }
@@ -17447,11 +17467,19 @@ fn harness_terminal_title(title: &str, agent: &str) -> Option<String> {
         return None;
     }
     let title = agent_screen::stable_title(agent, title);
+    let pi_title = (agent == "pi" || agent == "omp" || agent == "oh-my-pi")
+        .then(|| title.strip_prefix("π:").map(str::trim))
+        .flatten();
+    if let Some(title) = pi_title {
+        return (!title.is_empty()).then(|| title.to_owned());
+    }
     if title.is_empty()
         || title.eq_ignore_ascii_case(agent)
         || title.eq_ignore_ascii_case(agent_display_name(agent))
         || (agent == "codex" && title.eq_ignore_ascii_case("Codex CLI"))
         || ((agent == "claude" || agent == "claude-code") && title.eq_ignore_ascii_case("Claude"))
+        || ((agent == "pi" || agent == "omp" || agent == "oh-my-pi")
+            && (title == "π" || title.eq_ignore_ascii_case("omp")))
     {
         None
     } else {
@@ -17463,10 +17491,16 @@ fn agent_command(command: &str, settings: &AppSettings) -> Option<Agent> {
     let executable = command_executable(command)?;
     let codex = command_executable(&settings.codex_command).unwrap_or("codex");
     let claude = command_executable(&settings.claude_command).unwrap_or("claude");
+    let pi = command_executable(&settings.pi_command).unwrap_or("omp");
     if executable.eq_ignore_ascii_case(codex) || executable.eq_ignore_ascii_case("codex") {
         Some(Agent::Codex)
     } else if executable.eq_ignore_ascii_case(claude) || executable.eq_ignore_ascii_case("claude") {
         Some(Agent::Claude)
+    } else if executable.eq_ignore_ascii_case(pi)
+        || executable.eq_ignore_ascii_case("omp")
+        || executable.eq_ignore_ascii_case("pi")
+    {
+        Some(Agent::Pi)
     } else {
         None
     }
@@ -22555,6 +22589,7 @@ mod tests {
             agent_command("/home/user/bin/claude --continue", &app.settings),
             Some(Agent::Claude)
         );
+        assert_eq!(agent_command("omp", &app.settings), Some(Agent::Pi));
         assert_eq!(agent_command("cargo test", &app.settings), None);
     }
 
