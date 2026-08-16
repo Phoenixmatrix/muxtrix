@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 libghostty-vt.workspace = true
+png.workspace = true
 muxtrix-platform = { path = "../muxtrix-platform" }
 thiserror.workspace = true
 

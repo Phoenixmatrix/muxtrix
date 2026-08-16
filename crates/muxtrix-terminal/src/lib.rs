@@ -1,16 +1,18 @@
 //! A thread-confined Ghostty VT engine exposed through a Send-safe actor.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::io::Read;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Cursor, Read};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use libghostty_vt::alloc::{Allocator, Bytes};
 use libghostty_vt::fmt::Format;
 use libghostty_vt::key::Mods as GhosttyMods;
+use libghostty_vt::kitty::graphics::{self, ImageFormat, PlacementIterator};
 use libghostty_vt::mouse::{
     Action as GhosttyMouseAction, Button as GhosttyMouseButton, Encoder as MouseEncoder,
     EncoderSize as MouseEncoderSize, Event as GhosttyMouseEvent, Position as GhosttyMousePosition,
@@ -28,11 +30,63 @@ use thiserror::Error;
 /// Ghostty's full terminal host resets a stuck synchronized-output frame after
 /// one second. libghostty-vt deliberately leaves that host policy to embedders.
 const SYNC_OUTPUT_RESET_AFTER: Duration = Duration::from_secs(1);
+const KITTY_IMAGE_STORAGE_LIMIT: u64 = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct PngDecoder {
+    buffer: Vec<u8>,
+}
+
+impl graphics::DecodePng for PngDecoder {
+    fn decode_png<'alloc>(
+        &mut self,
+        alloc: &'alloc Allocator<'_>,
+        data: &[u8],
+    ) -> Option<graphics::DecodedImage<'alloc>> {
+        let mut decoder = png::Decoder::new(Cursor::new(data));
+        decoder.set_transformations(png::Transformations::ALPHA | png::Transformations::STRIP_16);
+        let mut reader = decoder.read_info().ok()?;
+        self.buffer.resize(reader.output_buffer_size(), 0);
+        let info = reader.next_frame(&mut self.buffer).ok()?;
+        let pixel_count = usize::try_from(info.width)
+            .ok()?
+            .checked_mul(usize::try_from(info.height).ok()?)?;
+        let mut rgba = Bytes::new_with_alloc(alloc, pixel_count.checked_mul(4)?).ok()?;
+        let source = &self.buffer[..info.buffer_size()];
+
+        match info.color_type {
+            png::ColorType::Rgba => rgba.copy_from_slice(source),
+            png::ColorType::Rgb => {
+                for (source, target) in source.chunks_exact(3).zip(rgba.chunks_exact_mut(4)) {
+                    target.copy_from_slice(&[source[0], source[1], source[2], u8::MAX]);
+                }
+            }
+            png::ColorType::GrayscaleAlpha => {
+                for (source, target) in source.chunks_exact(2).zip(rgba.chunks_exact_mut(4)) {
+                    target.copy_from_slice(&[source[0], source[0], source[0], source[1]]);
+                }
+            }
+            png::ColorType::Grayscale => {
+                for (source, target) in source.iter().zip(rgba.chunks_exact_mut(4)) {
+                    target.copy_from_slice(&[*source, *source, *source, u8::MAX]);
+                }
+            }
+            png::ColorType::Indexed => return None,
+        }
+
+        Some(graphics::DecodedImage {
+            width: info.width,
+            height: info.height,
+            data: rgba,
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GridSnapshot {
     pub rows: Vec<Arc<str>>,
     pub cells: Vec<Arc<[CellSnapshot]>>,
+    pub images: Vec<ImagePlacementSnapshot>,
     pub default_foreground: Rgb,
     pub default_background: Rgb,
     pub cursor_color: Option<Rgb>,
@@ -56,6 +110,59 @@ pub struct GridSnapshot {
     /// tracked references, so these ranges already account for whatever the
     /// terminal scrolled between frames.
     pub selection: Vec<Option<SelectedColumns>>,
+}
+
+/// Decoded pixels retained across frames for every visible Kitty image.
+#[derive(Debug, Clone)]
+pub struct ImageSnapshot {
+    pub id: u32,
+    pub generation: u64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<[u8]>,
+}
+
+impl PartialEq for ImageSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.generation == other.generation
+            && self.width == other.width
+            && self.height == other.height
+    }
+}
+
+impl Eq for ImageSnapshot {}
+
+/// Source pixels selected from a Kitty image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSourceRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Ghostty's three image planes around terminal cell backgrounds and text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageLayer {
+    BelowBackground,
+    BelowText,
+    AboveText,
+}
+
+/// One viewport-relative Kitty image placement ready for the GPU host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePlacementSnapshot {
+    pub image: Arc<ImageSnapshot>,
+    pub source: ImageSourceRect,
+    pub column: i32,
+    pub row: i32,
+    pub width: u32,
+    pub height: u32,
+    pub x_offset: u32,
+    pub y_offset: u32,
+    pub z: i32,
+    pub layer: ImageLayer,
 }
 
 /// An inclusive run of selected columns within one viewport row.
@@ -194,6 +301,8 @@ struct TerminalCore {
     render_state: RenderState<'static>,
     row_iterator: RowIterator<'static>,
     cell_iterator: CellIterator<'static>,
+    image_iterator: PlacementIterator<'static>,
+    image_cache: HashMap<u64, Arc<ImageSnapshot>>,
     pty_responses: Rc<RefCell<Vec<Vec<u8>>>>,
     last_snapshot: Option<GridSnapshot>,
     /// Start of a DEC mode 2026 frame. While this is set, `last_snapshot` is
@@ -220,7 +329,11 @@ struct SelectionFollow {
 
 impl TerminalCore {
     fn new(options: TerminalOptions) -> Result<Self, TerminalActorError> {
+        graphics::set_png_decoder(Some(Box::new(PngDecoder::default()))).map_err(ghostty_error)?;
         let mut terminal = Terminal::new(options).map_err(ghostty_error)?;
+        terminal
+            .set_kitty_image_storage_limit(KITTY_IMAGE_STORAGE_LIMIT)
+            .map_err(ghostty_error)?;
         let mut mouse_encoder = MouseEncoder::new().map_err(ghostty_error)?;
         mouse_encoder
             .set_options_from_terminal(&terminal)
@@ -249,6 +362,8 @@ impl TerminalCore {
             render_state: RenderState::new().map_err(ghostty_error)?,
             row_iterator: RowIterator::new().map_err(ghostty_error)?,
             cell_iterator: CellIterator::new().map_err(ghostty_error)?,
+            image_iterator: PlacementIterator::new().map_err(ghostty_error)?,
+            image_cache: HashMap::new(),
             pty_responses,
             last_snapshot: None,
             sync_output_started_at: None,
@@ -693,11 +808,17 @@ impl TerminalCore {
             row_index += 1;
         }
         snapshot.set_dirty(Dirty::Clean).map_err(ghostty_error)?;
+        let images = image_snapshots(
+            &self.terminal,
+            &mut self.image_iterator,
+            &mut self.image_cache,
+        )?;
         let scrollbar = self.terminal.scrollbar().map_err(ghostty_error)?;
 
         let mut result = GridSnapshot {
             rows,
             cells: cell_rows,
+            images,
             default_foreground,
             default_background,
             cursor_color,
@@ -783,6 +904,125 @@ impl TerminalCore {
     fn scroll_viewport(&mut self, lines: isize) {
         self.terminal.scroll_viewport(ScrollViewport::Delta(lines));
     }
+}
+fn image_snapshots(
+    terminal: &Terminal<'_, '_>,
+    iterator: &mut PlacementIterator<'_>,
+    cache: &mut HashMap<u64, Arc<ImageSnapshot>>,
+) -> Result<Vec<ImagePlacementSnapshot>, TerminalActorError> {
+    let graphics = terminal.kitty_graphics().map_err(ghostty_error)?;
+    let mut iteration = iterator.update(&graphics).map_err(ghostty_error)?;
+    let mut active_generations = HashSet::new();
+    let mut placements = Vec::new();
+
+    while let Some(placement) = iteration.next() {
+        if placement.is_virtual().map_err(ghostty_error)? {
+            continue;
+        }
+        let image_id = placement.image_id().map_err(ghostty_error)?;
+        let Some(image) = graphics.image(image_id) else {
+            continue;
+        };
+        let generation = image.generation().map_err(ghostty_error)?;
+        active_generations.insert(generation);
+        let info = placement
+            .placement_render_info(&image, terminal)
+            .map_err(ghostty_error)?;
+        if !info.viewport_visible || info.pixel_width == 0 || info.pixel_height == 0 {
+            continue;
+        }
+        let image = if let Some(image) = cache.get(&generation) {
+            Arc::clone(image)
+        } else {
+            let width = image.width().map_err(ghostty_error)?;
+            let height = image.height().map_err(ghostty_error)?;
+            let Some(rgba) = image_rgba(
+                width,
+                height,
+                image.format().map_err(ghostty_error)?,
+                image.data().map_err(ghostty_error)?,
+            ) else {
+                continue;
+            };
+            let image = Arc::new(ImageSnapshot {
+                id: image_id,
+                generation,
+                width,
+                height,
+                rgba,
+            });
+            cache.insert(generation, Arc::clone(&image));
+            image
+        };
+        let z = placement.z().map_err(ghostty_error)?;
+        placements.push(ImagePlacementSnapshot {
+            image,
+            source: ImageSourceRect {
+                x: info.source_x,
+                y: info.source_y,
+                width: info.source_width,
+                height: info.source_height,
+            },
+            column: info.viewport_col,
+            row: info.viewport_row,
+            width: info.pixel_width,
+            height: info.pixel_height,
+            x_offset: placement.x_offset().map_err(ghostty_error)?,
+            y_offset: placement.y_offset().map_err(ghostty_error)?,
+            z,
+            layer: if z < i32::MIN / 2 {
+                ImageLayer::BelowBackground
+            } else if z < 0 {
+                ImageLayer::BelowText
+            } else {
+                ImageLayer::AboveText
+            },
+        });
+    }
+
+    cache.retain(|generation, _| active_generations.contains(generation));
+    placements.sort_unstable_by_key(|placement| (placement.z, placement.image.id));
+    Ok(placements)
+}
+
+fn image_rgba(width: u32, height: u32, format: ImageFormat, data: &[u8]) -> Option<Arc<[u8]>> {
+    let pixels = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?;
+    let channels = match format {
+        ImageFormat::Rgba => 4,
+        ImageFormat::Rgb => 3,
+        ImageFormat::GrayAlpha => 2,
+        ImageFormat::Gray => 1,
+        ImageFormat::Png => return None,
+        _ => return None,
+    };
+    let data = data.get(..pixels.checked_mul(channels)?)?;
+    if channels == 4 {
+        return Some(Arc::from(data));
+    }
+
+    let mut rgba = Vec::with_capacity(pixels.checked_mul(4)?);
+    match format {
+        ImageFormat::Rgb => {
+            for pixel in data.chunks_exact(3) {
+                rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], u8::MAX]);
+            }
+        }
+        ImageFormat::GrayAlpha => {
+            for pixel in data.chunks_exact(2) {
+                rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
+            }
+        }
+        ImageFormat::Gray => {
+            for value in data {
+                rgba.extend_from_slice(&[*value, *value, *value, u8::MAX]);
+            }
+        }
+        ImageFormat::Rgba | ImageFormat::Png => unreachable!("handled before allocation"),
+        _ => return None,
+    }
+    Some(rgba.into())
 }
 
 /// A point in the visible grid, which is the only space a pointer knows.
@@ -2484,6 +2724,34 @@ mod tests {
     }
 
     #[test]
+    fn kitty_png_placements_are_exposed_as_reusable_rgba_frames() -> Result<(), TerminalActorError>
+    {
+        let mut terminal = TerminalCore::new(options())?;
+        terminal
+            .terminal
+            .resize(options().cols, options().rows, 8, 16)
+            .map_err(ghostty_error)?;
+        terminal.feed(
+            b"\x1b_Gi=7,a=T,f=100,q=2,z=-1;iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\x1b\\",
+        );
+
+        let first = terminal.snapshot()?;
+        let placement = first.images.first().expect("Kitty placement");
+        assert_eq!(placement.image.id, 7);
+        assert_eq!(&*placement.image.rgba, &[255, 0, 0, 255]);
+        assert_eq!(placement.source.width, 1);
+        assert_eq!(placement.source.height, 1);
+        assert_eq!(placement.layer, ImageLayer::BelowText);
+
+        let second = terminal.snapshot()?;
+        assert!(Arc::ptr_eq(
+            &placement.image,
+            &second.images.first().expect("retained placement").image,
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn themes_change_defaults_and_ansi_without_recoloring_direct_rgb()
     -> Result<(), TerminalActorError> {
         let actor = TerminalActor::spawn(options())?;
@@ -2851,6 +3119,7 @@ mod tests {
             GridSnapshot {
                 rows: vec![text.into()],
                 cells: Vec::new(),
+                images: Vec::new(),
                 default_foreground: Rgb {
                     red: 255,
                     green: 255,

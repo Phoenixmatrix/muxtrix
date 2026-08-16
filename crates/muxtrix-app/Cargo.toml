@@ -13,6 +13,7 @@ e2e = []
 
 [dependencies]
 async-channel.workspace = true
+bytes.workspace = true
 iced.workspace = true
 fontdb.workspace = true
 libghostty-vt.workspace = true

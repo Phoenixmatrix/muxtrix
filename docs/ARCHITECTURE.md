@@ -36,6 +36,18 @@ renderer milestone will batch all terminal primitives into a dedicated widget
 with a persistent glyph atlas. No CPU bitmap or nested native-window renderer
 is planned.
 
+Kitty graphics stay on the same boundary. `libghostty-vt` parses commands,
+limits each terminal's decoded image storage to 64 MiB, decodes PNG payloads on
+the terminal actor thread, and resolves placement geometry, source rectangles,
+viewport positions, and z-layers. Snapshots share decoded RGBA buffers by
+Ghostty generation stamp; the app retains one Iced image handle per visible
+generation instead of copying or uploading pixels on every repaint. Separate
+canvas passes place images below cell backgrounds, below glyphs, or above
+glyphs, matching Ghostty's renderer order; a renderer-owned overlay pass keeps
+selection and cursor backgrounds visible over below-text images. Placement
+extents scale from Ghostty's integer cell metrics to Iced's fractional grid,
+and the pane clip contains off-screen geometry.
+
 Terminal themes are applied on the Ghostty owner thread as default foreground,
 background, cursor, and ANSI palette values. Ghostty retains direct RGB cells
 and active OSC color overrides, so terminal programs remain authoritative over

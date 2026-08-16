@@ -21,6 +21,14 @@ shared cell edge; full blocks likewise render as exact cell geometry. Other
 variable-width Unicode remains isolated so fallback shaping cannot move the
 columns that follow it.
 
+Kitty graphics placements preserve Ghostty's terminal-grid ownership. Direct
+RGB/RGBA and PNG payloads render inside the pane without changing its grid;
+source crops and viewport clipping follow Ghostty's placement geometry. Images
+use Ghostty's three z-planes — below cell backgrounds, between backgrounds and
+text, and above text — so terminal glyphs and explicit cell backgrounds retain
+the protocol's intended stacking order. Selection and cursor backgrounds remain
+visible above below-text images.
+
 Application appearance and terminal color themes are separate controls.
 Terminal presets remap semantic terminal defaults and ANSI colors inside
 Ghostty; they never recolor explicit RGB output after rendering. The Settings
