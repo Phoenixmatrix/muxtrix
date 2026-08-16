@@ -39,15 +39,28 @@ workspace. Keep `--pane` and its value in the same shell command; a trailing
 
 ## Endpoint discovery
 
-- Linux/macOS: `$XDG_RUNTIME_DIR/muxtrix.sock`, or a private mode-0700
-  per-user directory below the system temporary directory when no runtime
-  directory is available.
-- Windows: a per-user local named pipe name.
-- Tests and diagnostics: `MUXTRIX_CONTROL_ENDPOINT` overrides discovery.
+Each GUI window owns a distinct endpoint. Before it chooses a persistent
+session the endpoint is window-scoped; after starting or resuming a session it
+is stable for that session ID. Closing one window therefore cannot occupy or
+redirect another window's control channel.
 
-The Unix socket itself is mode 0600. The API currently relies on local OS
-endpoint permissions and is not a network or multi-user protocol. Authentication
-and protocol version negotiation are required before any remote transport is
+- Linux/macOS: `$XDG_RUNTIME_DIR/muxtrix-<instance>.sock`, or the same filename
+  in a private mode-0700 per-user temporary directory.
+- Windows: a per-session local named pipe name.
+- Tests and diagnostics: `MUXTRIX_CONTROL_ENDPOINT` explicitly selects an
+  endpoint.
+
+The app publishes each active endpoint and its pane IDs under
+`~/.muxtrix/control` (`%USERPROFILE%\.muxtrix\control` on Windows).
+`muxtrixctl` uses `MUXTRIX_PANE_ID` to select the owning window, including for
+terminals resumed from an older session whose inherited endpoint is stale.
+Outside a Muxtrix pane, discovery selects the sole active window; with multiple
+windows it fails explicitly and requires `MUXTRIX_CONTROL_ENDPOINT`.
+Unreachable registrations are discarded during discovery.
+
+Unix sockets and route records are mode 0600. The API relies on local OS
+permissions and is not a network or multi-user protocol. Authentication and
+protocol version negotiation are required before any remote transport is
 introduced.
 
 ## Windows application with WSL sessions

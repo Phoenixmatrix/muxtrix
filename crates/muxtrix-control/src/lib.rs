@@ -6,7 +6,9 @@ mod transport;
 use serde::{Deserialize, Serialize};
 
 pub use hooks::{Agent, HookAction, HookManager, HookScope, HookStatus, ManagedHookResult};
-pub use transport::{ControlNotifier, ControlServer, Endpoint, IncomingRequest, send_request};
+pub use transport::{
+    ControlError, ControlNotifier, ControlServer, Endpoint, IncomingRequest, send_request,
+};
 
 /// Version of the control service and its `muxtrixctl` client.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
