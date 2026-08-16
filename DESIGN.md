@@ -376,10 +376,13 @@ list; when Pull requests is visible, it replaces that list immediately behind
 the existing loading state. Compaction and handoff maintenance do not count as
 turn completion.
 
-The pull-request list fetches lightweight summaries, then searches title,
-number, author, head, and base locally. Continuous 58 px rows keep title and
-state above identity and branch metadata. The search keeps a visible `Search`
-label above the field; placeholder text is guidance, never the field's only
+The pull-request list fetches lightweight identity and readiness summaries,
+then searches title, number, author, head, and base locally. Continuous 58 px
+rows keep title, open/draft state, and a semantic readiness icon above identity
+and branch metadata. Hovering the icon exposes the same concise readiness label
+and explanation used by detail view; its shape and text keep status legible
+without relying on color. The search keeps a visible `Search` label above the
+field; placeholder text is guidance, never the field's only
 name. Render only visible rows plus bounded overscan. Filtering resets the list
 to its start, and filtering or refresh clamps both scroll offset and keyboard
 cursor to the new result set so virtualization never produces a blank viewport

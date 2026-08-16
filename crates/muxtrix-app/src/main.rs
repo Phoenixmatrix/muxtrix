@@ -626,13 +626,14 @@ impl GitHubPanelState {
     }
 
     fn mark_pull_request_draft(&mut self, number: u64, draft: bool) {
-        if let Some(details) = self
+        let readiness = self
             .selected_pull_request
             .as_mut()
             .filter(|details| details.pull_request.number == number)
-        {
-            details.pull_request.draft = draft;
-        }
+            .map(|details| {
+                details.pull_request.draft = draft;
+                details.pull_request.readiness()
+            });
         let Some(pull_request) = self.pull_requests.as_mut().and_then(|pull_requests| {
             pull_requests
                 .iter_mut()
@@ -645,6 +646,11 @@ impl GitHubPanelState {
         } else {
             github::PullRequestSummaryStatus::Open
         };
+        pull_request.readiness = readiness.unwrap_or(if draft {
+            github::MergeReadiness::Draft
+        } else {
+            github::MergeReadiness::Unknown
+        });
     }
 }
 
@@ -9988,6 +9994,23 @@ impl Muxtrix {
             github::PullRequestSummaryStatus::Merged => ("Merged", tokens.github_merged),
         };
         let state: Element<'_, Message> = status_pill(status_label, status_color, &self.settings);
+        let (readiness_label, readiness_detail, readiness_color) =
+            github_pull_request_summary_copy(pull_request, tokens);
+        let readiness = app_tooltip(
+            container(icon(
+                github_readiness_icon(pull_request.readiness),
+                readiness_color,
+                14.0,
+            ))
+            .width(18)
+            .height(18)
+            .center_x(18)
+            .align_y(iced::alignment::Vertical::Center),
+            format!("{readiness_label} — {readiness_detail}"),
+            tooltip::Position::Left,
+            tokens,
+            self.settings.ui_pixels(8.0),
+        );
         button(
             row![
                 icon(IconKind::GitHub, tokens.faint, 13.0),
@@ -10005,6 +10028,7 @@ impl Muxtrix {
                         .color(tokens.text)
                         .width(Fill)
                         .wrapping(iced::widget::text::Wrapping::None),
+                        readiness,
                         state,
                     ]
                     .spacing(7)
@@ -10118,7 +10142,7 @@ impl Muxtrix {
                 tokens.accent,
             )
         } else {
-            github_readiness_copy(readiness.clone(), tokens)
+            github_readiness_copy(readiness, tokens)
         };
         let busy = panel.merging || panel.draft_state_updating;
         let draft_label = if panel.draft_state_updating {
@@ -16287,6 +16311,10 @@ enum IconKind {
     File,
     Close,
     Overflow,
+    StatusReady,
+    StatusWarning,
+    StatusError,
+    StatusInfo,
 }
 
 fn icon<'a>(kind: IconKind, color: Color, size: f32) -> svg::Svg<'a> {
@@ -16307,6 +16335,10 @@ fn icon<'a>(kind: IconKind, color: Color, size: f32) -> svg::Svg<'a> {
         IconKind::File => include_bytes!("../assets/icons/file.svg"),
         IconKind::Close => include_bytes!("../assets/icons/close.svg"),
         IconKind::Overflow => include_bytes!("../assets/icons/overflow.svg"),
+        IconKind::StatusReady => include_bytes!("../assets/icons/status-ready.svg"),
+        IconKind::StatusWarning => include_bytes!("../assets/icons/status-warning.svg"),
+        IconKind::StatusError => include_bytes!("../assets/icons/status-error.svg"),
+        IconKind::StatusInfo => include_bytes!("../assets/icons/status-info.svg"),
     };
     svg(svg::Handle::from_memory(bytes))
         .width(size)
@@ -16948,6 +16980,35 @@ enum SettingsButtonKind {
     /// rest so it cannot compete with the page's real actions, and gains a
     /// surface only under the pointer.
     Quiet,
+}
+
+fn github_pull_request_summary_copy(
+    pull_request: &github::PullRequestSummary,
+    tokens: DesignTokens,
+) -> (&'static str, &'static str, Color) {
+    if pull_request.status == github::PullRequestSummaryStatus::Merged {
+        (
+            "Merged pull request",
+            "This pull request has been merged",
+            tokens.github_merged,
+        )
+    } else {
+        github_readiness_copy(pull_request.readiness, tokens)
+    }
+}
+
+fn github_readiness_icon(readiness: github::MergeReadiness) -> IconKind {
+    match readiness {
+        github::MergeReadiness::Ready => IconKind::StatusReady,
+        github::MergeReadiness::Conflicts | github::MergeReadiness::ChecksFailed => {
+            IconKind::StatusError
+        }
+        github::MergeReadiness::Behind
+        | github::MergeReadiness::ChecksPending
+        | github::MergeReadiness::ReviewRequired
+        | github::MergeReadiness::Blocked => IconKind::StatusWarning,
+        github::MergeReadiness::Draft | github::MergeReadiness::Unknown => IconKind::StatusInfo,
+    }
 }
 
 fn github_readiness_copy(
@@ -20625,6 +20686,7 @@ mod tests {
             head: "keyboard-ledger".into(),
             base: "main".into(),
             status: github::PullRequestSummaryStatus::Open,
+            readiness: github::MergeReadiness::Ready,
         }]);
         app.github_panel = Some(panel);
 
@@ -20643,6 +20705,30 @@ mod tests {
                 .and_then(|panel| panel.selected_pull_request_number),
             Some(42)
         );
+    }
+
+    #[test]
+    fn pull_request_conflicts_use_error_icon_and_explanation() {
+        let pull_request = github::PullRequestSummary {
+            number: 42,
+            title: "Conflicting pull request".into(),
+            url: "https://github.com/example/muxtrix/pull/42".into(),
+            author: "octocat".into(),
+            head: "conflicts".into(),
+            base: "main".into(),
+            status: github::PullRequestSummaryStatus::Open,
+            readiness: github::MergeReadiness::Conflicts,
+        };
+        let tokens = DesignTokens::for_appearance(Appearance::Dark);
+
+        assert!(matches!(
+            github_readiness_icon(pull_request.readiness),
+            IconKind::StatusError
+        ));
+        let (label, detail, color) = github_pull_request_summary_copy(&pull_request, tokens);
+        assert_eq!(label, "Merge conflicts");
+        assert_eq!(detail, "Resolve conflicts before merging");
+        assert_eq!(color, tokens.danger);
     }
 
     #[test]
@@ -20667,6 +20753,7 @@ mod tests {
             head: "draft-toggle".into(),
             base: "main".into(),
             status: github::PullRequestSummaryStatus::Draft,
+            readiness: github::MergeReadiness::Draft,
         }]);
         panel.selected_pull_request_number = Some(42);
         panel.selected_pull_request = Some(github::PullRequestDetails {
@@ -20769,6 +20856,7 @@ mod tests {
             head: "merge-flow".into(),
             base: "main".into(),
             status: github::PullRequestSummaryStatus::Open,
+            readiness: github::MergeReadiness::Ready,
         }]);
         panel.selected_pull_request_number = Some(42);
         panel.selected_pull_request = Some(github::PullRequestDetails {
