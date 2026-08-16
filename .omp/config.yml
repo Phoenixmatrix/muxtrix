@@ -3,3 +3,6 @@ modelRoles:
 
 advisor:
   enabled: true
+
+memory:
+  backend: mnemopi
