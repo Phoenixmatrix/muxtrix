@@ -350,10 +350,16 @@ impl Scenario {
                         TerminalMouseButton::Left,
                     ));
                     let _ = app.update(Message::TerminalPointerMoved(second, point(last, row)));
-                    let _ = app.update(Message::TerminalMouseReleased(
+                    let copy_task = app.update(Message::TerminalMouseReleased(
                         second,
                         TerminalMouseButton::Left,
                     ));
+                    if copy_task.units() == 0 {
+                        return Err(
+                            "releasing a genuine text selection did not schedule a clipboard copy"
+                                .into(),
+                        );
+                    }
                     self.selection_dragged = true;
                     return Ok(TickAction::Wait);
                 }
