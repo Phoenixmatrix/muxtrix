@@ -495,8 +495,7 @@ pub(crate) fn load_diff(
         )?
     };
     // `git diff --no-index` returns one when differences exist.
-    if !output.status.success() && !(file.status == "Untracked" && output.status.code() == Some(1))
-    {
+    if !(output.status.success() || file.status == "Untracked" && output.status.code() == Some(1)) {
         return Err(nonempty_failure(
             &output,
             "Git could not read this file's diff.",
