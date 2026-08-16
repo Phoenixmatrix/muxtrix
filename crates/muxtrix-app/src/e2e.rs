@@ -117,6 +117,7 @@ pub(super) struct Scenario {
     third_pane: Option<PaneId>,
     original_tab: Option<TabId>,
     tab_pane: Option<PaneId>,
+    tab_pane_identity_replaced: bool,
     initial_cols: Option<u16>,
     initial_rows: Option<u16>,
     settle_ticks: u8,
@@ -184,6 +185,7 @@ impl Scenario {
             third_pane: None,
             original_tab: None,
             tab_pane: None,
+            tab_pane_identity_replaced: false,
             initial_cols: None,
             initial_rows: None,
             settle_ticks: 0,
@@ -565,6 +567,40 @@ impl Scenario {
                     .is_none_or(|runtime| runtime.snapshot.is_none())
                 {
                     return Ok(TickAction::Wait);
+                }
+                // Model session restoration at the widget boundary: a fresh
+                // pane/runtime replaces the terminal in an unchanged layout.
+                // The replacement must receive the existing viewport even
+                // though its sensor bounds do not move.
+                if !self.tab_pane_identity_replaced {
+                    let replacement = PaneId::new();
+                    let mut runtime = app
+                        .terminals
+                        .remove(&tab_pane)
+                        .ok_or_else(|| "new tab terminal runtime is missing".to_owned())?;
+                    runtime.viewport = None;
+                    app.terminals.insert(replacement, runtime);
+                    let tab = app
+                        .active_workspace_mut()?
+                        .active_tab_mut()
+                        .ok_or_else(|| "new tab is missing".to_owned())?;
+                    let mut pane = tab
+                        .panes
+                        .remove(&tab_pane)
+                        .ok_or_else(|| "new tab pane is missing".to_owned())?;
+                    pane.id = replacement;
+                    tab.panes.insert(replacement, pane);
+                    tab.root = muxtrix_domain::PaneTree::leaf(replacement);
+                    tab.focused_pane_id = replacement;
+                    self.tab_pane = Some(replacement);
+                    self.tab_pane_identity_replaced = true;
+                    return Ok(TickAction::Wait);
+                }
+                if app.terminals[&tab_pane].viewport.is_none() {
+                    return Err(
+                        "a same-sized terminal replacing the previous pane was never measured"
+                            .into(),
+                    );
                 }
                 let workspace = app.active_workspace()?;
                 if workspace.tabs.len() != 2
