@@ -13167,10 +13167,11 @@ impl Muxtrix {
                 self.agent_hook_row(Agent::Pi),
                 settings_divider(tokens),
                 row![
-                    text("Hook actions apply immediately. Muxtrix only changes its tagged entries; project-level controls remain available in muxtrixctl.")
+                    text("Hook changes apply immediately. Muxtrix updates only its tagged entries. Project hooks remain available in muxtrixctl.")
                         .size(self.settings_draft.ui_pixels(10.0))
                         .color(tokens.muted)
-                        .width(Fill),
+                        .width(Fill)
+                        .wrapping(iced::widget::text::Wrapping::Word),
                     settings_action_button(
                         "Refresh",
                         Message::RefreshHookStatus,
@@ -13178,6 +13179,7 @@ impl Muxtrix {
                         &self.settings_draft,
                     ),
                 ]
+                .spacing(18)
                 .padding(14)
                 .align_y(Alignment::Center),
             ],
