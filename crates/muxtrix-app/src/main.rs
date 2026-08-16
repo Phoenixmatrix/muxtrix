@@ -1355,6 +1355,12 @@ const GITHUB_STATUS_LABEL_WIDTH: f32 = SIDEBAR_WIDTH
 const GITHUB_PANEL_WIDTH: f32 = 372.0;
 const GITHUB_FILE_ROW_HEIGHT: f32 = 42.0;
 const GITHUB_PULL_REQUEST_ROW_HEIGHT: f32 = 58.0;
+const GITHUB_PULL_REQUEST_SEARCH_HEIGHT: f32 = 66.0;
+const GITHUB_PULL_REQUEST_SUMMARY_HEIGHT: f32 = 34.0;
+/// Keep the list viewport fixed while refresh hides search and summary chrome.
+/// Otherwise centered loading copy jumps upward by half the removed height.
+const GITHUB_PULL_REQUEST_LIST_CHROME_HEIGHT: f32 =
+    GITHUB_PULL_REQUEST_SEARCH_HEIGHT + GITHUB_PULL_REQUEST_SUMMARY_HEIGHT + 1.0;
 const GITHUB_FILE_OVERSCAN: usize = 5;
 /// Keep installed-font menus scannable instead of letting a large system font
 /// catalog consume the window. Iced's menu overlay uses the resulting height
@@ -9738,7 +9744,12 @@ impl Muxtrix {
         }
 
         if panel.pull_requests_loading {
-            return self.github_panel_loading_state(panel, tokens);
+            return column![
+                container("").height(GITHUB_PULL_REQUEST_LIST_CHROME_HEIGHT),
+                self.github_panel_loading_state(panel, tokens),
+            ]
+            .height(Fill)
+            .into();
         }
         if let Some(error) = panel.pull_requests_error.as_deref() {
             return self.github_centered_state(
@@ -9806,7 +9817,8 @@ impl Muxtrix {
             ]
             .spacing(5),
         )
-        .padding([8, 10]);
+        .padding([8, 10])
+        .height(GITHUB_PULL_REQUEST_SEARCH_HEIGHT);
         let summary_label = if pull_requests
             .iter()
             .any(|pull_request| pull_request.status == github::PullRequestSummaryStatus::Merged)
@@ -9835,7 +9847,7 @@ impl Muxtrix {
             .spacing(7)
             .align_y(Alignment::Center),
         )
-        .height(34)
+        .height(GITHUB_PULL_REQUEST_SUMMARY_HEIGHT)
         .padding([7, 12])
         .width(Fill)
         .style(move |_| container::Style::default().background(tokens.panel));
