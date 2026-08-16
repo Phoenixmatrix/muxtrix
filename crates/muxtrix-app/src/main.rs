@@ -2764,7 +2764,17 @@ impl Muxtrix {
             Message::RefreshGitHubPanel => return self.refresh_github_panel(),
             Message::RefreshGitHubPullRequestsAfterAgentTurn => {
                 self.github_pull_requests_refresh_pending = false;
-                return self.refresh_github_pull_requests();
+                let selected_pull_request_visible =
+                    self.github_panel.as_ref().is_some_and(|panel| {
+                        panel.active_tab == GitHubPanelTab::PullRequests
+                            && panel.selected_pull_request_number.is_some()
+                    });
+                let pull_requests = self.refresh_github_pull_requests();
+                return if selected_pull_request_visible {
+                    Task::batch([pull_requests, self.refresh_selected_github_pull_request()])
+                } else {
+                    pull_requests
+                };
             }
             Message::GitHubFocusedPaneLoaded(pane_id, generation, result) => {
                 if generation != self.github_context_generation {
@@ -5830,6 +5840,9 @@ impl Muxtrix {
         panel.pull_requests_error = None;
         if pull_requests_visible && authenticated {
             panel.pull_requests_loading = true;
+            if panel.selected_pull_request_number.is_some() {
+                panel.selected_pull_request_loading = true;
+            }
             self.github_pull_requests_refresh_pending = true;
         }
     }
@@ -5903,13 +5916,20 @@ impl Muxtrix {
         };
         panel.selected_pull_request_number = Some(number);
         panel.selected_pull_request = None;
+        panel.selected_pull_request_file_scroll_offset = 0.0;
+        panel.file_keyboard_cursor = None;
+        panel.keyboard_focus = Some(GitHubPanelKeyboardFocus::Back);
+        self.load_github_pull_request(number)
+    }
+
+    fn load_github_pull_request(&mut self, number: u64) -> Task<Message> {
+        let Some(panel) = self.github_panel.as_mut() else {
+            return Task::none();
+        };
         panel.selected_pull_request_loading = true;
         panel.selected_pull_request_error = None;
         panel.pull_request_action_error = None;
         panel.draft_state_updating = false;
-        panel.selected_pull_request_file_scroll_offset = 0.0;
-        panel.file_keyboard_cursor = None;
-        panel.keyboard_focus = Some(GitHubPanelKeyboardFocus::Back);
         panel.merge_confirmation = false;
         panel.loading_phase = 0;
         panel.pull_request_detail_generation = panel.pull_request_detail_generation.wrapping_add(1);
@@ -5937,7 +5957,7 @@ impl Muxtrix {
         else {
             return Task::none();
         };
-        self.select_github_pull_request(number)
+        self.load_github_pull_request(number)
     }
 
     fn refresh_github_focused_pane(&mut self) -> Task<Message> {
@@ -20688,6 +20708,58 @@ mod tests {
                 .map(|panel| panel.pull_request_generation),
             Some(1)
         );
+    }
+
+    #[test]
+    fn completed_agent_turn_refreshes_the_selected_pull_request_and_list() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.github_auth = github::AuthStatus::Authenticated {
+            login: "octocat".into(),
+        };
+        let mut panel = GitHubPanelState::loading(github::Repository {
+            root: std::env::temp_dir(),
+            name: "muxtrix".into(),
+            owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
+            branch: "mk-152".into(),
+            wsl_distribution: String::new(),
+        });
+        panel.active_tab = GitHubPanelTab::PullRequests;
+        panel.loading = false;
+        panel.pull_requests = Some(Vec::new());
+        panel.selected_pull_request_number = Some(42);
+        panel.selected_pull_request_file_scroll_offset = 84.0;
+        panel.file_keyboard_cursor = Some(3);
+        panel.keyboard_focus = Some(GitHubPanelKeyboardFocus::Files);
+        app.github_panel = Some(panel);
+
+        let response = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state: AgentState::Completed,
+            event: Some("Stop".into()),
+            title: "Codex · Stop".into(),
+            body: "Agent completed a turn".into(),
+            pane_id: Some(pane_id.as_uuid().to_string()),
+            session_id: Some("mk-152-session".into()),
+            cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+        });
+
+        assert!(response.ok);
+        let panel = app.github_panel.as_ref().expect("panel should remain open");
+        assert!(panel.pull_requests.is_none());
+        assert!(panel.pull_requests_loading);
+        assert!(panel.selected_pull_request_loading);
+        assert!(app.github_pull_requests_refresh_pending);
+
+        drop(app.update(Message::RefreshGitHubPullRequestsAfterAgentTurn));
+        let panel = app.github_panel.as_ref().expect("panel should remain open");
+        assert!(!app.github_pull_requests_refresh_pending);
+        assert_eq!(panel.pull_request_generation, 1);
+        assert_eq!(panel.pull_request_detail_generation, 1);
+        assert_eq!(panel.selected_pull_request_file_scroll_offset, 84.0);
+        assert_eq!(panel.file_keyboard_cursor, Some(3));
+        assert_eq!(panel.keyboard_focus, Some(GitHubPanelKeyboardFocus::Files));
     }
 
     #[test]

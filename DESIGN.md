@@ -372,9 +372,9 @@ change replaces both tab caches, while movement within one repository updates
 only local state. Pull requests load when their tab is first opened, when
 explicitly refreshed, or when a supported harness reports that the focused
 pane's agent completed a turn. Turn completion invalidates a hidden cached
-list; when Pull requests is visible, it replaces that list immediately behind
-the existing loading state. Compaction and handoff maintenance do not count as
-turn completion.
+list; when Pull requests is visible, it refreshes the list and any selected
+pull-request detail behind the existing loading state. Compaction and handoff
+maintenance do not count as turn completion.
 
 The pull-request list fetches lightweight identity and readiness summaries,
 then searches title, number, author, head, and base locally. Continuous 58 px
@@ -391,6 +391,10 @@ readiness, identity, checks, and paginated changed files. Only that selection
 fetches full metadata and patches, so repositories with many open pull requests
 do not pay the cost of every file list. A quiet back row returns to the
 searchable list.
+
+Because GitHub calculates mergeability asynchronously, each list or detail load
+briefly retries an unknown result before presenting it. That bounded retry is
+part of the requested load, never a repeating background poll.
 Readiness always pairs its semantic signal with a concise text label and
 explanation. Green means ready or passed, amber means pending or blocked on
 human or remote work, red means failed or conflicting, and neutral means
