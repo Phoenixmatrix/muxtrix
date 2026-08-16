@@ -30,6 +30,8 @@ ttf-parser.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56.0"
+process-wrap = { version = "9.1.0", default-features = false, features = ["std", "job-object", "creation-flags"] }
+windows = { version = "0.62.2", features = ["Win32_System_Threading"] }
 
 # Plain build-dependency: cfg(windows) here would gate on the HOST, which
 # breaks icon embedding when cross-compiling the Windows binary from WSL.

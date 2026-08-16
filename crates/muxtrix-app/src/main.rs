@@ -61,7 +61,7 @@ mod e2e;
 use commands::CommandAction;
 use ellipsized_text::EllipsizedText;
 use popover::Popover;
-use process::console_command;
+use process::{ProcessCancellation, command_output, console_command};
 #[cfg(any(target_os = "windows", test))]
 use settings::WindowsShellBackend;
 use settings::{
@@ -231,11 +231,14 @@ struct Muxtrix {
     github_auth: github::AuthStatus,
     github_auth_busy: bool,
     github_auth_generation: u64,
+    github_auth_cancellation: ProcessCancellation,
+    github_request_generation: u64,
     github_panel: Option<GitHubPanelState>,
     github_diff: Option<GitHubDiffState>,
     github_pane_refresh_pending: bool,
     github_pull_requests_refresh_pending: bool,
     github_context_generation: u64,
+    github_context_cancellation: ProcessCancellation,
     sidebar_collapsed: bool,
     maximized_pane: Option<PaneId>,
     pane_menu: Option<PaneId>,
@@ -313,6 +316,8 @@ struct Muxtrix {
     /// ordinary terminal repaints free of filesystem and process work.
     pane_repositories: BTreeMap<PaneId, PaneRepository>,
     pending_repository_directories: BTreeMap<PaneId, std::path::PathBuf>,
+    pane_repository_generation: u64,
+    pane_repository_cancellation: ProcessCancellation,
     hook_statuses: Vec<HookStatus>,
     integration_generation: u64,
     integration_refreshing: bool,
@@ -553,6 +558,10 @@ struct GitHubPanelState {
     file_scroll_offset: f32,
     pull_request_generation: u64,
     pull_request_detail_generation: u64,
+    action_generation: u64,
+    pull_requests_cancellation: ProcessCancellation,
+    pull_request_detail_cancellation: ProcessCancellation,
+    action_cancellation: ProcessCancellation,
     loading_phase: u8,
 }
 
@@ -585,6 +594,10 @@ impl GitHubPanelState {
             file_scroll_offset: 0.0,
             pull_request_generation: 0,
             pull_request_detail_generation: 0,
+            action_generation: 0,
+            pull_requests_cancellation: ProcessCancellation::default(),
+            pull_request_detail_cancellation: ProcessCancellation::default(),
+            action_cancellation: ProcessCancellation::default(),
             loading_phase: 0,
         }
     }
@@ -602,7 +615,15 @@ impl GitHubPanelState {
         }
     }
 
+    fn cancel_requests(&self) {
+        self.pull_requests_cancellation.cancel();
+        self.pull_request_detail_cancellation.cancel();
+        self.action_cancellation.cancel();
+    }
+
     fn close_selected_pull_request(&mut self) {
+        self.pull_request_detail_cancellation.cancel();
+        self.action_cancellation.cancel();
         self.selected_pull_request_number = None;
         self.selected_pull_request = None;
         self.selected_pull_request_loading = false;
@@ -691,6 +712,7 @@ struct GitHubDiffState {
     loading: bool,
     error: Option<String>,
     generation: u64,
+    cancellation: ProcessCancellation,
     scroll_offset: f32,
     wrap_columns: Option<usize>,
     line_starts: Vec<usize>,
@@ -939,8 +961,13 @@ struct AgentPaneStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneRepository {
     directory: std::path::PathBuf,
+    root: Option<std::path::PathBuf>,
     name: Option<String>,
     worktree_name: Option<String>,
+    branch: Option<String>,
+    head_oid: Option<String>,
+    pull_request: Option<github::CurrentPullRequest>,
+    checked_at: std::time::Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1151,7 +1178,7 @@ enum Message {
     SessionHostInitialized(PaneId, Result<Vec<muxtrix_sessions::SessionRecord>, String>),
     PollTerminal,
     AgentsRosterLoaded(Result<agents_roster::AgentsRoster, String>),
-    PaneRepositoriesLoaded(Result<Vec<(PaneId, PaneRepository)>, String>),
+    PaneRepositoriesLoaded(u64, Result<Vec<(PaneId, PaneRepository)>, String>),
     BlinkCursor,
     AnimateGitHubLoading,
     Keyboard(keyboard::Event),
@@ -1259,11 +1286,11 @@ enum Message {
     GitHubDiffScrolled(f32),
     OpenGitHubPullRequest(String),
     ToggleGitHubPullRequestDraft,
-    GitHubPullRequestDraftChanged(std::path::PathBuf, u64, bool, Result<String, String>),
+    GitHubPullRequestDraftChanged(std::path::PathBuf, u64, u64, bool, Result<String, String>),
     RequestGitHubMerge,
     CancelGitHubMerge,
     ConfirmGitHubMerge,
-    GitHubMergeFinished(std::path::PathBuf, u64, Result<String, String>),
+    GitHubMergeFinished(std::path::PathBuf, u64, u64, Result<String, String>),
     ToggleSidebar,
     ToggleMaximize(PaneId),
     ToggleMaximizeFromPaneMenu(PaneId),
@@ -1321,6 +1348,9 @@ const TERMINAL_SELECTION_DRAG_THRESHOLD: f32 = 3.0;
 /// read spawns a short-lived process, so it is paced well below the frame rate;
 /// entering the view bypasses this for an immediate first read.
 const AGENTS_ROSTER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Repository and linked-PR metadata is external state. Recheck it even when
+/// the pane stays on the same directory and branch so new commits and PRs land.
+const PANE_REPOSITORY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const SIDEBAR_WIDTH: f32 = 272.0;
 /// Width available to fleet entry copy: the rail less its 1px border, the
 /// entry's own 16px horizontal padding, and a reserve so the ellipsis fires
@@ -1470,8 +1500,9 @@ impl Muxtrix {
         let mut app = Self::new();
         let discovery = app.refresh_integrations();
         let github_host = app.settings.github_host.clone();
+        let github_auth_cancellation = app.github_auth_cancellation.clone();
         let github_auth = perform_blocking(
-            move || github::auth_status(&github_host),
+            move || github::auth_status(&github_host, &github_auth_cancellation),
             |result| {
                 Message::GitHubAuthChecked(
                     0,
@@ -1968,11 +1999,14 @@ impl Muxtrix {
             github_auth: github::AuthStatus::Checking,
             github_auth_busy: false,
             github_auth_generation: 0,
+            github_auth_cancellation: ProcessCancellation::default(),
+            github_request_generation: 0,
             github_panel: None,
             github_diff: None,
             github_pane_refresh_pending: false,
             github_pull_requests_refresh_pending: false,
             github_context_generation: 0,
+            github_context_cancellation: ProcessCancellation::default(),
             sidebar_collapsed: false,
             maximized_pane: None,
             pane_menu: None,
@@ -2016,6 +2050,8 @@ impl Muxtrix {
             agents_roster_checked: None,
             pane_repositories: BTreeMap::new(),
             pending_repository_directories: BTreeMap::new(),
+            pane_repository_generation: 0,
+            pane_repository_cancellation: ProcessCancellation::default(),
             hook_statuses: Vec::new(),
             integration_generation: 0,
             integration_refreshing: false,
@@ -2184,7 +2220,10 @@ impl Muxtrix {
                 }
                 return Task::none();
             }
-            Message::PaneRepositoriesLoaded(result) => {
+            Message::PaneRepositoriesLoaded(generation, result) => {
+                if generation != self.pane_repository_generation {
+                    return Task::none();
+                }
                 let repositories = match result {
                     Ok(repositories) => repositories,
                     Err(error) => {
@@ -2741,8 +2780,30 @@ impl Muxtrix {
             }
             Message::BeginGitHubAuth => return self.begin_github_auth(),
             Message::GitHubAuthChecked(generation, status) => {
-                if generation == self.github_auth_generation {
-                    self.github_auth = status;
+                if generation != self.github_auth_generation {
+                    return Task::none();
+                }
+                let authenticated = matches!(status, github::AuthStatus::Authenticated { .. });
+                self.github_auth = status;
+                if authenticated {
+                    self.pane_repositories.clear();
+                    self.pending_repository_directories.clear();
+                    let repositories = self.refresh_pane_repositories();
+                    let panel = if self.github_panel_visible() {
+                        self.refresh_github_focused_pane()
+                    } else {
+                        Task::none()
+                    };
+                    let pull_requests = if self
+                        .github_panel
+                        .as_ref()
+                        .is_some_and(|panel| panel.active_tab == GitHubPanelTab::PullRequests)
+                    {
+                        self.refresh_github_pull_requests()
+                    } else {
+                        Task::none()
+                    };
+                    return Task::batch([repositories, panel, pull_requests]);
                 }
                 return Task::none();
             }
@@ -2755,13 +2816,23 @@ impl Muxtrix {
                     Ok(status) => {
                         self.github_auth = status;
                         self.status = format!("Connected to {}", self.settings.github_host);
-                        if self
-                            .github_panel
-                            .as_ref()
-                            .is_some_and(|panel| panel.active_tab == GitHubPanelTab::PullRequests)
-                        {
-                            return self.refresh_github_panel();
-                        }
+                        self.pane_repositories.clear();
+                        self.pending_repository_directories.clear();
+                        let repositories = self.refresh_pane_repositories();
+                        let context = if self.github_panel_visible() {
+                            self.refresh_github_focused_pane()
+                        } else {
+                            Task::none()
+                        };
+                        let pull_requests =
+                            if self.github_panel.as_ref().is_some_and(|panel| {
+                                panel.active_tab == GitHubPanelTab::PullRequests
+                            }) {
+                                self.refresh_github_pull_requests()
+                            } else {
+                                Task::none()
+                            };
+                        return Task::batch([repositories, context, pull_requests]);
                     }
                     Err(error) => {
                         self.github_auth = github::AuthStatus::NeedsAuthentication;
@@ -2774,8 +2845,14 @@ impl Muxtrix {
                 return Task::none();
             }
             Message::CloseGitHubPanel => {
-                self.github_panel = None;
-                self.github_diff = None;
+                self.github_context_cancellation.cancel();
+                self.github_context_generation = self.github_context_generation.wrapping_add(1);
+                if let Some(panel) = self.github_panel.take() {
+                    panel.cancel_requests();
+                }
+                if let Some(diff) = self.github_diff.take() {
+                    diff.cancellation.cancel();
+                }
                 if self.active_view == ActiveView::GitHubDiff {
                     self.active_view = ActiveView::Workspace;
                 }
@@ -2817,8 +2894,12 @@ impl Muxtrix {
                 let (repository, data) = match *result {
                     Ok(loaded) => loaded,
                     Err(error) => {
-                        self.github_panel = None;
-                        self.github_diff = None;
+                        if let Some(panel) = self.github_panel.take() {
+                            panel.cancel_requests();
+                        }
+                        if let Some(diff) = self.github_diff.take() {
+                            diff.cancellation.cancel();
+                        }
                         self.active_view = ActiveView::Workspace;
                         self.status = error.clone();
                         self.show_toast(&error);
@@ -2833,6 +2914,7 @@ impl Muxtrix {
                     .github_panel
                     .as_ref()
                     .map_or(GitHubPanelTab::Local, |panel| panel.active_tab);
+
                 if same_repository {
                     let mut reload_diff = None;
                     if let Some(diff) = self
@@ -2846,26 +2928,51 @@ impl Muxtrix {
                             .find(|file| file.path == diff.path)
                             .map(|file| file.path.clone());
                         if reload_diff.is_none() {
-                            self.github_diff = None;
+                            if let Some(diff) = self.github_diff.take() {
+                                diff.cancellation.cancel();
+                            }
                             self.active_view = ActiveView::Workspace;
                             self.status =
                                 "The selected file is no longer in the local change set.".into();
                         }
                     }
+                    let file_count = data.files.len();
+                    let viewport_height = github_file_viewport_height(self.window_size, false);
                     let panel = self.github_panel.as_mut().expect("panel checked above");
+                    let clamped = github_clamped_scroll_offset(
+                        file_count,
+                        panel.file_scroll_offset,
+                        viewport_height,
+                        GITHUB_FILE_ROW_HEIGHT,
+                    );
+                    panel.file_scroll_offset = clamped;
+                    panel.file_keyboard_cursor = panel
+                        .file_keyboard_cursor
+                        .map(|cursor| cursor.min(file_count.saturating_sub(1)))
+                        .filter(|_| file_count > 0);
                     panel.repository = repository;
                     panel.data = Some(data);
                     panel.context_loading = false;
                     panel.loading = false;
                     panel.error = None;
-                    return reload_diff.map_or_else(Task::none, |path| self.open_github_diff(path));
+                    let diff_task =
+                        reload_diff.map_or_else(Task::none, |path| self.open_github_diff(path));
+                    return Task::batch([
+                        diff_task,
+                        github_scroll_to(GITHUB_FILE_SCROLL_ID, clamped),
+                    ]);
+                }
+                if let Some(panel) = self.github_panel.take() {
+                    panel.cancel_requests();
                 }
                 let mut panel = GitHubPanelState::loading(repository);
                 panel.active_tab = active_tab;
                 panel.data = Some(data);
                 panel.loading = false;
                 self.github_panel = Some(panel);
-                self.github_diff = None;
+                if let Some(diff) = self.github_diff.take() {
+                    diff.cancellation.cancel();
+                }
                 self.active_view = ActiveView::Workspace;
                 return if active_tab == GitHubPanelTab::PullRequests {
                     self.refresh_github_pull_requests()
@@ -2889,7 +2996,9 @@ impl Muxtrix {
                 panel.pull_request_keyboard_cursor = None;
                 panel.file_keyboard_cursor = None;
                 panel.loading_phase = 0;
-                self.github_diff = None;
+                if let Some(diff) = self.github_diff.take() {
+                    diff.cancellation.cancel();
+                }
                 self.active_view = ActiveView::Workspace;
                 return match tab {
                     GitHubPanelTab::Local if panel.data.is_none() => {
@@ -2968,7 +3077,9 @@ impl Muxtrix {
                     .as_ref()
                     .is_some_and(|diff| matches!(diff.source, GitHubDiffSource::PullRequest(_)))
                 {
-                    self.github_diff = None;
+                    if let Some(diff) = self.github_diff.take() {
+                        diff.cancellation.cancel();
+                    }
                     self.active_view = ActiveView::Workspace;
                 }
                 return Task::none();
@@ -2997,7 +3108,9 @@ impl Muxtrix {
                                 .find(|file| file.path == diff.path)
                                 .map(|file| file.path.clone());
                             if reload_diff.is_none() {
-                                self.github_diff = None;
+                                if let Some(diff) = self.github_diff.take() {
+                                    diff.cancellation.cancel();
+                                }
                                 self.active_view = ActiveView::Workspace;
                                 self.status =
                                     "The selected file is no longer in the pull request.".into();
@@ -3053,7 +3166,9 @@ impl Muxtrix {
                 return self.open_github_diff(path);
             }
             Message::CloseGitHubDiff => {
-                self.github_diff = None;
+                if let Some(diff) = self.github_diff.take() {
+                    diff.cancellation.cancel();
+                }
                 self.active_view = ActiveView::Workspace;
                 return Task::none();
             }
@@ -3104,12 +3219,10 @@ impl Muxtrix {
             Message::ToggleGitHubPullRequestDraft => {
                 return self.toggle_github_pull_request_draft();
             }
-            Message::GitHubPullRequestDraftChanged(root, number, draft, result) => {
-                let Some(panel) = self
-                    .github_panel
-                    .as_mut()
-                    .filter(|panel| panel.repository.root == root)
-                else {
+            Message::GitHubPullRequestDraftChanged(root, number, generation, draft, result) => {
+                let Some(panel) = self.github_panel.as_mut().filter(|panel| {
+                    panel.repository.root == root && panel.action_generation == generation
+                }) else {
                     return Task::none();
                 };
                 panel.draft_state_updating = false;
@@ -3117,6 +3230,12 @@ impl Muxtrix {
                     Ok(status) => {
                         panel.mark_pull_request_draft(number, draft);
                         panel.pull_request_action_error = None;
+                        let state = if draft {
+                            github::CurrentPullRequestState::Draft
+                        } else {
+                            github::CurrentPullRequestState::Open
+                        };
+                        self.set_cached_pull_request_state(&root, number, state);
                         self.status = status;
                     }
                     Err(error) => {
@@ -3148,12 +3267,10 @@ impl Muxtrix {
                 return Task::none();
             }
             Message::ConfirmGitHubMerge => return self.confirm_github_merge(),
-            Message::GitHubMergeFinished(root, number, result) => {
-                let Some(panel) = self
-                    .github_panel
-                    .as_mut()
-                    .filter(|panel| panel.repository.root == root)
-                else {
+            Message::GitHubMergeFinished(root, number, generation, result) => {
+                let Some(panel) = self.github_panel.as_mut().filter(|panel| {
+                    panel.repository.root == root && panel.action_generation == generation
+                }) else {
                     return Task::none();
                 };
                 panel.merging = false;
@@ -3165,9 +3282,16 @@ impl Muxtrix {
                         if self.github_diff.as_ref().is_some_and(|diff| {
                             diff.source == GitHubDiffSource::PullRequest(number)
                         }) {
-                            self.github_diff = None;
+                            if let Some(diff) = self.github_diff.take() {
+                                diff.cancellation.cancel();
+                            }
                             self.active_view = ActiveView::Workspace;
                         }
+                        self.set_cached_pull_request_state(
+                            &root,
+                            number,
+                            github::CurrentPullRequestState::Merged,
+                        );
                         self.status = status;
                         return self.refresh_github_pull_requests();
                     }
@@ -5185,7 +5309,9 @@ impl Muxtrix {
 
         if self.active_view == ActiveView::GitHubDiff {
             if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
-                self.github_diff = None;
+                if let Some(diff) = self.github_diff.take() {
+                    diff.cancellation.cancel();
+                }
                 self.active_view = ActiveView::Workspace;
             }
             return Task::none();
@@ -5692,9 +5818,47 @@ impl Muxtrix {
         self.palette.selected = 0;
     }
 
+    fn set_cached_pull_request_state(
+        &mut self,
+        root: &std::path::Path,
+        number: u64,
+        state: github::CurrentPullRequestState,
+    ) {
+        if let Some(current) = self
+            .github_panel
+            .as_mut()
+            .and_then(|panel| panel.data.as_mut())
+            .and_then(|data| data.current_pull_request.as_mut())
+            .filter(|pull_request| pull_request.number == number)
+        {
+            current.state = state;
+        }
+        for repository in self.pane_repositories.values_mut().filter(|repository| {
+            repository.root.as_deref() == Some(root)
+                && repository
+                    .pull_request
+                    .as_ref()
+                    .is_some_and(|pull_request| pull_request.number == number)
+        }) {
+            if let Some(pull_request) = repository.pull_request.as_mut() {
+                pull_request.state = state;
+            }
+            repository.checked_at = std::time::Instant::now();
+        }
+    }
+
+    fn next_github_request_generation(&mut self) -> u64 {
+        self.github_request_generation = self.github_request_generation.wrapping_add(1);
+        self.github_request_generation
+    }
+
     fn open_github_panel(&mut self) -> Task<Message> {
         self.close_command_palette();
-        let Some(directory) = self.focused_pane_directory() else {
+        let Ok(pane_id) = self.control_pane_id(None) else {
+            self.status = "The focused pane is unavailable.".into();
+            return Task::none();
+        };
+        let Some(directory) = self.pane_working_directory(pane_id) else {
             self.status = "The focused pane has no working directory.".into();
             self.show_toast("The focused pane has no working directory");
             return Task::none();
@@ -5712,6 +5876,7 @@ impl Muxtrix {
             owner_and_name: None,
             host: self.settings.github_host.clone(),
             branch: String::new(),
+            head_oid: String::new(),
             wsl_distribution: self.settings.wsl_distribution.clone(),
         });
         panel.context_loading = true;
@@ -5726,10 +5891,13 @@ impl Muxtrix {
         self.github_auth_busy = true;
         self.github_auth_generation = self.github_auth_generation.wrapping_add(1);
         let generation = self.github_auth_generation;
+        self.github_auth_cancellation.cancel();
+        self.github_auth_cancellation = ProcessCancellation::default();
+        let cancellation = self.github_auth_cancellation.clone();
         let github_host = self.settings.github_host.clone();
         self.status = format!("Finish connecting {github_host} in your browser");
         perform_blocking(
-            move || github::authenticate(&github_host),
+            move || github::authenticate(&github_host, &cancellation),
             move |result| {
                 Message::GitHubAuthFinished(generation, result.and_then(std::convert::identity))
             },
@@ -5740,6 +5908,8 @@ impl Muxtrix {
         let Some(panel) = self.github_panel.as_ref() else {
             return;
         };
+        self.github_context_generation = self.github_context_generation.wrapping_add(1);
+        self.github_context_cancellation.cancel();
         let repository_may_change = self
             .focused_pane_directory()
             .is_none_or(|directory| !directory.starts_with(&panel.repository.root));
@@ -5754,6 +5924,8 @@ impl Muxtrix {
     }
 
     fn queue_github_pull_request_refresh(&mut self, pane_id: PaneId) {
+        self.pane_repositories.remove(&pane_id);
+        self.pending_repository_directories.remove(&pane_id);
         if self.control_pane_id(None).ok() != Some(pane_id) {
             return;
         }
@@ -5797,18 +5969,21 @@ impl Muxtrix {
         if !matches!(self.github_auth, github::AuthStatus::Authenticated { .. }) {
             return Task::none();
         }
+        let generation = self.next_github_request_generation();
         let Some(panel) = self.github_panel.as_mut() else {
             return Task::none();
         };
         panel.pull_requests_loading = true;
         panel.pull_requests_error = None;
         panel.loading_phase = 0;
-        panel.pull_request_generation = panel.pull_request_generation.wrapping_add(1);
-        let generation = panel.pull_request_generation;
+        panel.pull_request_generation = generation;
+        panel.pull_requests_cancellation.cancel();
+        panel.pull_requests_cancellation = ProcessCancellation::default();
+        let cancellation = panel.pull_requests_cancellation.clone();
         let repository = panel.repository.clone();
         let root = repository.root.clone();
         perform_blocking(
-            move || github::list_pull_requests(&repository),
+            move || github::list_pull_requests(&repository, &cancellation),
             move |result| {
                 Message::GitHubPullRequestsLoaded(
                     root,
@@ -5832,6 +6007,7 @@ impl Muxtrix {
     }
 
     fn load_github_pull_request(&mut self, number: u64) -> Task<Message> {
+        let generation = self.next_github_request_generation();
         let Some(panel) = self.github_panel.as_mut() else {
             return Task::none();
         };
@@ -5841,12 +6017,14 @@ impl Muxtrix {
         panel.draft_state_updating = false;
         panel.merge_confirmation = false;
         panel.loading_phase = 0;
-        panel.pull_request_detail_generation = panel.pull_request_detail_generation.wrapping_add(1);
-        let generation = panel.pull_request_detail_generation;
+        panel.pull_request_detail_generation = generation;
+        panel.pull_request_detail_cancellation.cancel();
+        panel.pull_request_detail_cancellation = ProcessCancellation::default();
+        let cancellation = panel.pull_request_detail_cancellation.clone();
         let repository = panel.repository.clone();
         let root = repository.root.clone();
         perform_blocking(
-            move || github::load_pull_request_details(&repository, number),
+            move || github::load_pull_request_details(&repository, number, &cancellation),
             move |result| {
                 Message::GitHubPullRequestLoaded(
                     root,
@@ -5880,10 +6058,15 @@ impl Muxtrix {
         let Some(directory) = self.pane_working_directory(pane_id) else {
             return Task::none();
         };
+        let load_current_pull_request =
+            matches!(self.github_auth, github::AuthStatus::Authenticated { .. });
         let wsl_distribution = self.settings.wsl_distribution.clone();
         let github_host = self.settings.github_host.clone();
         self.github_context_generation = self.github_context_generation.wrapping_add(1);
         let generation = self.github_context_generation;
+        self.github_context_cancellation.cancel();
+        self.github_context_cancellation = ProcessCancellation::default();
+        let cancellation = self.github_context_cancellation.clone();
         if let Some(panel) = self.github_panel.as_mut() {
             let repository_may_change = !directory.starts_with(&panel.repository.root);
             panel.context_loading =
@@ -5894,9 +6077,19 @@ impl Muxtrix {
         }
         perform_blocking(
             move || {
-                let repository =
-                    github::repository_from(&directory, &wsl_distribution, &github_host)?;
-                let data = github::load_local(&repository)?;
+                let repository = github::repository_from(
+                    &directory,
+                    &wsl_distribution,
+                    &github_host,
+                    &cancellation,
+                )?;
+                let mut data = github::load_local(&repository, &cancellation)?;
+                if load_current_pull_request {
+                    data.current_pull_request =
+                        github::current_pull_request(&repository, &cancellation)
+                            .ok()
+                            .flatten();
+                }
                 Ok((repository, data))
             },
             move |result| {
@@ -5911,42 +6104,46 @@ impl Muxtrix {
     }
 
     fn open_github_diff(&mut self, path: String) -> Task<Message> {
-        let Some(panel) = self.github_panel.as_ref() else {
-            return Task::none();
-        };
-        let file_source_and_pull_request = match panel.active_tab {
-            GitHubPanelTab::Local => panel
-                .data
-                .as_ref()
-                .and_then(|data| data.files.iter().find(|file| file.path == path))
-                .cloned()
-                .map(|file| (file, GitHubDiffSource::Local, None)),
-            GitHubPanelTab::PullRequests => {
-                panel.selected_pull_request.as_ref().and_then(|details| {
-                    details
-                        .files
-                        .iter()
-                        .find(|file| file.path == path)
+        let Some((file, source, pull_request, repository)) =
+            self.github_panel.as_ref().and_then(|panel| {
+                let selection = match panel.active_tab {
+                    GitHubPanelTab::Local => panel
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.files.iter().find(|file| file.path == path))
                         .cloned()
-                        .map(|file| {
-                            (
-                                file,
-                                GitHubDiffSource::PullRequest(details.pull_request.number),
-                                Some(details.pull_request.clone()),
-                            )
+                        .map(|file| (file, GitHubDiffSource::Local, None)),
+                    GitHubPanelTab::PullRequests => {
+                        panel.selected_pull_request.as_ref().and_then(|details| {
+                            details
+                                .files
+                                .iter()
+                                .find(|file| file.path == path)
+                                .cloned()
+                                .map(|file| {
+                                    (
+                                        file,
+                                        GitHubDiffSource::PullRequest(details.pull_request.number),
+                                        Some(details.pull_request.clone()),
+                                    )
+                                })
                         })
+                    }
+                };
+                selection.map(|(file, source, pull_request)| {
+                    (file, source, pull_request, panel.repository.clone())
                 })
-            }
-        };
-        let Some((file, source, pull_request)) = file_source_and_pull_request else {
+            })
+        else {
             self.status = "The selected file is no longer in the change set.".into();
             return Task::none();
         };
-        let generation = self
-            .github_diff
-            .as_ref()
-            .map_or(1, |diff| diff.generation.wrapping_add(1));
-        let repository = panel.repository.clone();
+        let generation = self.next_github_request_generation();
+        if let Some(diff) = self.github_diff.take() {
+            diff.cancellation.cancel();
+        }
+        let cancellation = ProcessCancellation::default();
+        let request_cancellation = cancellation.clone();
         let root = repository.root.clone();
         self.github_diff = Some(GitHubDiffState {
             source,
@@ -5958,6 +6155,7 @@ impl Muxtrix {
             loading: true,
             error: None,
             generation,
+            cancellation,
             scroll_offset: 0.0,
             wrap_columns: None,
             line_starts: vec![0],
@@ -5966,10 +6164,13 @@ impl Muxtrix {
         let path = file.path.clone();
         perform_blocking(
             move || match pull_request {
-                Some(pull_request) => {
-                    github::load_pull_request_diff(&repository, &pull_request, &file)
-                }
-                None => github::load_diff(&repository, &file, false),
+                Some(pull_request) => github::load_pull_request_diff(
+                    &repository,
+                    &pull_request,
+                    &file,
+                    &request_cancellation,
+                ),
+                None => github::load_diff(&repository, &file, false, &request_cancellation),
             },
             move |result| {
                 Message::GitHubDiffLoaded(
@@ -6006,6 +6207,7 @@ impl Muxtrix {
     }
 
     fn toggle_github_pull_request_draft(&mut self) -> Task<Message> {
+        let generation = self.next_github_request_generation();
         let Some(panel) = self.github_panel.as_mut() else {
             return Task::none();
         };
@@ -6025,14 +6227,19 @@ impl Muxtrix {
         panel.pull_request_action_error = None;
         panel.merge_confirmation = false;
         panel.loading_phase = 0;
+        panel.action_generation = generation;
+        panel.action_cancellation.cancel();
+        panel.action_cancellation = ProcessCancellation::default();
+        let cancellation = panel.action_cancellation.clone();
         let repository = panel.repository.clone();
         let root = repository.root.clone();
         perform_blocking(
-            move || github::set_draft(&repository, number, draft),
+            move || github::set_draft(&repository, number, draft, &cancellation),
             move |result| {
                 Message::GitHubPullRequestDraftChanged(
                     root,
                     number,
+                    generation,
                     draft,
                     result.and_then(std::convert::identity),
                 )
@@ -6041,6 +6248,7 @@ impl Muxtrix {
     }
 
     fn confirm_github_merge(&mut self) -> Task<Message> {
+        let generation = self.next_github_request_generation();
         let Some(panel) = self.github_panel.as_mut() else {
             return Task::none();
         };
@@ -6069,12 +6277,21 @@ impl Muxtrix {
         panel.selected_pull_request_error = None;
         panel.pull_request_action_error = None;
         panel.loading_phase = 0;
+        panel.action_generation = generation;
+        panel.action_cancellation.cancel();
+        panel.action_cancellation = ProcessCancellation::default();
+        let cancellation = panel.action_cancellation.clone();
         let repository = panel.repository.clone();
         let root = repository.root.clone();
         perform_blocking(
-            move || github::merge(&repository, number, &head_oid),
+            move || github::merge(&repository, number, &head_oid, &cancellation),
             move |result| {
-                Message::GitHubMergeFinished(root, number, result.and_then(std::convert::identity))
+                Message::GitHubMergeFinished(
+                    root,
+                    number,
+                    generation,
+                    result.and_then(std::convert::identity),
+                )
             },
         )
     }
@@ -6602,13 +6819,25 @@ impl Muxtrix {
         if github_host_changed {
             self.github_auth_generation = self.github_auth_generation.wrapping_add(1);
             let generation = self.github_auth_generation;
+            self.github_auth_cancellation.cancel();
+            self.github_auth_cancellation = ProcessCancellation::default();
+            let cancellation = self.github_auth_cancellation.clone();
             let github_host = self.settings.github_host.clone();
             self.github_auth_busy = false;
             self.github_auth = github::AuthStatus::Checking;
-            self.github_panel = None;
-            self.github_diff = None;
+            self.github_context_cancellation.cancel();
+            self.github_context_generation = self.github_context_generation.wrapping_add(1);
+            if let Some(panel) = self.github_panel.take() {
+                panel.cancel_requests();
+            }
+            if let Some(diff) = self.github_diff.take() {
+                diff.cancellation.cancel();
+            }
+            self.pane_repositories.clear();
+            self.pending_repository_directories.clear();
+            tasks.push(self.refresh_pane_repositories());
             tasks.push(perform_blocking(
-                move || github::auth_status(&github_host),
+                move || github::auth_status(&github_host, &cancellation),
                 move |result| {
                     Message::GitHubAuthChecked(
                         generation,
@@ -7297,10 +7526,9 @@ impl Muxtrix {
         Task::batch([roster, repositories])
     }
 
-    /// Resolves repository and worktree names after a pane's working directory
-    /// changes. Every expanded fleet projection shows that identity, so the
-    /// cache stays warm even outside Repos. Git remains off the UI thread; on
-    /// native Windows, a Linux path may require a WSL process.
+    /// Resolves repository, branch, HEAD, and linked pull-request identity for
+    /// each fleet pane. Every subprocess runs off the UI thread and each pane
+    /// probes independently so one slow remote cannot hold the fleet hostage.
     fn refresh_pane_repositories(&mut self) -> Task<Message> {
         let live_panes = self
             .session
@@ -7332,7 +7560,15 @@ impl Muxtrix {
             let cached = self
                 .pane_repositories
                 .get(&pane_id)
-                .is_some_and(|repository| repository.directory == directory);
+                .is_some_and(|repository| {
+                    repository.directory == directory
+                        && repository.checked_at.elapsed() < PANE_REPOSITORY_INTERVAL
+                        && self
+                            .agent_statuses
+                            .get(&pane_id)
+                            .and_then(|status| status.git_branch.as_deref())
+                            .is_none_or(|branch| repository.branch.as_deref() == Some(branch))
+                });
             let pending = self.pending_repository_directories.get(&pane_id) == Some(&directory);
             if !cached && !pending {
                 self.pending_repository_directories
@@ -7343,28 +7579,78 @@ impl Muxtrix {
         if probes.is_empty() {
             return Task::none();
         }
+        for (pane_id, directory) in self.pending_repository_directories.clone() {
+            if live_panes.contains(&pane_id)
+                && !probes.iter().any(|(candidate, _)| *candidate == pane_id)
+                && self
+                    .pane_repositories
+                    .get(&pane_id)
+                    .is_none_or(|repository| repository.directory != directory)
+            {
+                probes.push((pane_id, directory));
+            }
+        }
+        self.pending_repository_directories.clear();
+        self.pending_repository_directories
+            .extend(probes.iter().cloned());
 
+        self.pane_repository_generation = self.pane_repository_generation.wrapping_add(1);
+        let generation = self.pane_repository_generation;
+        self.pane_repository_cancellation.cancel();
+        self.pane_repository_cancellation = ProcessCancellation::default();
+        let authenticated = matches!(self.github_auth, github::AuthStatus::Authenticated { .. });
         let wsl_distribution = self.settings.wsl_distribution.clone();
-        perform_blocking(
-            move || {
-                probes
-                    .into_iter()
-                    .map(|(pane_id, directory)| {
-                        let worktree_name = linked_worktree_name(&directory);
-                        let name = git_repository_name(&directory, &wsl_distribution);
-                        (
-                            pane_id,
-                            PaneRepository {
-                                directory,
-                                name,
-                                worktree_name,
-                            },
+        let github_host = self.settings.github_host.clone();
+        Task::batch(probes.into_iter().map(|(pane_id, directory)| {
+            let cancellation = self.pane_repository_cancellation.clone();
+            let wsl_distribution = wsl_distribution.clone();
+            let github_host = github_host.clone();
+            perform_blocking(
+                move || {
+                    let worktree_name = linked_worktree_name(&directory);
+                    let repository = github::repository_from(
+                        &directory,
+                        &wsl_distribution,
+                        &github_host,
+                        &cancellation,
+                    )
+                    .ok();
+                    let name = repository.as_ref().and_then(|repository| {
+                        git_repository_name_from_root_cancellable(
+                            &repository.root,
+                            &wsl_distribution,
+                            &cancellation,
                         )
-                    })
-                    .collect::<Vec<_>>()
-            },
-            Message::PaneRepositoriesLoaded,
-        )
+                    });
+                    let pull_request = repository.as_ref().and_then(|repository| {
+                        authenticated
+                            .then(|| github::current_pull_request(repository, &cancellation))
+                            .and_then(Result::ok)
+                            .flatten()
+                    });
+                    vec![(
+                        pane_id,
+                        PaneRepository {
+                            directory,
+                            root: repository
+                                .as_ref()
+                                .map(|repository| repository.root.clone()),
+                            name,
+                            worktree_name,
+                            branch: repository
+                                .as_ref()
+                                .map(|repository| repository.branch.clone()),
+                            head_oid: repository
+                                .as_ref()
+                                .map(|repository| repository.head_oid.clone()),
+                            pull_request,
+                            checked_at: std::time::Instant::now(),
+                        },
+                    )]
+                },
+                move |result| Message::PaneRepositoriesLoaded(generation, result),
+            )
+        }))
     }
 
     fn control_pane_ids(session: &SessionState) -> Vec<String> {
@@ -7899,24 +8185,21 @@ impl Muxtrix {
             ActiveView::GitHubDiff => self.github_diff_view(tokens),
         };
         let shell: Element<'_, Message> = if self.active_view == ActiveView::GitHubDiff {
-            let panel = self.github_panel.as_ref().map_or_else(
-                || container("").width(0).into(),
-                |_| self.github_panel_view(tokens, false),
-            );
+            let panel = self.github_side_panel_view(tokens, false);
             container(row![content, panel].height(Fill).width(Fill))
                 .style(move |_| container::Style::default().background(tokens.app))
                 .into()
         } else if self.active_view == ActiveView::Workspace {
             let workspace_shell = row![self.sidebar(), content].height(Fill).width(Fill);
-            if self.github_panel.is_some() && self.window_size.width >= 1_080.0 {
-                container(workspace_shell.push(self.github_panel_view(tokens, false)))
+            if self.github_panel_visible() && self.window_size.width >= 1_080.0 {
+                container(workspace_shell.push(self.github_side_panel_view(tokens, false)))
                     .style(move |_| container::Style::default().background(tokens.app))
                     .into()
-            } else if self.github_panel.is_some() {
+            } else if self.github_panel_visible() {
                 let base: Element<'_, Message> = container(workspace_shell)
                     .style(move |_| container::Style::default().background(tokens.app))
                     .into();
-                let panel = container(self.github_panel_view(tokens, true))
+                let panel = container(self.github_side_panel_view(tokens, true))
                     .width(Fill)
                     .height(Fill)
                     .align_x(iced::alignment::Horizontal::Right);
@@ -9093,6 +9376,14 @@ impl Muxtrix {
         .into()
     }
 
+    fn github_panel_visible(&self) -> bool {
+        self.github_panel.is_some()
+    }
+
+    fn github_side_panel_view(&self, tokens: DesignTokens, floating: bool) -> Element<'_, Message> {
+        self.github_panel_view(tokens, floating)
+    }
+
     fn github_panel_view(&self, tokens: DesignTokens, floating: bool) -> Element<'_, Message> {
         let panel = self
             .github_panel
@@ -9182,10 +9473,44 @@ impl Muxtrix {
                 .width(Fill)
                 .into()
             };
+        let current_pull_request: Element<'_, Message> = panel
+            .data
+            .as_ref()
+            .and_then(|data| data.current_pull_request.as_ref())
+            .map_or_else(
+                || container("").width(0).into(),
+                |pull_request| {
+                    let (state_label, color) = match pull_request.state {
+                        github::CurrentPullRequestState::Open => ("Open", tokens.accent),
+                        github::CurrentPullRequestState::Draft => ("Draft", tokens.muted),
+                        github::CurrentPullRequestState::Closed => ("Closed", tokens.faint),
+                        github::CurrentPullRequestState::Merged => ("Merged", tokens.github_merged),
+                    };
+                    app_tooltip(
+                        button(
+                            text(format!("#{}", pull_request.number))
+                                .size(self.settings.ui_pixels(8.5))
+                                .font(self.settings.terminal_font.iced())
+                                .color(color),
+                        )
+                        .on_press(Message::OpenGitHubPullRequest(pull_request.url.clone()))
+                        .padding([4, 6])
+                        .style(move |_, status| quiet_button_style(tokens, false, status)),
+                        format!(
+                            "Current branch pull request #{} · {state_label}\nOpen in GitHub",
+                            pull_request.number
+                        ),
+                        tooltip::Position::Bottom,
+                        tokens,
+                        self.settings.ui_pixels(9.0),
+                    )
+                },
+            );
         let header = container(
             row![
                 icon(IconKind::GitHub, tokens.text, 17.0),
                 header_identity,
+                current_pull_request,
                 header_actions,
             ]
             .spacing(9)
@@ -9390,12 +9715,22 @@ impl Muxtrix {
                 ),
             }
         };
+        self.github_loading_state(panel.loading_phase, title, detail, tokens)
+    }
+
+    fn github_loading_state(
+        &self,
+        loading_phase: u8,
+        title: String,
+        detail: String,
+        tokens: DesignTokens,
+    ) -> Element<'_, Message> {
         let mut dots = column![].spacing(5).align_x(Alignment::Center);
         for row_index in 0..3 {
             let mut dot_row = row![].spacing(5).align_y(Alignment::Center);
             for column_index in 0..3 {
                 let index = row_index * 3 + column_index;
-                let distance = (panel.loading_phase + GITHUB_LOADING_DOT_COUNT - index as u8)
+                let distance = (loading_phase + GITHUB_LOADING_DOT_COUNT - index as u8)
                     % GITHUB_LOADING_DOT_COUNT;
                 let color = match distance {
                     0 => tokens.accent,
@@ -11608,19 +11943,115 @@ impl Muxtrix {
         // No unread tally. The pip and the state label already say a pane wants
         // the user; the count only said how many times it said so while they
         // were elsewhere, which never changes what they do next.
-        let mut pane_line = row![pane_identity].spacing(10).align_y(Alignment::Center);
-        pane_line = pane_line.push(state);
+        let pane_line = row![pane_identity, state]
+            .spacing(10)
+            .align_y(Alignment::Center);
         let details = column![location_line, pane_line].spacing(3).width(Fill);
-        row![
+        let pull_request = self
+            .pane_repositories
+            .get(&pane_id)
+            .and_then(|repository| repository.pull_request.clone());
+        let has_pull_request = pull_request.is_some();
+        let mut row = row![
             rail_marker(focused, targeted, tokens),
             button(centered_button_content(details))
                 .on_press(Message::FocusFleetPane(workspace.id, pane_id))
                 .height(52)
                 .padding([5, 8])
                 .width(Fill)
-                .style(move |_, status| rail_row_style(tokens, focused, targeted, status)),
+                .style(move |_, status| {
+                    rail_row_style(
+                        tokens,
+                        focused && !has_pull_request,
+                        targeted && !has_pull_request,
+                        status,
+                    )
+                }),
         ]
-        .into()
+        .align_y(Alignment::Center);
+        if let Some(pull_request) = pull_request {
+            let (state_label, icon_kind, color) = match pull_request.state {
+                github::CurrentPullRequestState::Open => {
+                    ("Open", IconKind::PullRequestOpen, tokens.accent)
+                }
+                github::CurrentPullRequestState::Draft => {
+                    ("Draft", IconKind::PullRequestDraft, tokens.muted)
+                }
+                github::CurrentPullRequestState::Closed => {
+                    ("Closed", IconKind::PullRequestClosed, tokens.faint)
+                }
+                github::CurrentPullRequestState::Merged => {
+                    ("Merged", IconKind::PullRequestMerged, tokens.github_merged)
+                }
+            };
+            let marker = app_tooltip(
+                button(
+                    row![
+                        icon(icon_kind, color, self.settings.ui_pixels(9.0)),
+                        text(pull_request.number.to_string())
+                            .size(self.settings.ui_pixels(8.5))
+                            .font(self.settings.terminal_font.iced())
+                            .color(color),
+                    ]
+                    .spacing(3)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::OpenGitHubPullRequest(pull_request.url.clone()))
+                .height(30)
+                .padding([0, 3])
+                .style(move |_, status| quiet_button_style(tokens, false, status)),
+                format!(
+                    "Pull request #{} · {state_label}\nOpen in GitHub",
+                    pull_request.number
+                ),
+                tooltip::Position::Right,
+                tokens,
+                self.settings.ui_pixels(9.0),
+            );
+            row = row.push(
+                container(column![iced::widget::Space::new().height(22), marker])
+                    .height(52)
+                    .padding([0, 2]),
+            );
+            return container(row)
+                .width(Fill)
+                .style(move |_| {
+                    let background = if targeted {
+                        Some(
+                            Color {
+                                a: 0.18,
+                                ..tokens.accent
+                            }
+                            .into(),
+                        )
+                    } else if focused {
+                        Some(
+                            Color {
+                                a: 0.07,
+                                ..tokens.text
+                            }
+                            .into(),
+                        )
+                    } else {
+                        None
+                    };
+                    container::Style {
+                        background,
+                        border: if targeted {
+                            Border {
+                                color: tokens.accent,
+                                width: 1.0,
+                                radius: 0.0.into(),
+                            }
+                        } else {
+                            Border::default()
+                        },
+                        ..container::Style::default()
+                    }
+                })
+                .into();
+        }
+        row.into()
     }
 
     fn pane_location_label(&self, pane_id: PaneId) -> String {
@@ -15552,6 +15983,7 @@ fn git_repository_root(
 /// grouping from `--show-toplevel` would split one repository into many fake
 /// repos. Git's common directory points every linked worktree back to the
 /// primary checkout's `.git` directory.
+#[cfg(test)]
 fn git_repository_name(directory: &std::path::Path, wsl_distribution: &str) -> Option<String> {
     let root = git_repository_root(directory, wsl_distribution)?;
     git_repository_name_from_root(&root, wsl_distribution)
@@ -15561,10 +15993,23 @@ fn git_repository_name_from_root(
     repo_root: &std::path::Path,
     wsl_distribution: &str,
 ) -> Option<String> {
-    let common = git_in(
+    git_repository_name_from_root_cancellable(
+        repo_root,
+        wsl_distribution,
+        &ProcessCancellation::default(),
+    )
+}
+
+fn git_repository_name_from_root_cancellable(
+    repo_root: &std::path::Path,
+    wsl_distribution: &str,
+    cancellation: &ProcessCancellation,
+) -> Option<String> {
+    let common = git_in_cancellable(
         repo_root,
         wsl_distribution,
         &["rev-parse", "--git-common-dir"],
+        cancellation,
     )
     .ok()
     .filter(|output| output.status.success())
@@ -16017,10 +16462,24 @@ fn git_in(
     wsl_distribution: &str,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
+    git_in_cancellable(
+        repo_root,
+        wsl_distribution,
+        args,
+        &ProcessCancellation::default(),
+    )
+}
+
+fn git_in_cancellable(
+    repo_root: &std::path::Path,
+    wsl_distribution: &str,
+    args: &[&str],
+    cancellation: &ProcessCancellation,
+) -> Result<std::process::Output, String> {
     #[cfg(target_os = "windows")]
     let mut command = if path_is_wsl_side(repo_root) {
         let mut command = wsl_command(wsl_distribution);
-        command.args(["--exec", "git"]);
+        command.args(["--exec", "env", "GIT_OPTIONAL_LOCKS=0", "git"]);
         command
     } else {
         console_command("git")
@@ -16028,12 +16487,14 @@ fn git_in(
     #[cfg(not(target_os = "windows"))]
     let mut command = console_command("git");
     let _ = wsl_distribution;
-    command
-        .arg("-C")
-        .arg(repo_root)
-        .args(args)
-        .output()
-        .map_err(|error| format!("could not run git: {error}"))
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command.arg("-C").arg(repo_root).args(args);
+    command_output(
+        &mut command,
+        std::time::Duration::from_secs(2 * 60),
+        cancellation,
+    )
+    .map_err(|error| format!("could not run git: {error}"))
 }
 
 fn create_git_worktree(
@@ -16177,6 +16638,10 @@ enum IconKind {
     StatusWarning,
     StatusError,
     StatusInfo,
+    PullRequestOpen,
+    PullRequestDraft,
+    PullRequestClosed,
+    PullRequestMerged,
 }
 
 fn icon<'a>(kind: IconKind, color: Color, size: f32) -> svg::Svg<'a> {
@@ -16201,6 +16666,10 @@ fn icon<'a>(kind: IconKind, color: Color, size: f32) -> svg::Svg<'a> {
         IconKind::StatusWarning => include_bytes!("../assets/icons/status-warning.svg"),
         IconKind::StatusError => include_bytes!("../assets/icons/status-error.svg"),
         IconKind::StatusInfo => include_bytes!("../assets/icons/status-info.svg"),
+        IconKind::PullRequestOpen => include_bytes!("../assets/icons/pull-request-open.svg"),
+        IconKind::PullRequestDraft => include_bytes!("../assets/icons/pull-request-draft.svg"),
+        IconKind::PullRequestClosed => include_bytes!("../assets/icons/pull-request-closed.svg"),
+        IconKind::PullRequestMerged => include_bytes!("../assets/icons/pull-request-merged.svg"),
     };
     svg(svg::Handle::from_memory(bytes))
         .width(size)
@@ -20323,6 +20792,36 @@ mod tests {
             }
         );
     }
+    #[test]
+    fn startup_authentication_starts_the_visible_pull_request_list() {
+        let mut app = Muxtrix::new();
+        let mut panel = GitHubPanelState::loading(github::Repository {
+            root: std::env::temp_dir(),
+            name: "muxtrix".into(),
+            owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
+            branch: "main".into(),
+            head_oid: String::new(),
+            wsl_distribution: String::new(),
+        });
+        panel.active_tab = GitHubPanelTab::PullRequests;
+        panel.loading = false;
+        app.github_panel = Some(panel);
+        app.github_auth_generation = 3;
+
+        drop(app.update(Message::GitHubAuthChecked(
+            3,
+            github::AuthStatus::Authenticated {
+                login: "octocat".into(),
+            },
+        )));
+
+        assert!(
+            app.github_panel
+                .as_ref()
+                .is_some_and(|panel| panel.pull_requests_loading)
+        );
+    }
 
     #[test]
     fn invalid_github_host_keeps_the_settings_draft_open() {
@@ -20378,6 +20877,7 @@ mod tests {
             owner_and_name: None,
             host: "github.com".into(),
             branch: String::new(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         });
         pending.context_loading = true;
@@ -20394,6 +20894,7 @@ mod tests {
                     owner_and_name: Some("example/muxtrix".into()),
                     host: "github.com".into(),
                     branch: "main".into(),
+                    head_oid: String::new(),
                     wsl_distribution: String::new(),
                 },
                 github::PanelData {
@@ -20401,6 +20902,7 @@ mod tests {
                     files: Vec::new(),
                     additions: 0,
                     deletions: 0,
+                    current_pull_request: None,
                 },
             ))),
         )));
@@ -20459,6 +20961,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "diff-viewer".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         });
         panel.data = Some(github::PanelData {
@@ -20473,6 +20976,7 @@ mod tests {
             }],
             additions: 1,
             deletions: 1,
+            current_pull_request: None,
         });
         panel.loading = false;
         app.github_panel = Some(panel);
@@ -20495,6 +20999,111 @@ mod tests {
     }
 
     #[test]
+    fn github_panel_open_publishes_loading_state_before_repository_probe() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let directory = std::env::temp_dir().join("github-panel-loading");
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "codex".into(),
+                display_name: None,
+                state: AgentState::Running,
+                activity: None,
+                session_id: None,
+                cwd: Some(directory.display().to_string()),
+                git_branch: Some("main".into()),
+            },
+        );
+
+        drop(app.open_github_panel());
+
+        assert!(app.github_panel.as_ref().is_some_and(|panel| {
+            panel.repository.root == directory
+                && panel.repository.name.is_empty()
+                && panel.context_loading
+        }));
+    }
+
+    #[test]
+    fn periodic_repository_refresh_does_not_restart_an_in_flight_probe() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let directory = app
+            .pane_working_directory(pane_id)
+            .expect("active pane should have a working directory");
+        app.pending_repository_directories
+            .insert(pane_id, directory.clone());
+        app.pane_repository_generation = 7;
+
+        drop(app.refresh_pane_repositories());
+
+        assert_eq!(app.pane_repository_generation, 7);
+        assert_eq!(
+            app.pending_repository_directories.get(&pane_id),
+            Some(&directory)
+        );
+    }
+
+    #[test]
+    fn stale_repository_metadata_is_reprobed_without_a_directory_or_branch_change() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let directory = app
+            .pane_working_directory(pane_id)
+            .expect("active pane should have a working directory");
+        app.pane_repositories.insert(
+            pane_id,
+            PaneRepository {
+                directory: directory.clone(),
+                root: Some(directory.clone()),
+                name: Some("muxtrix".into()),
+                worktree_name: None,
+                branch: Some("main".into()),
+                head_oid: Some("old-head".into()),
+                pull_request: None,
+                checked_at: std::time::Instant::now() - PANE_REPOSITORY_INTERVAL,
+            },
+        );
+
+        drop(app.refresh_pane_repositories());
+
+        assert_eq!(
+            app.pending_repository_directories.get(&pane_id),
+            Some(&directory)
+        );
+        assert_eq!(app.pane_repository_generation, 1);
+    }
+
+    #[test]
+    fn completed_turn_invalidates_repository_metadata_for_a_background_pane() {
+        let mut app = Muxtrix::new();
+        let original = active_pane_id(&app);
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("second pane should open");
+        let directory = app
+            .pane_working_directory(original)
+            .expect("original pane should have a working directory");
+        app.pane_repositories.insert(
+            original,
+            PaneRepository {
+                directory: directory.clone(),
+                root: Some(directory),
+                name: Some("muxtrix".into()),
+                worktree_name: None,
+                branch: Some("feature".into()),
+                head_oid: Some("old-head".into()),
+                pull_request: None,
+                checked_at: std::time::Instant::now(),
+            },
+        );
+
+        app.queue_github_pull_request_refresh(original);
+
+        assert!(!app.pane_repositories.contains_key(&original));
+    }
+
+    #[test]
     fn pane_focus_invalidates_local_diff_and_wakes_refresh_subscription() {
         let mut app = Muxtrix::new();
         let original = active_pane_id(&app);
@@ -20508,6 +21117,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "main".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         });
         panel.context_loading = false;
@@ -20543,6 +21153,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "main".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         });
         panel.context_loading = false;
@@ -20581,6 +21192,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "main".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         });
         panel.context_loading = false;
@@ -20601,6 +21213,7 @@ mod tests {
                     owner_and_name: Some("example/stale".into()),
                     host: "github.com".into(),
                     branch: "stale".into(),
+                    head_oid: String::new(),
                     wsl_distribution: String::new(),
                 },
                 github::PanelData {
@@ -20608,6 +21221,7 @@ mod tests {
                     files: Vec::new(),
                     additions: 0,
                     deletions: 0,
+                    current_pull_request: None,
                 },
             ))),
         )));
@@ -20616,7 +21230,68 @@ mod tests {
         assert_eq!(active_pane_id(&app), second);
         assert_eq!(panel.repository.root, current_root);
         assert!(panel.context_loading);
-        assert!(app.github_pane_refresh_pending);
+        assert_eq!(
+            app.github_context_generation, 8,
+            "the focus mismatch must launch a fresh request instead of waiting for a timer"
+        );
+    }
+
+    #[test]
+    fn local_refresh_clamps_file_cursor_after_the_change_set_shrinks() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let root = std::env::temp_dir().join("github-local-clamp");
+        let repository = github::Repository {
+            root: root.clone(),
+            name: "muxtrix".into(),
+            owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
+            branch: "main".into(),
+            head_oid: String::new(),
+            wsl_distribution: String::new(),
+        };
+        let file = github::FileChange {
+            path: "src/main.rs".into(),
+            previous_path: None,
+            status: "Modified".into(),
+            additions: 1,
+            deletions: 0,
+            patch: None,
+        };
+        let mut panel = GitHubPanelState::loading(repository.clone());
+        panel.loading = false;
+        panel.context_loading = true;
+        panel.data = Some(github::PanelData {
+            branch: "main".into(),
+            files: vec![file.clone(); 5],
+            additions: 5,
+            deletions: 0,
+            current_pull_request: None,
+        });
+        panel.file_keyboard_cursor = Some(4);
+        panel.file_scroll_offset = 9_999.0;
+        app.github_panel = Some(panel);
+        app.github_context_generation = 3;
+
+        drop(app.update(Message::GitHubFocusedPaneLoaded(
+            pane_id,
+            3,
+            GitHubContextLoad::Refresh,
+            Box::new(Ok((
+                repository,
+                github::PanelData {
+                    branch: "main".into(),
+                    files: vec![file],
+                    additions: 1,
+                    deletions: 0,
+                    current_pull_request: None,
+                },
+            ))),
+        )));
+
+        let panel = app.github_panel.as_ref().expect("panel should remain open");
+        assert_eq!(panel.file_keyboard_cursor, Some(0));
+        assert_eq!(panel.file_scroll_offset, 0.0);
     }
 
     #[test]
@@ -20656,6 +21331,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "mk-152".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         });
         panel.active_tab = GitHubPanelTab::PullRequests;
@@ -20703,6 +21379,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "mk-152".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         });
         panel.active_tab = GitHubPanelTab::PullRequests;
@@ -20736,7 +21413,7 @@ mod tests {
         let panel = app.github_panel.as_ref().expect("panel should remain open");
         assert!(!app.github_pull_requests_refresh_pending);
         assert_eq!(panel.pull_request_generation, 1);
-        assert_eq!(panel.pull_request_detail_generation, 1);
+        assert_eq!(panel.pull_request_detail_generation, 2);
         assert_eq!(panel.selected_pull_request_file_scroll_offset, 84.0);
         assert_eq!(panel.file_keyboard_cursor, Some(3));
         assert_eq!(panel.keyboard_focus, Some(GitHubPanelKeyboardFocus::Files));
@@ -20752,6 +21429,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "mk-152".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         });
         panel.loading = false;
@@ -20785,6 +21463,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "main".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         });
         panel.active_tab = GitHubPanelTab::PullRequests;
@@ -20844,6 +21523,86 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_actions_update_panel_and_fleet_marker_caches() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let root = std::env::temp_dir().join("github-action-cache");
+        let current = github::CurrentPullRequest {
+            number: 42,
+            url: "https://github.com/example/muxtrix/pull/42".into(),
+            state: github::CurrentPullRequestState::Draft,
+        };
+        let mut panel = GitHubPanelState::loading(github::Repository {
+            root: root.clone(),
+            name: "muxtrix".into(),
+            owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
+            branch: "feature".into(),
+            head_oid: String::new(),
+            wsl_distribution: String::new(),
+        });
+        panel.loading = false;
+        panel.data = Some(github::PanelData {
+            branch: "feature".into(),
+            files: Vec::new(),
+            additions: 0,
+            deletions: 0,
+            current_pull_request: Some(current.clone()),
+        });
+        app.github_panel = Some(panel);
+        app.pane_repositories.insert(
+            pane_id,
+            PaneRepository {
+                directory: root.clone(),
+                root: Some(root.clone()),
+                name: Some("muxtrix".into()),
+                worktree_name: None,
+                branch: Some("feature".into()),
+                head_oid: Some(String::new()),
+                pull_request: Some(current),
+                checked_at: std::time::Instant::now(),
+            },
+        );
+
+        drop(app.update(Message::GitHubPullRequestDraftChanged(
+            root.clone(),
+            42,
+            0,
+            false,
+            Ok("ready".into()),
+        )));
+        assert_eq!(
+            app.pane_repositories[&pane_id]
+                .pull_request
+                .as_ref()
+                .map(|pull_request| pull_request.state),
+            Some(github::CurrentPullRequestState::Open)
+        );
+        assert_eq!(
+            app.github_panel
+                .as_ref()
+                .and_then(|panel| panel.data.as_ref())
+                .and_then(|data| data.current_pull_request.as_ref())
+                .map(|pull_request| pull_request.state),
+            Some(github::CurrentPullRequestState::Open)
+        );
+
+        drop(app.update(Message::GitHubMergeFinished(
+            root,
+            42,
+            0,
+            Ok("merged".into()),
+        )));
+        assert_eq!(
+            app.pane_repositories[&pane_id]
+                .pull_request
+                .as_ref()
+                .map(|pull_request| pull_request.state),
+            Some(github::CurrentPullRequestState::Merged)
+        );
+    }
+
+    #[test]
     fn draft_update_keeps_detail_and_summary_in_sync() {
         let mut app = Muxtrix::new();
         let repository = github::Repository {
@@ -20852,6 +21611,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "draft-toggle".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         };
         let mut panel = GitHubPanelState::loading(repository.clone());
@@ -20918,6 +21678,7 @@ mod tests {
         drop(app.update(Message::GitHubPullRequestDraftChanged(
             repository.root,
             42,
+            0,
             false,
             Ok("Marked pull request #42 ready for review".into()),
         )));
@@ -20955,6 +21716,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "main".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         };
         let mut panel = GitHubPanelState::loading(repository.clone());
@@ -21012,6 +21774,7 @@ mod tests {
             loading: false,
             error: None,
             generation: 0,
+            cancellation: ProcessCancellation::default(),
             scroll_offset: 0.0,
             wrap_columns: None,
             line_starts: Vec::new(),
@@ -21021,6 +21784,7 @@ mod tests {
         drop(app.update(Message::GitHubMergeFinished(
             repository.root.clone(),
             42,
+            0,
             Ok("Merged pull request #42".into()),
         )));
 
@@ -21052,6 +21816,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "main".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         };
         let mut panel = GitHubPanelState::loading(repository);
@@ -21108,6 +21873,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "main".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         }));
 
@@ -21135,6 +21901,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "main".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         });
         panel.active_tab = GitHubPanelTab::PullRequests;
@@ -24237,8 +25004,13 @@ mod tests {
                 pane_id,
                 PaneRepository {
                     directory,
+                    root: None,
                     name: name.map(str::to_owned),
                     worktree_name: None,
+                    branch: None,
+                    head_oid: None,
+                    pull_request: None,
+                    checked_at: std::time::Instant::now(),
                 },
             );
         }
@@ -24299,8 +25071,13 @@ mod tests {
                 pane_id,
                 PaneRepository {
                     directory,
+                    root: None,
                     name: Some("muxtrix".into()),
                     worktree_name: None,
+                    branch: None,
+                    head_oid: None,
+                    pull_request: None,
+                    checked_at: std::time::Instant::now(),
                 },
             );
         }
@@ -24530,8 +25307,13 @@ mod tests {
             pane_id,
             PaneRepository {
                 directory: directory.clone(),
+                root: None,
                 name: Some("muxtrix".into()),
                 worktree_name: Some("fleet-two-line-rows".into()),
+                branch: None,
+                head_oid: None,
+                pull_request: None,
+                checked_at: std::time::Instant::now(),
             },
         );
 
@@ -24576,8 +25358,13 @@ mod tests {
             pane_id,
             PaneRepository {
                 directory,
+                root: None,
                 name: Some("muxtrix".into()),
                 worktree_name: Some(duplicate.into()),
+                branch: None,
+                head_oid: None,
+                pull_request: None,
+                checked_at: std::time::Instant::now(),
             },
         );
 
@@ -24629,8 +25416,13 @@ mod tests {
             pane_id,
             PaneRepository {
                 directory,
+                root: None,
                 name: Some("muxtrix".into()),
                 worktree_name: Some(duplicate.into()),
+                branch: None,
+                head_oid: None,
+                pull_request: None,
+                checked_at: std::time::Instant::now(),
             },
         );
         app.agent_statuses.insert(

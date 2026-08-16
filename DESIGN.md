@@ -185,6 +185,13 @@ rollup dot when a visible pane inside needs a person. Repos uses workspace and
 repository bands only, with no nested tab grouping. The workspace cards above
 the fleet keep their roll-ups: name, state, counts, and the live mono path.
 
+When a pane's checked-out branch has a linked GitHub pull request, the row
+ends with its state-specific pull-request mark and number. Open, draft, closed,
+and merged remain distinguishable by icon shape as well as semantic color; the
+tooltip names the state, and activating only that compact marker opens the
+pull request in GitHub without changing pane focus. The selected/cursor surface
+continues beneath the marker so it remains visibly owned by the pane row.
+
 A rail row never changes type weight with its state. Weight is the one property
 that alters text metrics, so varying it re-fits the row's own ellipsis and
 slides every glyph sideways as the selection moves; state rides on colour, fill,

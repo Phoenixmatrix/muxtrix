@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::{process::console_command, settings::normalize_github_host};
+use crate::{
+    process::{ProcessCancellation, command_output, command_output_limited, console_command},
+    settings::normalize_github_host,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuthStatus {
@@ -23,6 +25,7 @@ pub(crate) struct Repository {
     pub(crate) owner_and_name: Option<String>,
     pub(crate) host: String,
     pub(crate) branch: String,
+    pub(crate) head_oid: String,
     pub(crate) wsl_distribution: String,
 }
 
@@ -75,6 +78,9 @@ const REMOTE_DIFF_SOURCE_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// resolved result, so give it a short, bounded window to settle.
 const MERGEABILITY_QUERY_ATTEMPTS: usize = 3;
 const MERGEABILITY_RETRY_DELAY: Duration = Duration::from_millis(500);
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const GITHUB_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const GITHUB_AUTH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckSummary {
@@ -119,6 +125,21 @@ impl PullRequestSummaryStatus {
             Self::Merged => "Merged",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CurrentPullRequestState {
+    Open,
+    Draft,
+    Closed,
+    Merged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrentPullRequest {
+    pub(crate) number: u64,
+    pub(crate) url: String,
+    pub(crate) state: CurrentPullRequestState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,12 +241,14 @@ pub(crate) struct PanelData {
     pub(crate) files: Vec<FileChange>,
     pub(crate) additions: usize,
     pub(crate) deletions: usize,
+    pub(crate) current_pull_request: Option<CurrentPullRequest>,
 }
 
 pub(crate) fn repository_from(
     directory: &Path,
     wsl_distribution: &str,
     github_host: &str,
+    cancellation: &ProcessCancellation,
 ) -> Result<Repository, String> {
     let github_host = normalize_github_host(github_host)
         .map_err(|error| format!("GitHub host is invalid: {error}"))?;
@@ -233,6 +256,7 @@ pub(crate) fn repository_from(
         directory,
         wsl_distribution,
         &["rev-parse", "--show-toplevel"],
+        cancellation,
     )?;
     if !root_output.status.success() {
         return Err("The focused pane is not inside a Git repository.".into());
@@ -241,7 +265,12 @@ pub(crate) fn repository_from(
     if root.as_os_str().is_empty() {
         return Err("Git did not return a repository root for the focused pane.".into());
     }
-    let branch_output = git(&root, wsl_distribution, &["branch", "--show-current"])?;
+    let branch_output = git(
+        &root,
+        wsl_distribution,
+        &["branch", "--show-current"],
+        cancellation,
+    )?;
     let branch = if branch_output.status.success() {
         let branch = stdout_line(&branch_output);
         if branch.is_empty() {
@@ -252,10 +281,26 @@ pub(crate) fn repository_from(
     } else {
         "Unknown branch".into()
     };
-    let remote = git(&root, wsl_distribution, &["remote", "get-url", "origin"])
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| stdout_line(&output));
+    let head_output = git(
+        &root,
+        wsl_distribution,
+        &["rev-parse", "HEAD"],
+        cancellation,
+    )?;
+    let head_oid = if head_output.status.success() {
+        stdout_line(&head_output)
+    } else {
+        String::new()
+    };
+    let remote = git(
+        &root,
+        wsl_distribution,
+        &["remote", "get-url", "origin"],
+        cancellation,
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| stdout_line(&output));
     let name = root
         .file_name()
         .and_then(|name| name.to_str())
@@ -269,11 +314,52 @@ pub(crate) fn repository_from(
             .and_then(|remote| parse_github_remote(remote, &github_host)),
         host: github_host,
         branch,
+        head_oid,
         wsl_distribution: wsl_distribution.to_owned(),
     })
 }
 
-pub(crate) fn auth_status(github_host: &str) -> AuthStatus {
+pub(crate) fn current_pull_request(
+    repository: &Repository,
+    cancellation: &ProcessCancellation,
+) -> Result<Option<CurrentPullRequest>, String> {
+    if matches!(
+        repository.branch.as_str(),
+        "Detached HEAD" | "Unknown branch"
+    ) {
+        return Ok(None);
+    }
+    let owner_and_name = github_repository(repository)?;
+    let mut command = github_command(&repository.host);
+    command.args([
+        "pr",
+        "view",
+        &repository.branch,
+        "--repo",
+        owner_and_name,
+        "--json",
+        "number,state,isDraft,url",
+    ]);
+    let output = command_output(&mut command, GITHUB_COMMAND_TIMEOUT, cancellation)
+        .map_err(|error| format!("GitHub current pull request could not be read: {error}"))?;
+    if !output.status.success() {
+        let failure = output_failure(&output);
+        let normalized = failure.to_ascii_lowercase();
+        if normalized.contains("no pull requests found")
+            || normalized.contains("could not resolve to a pullrequest")
+        {
+            return Ok(None);
+        }
+        return Err(if failure.is_empty() {
+            "GitHub current pull request is unavailable.".into()
+        } else {
+            failure
+        });
+    }
+    parse_current_pull_request(&output.stdout).map(Some)
+}
+
+pub(crate) fn auth_status(github_host: &str, cancellation: &ProcessCancellation) -> AuthStatus {
     let github_host = match normalize_github_host(github_host) {
         Ok(host) => host,
         Err(error) => {
@@ -282,10 +368,9 @@ pub(crate) fn auth_status(github_host: &str) -> AuthStatus {
             };
         }
     };
-    let output = match github_command(&github_host)
-        .args(["api", "user", "--jq", ".login"])
-        .output()
-    {
+    let mut command = github_command(&github_host);
+    command.args(["api", "user", "--jq", ".login"]);
+    let output = match command_output(&mut command, GITHUB_COMMAND_TIMEOUT, cancellation) {
         Ok(output) => output,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return AuthStatus::Unavailable {
@@ -321,21 +406,24 @@ pub(crate) fn auth_status(github_host: &str) -> AuthStatus {
     }
 }
 
-pub(crate) fn authenticate(github_host: &str) -> Result<AuthStatus, String> {
+pub(crate) fn authenticate(
+    github_host: &str,
+    cancellation: &ProcessCancellation,
+) -> Result<AuthStatus, String> {
     let github_host = normalize_github_host(github_host)
         .map_err(|error| format!("GitHub host is invalid: {error}"))?;
-    let output = github_command(&github_host)
-        .args([
-            "auth",
-            "login",
-            "--hostname",
-            &github_host,
-            "--git-protocol",
-            "https",
-            "--web",
-        ])
-        .output()
-        .map_err(|error| {
+    let mut command = github_auth_command(&github_host);
+    command.args([
+        "auth",
+        "login",
+        "--hostname",
+        &github_host,
+        "--git-protocol",
+        "https",
+        "--web",
+    ]);
+    let output =
+        command_output(&mut command, GITHUB_AUTH_TIMEOUT, cancellation).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 "Install the GitHub CLI, then try connecting again.".to_owned()
             } else {
@@ -348,7 +436,7 @@ pub(crate) fn authenticate(github_host: &str) -> Result<AuthStatus, String> {
             "GitHub authentication did not finish. Try again when you are ready.",
         ));
     }
-    match auth_status(&github_host) {
+    match auth_status(&github_host, cancellation) {
         status @ AuthStatus::Authenticated { .. } => Ok(status),
         _ => Err(format!(
             "{github_host} did not report an authenticated account after login."
@@ -356,11 +444,15 @@ pub(crate) fn authenticate(github_host: &str) -> Result<AuthStatus, String> {
     }
 }
 
-pub(crate) fn load_local(repository: &Repository) -> Result<PanelData, String> {
+pub(crate) fn load_local(
+    repository: &Repository,
+    cancellation: &ProcessCancellation,
+) -> Result<PanelData, String> {
     let status = git(
         &repository.root,
         &repository.wsl_distribution,
-        &["status", "--porcelain=v1"],
+        &["status", "--porcelain=v1", "-z"],
+        cancellation,
     )?;
     if !status.status.success() {
         return Err(nonempty_failure(
@@ -368,14 +460,15 @@ pub(crate) fn load_local(repository: &Repository) -> Result<PanelData, String> {
             "Git could not read the repository status.",
         ));
     }
-    let mut files = parse_status(&String::from_utf8_lossy(&status.stdout));
+    let mut files = parse_status(&status.stdout)?;
     let numstat = git(
         &repository.root,
         &repository.wsl_distribution,
-        &["diff", "HEAD", "--numstat"],
+        &["diff", "HEAD", "--numstat", "-z"],
+        cancellation,
     )?;
     if numstat.status.success() {
-        apply_numstat(&mut files, &String::from_utf8_lossy(&numstat.stdout));
+        apply_numstat(&mut files, &numstat.stdout)?;
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let additions = files.iter().map(|file| file.additions).sum();
@@ -385,14 +478,16 @@ pub(crate) fn load_local(repository: &Repository) -> Result<PanelData, String> {
         files,
         additions,
         deletions,
+        current_pull_request: None,
     })
 }
 
 pub(crate) fn list_pull_requests(
     repository: &Repository,
+    cancellation: &ProcessCancellation,
 ) -> Result<Vec<PullRequestSummary>, String> {
     retry_pending_mergeability(
-        || load_pull_request_summaries(repository),
+        || load_pull_request_summaries(repository, cancellation),
         |pull_requests| {
             pull_requests
                 .iter()
@@ -402,22 +497,25 @@ pub(crate) fn list_pull_requests(
     )
 }
 
-fn load_pull_request_summaries(repository: &Repository) -> Result<Vec<PullRequestSummary>, String> {
+fn load_pull_request_summaries(
+    repository: &Repository,
+    cancellation: &ProcessCancellation,
+) -> Result<Vec<PullRequestSummary>, String> {
     let owner_and_name = github_repository(repository)?;
-    let output = github_command(&repository.host)
-        .args([
-            "pr",
-            "list",
-            "--repo",
-            owner_and_name,
-            "--state",
-            "open",
-            "--limit",
-            "1000",
-            "--json",
-            "number,title,url,author,headRefName,baseRefName,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup",
-        ])
-        .output()
+    let mut command = github_command(&repository.host);
+    command.args([
+        "pr",
+        "list",
+        "--repo",
+        owner_and_name,
+        "--state",
+        "open",
+        "--limit",
+        "1000",
+        "--json",
+        "number,title,url,author,headRefName,baseRefName,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup",
+    ]);
+    let output = command_output(&mut command, GITHUB_COMMAND_TIMEOUT, cancellation)
         .map_err(|error| format!("GitHub pull requests could not be read: {error}"))?;
     if !output.status.success() {
         return Err(nonempty_failure(
@@ -431,10 +529,12 @@ fn load_pull_request_summaries(repository: &Repository) -> Result<Vec<PullReques
 pub(crate) fn load_pull_request_details(
     repository: &Repository,
     number: u64,
+    cancellation: &ProcessCancellation,
 ) -> Result<PullRequestDetails, String> {
     let owner_and_name = github_repository(repository)?;
-    let pull_request = load_pull_request(repository, number)?;
-    let mut files = load_pull_request_files(&repository.host, owner_and_name, number)?;
+    let pull_request = load_pull_request(repository, number, cancellation)?;
+    let mut files =
+        load_pull_request_files(&repository.host, owner_and_name, number, cancellation)?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(PullRequestDetails {
         pull_request,
@@ -446,6 +546,7 @@ pub(crate) fn load_diff(
     repository: &Repository,
     file: &FileChange,
     github_patch: bool,
+    cancellation: &ProcessCancellation,
 ) -> Result<DiffDocument, String> {
     validate_relative_git_path(&file.path)?;
     if let Some(previous) = file.previous_path.as_deref() {
@@ -496,6 +597,7 @@ pub(crate) fn load_diff(
                 "/dev/null",
                 &file.path,
             ],
+            cancellation,
         )?
     } else if let Some(previous) = file.previous_path.as_deref() {
         git(
@@ -510,6 +612,7 @@ pub(crate) fn load_diff(
                 previous,
                 &file.path,
             ],
+            cancellation,
         )?
     } else {
         git(
@@ -523,6 +626,7 @@ pub(crate) fn load_diff(
                 "--",
                 &file.path,
             ],
+            cancellation,
         )?
     };
     // `git diff --no-index` returns one when differences exist.
@@ -547,13 +651,14 @@ pub(crate) fn load_pull_request_diff(
     repository: &Repository,
     pull_request: &PullRequest,
     file: &FileChange,
+    cancellation: &ProcessCancellation,
 ) -> Result<DiffDocument, String> {
     validate_relative_git_path(&file.path)?;
     if let Some(previous) = file.previous_path.as_deref() {
         validate_relative_git_path(previous)?;
     }
     let inline = if file.patch.is_some() {
-        let document = load_diff(repository, file, true)?;
+        let document = load_diff(repository, file, true, cancellation)?;
         if !document.truncated {
             return Ok(document);
         }
@@ -562,7 +667,7 @@ pub(crate) fn load_pull_request_diff(
         None
     };
 
-    match reconstruct_pull_request_diff(repository, pull_request, file) {
+    match reconstruct_pull_request_diff(repository, pull_request, file, cancellation) {
         Ok(document) if !document.lines.is_empty() || inline.is_none() => Ok(document),
         Ok(_) | Err(_) if inline.is_some() => Ok(inline.expect("inline patch checked above")),
         Err(error) => Err(error),
@@ -574,6 +679,7 @@ fn reconstruct_pull_request_diff(
     repository: &Repository,
     pull_request: &PullRequest,
     file: &FileChange,
+    cancellation: &ProcessCancellation,
 ) -> Result<DiffDocument, String> {
     let previous_path = file.previous_path.as_deref().unwrap_or(&file.path);
     let before = if file.status == "Added" {
@@ -585,6 +691,7 @@ fn reconstruct_pull_request_diff(
             &pull_request.base_oid,
             previous_path,
             "base",
+            cancellation,
         )? {
             RemoteFile::Content(bytes) => bytes,
             RemoteFile::TooLarge => return Ok(remote_diff_too_large()),
@@ -603,6 +710,7 @@ fn reconstruct_pull_request_diff(
             &pull_request.head_oid,
             &file.path,
             "head",
+            cancellation,
         )? {
             RemoteFile::Content(bytes) => bytes,
             RemoteFile::TooLarge => return Ok(remote_diff_too_large()),
@@ -618,7 +726,7 @@ fn reconstruct_pull_request_diff(
         });
     }
 
-    diff_remote_file_contents(&before, &after)
+    diff_remote_file_contents(&before, &after, cancellation)
 }
 
 fn load_remote_file(
@@ -627,6 +735,7 @@ fn load_remote_file(
     oid: &str,
     path: &str,
     revision_label: &str,
+    cancellation: &ProcessCancellation,
 ) -> Result<RemoteFile, String> {
     let endpoint = format!(
         "repos/{owner_and_name}/contents/{}?ref={}",
@@ -634,57 +743,32 @@ fn load_remote_file(
         percent_encode_github_path(oid),
     );
     let mut command = github_command(github_host);
-    command
-        .args([
-            "api",
-            "-H",
-            "Accept: application/vnd.github.raw+json",
-            &endpoint,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("GitHub could not load the {revision_label} file: {error}"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "GitHub did not expose the requested file contents.".to_owned())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "GitHub did not expose diagnostics for the file request.".to_owned())?;
-    // Drain diagnostics concurrently so an unexpectedly verbose CLI error can
-    // never block the bounded content read. Only the first 64 KiB is retained.
-    let stderr_reader = std::thread::spawn(move || drain_with_storage_limit(stderr, 64 * 1024));
-    let mut bytes = Vec::with_capacity(REMOTE_DIFF_SOURCE_MAX_BYTES.min(256 * 1024));
-    let read_result = stdout
-        .by_ref()
-        .take((REMOTE_DIFF_SOURCE_MAX_BYTES + 1) as u64)
-        .read_to_end(&mut bytes);
-    let too_large = bytes.len() > REMOTE_DIFF_SOURCE_MAX_BYTES;
-    if too_large || read_result.is_err() {
-        let _ = child.kill();
-    }
-    let status = child
-        .wait()
-        .map_err(|error| format!("GitHub file loading did not finish cleanly: {error}"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| "GitHub's diagnostic reader stopped unexpectedly.".to_owned())?;
-    read_result.map_err(|error| format!("GitHub file contents could not be read: {error}"))?;
-    if too_large {
+    command.args([
+        "api",
+        "-H",
+        "Accept: application/vnd.github.raw+json",
+        &endpoint,
+    ]);
+    let captured = command_output_limited(
+        &mut command,
+        GITHUB_COMMAND_TIMEOUT,
+        cancellation,
+        Some(REMOTE_DIFF_SOURCE_MAX_BYTES),
+        Some(64 * 1024),
+    )
+    .map_err(|error| format!("GitHub could not load the {revision_label} file: {error}"))?;
+    if captured.stdout_truncated {
         return Ok(RemoteFile::TooLarge);
     }
-    if !status.success() {
-        let failure = String::from_utf8_lossy(&stderr).trim().to_owned();
+    if !captured.output.status.success() {
+        let failure = output_failure(&captured.output);
         return Err(if failure.is_empty() {
             format!("GitHub could not load the {revision_label} version of {path}.")
         } else {
             failure
         });
     }
-    Ok(RemoteFile::Content(bytes))
+    Ok(RemoteFile::Content(captured.output.stdout))
 }
 
 enum RemoteFile {
@@ -704,19 +788,6 @@ fn remote_diff_too_large() -> DiffDocument {
     }
 }
 
-fn drain_with_storage_limit(mut reader: impl std::io::Read, limit: usize) -> Vec<u8> {
-    let mut stored = Vec::with_capacity(limit.min(8 * 1024));
-    let mut buffer = [0_u8; 8 * 1024];
-    while let Ok(read) = reader.read(&mut buffer) {
-        if read == 0 {
-            break;
-        }
-        let keep = read.min(limit.saturating_sub(stored.len()));
-        stored.extend_from_slice(&buffer[..keep]);
-    }
-    stored
-}
-
 fn percent_encode_github_path(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -734,13 +805,18 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8 * 1024).any(|byte| *byte == 0)
 }
 
-fn diff_remote_file_contents(before: &[u8], after: &[u8]) -> Result<DiffDocument, String> {
+fn diff_remote_file_contents(
+    before: &[u8],
+    after: &[u8],
+    cancellation: &ProcessCancellation,
+) -> Result<DiffDocument, String> {
     let files = TemporaryDiffFiles::create(before, after)?;
-    let output = console_command("git")
+    let mut command = console_command("git");
+    command
         .args(["diff", "--no-index", "--no-color", "--no-ext-diff", "--"])
         .arg(&files.before)
-        .arg(&files.after)
-        .output()
+        .arg(&files.after);
+    let output = command_output(&mut command, GIT_COMMAND_TIMEOUT, cancellation)
         .map_err(|error| format!("Git could not reconstruct this pull request diff: {error}"))?;
     // `git diff --no-index` returns one when differences exist.
     if !output.status.success() && output.status.code() != Some(1) {
@@ -950,11 +1026,12 @@ fn load_pull_request_files(
     github_host: &str,
     owner_and_name: &str,
     number: u64,
+    cancellation: &ProcessCancellation,
 ) -> Result<Vec<FileChange>, String> {
     let endpoint = format!("repos/{owner_and_name}/pulls/{number}/files");
-    let output = github_command(github_host)
-        .args(["api", &endpoint, "--paginate", "--slurp"])
-        .output()
+    let mut command = github_command(github_host);
+    command.args(["api", &endpoint, "--paginate", "--slurp"]);
+    let output = command_output(&mut command, GITHUB_COMMAND_TIMEOUT, cancellation)
         .map_err(|error| format!("GitHub changed files could not be read: {error}"))?;
     if !output.status.success() {
         return Err(nonempty_failure(
@@ -969,21 +1046,22 @@ pub(crate) fn merge(
     repository: &Repository,
     number: u64,
     head_oid: &str,
+    cancellation: &ProcessCancellation,
 ) -> Result<String, String> {
     let owner_and_name = github_repository(repository)?;
     let number = number.to_string();
-    let output = github_command(&repository.host)
-        .args([
-            "pr",
-            "merge",
-            &number,
-            "--repo",
-            owner_and_name,
-            "--merge",
-            "--match-head-commit",
-            head_oid,
-        ])
-        .output()
+    let mut command = github_command(&repository.host);
+    command.args([
+        "pr",
+        "merge",
+        &number,
+        "--repo",
+        owner_and_name,
+        "--merge",
+        "--match-head-commit",
+        head_oid,
+    ]);
+    let output = command_output(&mut command, GITHUB_COMMAND_TIMEOUT, cancellation)
         .map_err(|error| format!("GitHub merge could not start: {error}"))?;
     if output.status.success() {
         Ok(format!("Merged pull request #{number}"))
@@ -999,10 +1077,10 @@ pub(crate) fn set_draft(
     repository: &Repository,
     number: u64,
     draft: bool,
+    cancellation: &ProcessCancellation,
 ) -> Result<String, String> {
     let mut command = pull_request_ready_command(repository, number, draft)?;
-    let output = command
-        .output()
+    let output = command_output(&mut command, GITHUB_COMMAND_TIMEOUT, cancellation)
         .map_err(|error| format!("GitHub could not update the pull request: {error}"))?;
     if output.status.success() {
         Ok(if draft {
@@ -1022,17 +1100,25 @@ pub(crate) fn set_draft(
     }
 }
 
-fn load_pull_request(repository: &Repository, number: u64) -> Result<PullRequest, String> {
+fn load_pull_request(
+    repository: &Repository,
+    number: u64,
+    cancellation: &ProcessCancellation,
+) -> Result<PullRequest, String> {
     retry_pending_mergeability(
-        || load_pull_request_once(repository, number),
+        || load_pull_request_once(repository, number, cancellation),
         |pull_request| pull_request.readiness() == MergeReadiness::Unknown,
         || std::thread::sleep(MERGEABILITY_RETRY_DELAY),
     )
 }
 
-fn load_pull_request_once(repository: &Repository, number: u64) -> Result<PullRequest, String> {
-    let output = pull_request_view_command(repository, number)?
-        .output()
+fn load_pull_request_once(
+    repository: &Repository,
+    number: u64,
+    cancellation: &ProcessCancellation,
+) -> Result<PullRequest, String> {
+    let mut command = pull_request_view_command(repository, number)?;
+    let output = command_output(&mut command, GITHUB_COMMAND_TIMEOUT, cancellation)
         .map_err(|error| format!("GitHub pull request details could not be read: {error}"))?;
     if !output.status.success() {
         let failure = output_failure(&output);
@@ -1065,6 +1151,15 @@ fn retry_pending_mergeability<T>(
         value = updated;
     }
     Ok(value)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentPullRequestResponse {
+    number: u64,
+    state: String,
+    is_draft: bool,
+    url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1163,6 +1258,28 @@ fn parse_pull_request_files(bytes: &[u8]) -> Result<Vec<FileChange>, String> {
         .collect())
 }
 
+fn parse_current_pull_request(bytes: &[u8]) -> Result<CurrentPullRequest, String> {
+    let response: CurrentPullRequestResponse = serde_json::from_slice(bytes).map_err(|error| {
+        format!("GitHub returned invalid current pull request details: {error}")
+    })?;
+    let state = match response.state.as_str() {
+        "MERGED" => CurrentPullRequestState::Merged,
+        "CLOSED" => CurrentPullRequestState::Closed,
+        "OPEN" if response.is_draft => CurrentPullRequestState::Draft,
+        "OPEN" => CurrentPullRequestState::Open,
+        state => {
+            return Err(format!(
+                "GitHub returned an unknown pull request state: {state}"
+            ));
+        }
+    };
+    Ok(CurrentPullRequest {
+        number: response.number,
+        url: response.url,
+        state,
+    })
+}
+
 fn parse_pull_request_summaries(bytes: &[u8]) -> Result<Vec<PullRequestSummary>, String> {
     let responses: Vec<PullRequestSummaryResponse> = serde_json::from_slice(bytes)
         .map_err(|error| format!("GitHub returned an invalid pull request list: {error}"))?;
@@ -1228,6 +1345,14 @@ fn parse_pull_request(bytes: &[u8]) -> Result<PullRequest, String> {
 }
 
 fn github_command(github_host: &str) -> Command {
+    let mut command = github_auth_command(github_host);
+    command
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+fn github_auth_command(github_host: &str) -> Command {
     let mut command = console_command("gh");
     command.env("GH_HOST", github_host);
     command
@@ -1251,8 +1376,13 @@ fn summarize_checks(checks: Vec<PullRequestCheck>) -> CheckSummary {
     }
     summary
 }
-fn git(directory: &Path, wsl_distribution: &str, arguments: &[&str]) -> Result<Output, String> {
-    super::git_in(directory, wsl_distribution, arguments)
+fn git(
+    directory: &Path,
+    wsl_distribution: &str,
+    arguments: &[&str],
+    cancellation: &ProcessCancellation,
+) -> Result<Output, String> {
+    super::git_in_cancellable(directory, wsl_distribution, arguments, cancellation)
         .map_err(|error| format!("Git could not start: {error}"))
 }
 
@@ -1269,7 +1399,7 @@ fn pull_request_ready_command(
     draft: bool,
 ) -> Result<Command, String> {
     let owner_and_name = github_repository(repository)?;
-    let mut command = console_command("gh");
+    let mut command = github_command(&repository.host);
     command.args(["pr", "ready", &number.to_string(), "--repo", owner_and_name]);
     if draft {
         command.arg("--undo");
@@ -1292,66 +1422,98 @@ fn pull_request_view_command(repository: &Repository, number: u64) -> Result<Com
     Ok(command)
 }
 
-fn parse_status(status: &str) -> Vec<FileChange> {
-    status
-        .lines()
-        .filter_map(|line| {
-            if line.len() < 4 {
-                return None;
-            }
-            let code = line.get(..2)?.trim();
-            let raw_path = line.get(3..)?.trim();
-            let path = raw_path
-                .rsplit_once(" -> ")
-                .map_or(raw_path, |(_, destination)| destination)
-                .trim_matches('"')
-                .to_owned();
-            let status = match code.chars().next().unwrap_or('M') {
-                '?' => "Untracked",
-                'A' => "Added",
-                'D' => "Deleted",
-                'R' => "Renamed",
-                'C' => "Copied",
-                'U' => "Conflict",
-                _ => "Modified",
-            }
-            .to_owned();
-            Some(FileChange {
-                path,
-                previous_path: raw_path
-                    .rsplit_once(" -> ")
-                    .map(|(source, _)| source.trim_matches('"').to_owned()),
-                status,
-                additions: 0,
-                deletions: 0,
-                patch: None,
-            })
-        })
-        .collect()
+fn parse_status(status: &[u8]) -> Result<Vec<FileChange>, String> {
+    let mut records = status
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    let mut files = Vec::new();
+    while let Some(record) = records.next() {
+        if record.len() < 4 || record[2] != b' ' {
+            continue;
+        }
+        let code = [record[0], record[1]];
+        let status_code = code.into_iter().find(|code| *code != b' ').unwrap_or(b'M');
+        let renamed = code.into_iter().any(|code| matches!(code, b'R' | b'C'));
+        let path = parse_git_path(&record[3..])?;
+        let previous_path = renamed
+            .then(|| records.next())
+            .flatten()
+            .map(parse_git_path)
+            .transpose()?;
+        let status = match status_code {
+            b'?' => "Untracked",
+            b'A' => "Added",
+            b'D' => "Deleted",
+            b'R' => "Renamed",
+            b'C' => "Copied",
+            b'U' => "Conflict",
+            _ => "Modified",
+        }
+        .to_owned();
+        files.push(FileChange {
+            path,
+            previous_path,
+            status,
+            additions: 0,
+            deletions: 0,
+            patch: None,
+        });
+    }
+    Ok(files)
 }
 
-fn apply_numstat(files: &mut [FileChange], numstat: &str) {
-    let counts: BTreeMap<String, (usize, usize)> = numstat
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.splitn(3, '\t');
-            let additions = fields.next()?.parse().unwrap_or(0);
-            let deletions = fields.next()?.parse().unwrap_or(0);
-            let path = fields.next()?.to_owned();
-            Some((path, (additions, deletions)))
-        })
-        .collect();
+fn parse_git_path(path: &[u8]) -> Result<String, String> {
+    std::str::from_utf8(path)
+        .map(str::to_owned)
+        .map_err(|_| "Git reported a file name that is not valid UTF-8.".to_owned())
+}
+fn apply_numstat(files: &mut [FileChange], numstat: &[u8]) -> Result<(), String> {
+    let mut records = numstat.split(|byte| *byte == 0);
+    let mut counts = BTreeMap::new();
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let mut fields = record.splitn(3, |byte| *byte == b'\t');
+        let additions = fields
+            .next()
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let deletions = fields
+            .next()
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let Some(path) = fields.next() else {
+            continue;
+        };
+        let path = if path.is_empty() {
+            let _previous_path = records.next();
+            records.next()
+        } else {
+            Some(path)
+        };
+        if let Some(path) = path {
+            counts.insert(parse_git_path(path)?, (additions, deletions));
+        }
+    }
     for file in files {
         if let Some((additions, deletions)) = counts.get(&file.path) {
             file.additions = *additions;
             file.deletions = *deletions;
         }
     }
+    Ok(())
 }
-
 fn parse_github_remote(remote: &str, github_host: &str) -> Option<String> {
     let trimmed = remote.trim().trim_end_matches(".git");
-    let (remote_host, repository) = if let Some((_, url)) = trimmed.split_once("://") {
+    let (remote_host, repository) = if let Some(url) =
+        trimmed.strip_prefix("https://").or_else(|| {
+            trimmed
+                .strip_prefix("http://")
+                .or_else(|| trimmed.strip_prefix("ssh://"))
+        }) {
         let (authority, repository) = url.split_once('/')?;
         (authority.rsplit('@').next()?, repository)
     } else {
@@ -1429,6 +1591,7 @@ mod tests {
             owner_and_name: Some("Phoenixmatrix/muxtrix".into()),
             host: "github.example.com".into(),
             branch: "wsl-fix".into(),
+            head_oid: String::new(),
             wsl_distribution: "Ubuntu-24.04".into(),
         };
         let command =
@@ -1459,6 +1622,7 @@ mod tests {
             owner_and_name: Some("Phoenixmatrix/muxtrix".into()),
             host: "github.com".into(),
             branch: "draft-toggle".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         };
         let ready = pull_request_ready_command(&repository, 42, false)
@@ -1501,11 +1665,11 @@ mod tests {
             status: PullRequestSummaryStatus::Open,
             readiness: MergeReadiness::Ready,
         };
-
-        assert!(pull_request.matches("review panel"));
-        assert!(pull_request.matches("#391"));
-        assert!(pull_request.matches("PHOENIX"));
+        assert!(pull_request.matches("391"));
+        assert!(pull_request.matches("native github"));
+        assert!(pull_request.matches("phoenixmatrix"));
         assert!(pull_request.matches("github-support"));
+        assert!(pull_request.matches("main"));
         assert!(!pull_request.matches("unrelated"));
     }
 
@@ -1525,18 +1689,33 @@ mod tests {
     }
 
     #[test]
-    fn status_and_numstat_form_truthful_file_rows() {
-        let mut files =
-            parse_status(" M src/main.rs\nA  src/new.rs\nR  old.rs -> src/moved.rs\n?? notes.md\n");
+    fn nul_status_and_numstat_preserve_unusual_paths_and_renames() {
+        let mut files = parse_status(
+            b" M src/caf\xc3\xa9.rs\0A  src/new.rs\0R  src/after -> name.rs\0src/before\nname.rs\0?? notes.md\0",
+        )
+        .expect("valid UTF-8 status should parse");
         apply_numstat(
             &mut files,
-            "12\t3\tsrc/main.rs\n7\t0\tsrc/new.rs\n1\t1\tsrc/moved.rs\n",
-        );
+            b"12\t3\tsrc/caf\xc3\xa9.rs\x007\t0\tsrc/new.rs\x001\t1\t\x00src/before\nname.rs\x00src/after -> name.rs\x00",
+        )
+        .expect("valid UTF-8 numstat should parse");
         assert_eq!(files.len(), 4);
+        assert_eq!(files[0].path, "src/café.rs");
         assert_eq!(files[0].additions, 12);
-        assert_eq!(files[2].path, "src/moved.rs");
-        assert_eq!(files[2].previous_path.as_deref(), Some("old.rs"));
+        assert_eq!(files[2].path, "src/after -> name.rs");
+        assert_eq!(
+            files[2].previous_path.as_deref(),
+            Some("src/before\nname.rs")
+        );
+        assert_eq!(files[2].additions, 1);
+        assert_eq!(files[2].deletions, 1);
         assert_eq!(files[3].status, "Untracked");
+    }
+    #[test]
+    fn status_rejects_non_utf8_paths_instead_of_changing_identity() {
+        let error = parse_status(b" M invalid-\xff.rs\0")
+            .expect_err("non-UTF-8 paths cannot be represented safely");
+        assert!(error.contains("not valid UTF-8"));
     }
 
     #[test]
@@ -1595,6 +1774,7 @@ mod tests {
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "diff-viewer".into(),
+            head_oid: String::new(),
             wsl_distribution: String::new(),
         };
         let file = FileChange {
@@ -1606,7 +1786,8 @@ mod tests {
             patch: Some("@@ -1 +1 @@\n-old\n+new".into()),
         };
 
-        let document = load_diff(&repository, &file, true).expect("patch should parse");
+        let document = load_diff(&repository, &file, true, &ProcessCancellation::default())
+            .expect("patch should parse");
         assert!(document.truncated);
         assert!(
             document
@@ -1625,8 +1806,12 @@ mod tests {
         before.push_str("old ending\n");
         after.push_str("new ending\n");
 
-        let document = diff_remote_file_contents(before.as_bytes(), after.as_bytes())
-            .expect("large textual source should diff");
+        let document = diff_remote_file_contents(
+            before.as_bytes(),
+            after.as_bytes(),
+            &ProcessCancellation::default(),
+        )
+        .expect("large textual source should diff");
 
         assert!(
             document
@@ -1685,15 +1870,6 @@ mod tests {
             );
         }
         assert!(!root.exists());
-    }
-
-    #[test]
-    fn diagnostic_drain_stores_only_its_declared_limit() {
-        let bytes = vec![b'x'; 128 * 1024];
-        assert_eq!(
-            drain_with_storage_limit(bytes.as_slice(), 64 * 1024).len(),
-            64 * 1024
-        );
     }
 
     #[test]
@@ -1780,5 +1956,41 @@ mod tests {
         );
         assert_eq!(files[1].status, "Added");
         assert_eq!(files[1].additions, 8);
+    }
+    #[test]
+    fn current_pull_request_parser_preserves_link_and_display_state() {
+        for (payload, expected_state) in [
+            (
+                br#"{"number":42,"state":"OPEN","isDraft":false,"url":"https://github.com/example/repo/pull/42"}"#
+                    .as_slice(),
+                CurrentPullRequestState::Open,
+            ),
+            (
+                br#"{"number":43,"state":"OPEN","isDraft":true,"url":"https://github.com/example/repo/pull/43"}"#
+                    .as_slice(),
+                CurrentPullRequestState::Draft,
+            ),
+            (
+                br#"{"number":44,"state":"MERGED","isDraft":false,"url":"https://github.com/example/repo/pull/44"}"#
+                    .as_slice(),
+                CurrentPullRequestState::Merged,
+            ),
+            (
+                br#"{"number":45,"state":"CLOSED","isDraft":true,"url":"https://github.com/example/repo/pull/45"}"#
+                    .as_slice(),
+                CurrentPullRequestState::Closed,
+            ),
+        ] {
+            let pull_request =
+                parse_current_pull_request(payload).expect("current pull request should parse");
+            assert_eq!(pull_request.state, expected_state);
+            assert_eq!(
+                pull_request.url,
+                format!(
+                    "https://github.com/example/repo/pull/{}",
+                    pull_request.number
+                )
+            );
+        }
     }
 }
