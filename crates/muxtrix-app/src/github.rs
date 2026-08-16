@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -69,6 +70,11 @@ const DIFF_MAX_LINES: usize = 50_000;
 /// commonly omits from its inline `patch` field without letting a generated
 /// artifact consume unbounded memory.
 const REMOTE_DIFF_SOURCE_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// GitHub calculates mergeability asynchronously. A first query can return
+/// `UNKNOWN` and trigger that calculation even when the web UI already has a
+/// resolved result, so give it a short, bounded window to settle.
+const MERGEABILITY_QUERY_ATTEMPTS: usize = 3;
+const MERGEABILITY_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckSummary {
@@ -385,6 +391,18 @@ pub(crate) fn load_local(repository: &Repository) -> Result<PanelData, String> {
 pub(crate) fn list_pull_requests(
     repository: &Repository,
 ) -> Result<Vec<PullRequestSummary>, String> {
+    retry_pending_mergeability(
+        || load_pull_request_summaries(repository),
+        |pull_requests| {
+            pull_requests
+                .iter()
+                .any(|pull_request| pull_request.readiness == MergeReadiness::Unknown)
+        },
+        || std::thread::sleep(MERGEABILITY_RETRY_DELAY),
+    )
+}
+
+fn load_pull_request_summaries(repository: &Repository) -> Result<Vec<PullRequestSummary>, String> {
     let owner_and_name = github_repository(repository)?;
     let output = github_command(&repository.host)
         .args([
@@ -1005,6 +1023,14 @@ pub(crate) fn set_draft(
 }
 
 fn load_pull_request(repository: &Repository, number: u64) -> Result<PullRequest, String> {
+    retry_pending_mergeability(
+        || load_pull_request_once(repository, number),
+        |pull_request| pull_request.readiness() == MergeReadiness::Unknown,
+        || std::thread::sleep(MERGEABILITY_RETRY_DELAY),
+    )
+}
+
+fn load_pull_request_once(repository: &Repository, number: u64) -> Result<PullRequest, String> {
     let output = pull_request_view_command(repository, number)?
         .output()
         .map_err(|error| format!("GitHub pull request details could not be read: {error}"))?;
@@ -1017,6 +1043,28 @@ fn load_pull_request(repository: &Repository, number: u64) -> Result<PullRequest
         });
     }
     parse_pull_request(&output.stdout)
+}
+
+/// Keep the last successful snapshot if a best-effort retry fails. The initial
+/// query already produced usable data; a transient retry failure must not
+/// replace it with an error state.
+fn retry_pending_mergeability<T>(
+    mut load: impl FnMut() -> Result<T, String>,
+    pending: impl Fn(&T) -> bool,
+    mut wait: impl FnMut(),
+) -> Result<T, String> {
+    let mut value = load()?;
+    for _ in 1..MERGEABILITY_QUERY_ATTEMPTS {
+        if !pending(&value) {
+            break;
+        }
+        wait();
+        let Ok(updated) = load() else {
+            break;
+        };
+        value = updated;
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1691,6 +1739,28 @@ mod tests {
         pull_request.checks.failed = 0;
         pull_request.mergeable = "CONFLICTING".into();
         assert_eq!(pull_request.readiness(), MergeReadiness::Conflicts);
+    }
+
+    #[test]
+    fn unknown_mergeability_is_retried_before_display() {
+        let responses = [MergeReadiness::Unknown, MergeReadiness::Ready];
+        let mut attempts = 0;
+        let mut waits = 0;
+
+        let readiness = retry_pending_mergeability(
+            || {
+                let response = responses[attempts];
+                attempts += 1;
+                Ok(response)
+            },
+            |readiness| *readiness == MergeReadiness::Unknown,
+            || waits += 1,
+        )
+        .expect("eventually resolved mergeability should load");
+
+        assert_eq!(readiness, MergeReadiness::Ready);
+        assert_eq!(attempts, 2);
+        assert_eq!(waits, 1);
     }
 
     #[test]
