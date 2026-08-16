@@ -166,6 +166,7 @@ enum Stage {
 enum TickAction {
     Wait,
     ScrollSettingsToEnd,
+    ScrollSettingsToTerminal,
     ScrollSettingsToGitHub,
     ScrollGitHubToEnd,
     ScrollGitHubPullRequestsToEnd,
@@ -607,6 +608,9 @@ impl Scenario {
                 if self.capturing("github-scrolled") && self.settle_ticks == 2 {
                     return Ok(TickAction::ScrollGitHubToEnd);
                 }
+                if self.capturing("settings-scrollback") && self.settle_ticks == 2 {
+                    return Ok(TickAction::ScrollSettingsToTerminal);
+                }
                 if self.capturing("worktree-agent-settings") && self.settle_ticks == 2 {
                     return Ok(TickAction::ScrollSettingsToEnd);
                 }
@@ -752,7 +756,7 @@ impl Scenario {
                     .into_bytes(),
                 )
                 .map_err(|error| error.to_string())?;
-        } else if self.capturing("settings") {
+        } else if self.capturing("settings") || self.capturing("settings-scrollback") {
             drop(app.open_settings());
         } else if self.capturing("settings-github-enterprise") {
             drop(app.open_settings());
@@ -1985,6 +1989,13 @@ impl Muxtrix {
                 iced::widget::operation::snap_to_end(iced::widget::Id::new(
                     super::SETTINGS_SCROLL_ID,
                 ))
+            }
+            Ok(TickAction::ScrollSettingsToTerminal) => {
+                self.e2e = Some(scenario);
+                iced::widget::operation::snap_to(
+                    iced::widget::Id::new(super::SETTINGS_SCROLL_ID),
+                    iced::widget::operation::RelativeOffset { x: 0.0, y: 0.45 },
+                )
             }
             Ok(TickAction::ScrollSettingsToGitHub) => {
                 self.e2e = Some(scenario);

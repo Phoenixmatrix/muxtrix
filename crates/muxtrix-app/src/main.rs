@@ -190,6 +190,7 @@ struct Muxtrix {
     palette: CommandPalette,
     settings: AppSettings,
     settings_draft: AppSettings,
+    settings_scrollback_lines_input: String,
     installed_versions: InstalledVersionsState,
     installed_muxtrix_path: Result<std::path::PathBuf, String>,
     installed_fonts: InstalledFontCatalog,
@@ -1070,34 +1071,6 @@ impl std::fmt::Display for DefaultAgentChoice {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ScrollbackLimitChoice(usize);
-
-impl ScrollbackLimitChoice {
-    const ALL: [Self; 6] = [
-        Self(1_000),
-        Self(5_000),
-        Self(DEFAULT_TERMINAL_SCROLLBACK_LINES),
-        Self(25_000),
-        Self(50_000),
-        Self(100_000),
-    ];
-}
-
-impl std::fmt::Display for ScrollbackLimitChoice {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            1_000 => formatter.write_str("1,000 lines"),
-            5_000 => formatter.write_str("5,000 lines"),
-            10_000 => formatter.write_str("10,000 lines"),
-            25_000 => formatter.write_str("25,000 lines"),
-            50_000 => formatter.write_str("50,000 lines"),
-            100_000 => formatter.write_str("100,000 lines"),
-            lines => write!(formatter, "{lines} lines"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaletteMove {
     Next,
     Previous,
@@ -1283,7 +1256,7 @@ enum Message {
     SettingsUiFontWeight(FontWeight),
     SettingsTerminalFontSize(f32),
     SettingsLineHeight(f32),
-    SettingsScrollbackLimit(ScrollbackLimitChoice),
+    SettingsScrollbackLimit(String),
     SettingsUiFontSize(f32),
     SettingsShowAllWorkspaces(bool),
     SetFleetView(FleetView),
@@ -1925,6 +1898,7 @@ impl Muxtrix {
             )));
         }
 
+        let settings_scrollback_lines_input = settings.terminal_scrollback_lines.to_string();
         let app = Self {
             session: SessionState::new(workspace, vec![profile]),
             terminals: BTreeMap::from([(initial_pane_id, runtime)]),
@@ -1936,6 +1910,7 @@ impl Muxtrix {
             settings_page: SettingsPage::Preferences,
             palette: CommandPalette::default(),
             settings_draft: settings.clone(),
+            settings_scrollback_lines_input,
             settings,
             installed_versions: InstalledVersionsState::default(),
             installed_muxtrix_path,
@@ -3375,7 +3350,17 @@ impl Muxtrix {
                 return Task::none();
             }
             Message::SettingsScrollbackLimit(limit) => {
-                self.settings_draft.terminal_scrollback_lines = limit.0;
+                if limit
+                    .chars()
+                    .all(|character| character.is_ascii_digit() || character == ',')
+                {
+                    self.settings_scrollback_lines_input = limit;
+                    if let Ok(lines) = settings::parse_terminal_scrollback_lines(
+                        &self.settings_scrollback_lines_input,
+                    ) {
+                        self.settings_draft.terminal_scrollback_lines = lines;
+                    }
+                }
                 return Task::none();
             }
             Message::SettingsUiFontSize(size) => {
@@ -3457,7 +3442,7 @@ impl Muxtrix {
                 return Task::none();
             }
             Message::CancelSettings => {
-                self.settings_draft = self.settings.clone();
+                self.reset_settings_draft();
                 self.pending_default_agent_command = None;
                 self.active_view = ActiveView::Workspace;
                 self.status = "Settings changes discarded".into();
@@ -5261,7 +5246,7 @@ impl Muxtrix {
             && self.settings_page == SettingsPage::Worktrees;
         if self.active_view != ActiveView::Workspace && !worktree_settings_owns_keys {
             if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
-                self.settings_draft = self.settings.clone();
+                self.reset_settings_draft();
                 self.active_view = ActiveView::Workspace;
             }
             return Task::none();
@@ -5366,7 +5351,7 @@ impl Muxtrix {
                         // Leaving settings by keyboard discards the draft
                         // wherever it happens, so returning from Worktrees
                         // cannot strand an edited Preferences draft.
-                        self.settings_draft = self.settings.clone();
+                        self.reset_settings_draft();
                         self.active_view = ActiveView::Workspace;
                     }
                 }
@@ -6459,8 +6444,13 @@ impl Muxtrix {
         agent
     }
 
-    fn open_settings(&mut self) -> Task<Message> {
+    fn reset_settings_draft(&mut self) {
         self.settings_draft = self.settings.clone();
+        self.settings_scrollback_lines_input = self.settings.terminal_scrollback_lines.to_string();
+    }
+
+    fn open_settings(&mut self) -> Task<Message> {
+        self.reset_settings_draft();
         self.workspace_name_draft = self
             .active_workspace()
             .map_or_else(|_| String::new(), |workspace| workspace.name.clone());
@@ -6606,6 +6596,17 @@ impl Muxtrix {
     }
 
     fn save_settings(&mut self) -> Task<Message> {
+        let scrollback_lines = match settings::parse_terminal_scrollback_lines(
+            &self.settings_scrollback_lines_input,
+        ) {
+            Ok(lines) => lines,
+            Err(error) => {
+                self.status = format!("Could not save settings: {error}");
+                return Task::none();
+            }
+        };
+        self.settings_draft.terminal_scrollback_lines = scrollback_lines;
+        self.settings_scrollback_lines_input = scrollback_lines.to_string();
         let github_host = match settings::normalize_github_host(&self.settings_draft.github_host) {
             Ok(host) => host,
             Err(error) => {
@@ -12518,7 +12519,9 @@ impl Muxtrix {
 
     fn settings_view(&self) -> Element<'_, Message> {
         let tokens = DesignTokens::for_appearance(self.settings_draft.appearance);
-        let changed = settings_have_changes(&self.settings, &self.settings_draft);
+        let changed = settings_have_changes(&self.settings, &self.settings_draft)
+            || self.settings_scrollback_lines_input
+                != self.settings.terminal_scrollback_lines.to_string();
         let terminal_label = if changed {
             "Discard changes and return"
         } else {
@@ -13177,14 +13180,33 @@ impl Muxtrix {
         ]
         .spacing(12)
         .align_y(Alignment::Center);
-        let scrollback_limit = pick_list(
-            ScrollbackLimitChoice::ALL,
-            Some(ScrollbackLimitChoice(
-                self.settings_draft.terminal_scrollback_lines,
-            )),
-            Message::SettingsScrollbackLimit,
-        )
-        .width(220);
+        let scrollback_validation =
+            settings::parse_terminal_scrollback_lines(&self.settings_scrollback_lines_input);
+        let scrollback_valid = scrollback_validation.is_ok();
+        let mut scrollback_limit = column![
+            row![
+                text_input("10000", &self.settings_scrollback_lines_input)
+                    .on_input(Message::SettingsScrollbackLimit)
+                    .line_height(Pixels(30.0))
+                    .padding([0, 9])
+                    .size(self.settings_draft.ui_pixels(11.0))
+                    .width(180),
+                text("lines")
+                    .size(self.settings_draft.ui_pixels(10.0))
+                    .color(tokens.muted),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+        ]
+        .spacing(4);
+        if let Err(error) = scrollback_validation {
+            scrollback_limit = scrollback_limit.push(
+                text(error)
+                    .size(self.settings_draft.ui_pixels(9.0))
+                    .color(tokens.danger)
+                    .width(260),
+            );
+        }
         let typography_preview = container(
             text("$ cargo test --workspace\n✓ all checks passed")
                 .font(font_with_style(
@@ -13287,9 +13309,9 @@ impl Muxtrix {
                 settings_divider(tokens),
                 settings_row(
                     "Scrollback history",
-                    "Maximum lines kept by each new or restarted pane",
+                    "Lines kept by new and restarted panes (1,000–100,000)",
                     scrollback_limit,
-                    &self.settings_draft
+                    &self.settings_draft,
                 ),
                 settings_divider(tokens),
                 settings_row(
@@ -13454,7 +13476,9 @@ impl Muxtrix {
                     } else {
                         "Apply changes"
                     },
-                    ((changed || can_continue_pending_command) && github_host_valid)
+                    ((changed || can_continue_pending_command)
+                        && github_host_valid
+                        && scrollback_valid)
                         .then_some(Message::SaveSettings),
                     SettingsButtonKind::Primary,
                     &self.settings_draft,
@@ -20106,6 +20130,37 @@ mod tests {
         assert!(settings_have_changes(&saved, &draft));
         draft.show_status_bar = saved.show_status_bar;
         assert!(!settings_have_changes(&saved, &draft));
+    }
+
+    #[test]
+    fn scrollback_history_input_updates_the_draft_with_an_arbitrary_bounded_value() {
+        let mut app = Muxtrix::new();
+        drop(app.open_settings());
+
+        let _ = app.update(Message::SettingsScrollbackLimit("42,731".into()));
+
+        assert_eq!(app.settings_scrollback_lines_input, "42,731");
+        assert_eq!(app.settings_draft.terminal_scrollback_lines, 42_731);
+        assert_eq!(
+            app.settings.terminal_scrollback_lines,
+            settings::DEFAULT_TERMINAL_SCROLLBACK_LINES
+        );
+    }
+
+    #[test]
+    fn invalid_scrollback_history_input_cannot_be_saved() {
+        let mut app = Muxtrix::new();
+        app.active_view = ActiveView::Settings;
+        app.settings_scrollback_lines_input = "999".into();
+
+        drop(app.save_settings());
+
+        assert_eq!(app.active_view, ActiveView::Settings);
+        assert_eq!(
+            app.settings.terminal_scrollback_lines,
+            settings::DEFAULT_TERMINAL_SCROLLBACK_LINES
+        );
+        assert!(app.status.contains("between 1,000 and 100,000 lines"));
     }
 
     #[test]

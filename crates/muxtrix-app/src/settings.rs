@@ -24,6 +24,34 @@ const MIN_TERMINAL_SCROLLBACK_LINES: usize = 1_000;
 const MAX_TERMINAL_SCROLLBACK_LINES: usize = 100_000;
 pub(crate) const DEFAULT_GITHUB_HOST: &str = "github.com";
 
+pub(crate) fn parse_terminal_scrollback_lines(value: &str) -> Result<usize, String> {
+    let mut lines = 0usize;
+    let mut has_digit = false;
+    for byte in value.bytes() {
+        match byte {
+            b'0'..=b'9' => {
+                has_digit = true;
+                lines = lines
+                    .checked_mul(10)
+                    .and_then(|lines| lines.checked_add(usize::from(byte - b'0')))
+                    .ok_or_else(|| {
+                        "Scrollback history must be between 1,000 and 100,000 lines".to_owned()
+                    })?;
+            }
+            b',' => {}
+            _ => return Err("Scrollback history must be a whole number".into()),
+        }
+    }
+    if !has_digit {
+        return Err("Scrollback history must be a whole number".into());
+    }
+    if (MIN_TERMINAL_SCROLLBACK_LINES..=MAX_TERMINAL_SCROLLBACK_LINES).contains(&lines) {
+        Ok(lines)
+    } else {
+        Err("Scrollback history must be between 1,000 and 100,000 lines".into())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Appearance {
@@ -1050,6 +1078,15 @@ mod tests {
             too_large.terminal_scrollback_lines,
             MAX_TERMINAL_SCROLLBACK_LINES
         );
+    }
+
+    #[test]
+    fn scrollback_history_accepts_any_whole_number_within_bounds() {
+        assert_eq!(parse_terminal_scrollback_lines("42731"), Ok(42_731));
+        assert_eq!(parse_terminal_scrollback_lines("42,731"), Ok(42_731));
+        assert!(parse_terminal_scrollback_lines("999").is_err());
+        assert!(parse_terminal_scrollback_lines("100001").is_err());
+        assert!(parse_terminal_scrollback_lines("ten thousand").is_err());
     }
 
     #[test]
