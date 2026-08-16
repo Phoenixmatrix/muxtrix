@@ -1,0 +1,5 @@
+modelRoles:
+  advisor: "@default"
+
+advisor:
+  enabled: true
