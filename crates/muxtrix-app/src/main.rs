@@ -14270,8 +14270,13 @@ impl Muxtrix {
             ))
             .on_scroll(move |delta| Message::ScrollTerminal(pane_id, delta))
             .interaction(terminal_mouse_interaction(hovered_link.is_some()));
+        // A restored session can replace a terminal at the same tree position
+        // without changing its bounds. `on_resize` alone retains the previous
+        // sensor size and emits nothing; `on_show` makes a pane-key change
+        // replay that unchanged viewport into the replacement runtime.
         let terminal_view = sensor(terminal_view)
             .key(pane_id)
+            .on_show(move |size| Message::ResizePane(pane_id, size))
             .on_resize(move |size| Message::ResizePane(pane_id, size));
         let header_button = |kind: IconKind,
                              label: &'static str,
