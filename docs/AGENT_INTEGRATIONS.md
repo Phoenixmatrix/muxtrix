@@ -132,12 +132,15 @@ can clear it. `Done` preserves the previous completion while the composer is
 idle, but a positively recognized working frame starts the next turn even when
 its prompt hook was delayed or unavailable.
 
-Oh My Pi keeps its exact approval and coarse lifecycle events. Its documented
-OSC title state (`π >` idle, `π ⠋` working, `π !` attention, with all spinner
-frames accepted) supplies the live correction layer, so a scheduled
-continuation cannot leave the fleet green after Pi has painted an idle title.
-Outdated managed Pi extensions migrate automatically when Muxtrix synchronizes
-hook status; re-add remains the explicit repair path. See
+Oh My Pi keeps exact approval and active-turn lifecycle events. From
+`agent_start` through terminal `agent_end`, an idle title cannot demote the
+fleet row; this covers Pi releases that briefly paint `π >` while async work or
+a scheduled continuation still owns the turn. Outside that bracket, Pi's
+documented OSC title state (`π >` idle, `π ⠋` working, `π !` attention, with
+all spinner frames accepted) remains the live correction and reattach layer.
+Maintenance completion stays `Running` and does not masquerade as a completed
+turn. Outdated managed Pi extensions migrate automatically when Muxtrix
+synchronizes hook status; re-add remains the explicit repair path. See
 [Agent state detection](AGENT_STATE_DETECTION.md) for precedence and limits.
 
 Typing a configured `codex`, `claude`, or `omp` launch command assigns that

@@ -3,18 +3,20 @@
 ## Decision
 
 For Codex and Claude Code, the live terminal screen is authoritative for
-`Running`, `Idle`, and `Needs input`. Oh My Pi supplies coarse lifecycle state
-and exact approval transitions through its managed extension, while OMP's
-documented state-bearing OSC title supplies the live correction layer. `π >`
+`Running`, `Idle`, and `Needs input`. Oh My Pi supplies exact active-turn and
+approval transitions through its managed extension, while OMP's documented
+state-bearing OSC title supplies the correction and recovery layer. `π >`
 means idle, `π !` means attention, and `π` followed by a supported Braille
 spinner means working; ConPTY uses the static working form `π :`.
 
 Other lifecycle hooks still identify the agent, session, working directory,
 prompt submission, completion, and shutdown. Codex or Claude permission and
 notification hooks are not allowed to create human attention because their
-harnesses may resolve those requests automatically. Pi's approval event is
-emitted only after OMP has decided that a person is required, so it is itself
-positive evidence and may create or clear `Needs input`.
+harnesses may resolve those requests automatically. Pi's `agent_start` through
+terminal `agent_end` interval and its approval events are exact. During that
+interval, an idle title cannot demote the pane; this covers older OMP releases
+that briefly published `π >` while an async job or scheduled continuation still
+owned the turn.
 
 An unrecognized screen or title preserves the last trusted state. This favors a
 missed new prompt over inventing activity or repeatedly telling the user that
@@ -57,10 +59,11 @@ model: session-integration hooks are separated from state authority, and
 On each terminal poll, the application evaluates each pane's latest Ghostty
 grid snapshot and OSC title. Retained frames are re-evaluated so an identity
 hook arriving just after a stable prompt paint cannot miss it on the next poll.
-Codex and Claude Code use their live screen and title; Oh My Pi uses its
-state-bearing title while retaining exact lifecycle, session switch/branch,
-approval-request, and context compaction/handoff events from the managed
-extension.
+Codex and Claude Code use their live screen and title. Oh My Pi uses its
+state-bearing title except that its exact `agent_start` through terminal
+`agent_end` lifecycle bracket prevents an idle title from ending active work.
+Pi also retains exact session switch/branch, approval-request, context
+compaction/handoff, and shutdown events from the managed extension.
 
 - Codex `Action Required` OSC titles and strong live confirmation/answer forms
   create `Needs input`.
@@ -69,10 +72,10 @@ extension.
 - Claude spinner titles and its active `/btw` overlay create `Running`.
 - Claude confirmation/navigation forms and dynamic-workflow prompts create
   `Needs input`; its idle OSC title creates `Idle`.
-- Oh My Pi's `π >` title creates `Idle`, `π !` creates `Needs input`, and its
-  ten supported Braille separators create `Running`. `π :` is the static
-  ConPTY working form. A state-disabled `π: <label>` title identifies Pi but
-  does not invent a state.
+- Oh My Pi's `π >` title creates `Idle` outside an active lifecycle bracket,
+  `π !` creates `Needs input`, and its ten supported Braille separators create
+  `Running`. `π :` is the static ConPTY working form. A state-disabled
+  `π: <label>` title identifies Pi but does not invent a state.
 - A Claude frame showing the Agents view returns no classification at all, and
   is evaluated before every rule below it. The roster draws its own composer and
   its own spinner-free title, either of which a later rule would otherwise read
@@ -88,18 +91,19 @@ extension.
 - Retained idle evidence may initialize a detected agent or resolve a visible
   wait, but the exact frame retained when `UserPromptSubmit` arrives cannot
   regress that newer running state. Muxtrix records the frame revision at the
-  transition; a subsequently rendered idle frame can resolve `Running`. This
-  guards the hook/frame race without leaving a visibly idle pane stuck green.
+  transition; a subsequently rendered idle frame can resolve `Running` unless
+  Pi's exact active-lifecycle bracket is still open.
 - A completed turn remains `Done` while its idle composer is visible, preserving
   the useful completion signal. Strong working evidence starts the next turn
   even if `UserPromptSubmit` was lost, so `Done` cannot become a permanent latch
-  when hook delivery is unavailable.
+  when hook delivery is unavailable. Pi maintenance completion remains
+  `Running`; only terminal `agent_end` completes its active turn.
 
 The typed control event carries the original hook event name. Codex and Claude
 waiting hooks remain metadata only, and `PostToolUse` cannot clear their
-screen-confirmed wait. Pi approval events remain exact state transitions.
-Completion, failure, stop, and new-prompt lifecycle events retain their coarse
-roles for every supported harness.
+screen-confirmed wait. Pi approval events and active-turn lifecycle brackets
+remain exact state transitions. Completion, failure, stop, and new-prompt
+lifecycle events retain their coarse roles for every supported harness.
 
 The managed Pi extension is versioned. Existing modules without the current
 behavior marker are migrated during normal Muxtrix hook synchronization, while
@@ -187,8 +191,8 @@ over-reporting rather than to an empty roster. `done` is counted and named
 
 - Automatic approvals never flash or accumulate false human attention.
 - Manual approvals still turn amber from the UI the user can actually act on.
-- State clears as soon as a working/idle frame is rendered instead of waiting
-  for tool completion.
+- State clears as soon as an authoritative working/idle frame is rendered
+  instead of waiting for tool completion; Pi's active lifecycle is the exception.
 - Historical transcript questions and parallel tool completions cannot own the
   current attention state.
 - Hooks remain useful for pane/session attribution and terminal-independent
@@ -224,13 +228,15 @@ over-reporting rather than to an empty roster. `done` is counted and named
 
 ## Validation contract
 
-Regression coverage pins four cases:
+Regression coverage pins five cases:
 
 1. repeated Codex `PermissionRequest` / `PostToolUse` automatic-review cycles
    never create unread attention;
 2. a recognized visible prompt creates `Needs input`;
 3. a late `PostToolUse` cannot clear that visible prompt;
-4. a subsequent working screen frame clears it.
+4. a subsequent working screen frame clears it;
+5. a Pi idle title cannot override an active lifecycle, while the same title
+   can still clear a stale screen- or process-detected `Running` state.
 
 Classifier fixtures also cover OSC precedence, transcript-viewer suppression,
 Claude blocked/working/idle forms, and rejection of narrative questions.

@@ -274,10 +274,14 @@ struct Muxtrix {
     control_endpoint: Option<String>,
     agent_statuses: BTreeMap<PaneId, AgentPaneStatus>,
     /// Terminal-frame revision that was current when a pane most recently
-    /// entered Running. An Idle classification may only demote it after a
-    /// newer frame arrives; this preserves the hook/frame race guard without
-    /// making Running sticky forever.
+    /// entered Running. Outside Pi's exact active lifecycle, an Idle
+    /// classification may only demote it after a newer frame arrives; this
+    /// preserves the hook/frame race guard without making Running sticky.
     agent_running_frame_revisions: BTreeMap<PaneId, u64>,
+    /// Pi panes between an exact `agent_start` and terminal `agent_end`.
+    /// Pi's lifecycle owns this interval: an erroneously idle OSC title must
+    /// not demote work that the harness still reports as active.
+    pi_active_lifecycles: BTreeSet<PaneId>,
     /// Panes where process-tree detection has observed a live agent, with the
     /// instant it last saw that process. Lifecycle hooks enrich the same
     /// status but do not disable exit observation; the entry self-cleans after
@@ -1759,6 +1763,7 @@ impl Muxtrix {
         }
         self.pending_terminal_input.remove(&pane_id);
         self.agent_running_frame_revisions.remove(&pane_id);
+        self.pi_active_lifecycles.remove(&pane_id);
         if let Some(agent) = self.agent_statuses.get_mut(&pane_id) {
             agent.state = AgentState::Failed;
             agent.activity = Some("Terminal failed before the agent could start".into());
@@ -1976,6 +1981,7 @@ impl Muxtrix {
             control_endpoint,
             agent_statuses: BTreeMap::new(),
             agent_running_frame_revisions: BTreeMap::new(),
+            pi_active_lifecycles: BTreeSet::new(),
             detected_agents: BTreeMap::new(),
             agents_view_panes: BTreeSet::new(),
             agents_roster: None,
@@ -4478,6 +4484,7 @@ impl Muxtrix {
         self.hovered_terminal = None;
         self.agent_statuses = restored_agent_statuses;
         self.agent_running_frame_revisions.clear();
+        self.pi_active_lifecycles.clear();
         self.detected_agents.clear();
         self.agents_view_panes.clear();
         self.pane_layouts.clear();
@@ -4776,6 +4783,7 @@ impl Muxtrix {
             .retain(|notification| notification.pane_id != pane_id);
         self.agent_statuses.remove(&pane_id);
         self.agent_running_frame_revisions.remove(&pane_id);
+        self.pi_active_lifecycles.remove(&pane_id);
         self.detected_agents.remove(&pane_id);
         self.agents_view_panes.remove(&pane_id);
         self.terminal_pointer_positions.remove(&pane_id);
@@ -4869,6 +4877,7 @@ impl Muxtrix {
             .retain(|notification| notification.pane_id != pane_id);
         self.agent_statuses.remove(&pane_id);
         self.agent_running_frame_revisions.remove(&pane_id);
+        self.pi_active_lifecycles.remove(&pane_id);
         self.detected_agents.remove(&pane_id);
         self.agents_view_panes.remove(&pane_id);
         self.terminal_pointer_positions.remove(&pane_id);
@@ -6677,6 +6686,7 @@ impl Muxtrix {
                 {
                     self.agent_statuses.remove(&pane_id);
                     self.agent_running_frame_revisions.remove(&pane_id);
+                    self.pi_active_lifecycles.remove(&pane_id);
                     self.detected_agents.remove(&pane_id);
                 }
                 None => {}
@@ -6755,6 +6765,7 @@ impl Muxtrix {
         if !bytes.contains(&0x03) {
             return;
         }
+        self.pi_active_lifecycles.remove(&pane_id);
         let Some(status) = self.agent_statuses.get_mut(&pane_id) else {
             return;
         };
@@ -7256,6 +7267,7 @@ impl Muxtrix {
             }
             self.agent_statuses.remove(&pane_id);
             self.agent_running_frame_revisions.remove(&pane_id);
+            self.pi_active_lifecycles.remove(&pane_id);
             self.detected_agents.remove(&pane_id);
             self.agents_view_panes.remove(&pane_id);
             self.terminal_command_buffers.remove(&pane_id);
@@ -7437,6 +7449,49 @@ impl Muxtrix {
                     ) {
                         return ControlResponse::success("stale agent lifecycle state ignored");
                     }
+                    let is_pi = pane_agent(&agent) == Some(PaneAgent::OhMyPi);
+                    // Pi's managed extension brackets active work with
+                    // `agent_start` and terminal `agent_end`. Maintenance
+                    // completion used to be reported as Completed by older
+                    // extension versions even when it ran inside that bracket;
+                    // preserve the active run for those already-installed
+                    // modules while automatic migration replaces them.
+                    let state = if is_pi
+                        && self.pi_active_lifecycles.contains(&pane_id)
+                        && state == AgentState::Completed
+                        && matches!(
+                            event.as_deref(),
+                            Some("session_compact" | "auto_compaction_end")
+                        ) {
+                        AgentState::Running
+                    } else {
+                        state
+                    };
+                    if is_pi {
+                        match (event.as_deref(), state) {
+                            (
+                                Some(
+                                    "agent_start"
+                                    | "tool_approval_requested"
+                                    | "tool_approval_resolved",
+                                ),
+                                _,
+                            )
+                            | (Some("agent_end"), AgentState::Running) => {
+                                self.pi_active_lifecycles.insert(pane_id);
+                            }
+                            (
+                                Some(
+                                    "agent_end" | "session_start" | "session_switch"
+                                    | "session_branch" | "session_shutdown",
+                                ),
+                                _,
+                            ) => {
+                                self.pi_active_lifecycles.remove(&pane_id);
+                            }
+                            _ => {}
+                        }
+                    }
                     // Codex PermissionRequest runs before its automatic
                     // reviewer, and Claude notifications are similarly not
                     // proof that a person is required. Those two agents may
@@ -7502,6 +7557,7 @@ impl Muxtrix {
                     if state == AgentState::Stopped {
                         self.agent_statuses.remove(&pane_id);
                         self.agent_running_frame_revisions.remove(&pane_id);
+                        self.pi_active_lifecycles.remove(&pane_id);
                         self.terminal_command_buffers.remove(&pane_id);
                         self.detected_agents.remove(&pane_id);
                     } else {
@@ -7648,6 +7704,16 @@ impl Muxtrix {
         // lifecycle-owned so stale terminal chrome cannot revive them.
         if matches!(current.state, AgentState::Failed | AgentState::Stopped)
             || (current.state == AgentState::Completed && state != AgentState::Running)
+        {
+            return;
+        }
+        // Pi's exact lifecycle bracket is stronger than its correction-layer
+        // title. Older Pi releases could briefly publish `π >` while an async
+        // job or scheduled continuation still owned the turn; accepting that
+        // title made the fleet row stay Idle for the rest of the task.
+        if pane_agent(agent) == Some(PaneAgent::OhMyPi)
+            && state == AgentState::Idle
+            && self.pi_active_lifecycles.contains(&pane_id)
         {
             return;
         }
@@ -25812,6 +25878,71 @@ mod tests {
             Some("Agent is working")
         );
         assert_eq!(app.agent_running_frame_revisions.get(&pane_id), Some(&2));
+    }
+
+    #[test]
+    fn pi_idle_title_does_not_override_an_active_lifecycle() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let pane = Some(pane_id.as_uuid().to_string());
+        let running_revision = app.terminals[&pane_id].snapshot_revision;
+
+        let started = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "pi".into(),
+            state: AgentState::Running,
+            event: Some("agent_start".into()),
+            title: "Oh My Pi".into(),
+            body: "Agent is running".into(),
+            pane_id: pane.clone(),
+            session_id: Some("session-1".into()),
+            cwd: None,
+        });
+        assert!(started.ok);
+
+        app.apply_agent_screen_classification(
+            pane_id,
+            "pi",
+            running_revision.wrapping_add(1),
+            agent_screen::Classification {
+                state: agent_screen::ScreenState::Idle,
+                rule: "pi.osc_title_idle",
+            },
+        );
+        assert_eq!(
+            app.agent_statuses[&pane_id].state,
+            AgentState::Running,
+            "a stale Pi idle title must not override an active agent lifecycle"
+        );
+
+        let compacted = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "pi".into(),
+            state: AgentState::Completed,
+            event: Some("session_compact".into()),
+            title: "Oh My Pi".into(),
+            body: "Context compacted".into(),
+            pane_id: pane.clone(),
+            session_id: Some("session-1".into()),
+            cwd: None,
+        });
+        assert!(compacted.ok);
+        assert_eq!(
+            app.agent_statuses[&pane_id].state,
+            AgentState::Running,
+            "an older managed extension's maintenance completion must preserve the active run"
+        );
+
+        let ended = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "pi".into(),
+            state: AgentState::Completed,
+            event: Some("agent_end".into()),
+            title: "Oh My Pi".into(),
+            body: "Agent completed a turn".into(),
+            pane_id: pane,
+            session_id: Some("session-1".into()),
+            cwd: None,
+        });
+        assert!(ended.ok);
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Completed);
     }
 
     #[test]
