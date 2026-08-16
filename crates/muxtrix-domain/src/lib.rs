@@ -24,11 +24,6 @@ macro_rules! entity_id {
             }
 
             #[must_use]
-            pub const fn from_uuid(value: Uuid) -> Self {
-                Self(value)
-            }
-
-            #[must_use]
             pub const fn as_uuid(self) -> Uuid {
                 self.0
             }

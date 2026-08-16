@@ -775,6 +775,23 @@ struct WorktreeManagerState {
     restart_target: Option<usize>,
 }
 
+impl WorktreeManagerState {
+    fn loading(mode: WorktreeManagerMode, generation: u64) -> Self {
+        Self {
+            mode,
+            generation,
+            repo_root: None,
+            failure: None,
+            entries: Vec::new(),
+            loading: true,
+            selected: 0,
+            busy: false,
+            error: None,
+            restart_target: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WorktreeManagerDiscovery {
     repo_root: Option<std::path::PathBuf>,
@@ -3470,19 +3487,27 @@ impl Muxtrix {
         iced::window::set_resize_increments(window_id, Some(increments))
     }
 
+    fn default_terminal_profile(&self) -> Result<LaunchProfile, String> {
+        self.session
+            .profiles
+            .first()
+            .cloned()
+            .ok_or_else(|| "terminal launch profile is missing".to_owned())
+    }
+
+    fn regular_terminal_profile(&self) -> Result<LaunchProfile, String> {
+        let mut profile = self.default_terminal_profile()?;
+        if let Some(directory) = self.regular_creation_directory() {
+            profile.working_directory = Some(directory);
+        }
+        Ok(profile)
+    }
+
     fn split_terminal(&mut self, axis: SplitAxis) -> Result<(), String> {
         if self.maximized_pane.is_some() {
             return Err("Restore panes before splitting the focused pane".into());
         }
-        let mut profile = self
-            .session
-            .profiles
-            .first()
-            .cloned()
-            .ok_or_else(|| "terminal launch profile is missing".to_owned())?;
-        if let Some(directory) = self.regular_creation_directory() {
-            profile.working_directory = Some(directory);
-        }
+        let profile = self.regular_terminal_profile()?;
         let pane_count = self
             .active_workspace()?
             .active_tab()
@@ -3687,15 +3712,7 @@ impl Muxtrix {
     }
 
     fn create_workspace(&mut self) -> Result<(), String> {
-        let mut profile = self
-            .session
-            .profiles
-            .first()
-            .cloned()
-            .ok_or_else(|| "terminal launch profile is missing".to_owned())?;
-        if let Some(directory) = self.regular_creation_directory() {
-            profile.working_directory = Some(directory);
-        }
+        let profile = self.regular_terminal_profile()?;
         let workspace_name = self.workspace_name_draft.trim().to_owned();
         if workspace_name.is_empty() {
             return Err("Workspace names cannot be empty".into());
@@ -3998,18 +4015,7 @@ impl Muxtrix {
         let wsl_distribution = self.settings.wsl_distribution.clone();
         self.worktree_manager_generation = self.worktree_manager_generation.wrapping_add(1);
         let generation = self.worktree_manager_generation;
-        self.worktree_manager = Some(WorktreeManagerState {
-            mode,
-            generation,
-            repo_root: None,
-            failure: None,
-            entries: Vec::new(),
-            loading: true,
-            selected: 0,
-            busy: false,
-            error: None,
-            restart_target: None,
-        });
+        self.worktree_manager = Some(WorktreeManagerState::loading(mode, generation));
         perform_blocking(
             move || discover_worktree_manager(mode, probed_directory, &wsl_distribution),
             move |result| {
@@ -4527,12 +4533,7 @@ impl Muxtrix {
         if self.maximized_pane.is_some() && matches!(kind, commands::WorktreeKind::Pane(_)) {
             return Err("Restore panes before opening a worktree beside them".into());
         }
-        let mut profile = self
-            .session
-            .profiles
-            .first()
-            .cloned()
-            .ok_or_else(|| "terminal launch profile is missing".to_owned())?;
+        let mut profile = self.default_terminal_profile()?;
         profile.working_directory = Some(directory.clone());
         let title = directory.file_name().map_or_else(
             || "worktree".into(),
@@ -4612,15 +4613,7 @@ impl Muxtrix {
     }
 
     fn new_tab(&mut self) -> Result<(), String> {
-        let mut profile = self
-            .session
-            .profiles
-            .first()
-            .cloned()
-            .ok_or_else(|| "terminal launch profile is missing".to_owned())?;
-        if let Some(directory) = self.regular_creation_directory() {
-            profile.working_directory = Some(directory);
-        }
+        let profile = self.regular_terminal_profile()?;
         let tab_name = format!("Tab {}", self.active_workspace()?.tabs.len() + 1);
         let title = "shell 1";
         let tab = WorkspaceTab::new(
@@ -4780,6 +4773,17 @@ impl Muxtrix {
             session.terminate();
         }
         forget_host_pane(pane_id);
+        self.clear_pane_activity_state(pane_id);
+        self.queued_terminal_restarts.remove(&pane_id);
+        if self.maximized_pane == Some(pane_id) {
+            self.maximized_pane = None;
+        }
+        if self.pane_menu == Some(pane_id) {
+            self.pane_menu = None;
+        }
+    }
+
+    fn clear_pane_activity_state(&mut self, pane_id: PaneId) {
         self.notifications
             .retain(|notification| notification.pane_id != pane_id);
         self.agent_statuses.remove(&pane_id);
@@ -4790,16 +4794,9 @@ impl Muxtrix {
         self.terminal_pointer_positions.remove(&pane_id);
         self.terminal_scrollbar_positions.remove(&pane_id);
         self.terminal_command_buffers.remove(&pane_id);
-        self.queued_terminal_restarts.remove(&pane_id);
         self.pending_terminal_input.remove(&pane_id);
         if self.hovered_terminal == Some(pane_id) {
             self.hovered_terminal = None;
-        }
-        if self.maximized_pane == Some(pane_id) {
-            self.maximized_pane = None;
-        }
-        if self.pane_menu == Some(pane_id) {
-            self.pane_menu = None;
         }
         if self
             .terminal_scroll_drag
@@ -4874,26 +4871,7 @@ impl Muxtrix {
             || "terminal".to_owned(),
             |runtime| runtime.fallback_title.clone(),
         );
-        self.notifications
-            .retain(|notification| notification.pane_id != pane_id);
-        self.agent_statuses.remove(&pane_id);
-        self.agent_running_frame_revisions.remove(&pane_id);
-        self.pi_active_lifecycles.remove(&pane_id);
-        self.detected_agents.remove(&pane_id);
-        self.agents_view_panes.remove(&pane_id);
-        self.terminal_pointer_positions.remove(&pane_id);
-        self.terminal_scrollbar_positions.remove(&pane_id);
-        self.terminal_command_buffers.remove(&pane_id);
-        self.pending_terminal_input.remove(&pane_id);
-        if self.hovered_terminal == Some(pane_id) {
-            self.hovered_terminal = None;
-        }
-        if self
-            .terminal_scroll_drag
-            .is_some_and(|drag| drag.pane_id == pane_id)
-        {
-            self.terminal_scroll_drag = None;
-        }
+        self.clear_pane_activity_state(pane_id);
 
         let pane = self
             .session
@@ -6358,15 +6336,21 @@ impl Muxtrix {
                 .or_default()
                 .push(input);
         }
-        let agent_name = agent.to_string();
+        let agent = agent.to_string();
+        let activity = Some(format!("Starting {}", agent_display_name(&agent)));
+        self.record_running_agent(pane_id, agent, activity);
+        Ok(())
+    }
+
+    fn record_running_agent(&mut self, pane_id: PaneId, agent: String, activity: Option<String>) {
         let display_name = self.agent_worktree_name(pane_id);
         self.agent_statuses.insert(
             pane_id,
             AgentPaneStatus {
-                activity: Some(format!("Starting {}", agent_display_name(&agent_name))),
-                agent: agent_name,
+                agent,
                 display_name,
                 state: AgentState::Running,
+                activity,
                 session_id: None,
                 cwd: None,
                 git_branch: None,
@@ -6378,7 +6362,6 @@ impl Muxtrix {
                 .get(&pane_id)
                 .map_or(0, |runtime| runtime.snapshot_revision),
         );
-        Ok(())
     }
 
     fn agent_launch_command(&self, agent: Agent) -> Result<String, String> {
@@ -6682,25 +6665,7 @@ impl Muxtrix {
                     self.detected_agents
                         .insert(pane_id, std::time::Instant::now());
                     if !self.agent_statuses.contains_key(&pane_id) {
-                        let display_name = self.agent_worktree_name(pane_id);
-                        self.agent_statuses.insert(
-                            pane_id,
-                            AgentPaneStatus {
-                                agent,
-                                display_name,
-                                state: AgentState::Running,
-                                activity: None,
-                                session_id: None,
-                                cwd: None,
-                                git_branch: None,
-                            },
-                        );
-                        self.agent_running_frame_revisions.insert(
-                            pane_id,
-                            self.terminals
-                                .get(&pane_id)
-                                .map_or(0, |runtime| runtime.snapshot_revision),
-                        );
+                        self.record_running_agent(pane_id, agent, None);
                     }
                 }
                 None if self.detected_agents.get(&pane_id).is_some_and(|last_seen| {
@@ -6827,26 +6792,9 @@ impl Muxtrix {
         let Some(agent) = agent_command(&command, &self.settings) else {
             return;
         };
-        let agent_name = agent.to_string();
-        let display_name = self.agent_worktree_name(pane_id);
-        self.agent_statuses.insert(
-            pane_id,
-            AgentPaneStatus {
-                activity: Some(format!("Starting {}", agent_display_name(&agent_name))),
-                agent: agent_name,
-                display_name,
-                state: AgentState::Running,
-                session_id: None,
-                cwd: None,
-                git_branch: None,
-            },
-        );
-        self.agent_running_frame_revisions.insert(
-            pane_id,
-            self.terminals
-                .get(&pane_id)
-                .map_or(0, |runtime| runtime.snapshot_revision),
-        );
+        let agent = agent.to_string();
+        let activity = Some(format!("Starting {}", agent_display_name(&agent)));
+        self.record_running_agent(pane_id, agent, activity);
     }
 
     fn agent_worktree_name(&self, pane_id: PaneId) -> Option<String> {
@@ -8021,7 +7969,7 @@ impl Muxtrix {
         }) {
             Some((
                 Message::CloseWorktreeManager,
-                container(opaque(self.worktree_manager_dialog()))
+                container(opaque(self.worktree_restart_dialog()))
                     .center_x(Fill)
                     .center_y(Fill),
             ))
@@ -8782,19 +8730,20 @@ impl Muxtrix {
             .into()
     }
 
-    fn worktree_manager_dialog(&self) -> Element<'_, Message> {
+    fn worktree_restart_dialog(&self) -> Element<'_, Message> {
         let tokens = DesignTokens::for_appearance(self.settings.appearance);
         let Some(manager) = &self.worktree_manager else {
             return container("").into();
+        };
+        let restart_agent = match manager.mode {
+            WorktreeManagerMode::RestartPaneWithAgent(_, agent) => Some(agent),
+            WorktreeManagerMode::RestartPane(_) => None,
+            WorktreeManagerMode::Manage => return container("").into(),
         };
         if let Some(entry) = manager
             .restart_target
             .and_then(|index| manager.entries.get(index))
         {
-            let restart_agent = match manager.mode {
-                WorktreeManagerMode::RestartPaneWithAgent(_, agent) => Some(agent),
-                WorktreeManagerMode::Manage | WorktreeManagerMode::RestartPane(_) => None,
-            };
             let name = entry.branch.as_deref().unwrap_or_else(|| {
                 entry
                     .path
@@ -8808,11 +8757,11 @@ impl Muxtrix {
                 } else {
                     "Restart pane?"
                 })
-                    .size(self.settings.ui_pixels(18.0))
-                    .font(Font {
-                        weight: font::Weight::Bold,
-                        ..Font::DEFAULT
-                    }),
+                .size(self.settings.ui_pixels(18.0))
+                .font(Font {
+                    weight: font::Weight::Bold,
+                    ..Font::DEFAULT
+                }),
                 text(restart_agent.map_or_else(
                     || format!("Open a fresh terminal in {name}?"),
                     |agent| format!(
@@ -8820,8 +8769,8 @@ impl Muxtrix {
                         agent_display_name(&agent.to_string())
                     ),
                 ))
-                    .size(self.settings.ui_pixels(10.5))
-                    .color(tokens.text),
+                .size(self.settings.ui_pixels(10.5))
+                .color(tokens.text),
                 text("The current process and terminal history will close. The pane stays in its present tab and position.")
                     .size(self.settings.ui_pixels(9.5))
                     .color(tokens.muted),
@@ -8874,56 +8823,17 @@ impl Muxtrix {
                 .into();
         }
 
-        let restart_mode = matches!(
-            manager.mode,
-            WorktreeManagerMode::RestartPane(_) | WorktreeManagerMode::RestartPaneWithAgent(_, _)
-        );
-        let restart_with_agent = matches!(
-            manager.mode,
-            WorktreeManagerMode::RestartPaneWithAgent(_, _)
-        );
-        let unused_count = unused_worktree_paths(&manager.entries).len();
-        let title = text(if restart_mode {
-            if restart_with_agent {
-                "Restart pane with agent in worktree"
-            } else {
-                "Restart pane in worktree"
-            }
+        let title = text(if restart_agent.is_some() {
+            "Restart pane with agent in worktree"
         } else {
-            "Worktrees"
+            "Restart pane in worktree"
         })
         .size(self.settings.ui_pixels(18.0))
         .font(Font {
             weight: font::Weight::Bold,
             ..Font::DEFAULT
         });
-        let header: Element<'_, Message> = if restart_mode {
-            title.into()
-        } else {
-            let label = if manager.busy {
-                "Removing…".to_owned()
-            } else {
-                format!("Remove unused ({unused_count})")
-            };
-            let mut remove_unused = button(centered_button_content(
-                text(label).size(self.settings.ui_pixels(9.0)),
-            ))
-            .height(30)
-            .padding([0, 11])
-            .style({
-                let settings_tokens = tokens;
-                move |_, status| {
-                    settings_button_style(settings_tokens, SettingsButtonKind::Danger, status)
-                }
-            });
-            if unused_count > 0 && !manager.busy {
-                remove_unused = remove_unused.on_press(Message::WorktreeManagerDeleteUnused);
-            }
-            row![title.width(Fill), remove_unused]
-                .spacing(12)
-                .align_y(Alignment::Center)
-                .into()
-        };
+        let header: Element<'_, Message> = title.into();
         let mut body = column![header].spacing(14);
         if manager.loading {
             body = body.push(settings_notice(
@@ -8939,29 +8849,17 @@ impl Muxtrix {
                     .size(self.settings.ui_pixels(10.0))
                     .color(tokens.danger),
             );
-        } else if let Some(repo_root) = &manager.repo_root {
+        } else if manager.repo_root.is_some() {
             body = body.push(
-                text(if restart_mode {
-                    "Choose another checkout. You’ll confirm before the current terminal closes."
-                        .to_owned()
-                } else {
-                    format!(
-                        "Manage registered checkouts for {}.",
-                        worktree_display_name(repo_root)
-                    )
-                })
-                .size(self.settings.ui_pixels(10.0))
-                .color(tokens.muted),
+                text("Choose another checkout. You’ll confirm before the current terminal closes.")
+                    .size(self.settings.ui_pixels(10.0))
+                    .color(tokens.muted),
             );
             if manager.entries.is_empty() {
                 body = body.push(
-                    text(if restart_mode {
-                        "No other worktrees are registered for this repository."
-                    } else {
-                        "No worktrees yet. Create one with the New worktree commands."
-                    })
-                    .size(self.settings.ui_pixels(9.5))
-                    .color(tokens.faint),
+                    text("No other worktrees are registered for this repository.")
+                        .size(self.settings.ui_pixels(9.5))
+                        .color(tokens.faint),
                 );
             } else {
                 let mut list = column![].spacing(2);
@@ -8972,77 +8870,27 @@ impl Muxtrix {
                         .branch
                         .as_deref()
                         .map_or_else(|| "Detached HEAD".to_owned(), |branch| branch.to_owned());
-                    let status = if restart_mode {
-                        match &entry.used_by {
-                            Some(pane) => status_pill(
-                                &format!(
-                                    "In use · {}",
-                                    ellipsize(pane, self.settings.ui_char_budget(18))
-                                ),
-                                tokens.warning,
-                                &self.settings,
+                    let status = match &entry.used_by {
+                        Some(pane) => status_pill(
+                            &format!(
+                                "In use · {}",
+                                ellipsize(pane, self.settings.ui_char_budget(18))
                             ),
-                            None => status_pill("Idle", tokens.faint, &self.settings),
-                        }
-                    } else {
-                        match (&entry.deletion_blocker, &entry.used_by) {
-                            (Some(blocker), _) => {
-                                status_pill(blocker, tokens.faint, &self.settings)
-                            }
-                            (None, Some(pane)) => status_pill(
-                                &format!(
-                                    "In use · {}",
-                                    ellipsize(pane, self.settings.ui_char_budget(18))
-                                ),
-                                tokens.warning,
-                                &self.settings,
-                            ),
-                            (None, None) => status_pill("Idle", tokens.faint, &self.settings),
-                        }
-                    };
-                    let action: Element<'_, Message> = if restart_mode {
-                        settings_action_button(
-                            "Restart",
-                            Message::WorktreeManagerRestart(index),
-                            if selected {
-                                SettingsButtonKind::Primary
-                            } else {
-                                SettingsButtonKind::Secondary
-                            },
+                            tokens.warning,
                             &self.settings,
-                        )
-                    } else {
-                        let delete_label = if manager.busy && selected {
-                            "Removing…"
-                        } else if entry.deletion_blocker.is_some() {
-                            "Protected"
-                        } else {
-                            "Delete"
-                        };
-                        let mut delete = button(centered_button_label(
-                            delete_label,
-                            self.settings.ui_pixels(9.0),
-                        ))
-                        .height(28)
-                        .padding([0, 14])
-                        .style({
-                            let settings_tokens = tokens;
-                            move |_, status| {
-                                settings_button_style(
-                                    settings_tokens,
-                                    SettingsButtonKind::Danger,
-                                    status,
-                                )
-                            }
-                        });
-                        if entry.deletion_blocker.is_none()
-                            && entry.used_by.is_none()
-                            && !manager.busy
-                        {
-                            delete = delete.on_press(Message::WorktreeManagerDelete(index));
-                        }
-                        delete.into()
+                        ),
+                        None => status_pill("Idle", tokens.faint, &self.settings),
                     };
+                    let action = settings_action_button(
+                        "Restart",
+                        Message::WorktreeManagerRestart(index),
+                        if selected {
+                            SettingsButtonKind::Primary
+                        } else {
+                            SettingsButtonKind::Secondary
+                        },
+                        &self.settings,
+                    );
                     let push_status: Element<'_, Message> = if entry.unpushed_commits > 0 {
                         status_pill(
                             &format!(
@@ -9137,11 +8985,7 @@ impl Muxtrix {
             }
         }
         let hint = if manager.failure.is_none() && !manager.entries.is_empty() {
-            if restart_mode {
-                "↑↓ select · Enter reviews · Esc closes"
-            } else {
-                "↑↓ select · Del deletes eligible worktrees · Enter or Esc closes"
-            }
+            "↑↓ select · Enter reviews · Esc closes"
         } else {
             ""
         };
@@ -15033,23 +14877,32 @@ fn first_enabled_palette_command(enabled: &[bool]) -> usize {
 }
 
 fn enabled_palette_selection(current: usize, enabled: &[bool], direction: PaletteMove) -> usize {
-    let enabled_indices: Vec<_> = enabled
+    let enabled_count = enabled
+        .iter()
+        .filter(|command_enabled| **command_enabled)
+        .count();
+    if enabled_count == 0 {
+        return 0;
+    }
+    let current_position = enabled.get(current).copied().unwrap_or(false).then(|| {
+        enabled[..current]
+            .iter()
+            .filter(|command_enabled| **command_enabled)
+            .count()
+    });
+    let next_position = current_position.map_or_else(
+        || match direction {
+            PaletteMove::Next => 0,
+            PaletteMove::Previous => enabled_count - 1,
+        },
+        |position| palette_selection(position, enabled_count, direction),
+    );
+    enabled
         .iter()
         .enumerate()
         .filter_map(|(index, command_enabled)| command_enabled.then_some(index))
-        .collect();
-    if enabled_indices.is_empty() {
-        return 0;
-    }
-    let current_enabled_index = enabled_indices.iter().position(|index| *index == current);
-    let next_enabled_index = current_enabled_index.map_or_else(
-        || match direction {
-            PaletteMove::Next => 0,
-            PaletteMove::Previous => enabled_indices.len() - 1,
-        },
-        |position| palette_selection(position, enabled_indices.len(), direction),
-    );
-    enabled_indices[next_enabled_index]
+        .nth(next_position)
+        .unwrap_or(0)
 }
 
 fn pane_ids_in_layout(tree: &PaneTree) -> Vec<PaneId> {
@@ -17809,56 +17662,56 @@ struct RuntimePoll {
 }
 
 impl TerminalRuntime {
-    fn preparing_host(fallback_title: &str) -> Self {
+    fn with_state(
+        preview: impl Into<String>,
+        fallback_title: &str,
+        session: Option<LiveSession>,
+        viewport: Option<Size>,
+        launch_state: TerminalLaunchState,
+    ) -> Self {
         Self {
-            preview: "Preparing terminal host…\n\nThe workspace remains usable while this runs."
-                .into(),
+            preview: preview.into(),
             snapshot: None,
             snapshot_revision: 0,
             image_handles: BTreeMap::new(),
-            session: None,
-            fallback_title: fallback_title.into(),
-            display_title: fallback_title.into(),
-            size: initial_pty_size(),
-            viewport: None,
-            launch_state: TerminalLaunchState::PreparingHost,
-            has_selection: false,
-        }
-    }
-
-    fn suppressed(fallback_title: &str) -> Self {
-        Self {
-            preview: "No terminal was started.\n\nYou can browse the workspace and start a terminal when the host is healthy."
-                .into(),
-            snapshot: None,
-            snapshot_revision: 0,
-            image_handles: BTreeMap::new(),
-            session: None,
-            fallback_title: fallback_title.into(),
-            display_title: fallback_title.into(),
-            size: initial_pty_size(),
-            viewport: None,
-            launch_state: TerminalLaunchState::Suppressed,
-            has_selection: false,
-        }
-    }
-
-    fn starting(fallback_title: &str, attempt_id: u64, viewport: Option<Size>) -> Self {
-        Self {
-            preview:
-                "Starting terminal…\n\nThis pane can be cancelled without blocking the workspace."
-                    .into(),
-            snapshot: None,
-            snapshot_revision: 0,
-            image_handles: BTreeMap::new(),
-            session: None,
+            session,
             fallback_title: fallback_title.into(),
             display_title: fallback_title.into(),
             size: initial_pty_size(),
             viewport,
-            launch_state: TerminalLaunchState::Starting { attempt_id },
+            launch_state,
             has_selection: false,
         }
+    }
+
+    fn preparing_host(fallback_title: &str) -> Self {
+        Self::with_state(
+            "Preparing terminal host…\n\nThe workspace remains usable while this runs.",
+            fallback_title,
+            None,
+            None,
+            TerminalLaunchState::PreparingHost,
+        )
+    }
+
+    fn suppressed(fallback_title: &str) -> Self {
+        Self::with_state(
+            "No terminal was started.\n\nYou can browse the workspace and start a terminal when the host is healthy.",
+            fallback_title,
+            None,
+            None,
+            TerminalLaunchState::Suppressed,
+        )
+    }
+
+    fn starting(fallback_title: &str, attempt_id: u64, viewport: Option<Size>) -> Self {
+        Self::with_state(
+            "Starting terminal…\n\nThis pane can be cancelled without blocking the workspace.",
+            fallback_title,
+            None,
+            viewport,
+            TerminalLaunchState::Starting { attempt_id },
+        )
     }
 
     fn launch(
@@ -17879,41 +17732,32 @@ impl TerminalRuntime {
             control_endpoint,
         ) {
             Ok(session) => (
-                Self {
-                    preview: "Starting local terminal…".into(),
-                    snapshot: None,
-                    snapshot_revision: 0,
-                    image_handles: BTreeMap::new(),
-                    session: Some(session),
-                    fallback_title: fallback_title.into(),
-                    display_title: fallback_title.into(),
-                    size: initial_pty_size(),
-                    viewport: None,
-                    launch_state: TerminalLaunchState::Running,
-                    has_selection: false,
-                },
+                Self::with_state(
+                    "Starting local terminal…",
+                    fallback_title,
+                    Some(session),
+                    None,
+                    TerminalLaunchState::Running,
+                ),
                 "Live terminal — GPU compositor: Iced/wgpu".into(),
             ),
-            Err(error) => (
-                Self {
-                    preview: ghostty_preview().unwrap_or_else(|preview_error| {
-                        format!(
-                            "Live terminal failed: {error}\nGhostty preview failed: {preview_error}"
-                        )
-                    }),
-                    snapshot: None,
-                    snapshot_revision: 0,
-                    image_handles: BTreeMap::new(),
-                    session: None,
-                    fallback_title: fallback_title.into(),
-                    display_title: fallback_title.into(),
-                    size: initial_pty_size(),
-                    viewport: None,
-                    launch_state: TerminalLaunchState::Failed(error.clone()),
-                    has_selection: false,
-                },
-                format!("Terminal launch failed: {error}"),
-            ),
+            Err(error) => {
+                let preview = ghostty_preview().unwrap_or_else(|preview_error| {
+                    format!(
+                        "Live terminal failed: {error}\nGhostty preview failed: {preview_error}"
+                    )
+                });
+                (
+                    Self::with_state(
+                        preview,
+                        fallback_title,
+                        None,
+                        None,
+                        TerminalLaunchState::Failed(error.clone()),
+                    ),
+                    format!("Terminal launch failed: {error}"),
+                )
+            }
         }
     }
 
@@ -17955,25 +17799,14 @@ impl TerminalRuntime {
             Some(notifier),
         )
         .ok();
-        let attached = session.is_some();
-        Self {
-            preview: "Reattaching…".into(),
-            snapshot: None,
-            snapshot_revision: 0,
-            image_handles: BTreeMap::new(),
-            session,
-            fallback_title: title.into(),
-            display_title: title.into(),
-            size,
-            viewport: None,
-            launch_state: if attached {
-                TerminalLaunchState::Running
-            } else {
-                TerminalLaunchState::Failed("Could not attach to the terminal session".into())
-            },
-            has_selection: false,
-        }
+        let launch_state = if session.is_some() {
+            TerminalLaunchState::Running
+        } else {
+            TerminalLaunchState::Failed("Could not attach to the terminal session".into())
+        };
+        Self::with_state("Reattaching…", title, session, None, launch_state)
     }
+
     fn set_snapshot(&mut self, snapshot: GridSnapshot) {
         let generations = snapshot
             .images

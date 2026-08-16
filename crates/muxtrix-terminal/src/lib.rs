@@ -1716,16 +1716,7 @@ impl LiveSession {
         size: PtySize,
         options: TerminalOptions,
     ) -> Result<Self, LiveSessionError> {
-        Self::spawn_with_notifier(plan, size, options, None)
-    }
-
-    pub fn spawn_with_notifier(
-        plan: LaunchPlan,
-        size: PtySize,
-        options: TerminalOptions,
-        notifier: Option<EventNotifier>,
-    ) -> Result<Self, LiveSessionError> {
-        Self::spawn_inner(plan, size, options, None, notifier)
+        Self::spawn_inner(plan, size, options, None, None)
     }
 
     pub fn spawn_with_notifier_and_theme(

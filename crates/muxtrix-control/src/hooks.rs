@@ -276,7 +276,7 @@ impl HookManager {
         if agent.uses_extension_file() {
             let target = self.target(agent, scope);
             let text = read_text_or_empty(&target)?;
-            if count_semantic_managed_text(&text, agent) != hook_events(agent).len() {
+            if count_managed_text(&text, agent) != hook_events(agent).len() {
                 return Ok(status);
             }
             // Path-only migration must not replace the original backup/record.
@@ -795,7 +795,7 @@ fn hook_command_suffix(agent: Agent, state: &str) -> String {
     )
 }
 
-fn count_managed(root: &Value) -> usize {
+fn hook_handlers(root: &Value) -> impl Iterator<Item = &Value> {
     root.get("hooks")
         .and_then(Value::as_object)
         .into_iter()
@@ -804,6 +804,23 @@ fn count_managed(root: &Value) -> usize {
         .flatten()
         .filter_map(|group| group.get("hooks").and_then(Value::as_array))
         .flatten()
+}
+
+fn event_handlers<'a>(
+    hooks: &'a Map<String, Value>,
+    event: &str,
+) -> impl Iterator<Item = &'a Value> {
+    hooks
+        .get(event)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+}
+
+fn count_managed(root: &Value) -> usize {
+    hook_handlers(root)
         .filter(|handler| is_managed(handler))
         .count()
 }
@@ -811,14 +828,7 @@ fn count_managed(root: &Value) -> usize {
 #[cfg(test)]
 fn count_managed_for_executable(root: &Value, executable: &Path) -> usize {
     let executable = executable.to_string_lossy();
-    root.get("hooks")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|hooks| hooks.values())
-        .filter_map(Value::as_array)
-        .flatten()
-        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
-        .flatten()
+    hook_handlers(root)
         .filter(|handler| {
             handler
                 .get("command")
@@ -838,14 +848,7 @@ fn count_managed_for_executable(root: &Value, executable: &Path) -> usize {
 /// is not one it should call broken.
 fn count_unreachable_managed(root: &Value) -> usize {
     let mut checked: BTreeMap<String, bool> = BTreeMap::new();
-    root.get("hooks")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|hooks| hooks.values())
-        .filter_map(Value::as_array)
-        .flatten()
-        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
-        .flatten()
+    hook_handlers(root)
         .filter(|handler| is_managed(handler))
         .filter_map(|handler| handler.get("command").and_then(Value::as_str))
         .filter_map(managed_executable)
@@ -897,16 +900,9 @@ fn count_expected_managed(root: &Value, agent: Agent, executable: &Path) -> usiz
         .iter()
         .filter(|(event, state)| {
             let expected = hook_command(executable, agent, state);
-            hooks
-                .get(*event)
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|group| group.get("hooks").and_then(Value::as_array))
-                .flatten()
-                .any(|handler| {
-                    handler.get("command").and_then(Value::as_str) == Some(expected.as_str())
-                })
+            event_handlers(hooks, event).any(|handler| {
+                handler.get("command").and_then(Value::as_str) == Some(expected.as_str())
+            })
         })
         .count()
 }
@@ -921,21 +917,14 @@ fn count_semantic_managed(root: &Value, agent: Agent) -> usize {
         .iter()
         .filter(|(event, state)| {
             let suffix = hook_command_suffix(agent, state);
-            hooks
-                .get(*event)
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|group| group.get("hooks").and_then(Value::as_array))
-                .flatten()
-                .any(|handler| {
-                    handler
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(|command| {
-                            command.contains(MANAGED_MARKER) && command.ends_with(&suffix)
-                        })
-                })
+            event_handlers(hooks, event).any(|handler| {
+                handler
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| {
+                        command.contains(MANAGED_MARKER) && command.ends_with(&suffix)
+                    })
+            })
         })
         .count()
 }
@@ -956,10 +945,6 @@ fn count_expected_managed_text(text: &str, agent: Agent, executable: &Path) -> u
                 && managed_text_has_event(text, agent, event, state)
         })
         .count()
-}
-
-fn count_semantic_managed_text(text: &str, agent: Agent) -> usize {
-    count_managed_text(text, agent)
 }
 
 fn extension_version_is_current(text: &str, agent: Agent) -> bool {
@@ -1196,51 +1181,31 @@ fn root_is_empty(value: &Value) -> bool {
 }
 
 fn write_json_atomic(path: &Path, value: &Value) -> Result<(), HookError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| HookError::PathHasNoParent(path.to_path_buf()))?;
-    std::fs::create_dir_all(parent)?;
-    let existing_permissions = std::fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    let temporary = path.with_extension("json.muxtrix-tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(value)?)?;
-    if let Some(permissions) = existing_permissions {
-        std::fs::set_permissions(&temporary, permissions)?;
-    } else {
-        set_file_private(&temporary)?;
-    }
-    #[cfg(windows)]
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    std::fs::rename(temporary, path)?;
-    Ok(())
+    write_atomic(path, "json.muxtrix-tmp", |temporary| {
+        std::fs::write(temporary, serde_json::to_vec_pretty(value)?)?;
+        Ok(())
+    })
 }
+
 fn write_text_atomic(path: &Path, text: &str) -> Result<(), HookError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| HookError::PathHasNoParent(path.to_path_buf()))?;
-    std::fs::create_dir_all(parent)?;
-    let existing_permissions = std::fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    let temporary = path.with_extension("ts.muxtrix-tmp");
-    std::fs::write(&temporary, text)?;
-    if let Some(permissions) = existing_permissions {
-        std::fs::set_permissions(&temporary, permissions)?;
-    } else {
-        set_file_private(&temporary)?;
-    }
-    #[cfg(windows)]
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    std::fs::rename(temporary, path)?;
-    Ok(())
+    write_atomic(path, "ts.muxtrix-tmp", |temporary| {
+        std::fs::write(temporary, text)?;
+        Ok(())
+    })
 }
 
 fn write_toml_atomic(path: &Path, document: &DocumentMut) -> Result<(), HookError> {
+    write_atomic(path, "toml.muxtrix-tmp", |temporary| {
+        std::fs::write(temporary, document.to_string())?;
+        Ok(())
+    })
+}
+
+fn write_atomic(
+    path: &Path,
+    temporary_extension: &str,
+    write: impl FnOnce(&Path) -> Result<(), HookError>,
+) -> Result<(), HookError> {
     let parent = path
         .parent()
         .ok_or_else(|| HookError::PathHasNoParent(path.to_path_buf()))?;
@@ -1248,8 +1213,8 @@ fn write_toml_atomic(path: &Path, document: &DocumentMut) -> Result<(), HookErro
     let existing_permissions = std::fs::metadata(path)
         .ok()
         .map(|metadata| metadata.permissions());
-    let temporary = path.with_extension("toml.muxtrix-tmp");
-    std::fs::write(&temporary, document.to_string())?;
+    let temporary = path.with_extension(temporary_extension);
+    write(&temporary)?;
     if let Some(permissions) = existing_permissions {
         std::fs::set_permissions(&temporary, permissions)?;
     } else {
