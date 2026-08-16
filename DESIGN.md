@@ -336,8 +336,12 @@ panel, their hover fill uses the line token, never the panel's own color.
 
 Clipboard bindings follow Ghostty's defaults: Ctrl+Shift+C/Ctrl+Shift+V, and
 Cmd+C/Cmd+V on macOS. Bare Ctrl+C and Ctrl+V always belong to the terminal.
-Paste is encoded against the terminal's own bracketed-paste state; the chords
-are surfaced in both the context menu and the command palette.
+A genuine terminal text-selection drag copies to the system clipboard once,
+when the left button is released; click jitter and pointer moves never replace
+clipboard contents. Mouse-reporting applications retain unmodified pointer
+input, while Shift explicitly restores local selection. Paste is encoded
+against the terminal's own bracketed-paste state; the chords are surfaced in
+both the context menu and the command palette.
 
 Terminal rows use fixed-height, fixed-column projection. Unicode fallback
 glyphs that may have variable natural metrics stand in isolated runs; wide

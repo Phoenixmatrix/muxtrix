@@ -2224,6 +2224,9 @@ impl Muxtrix {
                 return Task::none();
             }
             Message::EndPointerInteraction => {
+                let selected_text = self
+                    .finish_terminal_selection(None)
+                    .and_then(|pane_id| self.selected_terminal_text(pane_id));
                 if let Err(error) = self.finish_tab_drag() {
                     self.status = error;
                 }
@@ -2232,8 +2235,7 @@ impl Muxtrix {
                 }
                 self.split_drag = None;
                 self.terminal_scroll_drag = None;
-                self.terminal_selection_drag = None;
-                return Task::none();
+                return selected_text.map_or_else(Task::none, iced::clipboard::write);
             }
             Message::EnterTerminal(pane_id) => {
                 self.hovered_terminal = Some(pane_id);
@@ -2313,10 +2315,16 @@ impl Muxtrix {
                 return self.begin_terminal_mouse(pane_id, button);
             }
             Message::TerminalMouseReleased(pane_id, button) => {
+                let selected_text = if button == TerminalMouseButton::Left {
+                    self.finish_terminal_selection(Some(pane_id))
+                        .and_then(|pane_id| self.selected_terminal_text(pane_id))
+                } else {
+                    None
+                };
                 if let Err(error) = self.end_terminal_mouse(pane_id, button) {
                     self.status = format!("Terminal mouse release failed: {error}");
                 }
-                return Task::none();
+                return selected_text.map_or_else(Task::none, iced::clipboard::write);
             }
             Message::OpenPaneContextMenu(pane_id) => {
                 let _ = self.focus_pane(pane_id);
@@ -6933,17 +6941,26 @@ impl Muxtrix {
         Task::none()
     }
 
+    /// Commits a genuine text-selection drag and returns its pane exactly once.
+    ///
+    /// Ghostty copies only when the button is released rather than on every
+    /// pointer move. Accepting `None` lets the window-level release finish a
+    /// drag that ended outside the terminal; the pane-level release normally
+    /// wins, and taking the gesture prevents a duplicate clipboard write.
+    fn finish_terminal_selection(&mut self, pane_id: Option<PaneId>) -> Option<PaneId> {
+        let drag = self.terminal_selection_drag?;
+        if pane_id.is_some_and(|pane_id| pane_id != drag.pane_id) {
+            return None;
+        }
+        self.terminal_selection_drag = None;
+        drag.active.then_some(drag.pane_id)
+    }
+
     fn end_terminal_mouse(
         &mut self,
         pane_id: PaneId,
         button: TerminalMouseButton,
     ) -> Result<(), String> {
-        if self
-            .terminal_selection_drag
-            .is_some_and(|drag| drag.pane_id == pane_id)
-        {
-            self.terminal_selection_drag = None;
-        }
         if !self
             .terminal_mouse_capture
             .is_some_and(|capture| capture.pane_id == pane_id && capture.button == button)
@@ -21911,6 +21928,17 @@ mod tests {
         assert!(
             app.terminals[&pane_id].has_selection,
             "crossing the drag threshold should still select terminal text"
+        );
+        assert_eq!(
+            app.finish_terminal_selection(None),
+            Some(pane_id),
+            "a genuine drag should commit when the window observes its release"
+        );
+        assert!(app.terminal_selection_drag.is_none());
+        assert_eq!(
+            app.finish_terminal_selection(Some(pane_id)),
+            None,
+            "the pane-level release must not schedule a duplicate copy"
         );
     }
 
