@@ -2172,6 +2172,19 @@ fn staged_github_panel() -> GitHubPanelState {
             } else {
                 github::PullRequestSummaryStatus::Open
             },
+            readiness: if index % 9 == 4 {
+                github::MergeReadiness::Draft
+            } else {
+                match index % 7 {
+                    0 => github::MergeReadiness::Ready,
+                    1 => github::MergeReadiness::Conflicts,
+                    2 => github::MergeReadiness::ChecksFailed,
+                    3 => github::MergeReadiness::ChecksPending,
+                    4 => github::MergeReadiness::ReviewRequired,
+                    5 => github::MergeReadiness::Blocked,
+                    _ => github::MergeReadiness::Unknown,
+                }
+            },
         })
         .collect();
 

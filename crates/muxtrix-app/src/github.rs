@@ -124,6 +124,7 @@ pub(crate) struct PullRequestSummary {
     pub(crate) head: String,
     pub(crate) base: String,
     pub(crate) status: PullRequestSummaryStatus,
+    pub(crate) readiness: MergeReadiness,
 }
 
 impl PullRequestSummary {
@@ -148,7 +149,7 @@ pub(crate) struct PullRequestDetails {
     pub(crate) files: Vec<FileChange>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MergeReadiness {
     Ready,
     Draft,
@@ -163,36 +164,48 @@ pub(crate) enum MergeReadiness {
 
 impl PullRequest {
     pub(crate) fn readiness(&self) -> MergeReadiness {
-        if self.draft {
-            return MergeReadiness::Draft;
-        }
-        if self.mergeable == "CONFLICTING" || self.merge_state == "DIRTY" {
-            return MergeReadiness::Conflicts;
-        }
-        if self.checks.failed > 0 {
-            return MergeReadiness::ChecksFailed;
-        }
-        if self.checks.pending > 0 {
-            return MergeReadiness::ChecksPending;
-        }
-        if self.review_decision == "CHANGES_REQUESTED" || self.review_decision == "REVIEW_REQUIRED"
-        {
-            return MergeReadiness::ReviewRequired;
-        }
-        if self.merge_state == "BEHIND" {
-            return MergeReadiness::Behind;
-        }
-        if matches!(
-            self.merge_state.as_str(),
-            "BLOCKED" | "HAS_HOOKS" | "UNSTABLE"
-        ) {
-            return MergeReadiness::Blocked;
-        }
-        if self.mergeable == "MERGEABLE" && self.merge_state == "CLEAN" {
-            return MergeReadiness::Ready;
-        }
-        MergeReadiness::Unknown
+        merge_readiness(
+            self.draft,
+            &self.mergeable,
+            &self.merge_state,
+            &self.review_decision,
+            &self.checks,
+        )
     }
+}
+
+fn merge_readiness(
+    draft: bool,
+    mergeable: &str,
+    merge_state: &str,
+    review_decision: &str,
+    checks: &CheckSummary,
+) -> MergeReadiness {
+    if draft {
+        return MergeReadiness::Draft;
+    }
+    if mergeable == "CONFLICTING" || merge_state == "DIRTY" {
+        return MergeReadiness::Conflicts;
+    }
+    if checks.failed > 0 {
+        return MergeReadiness::ChecksFailed;
+    }
+    if checks.pending > 0 {
+        return MergeReadiness::ChecksPending;
+    }
+    if review_decision == "CHANGES_REQUESTED" || review_decision == "REVIEW_REQUIRED" {
+        return MergeReadiness::ReviewRequired;
+    }
+    if merge_state == "BEHIND" {
+        return MergeReadiness::Behind;
+    }
+    if matches!(merge_state, "BLOCKED" | "HAS_HOOKS" | "UNSTABLE") {
+        return MergeReadiness::Blocked;
+    }
+    if mergeable == "MERGEABLE" && merge_state == "CLEAN" {
+        return MergeReadiness::Ready;
+    }
+    MergeReadiness::Unknown
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -384,7 +397,7 @@ pub(crate) fn list_pull_requests(
             "--limit",
             "1000",
             "--json",
-            "number,title,url,author,headRefName,baseRefName,isDraft",
+            "number,title,url,author,headRefName,baseRefName,isDraft,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup",
         ])
         .output()
         .map_err(|error| format!("GitHub pull requests could not be read: {error}"))?;
@@ -1040,6 +1053,14 @@ struct PullRequestSummaryResponse {
     head_ref_name: String,
     base_ref_name: String,
     is_draft: bool,
+    #[serde(default)]
+    mergeable: String,
+    #[serde(default)]
+    merge_state_status: String,
+    #[serde(default)]
+    review_decision: String,
+    #[serde(default)]
+    status_check_rollup: Vec<PullRequestCheck>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1099,20 +1120,31 @@ fn parse_pull_request_summaries(bytes: &[u8]) -> Result<Vec<PullRequestSummary>,
         .map_err(|error| format!("GitHub returned an invalid pull request list: {error}"))?;
     Ok(responses
         .into_iter()
-        .map(|pull_request| PullRequestSummary {
-            number: pull_request.number,
-            title: pull_request.title,
-            url: pull_request.url,
-            author: pull_request
-                .author
-                .map_or_else(|| "Unknown author".into(), |author| author.login),
-            head: pull_request.head_ref_name,
-            base: pull_request.base_ref_name,
-            status: if pull_request.is_draft {
-                PullRequestSummaryStatus::Draft
-            } else {
-                PullRequestSummaryStatus::Open
-            },
+        .map(|pull_request| {
+            let checks = summarize_checks(pull_request.status_check_rollup);
+            let readiness = merge_readiness(
+                pull_request.is_draft,
+                &pull_request.mergeable,
+                &pull_request.merge_state_status,
+                &pull_request.review_decision,
+                &checks,
+            );
+            PullRequestSummary {
+                number: pull_request.number,
+                title: pull_request.title,
+                url: pull_request.url,
+                author: pull_request
+                    .author
+                    .map_or_else(|| "Unknown author".into(), |author| author.login),
+                head: pull_request.head_ref_name,
+                base: pull_request.base_ref_name,
+                status: if pull_request.is_draft {
+                    PullRequestSummaryStatus::Draft
+                } else {
+                    PullRequestSummaryStatus::Open
+                },
+                readiness,
+            }
         })
         .collect())
 }
@@ -1120,22 +1152,7 @@ fn parse_pull_request_summaries(bytes: &[u8]) -> Result<Vec<PullRequestSummary>,
 fn parse_pull_request(bytes: &[u8]) -> Result<PullRequest, String> {
     let response: PullRequestResponse = serde_json::from_slice(bytes)
         .map_err(|error| format!("GitHub returned invalid pull request details: {error}"))?;
-    let mut checks = CheckSummary {
-        passed: 0,
-        pending: 0,
-        failed: 0,
-    };
-    for check in response.status_check_rollup {
-        if check.status != "COMPLETED" {
-            checks.pending += 1;
-            continue;
-        }
-        match check.conclusion.as_deref().unwrap_or_default() {
-            "SUCCESS" | "NEUTRAL" | "SKIPPED" => checks.passed += 1,
-            "" => checks.pending += 1,
-            _ => checks.failed += 1,
-        }
-    }
+    let checks = summarize_checks(response.status_check_rollup);
     Ok(PullRequest {
         number: response.number,
         title: response.title,
@@ -1167,7 +1184,25 @@ fn github_command(github_host: &str) -> Command {
     command.env("GH_HOST", github_host);
     command
 }
-
+fn summarize_checks(checks: Vec<PullRequestCheck>) -> CheckSummary {
+    let mut summary = CheckSummary {
+        passed: 0,
+        pending: 0,
+        failed: 0,
+    };
+    for check in checks {
+        if check.status != "COMPLETED" {
+            summary.pending += 1;
+            continue;
+        }
+        match check.conclusion.as_deref().unwrap_or_default() {
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" => summary.passed += 1,
+            "" => summary.pending += 1,
+            _ => summary.failed += 1,
+        }
+    }
+    summary
+}
 fn git(directory: &Path, wsl_distribution: &str, arguments: &[&str]) -> Result<Output, String> {
     super::git_in(directory, wsl_distribution, arguments)
         .map_err(|error| format!("Git could not start: {error}"))
@@ -1416,6 +1451,7 @@ mod tests {
             head: "github-support".into(),
             base: "main".into(),
             status: PullRequestSummaryStatus::Open,
+            readiness: MergeReadiness::Ready,
         };
 
         assert!(pull_request.matches("review panel"));
@@ -1426,9 +1462,9 @@ mod tests {
     }
 
     #[test]
-    fn pull_request_list_parser_keeps_searchable_identity() {
+    fn pull_request_list_parser_keeps_identity_and_readiness() {
         let pull_requests = parse_pull_request_summaries(
-            br#"[{"number":17,"title":"Keep diffs readable","url":"https://github.com/example/repo/pull/17","author":{"login":"octocat"},"headRefName":"diff-wrap","baseRefName":"main","isDraft":false}]"#,
+            br#"[{"number":17,"title":"Keep diffs readable","url":"https://github.com/example/repo/pull/17","author":{"login":"octocat"},"headRefName":"diff-wrap","baseRefName":"main","isDraft":false,"mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","reviewDecision":"","statusCheckRollup":[]}]"#,
         )
         .expect("GitHub list should parse");
 
@@ -1436,6 +1472,7 @@ mod tests {
         assert_eq!(pull_requests[0].number, 17);
         assert_eq!(pull_requests[0].author, "octocat");
         assert_eq!(pull_requests[0].status, PullRequestSummaryStatus::Open);
+        assert_eq!(pull_requests[0].readiness, MergeReadiness::Conflicts);
         assert!(pull_requests[0].matches("diff-wrap"));
     }
 
