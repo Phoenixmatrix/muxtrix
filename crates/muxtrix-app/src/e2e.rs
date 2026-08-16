@@ -1711,6 +1711,18 @@ impl Scenario {
                 error: Some("Could not read the session registry: permission denied".into()),
                 startup: false,
             });
+        } else if self.capturing("github-opening") {
+            app.github_auth = github::AuthStatus::Authenticated {
+                login: "phoenixmatrix".into(),
+            };
+            let mut repository = staged_repository();
+            repository.name.clear();
+            repository.owner_and_name = None;
+            repository.branch.clear();
+            let mut panel = GitHubPanelState::loading(repository);
+            panel.context_loading = true;
+            panel.loading_phase = 4;
+            app.github_panel = Some(panel);
         } else if self.capturing("github-loading") {
             app.github_auth = github::AuthStatus::Authenticated {
                 login: "phoenixmatrix".into(),
@@ -2218,7 +2230,6 @@ fn staged_github_panel() -> GitHubPanelState {
         merge_confirmation: false,
         merging: false,
         file_scroll_offset: 0.0,
-        request_generation: 0,
         pull_request_generation: 0,
         pull_request_detail_generation: 0,
         loading_phase: 0,
