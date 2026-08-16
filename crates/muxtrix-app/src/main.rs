@@ -4921,6 +4921,7 @@ impl Muxtrix {
             | keyboard::Event::ModifiersChanged(modifiers) => *modifiers,
         };
         let keyboard::Event::KeyPressed {
+            key,
             modified_key,
             modifiers,
             text,
@@ -5038,16 +5039,28 @@ impl Muxtrix {
             return Task::none();
         }
 
+        if modifiers == Modifiers::COMMAND | Modifiers::SHIFT
+            && let Some(number) = number_shortcut(key.as_ref())
+        {
+            if let Some(workspace_id) = self
+                .session
+                .workspaces
+                .get(number - 1)
+                .map(|workspace| workspace.id)
+                && let Err(error) = self.switch_workspace(workspace_id)
+            {
+                self.status = error;
+            }
+            return Task::none();
+        }
         if modifiers.command() && character_key_is(modified_key.as_ref(), "p") {
             return self.toggle_command_palette();
         }
         if modifiers.command() && character_key_is(modified_key.as_ref(), ",") {
             return self.open_settings();
         }
-        if modifiers.command()
-            && let Key::Character(character) = modified_key.as_ref()
-            && let Ok(number) = character.parse::<usize>()
-            && (1..=9).contains(&number)
+        if modifiers == Modifiers::COMMAND
+            && let Some(number) = number_shortcut(key.as_ref())
         {
             if let Some((workspace_id, pane_id)) = self.fleet_entries().get(number - 1).copied() {
                 self.active_view = ActiveView::Workspace;
@@ -14729,6 +14742,16 @@ fn character_key_is(key: Key<&str>, expected: &str) -> bool {
     matches!(key, Key::Character(character) if character.eq_ignore_ascii_case(expected))
 }
 
+fn number_shortcut(key: Key<&str>) -> Option<usize> {
+    let Key::Character(character) = key else {
+        return None;
+    };
+    character
+        .parse::<usize>()
+        .ok()
+        .filter(|number| (1..=9).contains(number))
+}
+
 fn clipboard_shortcut(key: Key<&str>, modifiers: Modifiers) -> Option<ClipboardAction> {
     clipboard_shortcut_for(key, modifiers, cfg!(target_os = "macos"))
 }
@@ -23823,6 +23846,32 @@ mod tests {
         let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
         assert!(app.rail_nav.is_none());
         assert!(app.feedback_message().is_none());
+    }
+
+    #[test]
+    fn command_shift_number_switches_workspace_by_session_order() {
+        let mut app = Muxtrix::new();
+        create_test_workspace(&mut app);
+        create_test_workspace(&mut app);
+        let second_workspace = app.session.workspaces[1].id;
+        let second_workspace_name = app.session.workspaces[1].name.clone();
+        assert_ne!(app.session.active_workspace_id, second_workspace);
+
+        let _ = app.handle_keyboard(keyboard::Event::KeyPressed {
+            key: Key::Character("2".into()),
+            // Iced applies Shift to `modified_key`; shortcut matching must use
+            // the unmodified key or Shift+2 becomes "@" on a US layout.
+            modified_key: Key::Character("@".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit2),
+            location: keyboard::Location::Standard,
+            modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+            text: Some("@".into()),
+            repeat: false,
+        });
+
+        assert_eq!(app.session.active_workspace_id, second_workspace);
+        assert_eq!(app.workspace_name_draft, second_workspace_name);
+        assert_eq!(app.active_view, ActiveView::Workspace);
     }
 
     #[test]
