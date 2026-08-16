@@ -11,6 +11,11 @@
 
 - Keep automated checks headless. Do not run the GUI unless the host user
   explicitly opts in.
+- On Windows, console subprocesses launched by the app must never open a visible
+  terminal window. Create short-lived console commands with
+  `crates/muxtrix-app/src/process.rs::console_command` so they use
+  `CREATE_NO_WINDOW`; do not invoke console programs directly with
+  `std::process::Command::new`.
 
 # Seeing the UI
 

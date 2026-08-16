@@ -19076,7 +19076,7 @@ fn probe_installed_versions(
 }
 
 fn probe_binary_version(path: &std::path::Path, binary_name: &str) -> Result<String, String> {
-    let output = Command::new(path)
+    let output = console_command(path)
         .arg("--version")
         .output()
         .map_err(|error| format!("could not run {}: {error}", path.display()))?;
