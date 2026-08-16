@@ -551,7 +551,6 @@ struct GitHubPanelState {
     draft_state_updating: bool,
     merging: bool,
     file_scroll_offset: f32,
-    request_generation: u64,
     pull_request_generation: u64,
     pull_request_detail_generation: u64,
     loading_phase: u8,
@@ -584,7 +583,6 @@ impl GitHubPanelState {
             merge_confirmation: false,
             merging: false,
             file_scroll_offset: 0.0,
-            request_generation: 0,
             pull_request_generation: 0,
             pull_request_detail_generation: 0,
             loading_phase: 0,
@@ -657,6 +655,12 @@ impl GitHubPanelState {
             github::MergeReadiness::Unknown
         });
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitHubContextLoad {
+    Open,
+    Refresh,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1206,14 +1210,10 @@ enum Message {
     GitHubFocusedPaneLoaded(
         PaneId,
         u64,
+        GitHubContextLoad,
         Box<Result<(github::Repository, github::PanelData), String>>,
     ),
     SelectGitHubPanelTab(GitHubPanelTab),
-    GitHubPanelLoaded(
-        std::path::PathBuf,
-        u64,
-        Box<Result<github::PanelData, String>>,
-    ),
     GitHubPullRequestsLoaded(
         std::path::PathBuf,
         u64,
@@ -2779,12 +2779,22 @@ impl Muxtrix {
                     pull_requests
                 };
             }
-            Message::GitHubFocusedPaneLoaded(pane_id, generation, result) => {
+            Message::GitHubFocusedPaneLoaded(pane_id, generation, purpose, result) => {
                 if generation != self.github_context_generation {
                     return Task::none();
                 }
+                if purpose == GitHubContextLoad::Open && self.github_panel.is_none() {
+                    return Task::none();
+                }
                 if self.control_pane_id(None).ok() != Some(pane_id) {
+                    if purpose == GitHubContextLoad::Open {
+                        self.github_panel = None;
+                        return self.open_github_panel();
+                    }
                     self.queue_github_pane_refresh();
+                    return Task::none();
+                }
+                if self.github_panel.is_none() {
                     return Task::none();
                 }
                 let (repository, data) = match *result {
@@ -2798,11 +2808,14 @@ impl Muxtrix {
                         return Task::none();
                     }
                 };
-                let Some(current) = self.github_panel.as_ref() else {
-                    return Task::none();
-                };
-                let same_repository = current.repository.root == repository.root;
-                let active_tab = current.active_tab;
+                let same_repository = self
+                    .github_panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.repository.root == repository.root);
+                let active_tab = self
+                    .github_panel
+                    .as_ref()
+                    .map_or(GitHubPanelTab::Local, |panel| panel.active_tab);
                 if same_repository {
                     let mut reload_diff = None;
                     if let Some(diff) = self
@@ -2870,61 +2883,6 @@ impl Muxtrix {
                     }
                     _ => Task::none(),
                 };
-            }
-            Message::GitHubPanelLoaded(root, generation, result) => {
-                let Some(panel) = self.github_panel.as_mut().filter(|panel| {
-                    panel.repository.root == root && panel.request_generation == generation
-                }) else {
-                    return Task::none();
-                };
-                panel.loading = false;
-                let mut reload_diff = None;
-                let mut scroll_offset = None;
-                match *result {
-                    Ok(data) => {
-                        let viewport_height = github_file_viewport_height(self.window_size, false);
-                        let clamped = github_clamped_scroll_offset(
-                            data.files.len(),
-                            panel.file_scroll_offset,
-                            viewport_height,
-                            GITHUB_FILE_ROW_HEIGHT,
-                        );
-                        panel.file_scroll_offset = clamped;
-                        panel.file_keyboard_cursor = panel
-                            .file_keyboard_cursor
-                            .map(|cursor| cursor.min(data.files.len().saturating_sub(1)))
-                            .filter(|_| !data.files.is_empty());
-                        scroll_offset = Some(clamped);
-                        panel.data = Some(data);
-                        panel.error = None;
-                        if let Some(diff) = self
-                            .github_diff
-                            .as_ref()
-                            .filter(|diff| diff.source == GitHubDiffSource::Local)
-                        {
-                            reload_diff = panel
-                                .data
-                                .as_ref()
-                                .and_then(|data| {
-                                    data.files.iter().find(|file| file.path == diff.path)
-                                })
-                                .map(|file| file.path.clone());
-                            if reload_diff.is_none() {
-                                self.github_diff = None;
-                                self.active_view = ActiveView::Workspace;
-                                self.status =
-                                    "The selected file is no longer in the change set.".into();
-                            }
-                        }
-                    }
-                    Err(error) => panel.error = Some(error),
-                }
-                let diff_task =
-                    reload_diff.map_or_else(Task::none, |path| self.open_github_diff(path));
-                let scroll_task = scroll_offset.map_or_else(Task::none, |offset| {
-                    github_scroll_to(GITHUB_FILE_SCROLL_ID, offset)
-                });
-                return Task::batch([diff_task, scroll_task]);
             }
             Message::GitHubPullRequestsLoaded(root, generation, result) => {
                 let Some(panel) = self.github_panel.as_mut().filter(|panel| {
@@ -5763,30 +5721,24 @@ impl Muxtrix {
             self.show_toast("The focused pane has no working directory");
             return Task::none();
         };
-        let repository = match github::repository_from(
-            &directory,
-            &self.settings.wsl_distribution,
-            &self.settings.github_host,
-        ) {
-            Ok(repository) => repository,
-            Err(error) => {
-                self.status = error.clone();
-                self.show_toast(&error);
-                return Task::none();
-            }
-        };
-        let same_repository = self
-            .github_panel
-            .as_ref()
-            .is_some_and(|panel| panel.repository.root == repository.root);
-        if same_repository {
-            if let Some(panel) = self.github_panel.as_mut() {
-                panel.repository = repository;
-            }
-        } else {
-            self.github_panel = Some(GitHubPanelState::loading(repository));
+        if let Some(panel) = self.github_panel.as_ref() {
+            return if panel.active_loading() {
+                Task::none()
+            } else {
+                self.refresh_github_focused_pane()
+            };
         }
-        self.refresh_github_local()
+        let mut panel = GitHubPanelState::loading(github::Repository {
+            root: directory,
+            name: String::new(),
+            owner_and_name: None,
+            host: self.settings.github_host.clone(),
+            branch: String::new(),
+            wsl_distribution: self.settings.wsl_distribution.clone(),
+        });
+        panel.context_loading = true;
+        self.github_panel = Some(panel);
+        self.load_github_focused_pane(GitHubContextLoad::Open)
     }
 
     fn begin_github_auth(&mut self) -> Task<Message> {
@@ -5861,30 +5813,6 @@ impl Muxtrix {
             }
             GitHubPanelTab::PullRequests => self.refresh_github_pull_requests(),
         }
-    }
-
-    fn refresh_github_local(&mut self) -> Task<Message> {
-        let Some(panel) = self.github_panel.as_mut() else {
-            return Task::none();
-        };
-        panel.loading = true;
-        panel.loading_phase = 0;
-        panel.error = None;
-        panel.merge_confirmation = false;
-        panel.request_generation = panel.request_generation.wrapping_add(1);
-        let generation = panel.request_generation;
-        let repository = panel.repository.clone();
-        let root = repository.root.clone();
-        perform_blocking(
-            move || github::load_local(&repository),
-            move |result| {
-                Message::GitHubPanelLoaded(
-                    root,
-                    generation,
-                    Box::new(result.and_then(std::convert::identity)),
-                )
-            },
-        )
     }
 
     fn refresh_github_pull_requests(&mut self) -> Task<Message> {
@@ -5964,6 +5892,10 @@ impl Muxtrix {
     }
 
     fn refresh_github_focused_pane(&mut self) -> Task<Message> {
+        self.load_github_focused_pane(GitHubContextLoad::Refresh)
+    }
+
+    fn load_github_focused_pane(&mut self, purpose: GitHubContextLoad) -> Task<Message> {
         let Ok(pane_id) = self.control_pane_id(None) else {
             return Task::none();
         };
@@ -5993,6 +5925,7 @@ impl Muxtrix {
                 Message::GitHubFocusedPaneLoaded(
                     pane_id,
                     generation,
+                    purpose,
                     Box::new(result.and_then(std::convert::identity)),
                 )
             },
@@ -9362,9 +9295,24 @@ impl Muxtrix {
             ));
         }
         header_actions = header_actions.push(close);
-        let header = container(
-            row![
-                icon(IconKind::GitHub, tokens.text, 17.0),
+        let header_identity: Element<'_, Message> =
+            if panel.repository.name.is_empty() && panel.context_loading {
+                column![
+                    text("GitHub")
+                        .size(self.settings.ui_pixels(10.0))
+                        .font(Font {
+                            weight: font::Weight::Semibold,
+                            ..Font::DEFAULT
+                        })
+                        .color(tokens.text),
+                    text("Reading focused pane…")
+                        .size(self.settings.ui_pixels(8.0))
+                        .color(tokens.faint),
+                ]
+                .spacing(2)
+                .width(Fill)
+                .into()
+            } else {
                 column![
                     text(repo_label)
                         .size(self.settings.ui_pixels(10.0))
@@ -9387,7 +9335,13 @@ impl Muxtrix {
                     .align_y(Alignment::Center),
                 ]
                 .spacing(2)
-                .width(Fill),
+                .width(Fill)
+                .into()
+            };
+        let header = container(
+            row![
+                icon(IconKind::GitHub, tokens.text, 17.0),
+                header_identity,
                 header_actions,
             ]
             .spacing(9)
@@ -20551,6 +20505,119 @@ mod tests {
     }
 
     #[test]
+    fn opening_github_panel_defers_repository_discovery() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "codex".into(),
+                display_name: None,
+                state: AgentState::Idle,
+                activity: None,
+                session_id: None,
+                cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+                git_branch: None,
+            },
+        );
+
+        drop(app.open_github_panel());
+
+        let panel = app
+            .github_panel
+            .as_ref()
+            .expect("pending panel should open");
+        assert!(panel.context_loading);
+        assert!(panel.data.is_none());
+        assert!(panel.repository.name.is_empty());
+        assert_eq!(app.github_context_generation, 1);
+    }
+
+    #[test]
+    fn loaded_initial_github_context_opens_panel() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let root = std::env::temp_dir().join("muxtrix");
+        app.github_context_generation = 1;
+        let mut pending = GitHubPanelState::loading(github::Repository {
+            root: std::env::temp_dir(),
+            name: String::new(),
+            owner_and_name: None,
+            host: "github.com".into(),
+            branch: String::new(),
+            wsl_distribution: String::new(),
+        });
+        pending.context_loading = true;
+        app.github_panel = Some(pending);
+
+        drop(app.update(Message::GitHubFocusedPaneLoaded(
+            pane_id,
+            1,
+            GitHubContextLoad::Open,
+            Box::new(Ok((
+                github::Repository {
+                    root: root.clone(),
+                    name: "muxtrix".into(),
+                    owner_and_name: Some("example/muxtrix".into()),
+                    host: "github.com".into(),
+                    branch: "main".into(),
+                    wsl_distribution: String::new(),
+                },
+                github::PanelData {
+                    branch: "main".into(),
+                    files: Vec::new(),
+                    additions: 0,
+                    deletions: 0,
+                },
+            ))),
+        )));
+
+        let panel = app.github_panel.as_ref().expect("panel should open");
+        assert_eq!(panel.repository.root, root);
+        assert_eq!(
+            panel.data.as_ref().map(|data| data.branch.as_str()),
+            Some("main")
+        );
+        assert!(!panel.loading);
+    }
+
+    #[test]
+    fn closed_github_panel_ignores_refresh_results() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.github_context_generation = 1;
+        app.status = "Workspace ready".into();
+
+        drop(app.update(Message::GitHubFocusedPaneLoaded(
+            pane_id,
+            1,
+            GitHubContextLoad::Refresh,
+            Box::new(Err("late refresh failure".into())),
+        )));
+
+        assert!(app.github_panel.is_none());
+        assert_eq!(app.status, "Workspace ready");
+    }
+
+    #[test]
+    fn closed_pending_github_panel_ignores_open_result() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.github_context_generation = 1;
+        app.status = "Workspace ready".into();
+
+        drop(app.update(Message::GitHubFocusedPaneLoaded(
+            pane_id,
+            1,
+            GitHubContextLoad::Open,
+            Box::new(Err("late opening failure".into())),
+        )));
+
+        assert!(app.github_panel.is_none());
+        assert_eq!(app.status, "Workspace ready");
+    }
+
+    #[test]
     fn selecting_a_github_file_opens_the_diff_and_back_restores_the_workspace() {
         let mut app = Muxtrix::new();
         let mut panel = GitHubPanelState::loading(github::Repository {
@@ -20693,6 +20760,7 @@ mod tests {
         drop(app.update(Message::GitHubFocusedPaneLoaded(
             original,
             7,
+            GitHubContextLoad::Refresh,
             Box::new(Ok((
                 github::Repository {
                     root: stale_root,
