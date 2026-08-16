@@ -3,6 +3,8 @@
 use std::ffi::OsString;
 use std::io;
 
+use iced::wgpu;
+
 pub const WGPU_BACKEND: &str = "WGPU_BACKEND";
 pub const MESA_ADAPTER: &str = "MESA_D3D12_DEFAULT_ADAPTER_NAME";
 pub const GALLIUM_DRIVER: &str = "GALLIUM_DRIVER";
@@ -13,6 +15,13 @@ const BOOTSTRAPPED: &str = "MUXTRIX_WSL_GPU_BOOTSTRAPPED";
 pub struct EnvironmentDefault {
     pub name: &'static str,
     pub value: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdapterProbe {
+    pub backends: wgpu::Backends,
+    pub available: Vec<wgpu::AdapterInfo>,
+    pub selected: wgpu::AdapterInfo,
 }
 
 #[derive(Debug)]
@@ -81,6 +90,44 @@ pub fn is_wsl() -> bool {
 
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
+}
+
+/// Enumerates graphics adapters and applies the same high-performance selection
+/// policy as the application, without creating a window or surface.
+pub fn probe_adapters() -> Result<AdapterProbe, String> {
+    let backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends,
+        ..wgpu::InstanceDescriptor::default()
+    });
+    let available = instance
+        .enumerate_adapters(backends)
+        .into_iter()
+        .map(|adapter| adapter.get_info())
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        return Err("wgpu did not enumerate any adapters".into());
+    }
+
+    let selected =
+        iced::futures::executor::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .map_err(|error| error.to_string())?
+        .get_info();
+
+    Ok(AdapterProbe {
+        backends,
+        available,
+        selected,
+    })
+}
+
+#[must_use]
+pub fn adapter_is_software(info: &wgpu::AdapterInfo) -> bool {
+    info.device_type == wgpu::DeviceType::Cpu || info.name.to_ascii_lowercase().contains("llvmpipe")
 }
 
 /// Replaces the current Linux process with one carrying WSL GPU defaults.

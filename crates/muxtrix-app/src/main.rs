@@ -43,6 +43,7 @@ mod agent_screen;
 mod agents_roster;
 mod box_drawing;
 mod commands;
+mod doctor;
 mod ellipsized_text;
 mod github;
 mod metrics;
@@ -101,10 +102,19 @@ pub fn main() -> iced::Result {
         run_session_daemon(&arguments);
         return Ok(());
     }
-    NO_TERMINAL_STARTUP.store(no_terminal_requested(&arguments), Ordering::Relaxed);
     if let Err(error) = muxtrix::gpu::ensure_wsl_gpu_defaults() {
         eprintln!("failed to apply process-local WSL GPU defaults: {error}");
     }
+    if arguments
+        .get(1)
+        .is_some_and(|argument| argument == "doctor")
+    {
+        if let Err(code) = doctor::run(&arguments[2..]) {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
+    NO_TERMINAL_STARTUP.store(no_terminal_requested(&arguments), Ordering::Relaxed);
 
     let (startup_settings, _) = AppSettings::load();
     iced::application(Muxtrix::boot, Muxtrix::update, Muxtrix::view)

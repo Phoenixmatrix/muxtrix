@@ -73,6 +73,22 @@ Verify the download first:
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
+## Diagnostics
+
+Run the built-in headless diagnostic when Muxtrix cannot start or selects an
+unexpected graphics adapter:
+
+```sh
+muxtrix doctor
+```
+
+The report identifies the executable and version, validates the settings and
+session paths, shows the effective graphics environment, and enumerates the
+wgpu adapters using the application's selection policy. It contains no
+environment values beyond the four documented graphics overrides and uploads
+nothing. Warnings keep a zero exit status; failed required checks return status
+1.
+
 ## From source
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for the full build instructions,

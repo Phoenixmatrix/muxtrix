@@ -56,11 +56,7 @@ fn parse_requirements(mut arguments: impl Iterator<Item = String>) -> Result<Req
 }
 
 fn probe(requirements: &Requirements) -> Result<(), String> {
-    let backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends,
-        ..wgpu::InstanceDescriptor::default()
-    });
+    let probe = gpu::probe_adapters()?;
 
     println!("WSL detected: {}", gpu::is_wsl());
     println!(
@@ -84,30 +80,17 @@ fn probe(requirements: &Requirements) -> Result<(), String> {
         std::env::var(gpu::EGL_LOG_LEVEL).unwrap_or_else(|_| "<automatic>".into())
     );
 
-    let available = instance.enumerate_adapters(backends);
-    if available.is_empty() {
-        return Err("wgpu did not enumerate any adapters".into());
-    }
+    println!("Requested backends: {:?}", probe.backends);
     println!("Available adapters:");
-    for adapter in &available {
-        print_adapter("  -", &adapter.get_info());
+    for adapter in &probe.available {
+        print_adapter("  -", adapter);
     }
 
-    let selected =
-        iced::futures::executor::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .map_err(|error| error.to_string())?;
-    let info = selected.get_info();
+    let info = &probe.selected;
     println!("Selected adapter:");
-    print_adapter("  ", &info);
+    print_adapter("  ", info);
 
-    if requirements.hardware && info.device_type == wgpu::DeviceType::Cpu {
-        return Err(format!("selected CPU adapter `{}`", info.name));
-    }
-    if requirements.hardware && info.name.to_ascii_lowercase().contains("llvmpipe") {
+    if requirements.hardware && gpu::adapter_is_software(info) {
         return Err(format!("selected software adapter `{}`", info.name));
     }
     if let Some(required) = &requirements.adapter_substring {

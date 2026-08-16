@@ -766,7 +766,7 @@ impl AppSettings {
     }
 }
 
-fn config_path() -> PathBuf {
+pub(crate) fn config_path() -> PathBuf {
     if let Some(path) = std::env::var_os(CONFIG_OVERRIDE) {
         return PathBuf::from(path);
     }
