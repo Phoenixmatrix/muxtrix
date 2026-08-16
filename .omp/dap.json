@@ -1,0 +1,27 @@
+{
+  "adapters": {
+    "codelldb": {
+      "command": "codelldb",
+      "args": ["--port", "${port}"],
+      "languages": ["rust"],
+      "fileTypes": [".rs"],
+      "rootMarkers": ["Cargo.toml"],
+      "launchDefaults": {
+        "request": "launch"
+      },
+      "connectMode": "tcp"
+    },
+    "js-debug-adapter": {
+      "command": "js-debug-adapter",
+      "args": ["${port}"],
+      "languages": ["javascript", "typescript"],
+      "fileTypes": [".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"],
+      "rootMarkers": ["package.json", "pnpm-lock.yaml"],
+      "launchDefaults": {
+        "request": "launch",
+        "type": "pwa-node"
+      },
+      "connectMode": "tcp"
+    }
+  }
+}
