@@ -1,0 +1,8 @@
+modelRoles:
+  advisor: "@default"
+
+advisor:
+  enabled: true
+
+memory:
+  backend: mnemopi
