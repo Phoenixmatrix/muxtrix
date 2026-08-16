@@ -916,6 +916,9 @@ fn image_snapshots(
     let mut placements = Vec::new();
 
     while let Some(placement) = iteration.next() {
+        // libghostty-vt 0.2.1 reports virtual placements but does not expose
+        // Ghostty's Unicode-placeholder resolver, so it cannot supply a safe
+        // viewport position for this renderer.
         if placement.is_virtual().map_err(ghostty_error)? {
             continue;
         }
