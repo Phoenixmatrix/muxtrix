@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
+use iced::advanced::image::Handle as ImageHandle;
 use iced::futures::StreamExt as _;
 use iced::keyboard::{self, Key, Modifiers, key::Named};
 use iced::mouse::{self, ScrollDelta};
@@ -34,9 +36,9 @@ use muxtrix_domain::{
 };
 use muxtrix_platform::{LaunchPlan, PtySize};
 use muxtrix_terminal::{
-    EventNotifier, GridSnapshot, LiveSession, LiveSessionEvent, ScrollbarSnapshot, TerminalActor,
-    TerminalMouseAction, TerminalMouseButton, TerminalMouseEvent, TerminalNotification,
-    TerminalTheme,
+    EventNotifier, GridSnapshot, ImageLayer, LiveSession, LiveSessionEvent, ScrollbarSnapshot,
+    TerminalActor, TerminalMouseAction, TerminalMouseButton, TerminalMouseEvent,
+    TerminalNotification, TerminalTheme,
 };
 
 mod agent_screen;
@@ -50,6 +52,7 @@ mod metrics;
 mod popover;
 mod process;
 mod settings;
+mod terminal_image;
 mod themes;
 
 #[cfg(feature = "e2e")]
@@ -321,6 +324,7 @@ struct TerminalRuntime {
     preview: String,
     snapshot: Option<GridSnapshot>,
     snapshot_revision: u64,
+    image_handles: BTreeMap<u64, ImageHandle>,
     session: Option<LiveSession>,
     fallback_title: String,
     display_title: String,
@@ -1694,8 +1698,7 @@ impl Muxtrix {
                     .and_then(|runtime| runtime.viewport);
                 if let Some(runtime) = self.terminals.get_mut(&completion.pane_id) {
                     runtime.session = Some(launched.session);
-                    runtime.snapshot = Some(launched.snapshot);
-                    runtime.snapshot_revision = runtime.snapshot_revision.wrapping_add(1);
+                    runtime.set_snapshot(launched.snapshot);
                     runtime.size = launched.size;
                     runtime.launch_state = TerminalLaunchState::Running;
                     runtime.preview = "Starting terminal…".into();
@@ -14216,10 +14219,13 @@ impl Muxtrix {
         let hovered_link = terminal_link_modifiers(self.keyboard_modifiers)
             .then(|| self.hovered_terminal_link(pane_id))
             .flatten();
+        let no_image_handles = BTreeMap::new();
+        let image_handles = runtime.map_or(&no_image_handles, |runtime| &runtime.image_handles);
         let snapshot = runtime.and_then(|runtime| runtime.snapshot.as_ref());
         let terminal_content: Element<'_, Message> = match snapshot {
             Some(snapshot) => styled_terminal(
                 snapshot,
+                image_handles,
                 focused,
                 self.cursor_phase_visible,
                 hovered_link.as_ref(),
@@ -17855,6 +17861,7 @@ impl TerminalRuntime {
                 .into(),
             snapshot: None,
             snapshot_revision: 0,
+            image_handles: BTreeMap::new(),
             session: None,
             fallback_title: fallback_title.into(),
             display_title: fallback_title.into(),
@@ -17871,6 +17878,7 @@ impl TerminalRuntime {
                 .into(),
             snapshot: None,
             snapshot_revision: 0,
+            image_handles: BTreeMap::new(),
             session: None,
             fallback_title: fallback_title.into(),
             display_title: fallback_title.into(),
@@ -17888,6 +17896,7 @@ impl TerminalRuntime {
                     .into(),
             snapshot: None,
             snapshot_revision: 0,
+            image_handles: BTreeMap::new(),
             session: None,
             fallback_title: fallback_title.into(),
             display_title: fallback_title.into(),
@@ -17920,6 +17929,7 @@ impl TerminalRuntime {
                     preview: "Starting local terminal…".into(),
                     snapshot: None,
                     snapshot_revision: 0,
+                    image_handles: BTreeMap::new(),
                     session: Some(session),
                     fallback_title: fallback_title.into(),
                     display_title: fallback_title.into(),
@@ -17939,6 +17949,7 @@ impl TerminalRuntime {
                     }),
                     snapshot: None,
                     snapshot_revision: 0,
+                    image_handles: BTreeMap::new(),
                     session: None,
                     fallback_title: fallback_title.into(),
                     display_title: fallback_title.into(),
@@ -17995,6 +18006,7 @@ impl TerminalRuntime {
             preview: "Reattaching…".into(),
             snapshot: None,
             snapshot_revision: 0,
+            image_handles: BTreeMap::new(),
             session,
             fallback_title: title.into(),
             display_title: title.into(),
@@ -18007,6 +18019,28 @@ impl TerminalRuntime {
             },
             has_selection: false,
         }
+    }
+    fn set_snapshot(&mut self, snapshot: GridSnapshot) {
+        let generations = snapshot
+            .images
+            .iter()
+            .map(|placement| placement.image.generation)
+            .collect::<BTreeSet<_>>();
+        self.image_handles
+            .retain(|generation, _| generations.contains(generation));
+        for placement in &snapshot.images {
+            self.image_handles
+                .entry(placement.image.generation)
+                .or_insert_with(|| {
+                    ImageHandle::from_rgba(
+                        placement.image.width,
+                        placement.image.height,
+                        Bytes::from_owner(Arc::clone(&placement.image.rgba)),
+                    )
+                });
+        }
+        self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
+        self.snapshot = Some(snapshot);
     }
 
     fn poll(&mut self) -> RuntimePoll {
@@ -18029,8 +18063,7 @@ impl TerminalRuntime {
                         self.display_title.clone_from(&title);
                         poll.title = Some(title);
                     }
-                    self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
-                    self.snapshot = Some(snapshot);
+                    self.set_snapshot(snapshot);
                 }
                 Some(LiveSessionEvent::Notification(notification)) => {
                     poll.notifications.push(notification);
@@ -18584,6 +18617,7 @@ fn terminal_surface_background(
 
 fn styled_terminal(
     snapshot: &GridSnapshot,
+    image_handles: &BTreeMap<u64, ImageHandle>,
     focused: bool,
     cursor_phase_visible: bool,
     hovered_link: Option<&TerminalLink>,
@@ -18599,11 +18633,15 @@ fn styled_terminal(
     // A bold face may be wider than the regular one it shares a grid with. The
     // grid stays uniform, so shrink bold text instead of letting it overrun.
     let bold_scale = bold_size_scale(settings, cell_ratio);
-    let mut grid = column![].spacing(0);
+    let mut backgrounds = column![].spacing(0);
+    let mut overlays = column![].spacing(0);
+    let mut text_grid = column![].spacing(0);
     for runs in
         terminal_row_style_runs(snapshot, focused, cursor_phase_visible, hovered_link, theme)
     {
-        let mut line = row![].spacing(0).height(Length::Fixed(cell_height));
+        let mut background_line = row![].spacing(0).height(Length::Fixed(cell_height));
+        let mut overlay_line = row![].spacing(0).height(Length::Fixed(cell_height));
+        let mut text_line = row![].spacing(0).height(Length::Fixed(cell_height));
         for run in runs.into_iter().filter(|run| run.columns > 0) {
             let alpha = if run.style.faint { 0.6 } else { 1.0 };
             let foreground = if run.style.selected {
@@ -18613,12 +18651,29 @@ fn styled_terminal(
             };
             let foreground_color =
                 Color::from_rgba8(foreground.red, foreground.green, foreground.blue, alpha);
-            let background = if run.style.selected {
-                Some(theme.selection_background)
-            } else {
-                run.style.background
-            };
+            let background = run.style.background;
+            let overlay_background = run.style.overlay_background;
             let run_width = cell_width * run.columns as f32;
+            background_line = background_line.push(
+                container("")
+                    .width(Length::Fixed(run_width))
+                    .height(Length::Fixed(cell_height))
+                    .style(move |_| {
+                        background.map_or_else(container::Style::default, |background| {
+                            container::Style::default().background(rgb(background))
+                        })
+                    }),
+            );
+            overlay_line = overlay_line.push(
+                container("")
+                    .width(Length::Fixed(run_width))
+                    .height(Length::Fixed(cell_height))
+                    .style(move |_| {
+                        overlay_background.map_or_else(container::Style::default, |background| {
+                            container::Style::default().background(rgb(background))
+                        })
+                    }),
+            );
             if run.kind == TerminalRunKind::BoxDrawing {
                 let content = canvas(box_drawing::BoxDrawingRun::new(
                     run.text,
@@ -18628,16 +18683,11 @@ fn styled_terminal(
                 ))
                 .width(Length::Fixed(run_width))
                 .height(Length::Fixed(cell_height));
-                line = line.push(
+                text_line = text_line.push(
                     container(content)
                         .width(Length::Fixed(run_width))
                         .height(Length::Fixed(cell_height))
-                        .clip(true)
-                        .style(move |_| {
-                            background.map_or_else(container::Style::default, |background| {
-                                container::Style::default().background(rgb(background))
-                            })
-                        }),
+                        .clip(true),
                 );
                 continue;
             }
@@ -18754,7 +18804,7 @@ fn styled_terminal(
                 }
                 _ => content.into(),
             };
-            line = line.push(
+            text_line = text_line.push(
                 container(content)
                     .width(Length::Fixed(run_width))
                     .height(Length::Fixed(cell_height))
@@ -18762,17 +18812,40 @@ fn styled_terminal(
                     .align_y(vertical)
                     // A colour glyph is sized to match the text beside it, which
                     // needs marginally more than one cell on a square canvas.
-                    .clip(!fallback.is_some_and(|fallback| fallback.color))
-                    .style(move |_| {
-                        background.map_or_else(container::Style::default, |background| {
-                            container::Style::default().background(rgb(background))
-                        })
-                    }),
+                    .clip(!fallback.is_some_and(|fallback| fallback.color)),
             );
         }
-        grid = grid.push(line);
+        backgrounds = backgrounds.push(background_line);
+        overlays = overlays.push(overlay_line);
+        text_grid = text_grid.push(text_line);
     }
-    grid.into()
+    stack([
+        terminal_image::layer(
+            snapshot,
+            image_handles,
+            ImageLayer::BelowBackground,
+            cell_width,
+            cell_height,
+        ),
+        backgrounds.into(),
+        terminal_image::layer(
+            snapshot,
+            image_handles,
+            ImageLayer::BelowText,
+            cell_width,
+            cell_height,
+        ),
+        overlays.into(),
+        text_grid.into(),
+        terminal_image::layer(
+            snapshot,
+            image_handles,
+            ImageLayer::AboveText,
+            cell_width,
+            cell_height,
+        ),
+    ])
+    .into()
 }
 
 /// Shrinks bold text when the bold face is wider than one grid cell.
@@ -18794,6 +18867,7 @@ fn bold_size_scale(settings: &AppSettings, cell_ratio: f32) -> f32 {
 struct TerminalRunStyle {
     foreground: muxtrix_terminal::Rgb,
     background: Option<muxtrix_terminal::Rgb>,
+    overlay_background: Option<muxtrix_terminal::Rgb>,
     bold: bool,
     italic: bool,
     faint: bool,
@@ -18936,13 +19010,17 @@ fn terminal_row_style_runs(
                 || detected_links
                     .iter()
                     .any(|(start, end)| column_index >= *start && column_index < *end);
-            let (foreground, background) = if cursor_here {
-                (
-                    theme.cursor_text,
-                    snapshot.cursor_color.unwrap_or(theme.cursor),
-                )
+            let foreground = if cursor_here {
+                theme.cursor_text
             } else {
-                (cell.foreground, cell.background)
+                cell.foreground
+            };
+            let overlay_background = if selected {
+                Some(theme.selection_background)
+            } else if cursor_here {
+                Some(snapshot.cursor_color.unwrap_or(theme.cursor))
+            } else {
+                None
             };
             push_terminal_run(
                 &mut runs,
@@ -18950,8 +19028,9 @@ fn terminal_row_style_runs(
                 usize::from(cell.columns),
                 TerminalRunStyle {
                     foreground,
-                    background: (cursor_here || cell.background != snapshot.default_background)
-                        .then_some(background),
+                    background: (cell.background != snapshot.default_background)
+                        .then_some(cell.background),
+                    overlay_background,
                     bold: cell.bold,
                     italic: cell.italic,
                     faint: cell.faint,
@@ -22539,6 +22618,35 @@ mod tests {
         let snapshot = actor.snapshot().expect("snapshot should render");
         actor.shutdown().expect("terminal actor should stop");
         snapshot
+    }
+
+    #[test]
+    fn cursor_and_selection_backgrounds_use_the_overlay_plane() {
+        let mut snapshot = snapshot_in_mode(b"");
+        let theme = TerminalThemeId::Ghostty.preset();
+        let cursor = snapshot.cursor.expect("visible cursor position");
+        let cursor_color = snapshot.cursor_color.unwrap_or(theme.cursor);
+        let runs = terminal_row_style_runs(&snapshot, true, true, None, theme);
+        let cursor_run = runs[usize::from(cursor.row)]
+            .iter()
+            .find(|run| run.style.overlay_background == Some(cursor_color))
+            .expect("cursor overlay");
+        assert_eq!(cursor_run.style.background, None);
+
+        snapshot.selection[usize::from(cursor.row)] = Some(muxtrix_terminal::SelectedColumns {
+            start: usize::from(cursor.column),
+            end: usize::from(cursor.column),
+        });
+        let selected_runs = terminal_row_style_runs(&snapshot, true, true, None, theme);
+        let selected_cursor = selected_runs[usize::from(cursor.row)]
+            .iter()
+            .find(|run| run.style.selected)
+            .expect("selected cursor cell");
+        assert_eq!(
+            selected_cursor.style.overlay_background,
+            Some(theme.selection_background)
+        );
+        assert_eq!(selected_cursor.style.background, None);
     }
 
     #[test]

@@ -18,9 +18,10 @@ repository = "https://github.com/Phoenixmatrix/muxtrix"
 
 [workspace.dependencies]
 async-channel = "2.5.0"
-iced = { version = "0.14.0", features = ["advanced", "canvas", "tokio", "wgpu", "svg"] }
+iced = { version = "0.14.0", features = ["advanced", "canvas", "image", "tokio", "wgpu", "svg"] }
 fontdb = "0.23.0"
 base64 = "0.22.1"
+bytes = "1.10.1"
 interprocess = "2.4.2"
 libghostty-vt = "0.2.1"
 portable-pty = "0.9.0"

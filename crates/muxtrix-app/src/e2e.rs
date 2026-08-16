@@ -77,6 +77,13 @@ const TERMINAL_PALETTE_SCRIPT: &str = concat!(
 );
 const TERMINAL_PALETTE_MARKER: &str = "palette-ready";
 const SELECTION_FOLLOW_MARKER: &str = "selection-follow-target";
+const TERMINAL_IMAGE_SCRIPT: &str = concat!(
+    "printf '\\033[2J\\033[HKitty graphics via libghostty-vt\\n",
+    "PNG decode · source crop · Ghostty z-order\\n",
+    "\\033[5;5H\\0337\\033_Gi=42,a=T,f=100,q=2,c=24,r=12,z=-1;",
+    "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAECAYAAACzzX7wAAAALElEQVR42mNQ7vn/H4T/x1SBscelOWD8f58bGDPgkoBpZMAlAdPIgEsCphEAEu1ZwQwc9msAAAAASUVORK5CYII=",
+    "\\033\\\\\\0338\\033[1;97m  GHOSTTY IMAGE  \\033[0m\\033[8;8H'\r"
+);
 const STAGED_GITHUB_PATCH: &str = concat!(
     "@@ -312,10 +312,18 @@ pub(crate) fn load(repository: &Repository) -> Result<PanelData, String> {\n",
     "     })\n",
@@ -629,6 +636,16 @@ impl Scenario {
                     self.settle_ticks = 1;
                     return Ok(TickAction::Wait);
                 }
+                if self.capturing("terminal-image")
+                    && app.terminals.get(&self.initial_pane).is_none_or(|runtime| {
+                        runtime.snapshot.as_ref().is_none_or(|snapshot| {
+                            snapshot.images.is_empty() || runtime.image_handles.is_empty()
+                        })
+                    })
+                {
+                    self.settle_ticks = 1;
+                    return Ok(TickAction::Wait);
+                }
                 if self.capturing("terminal-palette")
                     && !pane_contains(app, self.initial_pane, TERMINAL_PALETTE_MARKER)
                 {
@@ -777,6 +794,15 @@ impl Scenario {
                         .as_bytes()
                         .to_vec(),
                 )
+                .map_err(|error| error.to_string())?;
+        } else if self.capturing("terminal-image") {
+            app.focus_pane(self.initial_pane)?;
+            app.maximized_pane = Some(self.initial_pane);
+            app.terminals
+                .get(&self.initial_pane)
+                .and_then(|runtime| runtime.session.as_ref())
+                .ok_or_else(|| "image capture pane lost its live session".to_owned())?
+                .input(TERMINAL_IMAGE_SCRIPT.as_bytes().to_vec())
                 .map_err(|error| error.to_string())?;
         } else if self.capturing("selection-follow") {
             app.focus_pane(self.initial_pane)?;
