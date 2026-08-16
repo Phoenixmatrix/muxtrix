@@ -1644,7 +1644,7 @@ impl Scenario {
             };
             let mut panel = staged_github_panel();
             panel.active_tab = GitHubPanelTab::PullRequests;
-            panel.pull_requests = None;
+            panel.pull_requests = Some(Vec::new());
             panel.pull_requests_loading = true;
             panel.loading_phase = 4;
             app.github_panel = Some(panel);
