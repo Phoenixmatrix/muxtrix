@@ -507,6 +507,20 @@ pub fn wait_until_ready(endpoint: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn start_test_daemon(prefix: &str) -> (Uuid, std::path::PathBuf, crate::SessionClient) {
+        let id = Uuid::new_v4();
+        let dir = std::env::temp_dir().join(format!("muxtrix-{prefix}-test-{id}"));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let endpoint = dir.join("test.sock").to_string_lossy().into_owned();
+        let daemon_endpoint = endpoint.clone();
+        std::thread::spawn(move || {
+            let _ = run(id, "test".into(), daemon_endpoint);
+        });
+        assert!(wait_until_ready(&endpoint));
+        let (client, _, _) = crate::SessionClient::connect_endpoint(&endpoint).expect("attach");
+        (id, dir, client)
+    }
+
     #[test]
     fn daemon_buffers_output_and_replays_it_on_reattach() {
         let id = Uuid::new_v4();
@@ -589,16 +603,7 @@ mod tests {
     /// its PTY, its reader and its backlog — not just stop showing it.
     #[test]
     fn killing_a_pane_releases_it_from_the_daemon() {
-        let id = Uuid::new_v4();
-        let dir = std::env::temp_dir().join(format!("muxtrix-kill-test-{id}"));
-        std::fs::create_dir_all(&dir).expect("test dir");
-        let endpoint = dir.join("test.sock").to_string_lossy().into_owned();
-        let daemon_endpoint = endpoint.clone();
-        std::thread::spawn(move || {
-            let _ = run(id, "test".into(), daemon_endpoint);
-        });
-        assert!(wait_until_ready(&endpoint));
-        let (client, _, _) = crate::SessionClient::connect_endpoint(&endpoint).expect("attach");
+        let (_, dir, client) = start_test_daemon("kill");
         let pane = Uuid::new_v4();
         let output = client.register_pane(pane);
         client
@@ -655,16 +660,7 @@ mod tests {
     /// the client releases the pane itself rather than waiting to be told.
     #[test]
     fn unregistering_a_pane_closes_its_output_channel_without_the_daemon() {
-        let id = Uuid::new_v4();
-        let dir = std::env::temp_dir().join(format!("muxtrix-unregister-test-{id}"));
-        std::fs::create_dir_all(&dir).expect("test dir");
-        let endpoint = dir.join("test.sock").to_string_lossy().into_owned();
-        let daemon_endpoint = endpoint.clone();
-        std::thread::spawn(move || {
-            let _ = run(id, "test".into(), daemon_endpoint);
-        });
-        assert!(wait_until_ready(&endpoint));
-        let (client, _, _) = crate::SessionClient::connect_endpoint(&endpoint).expect("attach");
+        let (_, dir, client) = start_test_daemon("unregister");
         let pane = Uuid::new_v4();
         let output = client.register_pane(pane);
         client.unregister_pane(pane);
@@ -688,16 +684,7 @@ mod tests {
     /// every 50 ms and would report the live replacement as exited.
     #[test]
     fn registering_a_pane_again_forgets_the_incarnation_before_it() {
-        let id = Uuid::new_v4();
-        let dir = std::env::temp_dir().join(format!("muxtrix-reregister-test-{id}"));
-        std::fs::create_dir_all(&dir).expect("test dir");
-        let endpoint = dir.join("test.sock").to_string_lossy().into_owned();
-        let daemon_endpoint = endpoint.clone();
-        std::thread::spawn(move || {
-            let _ = run(id, "test".into(), daemon_endpoint);
-        });
-        assert!(wait_until_ready(&endpoint));
-        let (client, _, _) = crate::SessionClient::connect_endpoint(&endpoint).expect("attach");
+        let (_, dir, client) = start_test_daemon("reregister");
         let pane = Uuid::new_v4();
         let output = client.register_pane(pane);
         client
@@ -738,16 +725,7 @@ mod tests {
     /// refusal is invisible.
     #[test]
     fn a_refused_spawn_keeps_its_reason_for_the_pane() {
-        let id = Uuid::new_v4();
-        let dir = std::env::temp_dir().join(format!("muxtrix-spawn-failure-test-{id}"));
-        std::fs::create_dir_all(&dir).expect("test dir");
-        let endpoint = dir.join("test.sock").to_string_lossy().into_owned();
-        let daemon_endpoint = endpoint.clone();
-        std::thread::spawn(move || {
-            let _ = run(id, "test".into(), daemon_endpoint);
-        });
-        assert!(wait_until_ready(&endpoint));
-        let (client, _, _) = crate::SessionClient::connect_endpoint(&endpoint).expect("attach");
+        let (_, dir, client) = start_test_daemon("spawn-failure");
         let pane = Uuid::new_v4();
         let output = client.register_pane(pane);
         client
@@ -780,16 +758,7 @@ mod tests {
 
     #[test]
     fn daemon_exits_on_its_own_once_every_pane_is_dead_and_nobody_is_attached() {
-        let id = Uuid::new_v4();
-        let dir = std::env::temp_dir().join(format!("muxtrix-settle-test-{id}"));
-        std::fs::create_dir_all(&dir).expect("test dir");
-        let endpoint = dir.join("test.sock").to_string_lossy().into_owned();
-        let daemon_endpoint = endpoint.clone();
-        std::thread::spawn(move || {
-            let _ = run(id, "test".into(), daemon_endpoint);
-        });
-        assert!(wait_until_ready(&endpoint));
-        let (client, _, _) = crate::SessionClient::connect_endpoint(&endpoint).expect("attach");
+        let (id, dir, client) = start_test_daemon("settle");
         let pane = Uuid::new_v4();
         let output = client.register_pane(pane);
         client
@@ -838,16 +807,7 @@ mod tests {
     /// attributed to it.
     #[test]
     fn respawning_a_killed_pane_id_keeps_the_replacement_streaming() {
-        let id = Uuid::new_v4();
-        let dir = std::env::temp_dir().join(format!("muxtrix-respawn-test-{id}"));
-        std::fs::create_dir_all(&dir).expect("test dir");
-        let endpoint = dir.join("test.sock").to_string_lossy().into_owned();
-        let daemon_endpoint = endpoint.clone();
-        std::thread::spawn(move || {
-            let _ = run(id, "test".into(), daemon_endpoint);
-        });
-        assert!(wait_until_ready(&endpoint));
-        let (client, _, _) = crate::SessionClient::connect_endpoint(&endpoint).expect("attach");
+        let (_, dir, client) = start_test_daemon("respawn");
         let pane = Uuid::new_v4();
 
         // The outgoing shell leaves a child holding the PTY open, so its

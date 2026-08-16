@@ -451,11 +451,7 @@ fn classification(state: ScreenState, rule: &'static str) -> Option<Classificati
 }
 
 fn recent_text(rows: &[String], count: usize) -> String {
-    rows.iter()
-        .skip(rows.len().saturating_sub(count))
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join("\n")
+    rows[rows.len().saturating_sub(count)..].join("\n")
 }
 
 fn after_last_codex_prompt(rows: &[String]) -> &[String] {

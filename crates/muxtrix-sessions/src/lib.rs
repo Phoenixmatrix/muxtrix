@@ -375,6 +375,19 @@ impl SessionClient {
         self.events.lock().expect("session events").try_recv()
     }
 
+    /// Clears state attached to one pane incarnation. Callers hold
+    /// `pane_outputs` across this operation so exit delivery cannot race the
+    /// transition to a replacement or unregistered pane.
+    fn clear_pane_metadata(&self, pane: Uuid) {
+        self.pane_exits.lock().expect("exits").remove(&pane);
+        self.pane_pids.lock().expect("pids").remove(&pane);
+        self.pane_replaying.lock().expect("replaying").remove(&pane);
+        self.pane_spawn_failures
+            .lock()
+            .expect("spawn failures")
+            .remove(&pane);
+    }
+
     /// Registers a pane and returns the receiver its output bytes arrive on.
     ///
     /// Pane ids are durable, so this is also how a replacement claims the id
@@ -388,13 +401,7 @@ impl SessionClient {
         // metadata is cleared prevents a concurrent exit event from leaving
         // the replacement with its predecessor's status.
         let mut outputs = self.pane_outputs.lock().expect("outputs");
-        self.pane_exits.lock().expect("exits").remove(&pane);
-        self.pane_pids.lock().expect("pids").remove(&pane);
-        self.pane_replaying.lock().expect("replaying").remove(&pane);
-        self.pane_spawn_failures
-            .lock()
-            .expect("spawn failures")
-            .remove(&pane);
+        self.clear_pane_metadata(pane);
         outputs.insert(pane, sender);
         receiver
     }
@@ -406,13 +413,7 @@ impl SessionClient {
         // Keep EOF last here as well. If the reader wakes while this method is
         // still clearing state, it must never find stale exit metadata.
         let mut outputs = self.pane_outputs.lock().expect("outputs");
-        self.pane_exits.lock().expect("exits").remove(&pane);
-        self.pane_pids.lock().expect("pids").remove(&pane);
-        self.pane_replaying.lock().expect("replaying").remove(&pane);
-        self.pane_spawn_failures
-            .lock()
-            .expect("spawn failures")
-            .remove(&pane);
+        self.clear_pane_metadata(pane);
         outputs.remove(&pane);
     }
 

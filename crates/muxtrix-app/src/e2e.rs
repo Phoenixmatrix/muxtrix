@@ -1206,53 +1206,45 @@ impl Scenario {
         {
             // Stage a synthetic manager so the dialog renders
             // populated; the state exists only for the frame.
-            app.worktree_manager = Some(WorktreeManagerState {
-                mode: if self.capturing("worktree-switcher") {
-                    WorktreeManagerMode::RestartPane(self.initial_pane)
-                } else {
-                    WorktreeManagerMode::Manage
+            let mode = if self.capturing("worktree-switcher") {
+                WorktreeManagerMode::RestartPane(self.initial_pane)
+            } else {
+                WorktreeManagerMode::Manage
+            };
+            let mut manager = WorktreeManagerState::loading(mode, 1);
+            manager.repo_root = Some("/home/user/dev/muxtrix".into());
+            manager.entries = vec![
+                WorktreeManagerEntry {
+                    path: "/home/user/dev/muxtrix".into(),
+                    branch: Some("release".into()),
+                    unpushed_commits: 0,
+                    deletion_blocker: Some("Primary worktree".into()),
+                    used_by: None,
                 },
-                generation: 1,
-                repo_root: Some("/home/user/dev/muxtrix".into()),
-                failure: None,
-                entries: vec![
-                    WorktreeManagerEntry {
-                        path: "/home/user/dev/muxtrix".into(),
-                        branch: Some("release".into()),
-                        unpushed_commits: 0,
-                        deletion_blocker: Some("Primary worktree".into()),
-                        used_by: None,
-                    },
-                    WorktreeManagerEntry {
-                        path: "/home/user/.muxtrix/worktrees/muxtrix/agent-title-sidebar-layout-hardening-with-a-very-long-name".into(),
-                        branch: Some(
-                            "agent-title-sidebar-layout-hardening-with-a-very-long-name"
-                                .into(),
-                        ),
-                        unpushed_commits: 3,
-                        deletion_blocker: None,
-                        used_by: Some(
-                            "shell with an exceptionally long descriptive pane title"
-                                .into(),
-                        ),
-                    },
-                    WorktreeManagerEntry {
-                        path: "/home/user/.muxtrix/worktrees/muxtrix/main".into(),
-                        branch: Some("main".into()),
-                        unpushed_commits: 1,
-                        deletion_blocker: None,
-                        used_by: None,
-                    },
-                ],
-                loading: false,
-                // Starts at the top so the settings capture can walk
-                // the selection down with real key events instead of
-                // staging the result it wants to prove.
-                selected: 0,
-                busy: false,
-                error: None,
-                restart_target: None,
-            });
+                WorktreeManagerEntry {
+                    path: "/home/user/.muxtrix/worktrees/muxtrix/agent-title-sidebar-layout-hardening-with-a-very-long-name".into(),
+                    branch: Some(
+                        "agent-title-sidebar-layout-hardening-with-a-very-long-name".into(),
+                    ),
+                    unpushed_commits: 3,
+                    deletion_blocker: None,
+                    used_by: Some(
+                        "shell with an exceptionally long descriptive pane title".into(),
+                    ),
+                },
+                WorktreeManagerEntry {
+                    path: "/home/user/.muxtrix/worktrees/muxtrix/main".into(),
+                    branch: Some("main".into()),
+                    unpushed_commits: 1,
+                    deletion_blocker: None,
+                    used_by: None,
+                },
+            ];
+            manager.loading = false;
+            // Starts at the top so the settings capture can walk
+            // the selection down with real key events instead of
+            // staging the result it wants to prove.
+            app.worktree_manager = Some(manager);
             if self.capturing("worktree-manager") {
                 app.active_view = ActiveView::Settings;
                 app.settings_page = super::SettingsPage::Worktrees;
@@ -1277,24 +1269,21 @@ impl Scenario {
                 ));
             }
         } else if self.capturing("worktree-restart-confirmation") {
-            app.worktree_manager = Some(WorktreeManagerState {
-                mode: WorktreeManagerMode::RestartPane(self.initial_pane),
-                generation: 1,
-                repo_root: Some("/home/user/dev/muxtrix".into()),
-                failure: None,
-                entries: vec![WorktreeManagerEntry {
-                    path: "/home/user/.muxtrix/worktrees/muxtrix/feature-ui".into(),
-                    branch: Some("feature-ui".into()),
-                    unpushed_commits: 0,
-                    deletion_blocker: None,
-                    used_by: None,
-                }],
-                loading: false,
-                selected: 0,
-                busy: false,
-                error: None,
-                restart_target: Some(0),
-            });
+            let mut manager = WorktreeManagerState::loading(
+                WorktreeManagerMode::RestartPane(self.initial_pane),
+                1,
+            );
+            manager.repo_root = Some("/home/user/dev/muxtrix".into());
+            manager.entries = vec![WorktreeManagerEntry {
+                path: "/home/user/.muxtrix/worktrees/muxtrix/feature-ui".into(),
+                branch: Some("feature-ui".into()),
+                unpushed_commits: 0,
+                deletion_blocker: None,
+                used_by: None,
+            }];
+            manager.loading = false;
+            manager.restart_target = Some(0);
+            app.worktree_manager = Some(manager);
         } else if self.capturing("toast") {
             app.toast = Some(("Copied to clipboard".into(), std::time::Instant::now()));
         } else if self.capturing("theme-gallery") {
@@ -1679,57 +1668,34 @@ impl Scenario {
         } else if self.capturing("settings-worktrees-loading") {
             app.active_view = ActiveView::Settings;
             app.settings_page = super::SettingsPage::Worktrees;
-            app.worktree_manager = Some(WorktreeManagerState {
-                mode: WorktreeManagerMode::Manage,
-                generation: 1,
-                repo_root: Some("/home/user/dev/muxtrix".into()),
-                failure: None,
-                entries: Vec::new(),
-                loading: true,
-                selected: 0,
-                busy: false,
-                error: None,
-                restart_target: None,
-            });
+            let mut manager = WorktreeManagerState::loading(WorktreeManagerMode::Manage, 1);
+            manager.repo_root = Some("/home/user/dev/muxtrix".into());
+            app.worktree_manager = Some(manager);
         } else if self.capturing("worktree-manager-error") {
             app.active_view = ActiveView::Settings;
             app.settings_page = super::SettingsPage::Worktrees;
-            app.worktree_manager = Some(WorktreeManagerState {
-                mode: WorktreeManagerMode::Manage,
-                generation: 1,
-                repo_root: Some("/home/user/dev/muxtrix".into()),
-                failure: None,
-                entries: vec![WorktreeManagerEntry {
-                    path: "/home/user/.muxtrix/worktrees/muxtrix/feature-ui".into(),
-                    branch: Some("feature-ui".into()),
-                    unpushed_commits: 2,
-                    deletion_blocker: None,
-                    used_by: None,
-                }],
-                loading: false,
-                selected: 0,
-                busy: false,
-                error: Some(
-                    "git worktree remove failed: feature-ui contains modified or untracked files"
-                        .into(),
-                ),
-                restart_target: None,
-            });
+            let mut manager = WorktreeManagerState::loading(WorktreeManagerMode::Manage, 1);
+            manager.repo_root = Some("/home/user/dev/muxtrix".into());
+            manager.entries = vec![WorktreeManagerEntry {
+                path: "/home/user/.muxtrix/worktrees/muxtrix/feature-ui".into(),
+                branch: Some("feature-ui".into()),
+                unpushed_commits: 2,
+                deletion_blocker: None,
+                used_by: None,
+            }];
+            manager.loading = false;
+            manager.error = Some(
+                "git worktree remove failed: feature-ui contains modified or untracked files"
+                    .into(),
+            );
+            app.worktree_manager = Some(manager);
         } else if self.capturing("worktree-manager-no-repo") {
             app.active_view = ActiveView::Settings;
             app.settings_page = super::SettingsPage::Worktrees;
-            app.worktree_manager = Some(WorktreeManagerState {
-                mode: WorktreeManagerMode::Manage,
-                generation: 1,
-                repo_root: None,
-                failure: Some("The focused pane is not inside a Git repository".into()),
-                entries: Vec::new(),
-                loading: false,
-                selected: 0,
-                busy: false,
-                error: None,
-                restart_target: None,
-            });
+            let mut manager = WorktreeManagerState::loading(WorktreeManagerMode::Manage, 1);
+            manager.failure = Some("The focused pane is not inside a Git repository".into());
+            manager.loading = false;
+            app.worktree_manager = Some(manager);
         } else if self.capturing("session-picker-error") {
             app.session_picker = Some(super::SessionPickerState {
                 entries: Vec::new(),
@@ -2226,40 +2192,16 @@ fn staged_github_panel() -> GitHubPanelState {
         })
         .collect();
 
-    GitHubPanelState {
-        repository: staged_repository(),
-        active_tab: GitHubPanelTab::Local,
-        context_loading: false,
-        data: Some(github::PanelData {
-            branch: "github-support".into(),
-            additions,
-            deletions,
-            files: files.clone(),
-        }),
-        loading: false,
-        error: None,
-        pull_requests: Some(pull_requests),
-        pull_requests_loading: false,
-        pull_requests_error: None,
-        pull_request_query: String::new(),
-        pull_request_scroll_offset: 0.0,
-        pull_request_keyboard_cursor: None,
-        keyboard_focus: None,
-        selected_pull_request_number: None,
-        selected_pull_request: None,
-        selected_pull_request_loading: false,
-        selected_pull_request_error: None,
-        selected_pull_request_file_scroll_offset: 0.0,
-        file_keyboard_cursor: None,
-        pull_request_action_error: None,
-        draft_state_updating: false,
-        merge_confirmation: false,
-        merging: false,
-        file_scroll_offset: 0.0,
-        pull_request_generation: 0,
-        pull_request_detail_generation: 0,
-        loading_phase: 0,
-    }
+    let mut panel = GitHubPanelState::loading(staged_repository());
+    panel.data = Some(github::PanelData {
+        branch: "github-support".into(),
+        additions,
+        deletions,
+        files: files.clone(),
+    });
+    panel.loading = false;
+    panel.pull_requests = Some(pull_requests);
+    panel
 }
 
 fn staged_github_pull_request_panel() -> GitHubPanelState {
