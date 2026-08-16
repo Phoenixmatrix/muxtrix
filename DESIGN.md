@@ -255,7 +255,10 @@ automatic reviewer are not human-attention evidence.
 
 ## Primary actions and navigation
 
-Commands is a top action and opens with `Ctrl/Cmd+P`. Settings is a top action and opens with `Ctrl/Cmd+,`. `Ctrl/Cmd+1` through `Ctrl/Cmd+9` navigates directly to panes.
+Commands is a top action and opens with `Ctrl/Cmd+P`. Settings is a top action
+and opens with `Ctrl/Cmd+,`. `Ctrl/Cmd+1` through `Ctrl/Cmd+9` navigates directly
+to panes; adding Shift switches directly to the workspace in the same numbered
+session-order position.
 
 The status bar is optional and defaults to off.
 
