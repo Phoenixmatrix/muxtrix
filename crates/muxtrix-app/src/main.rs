@@ -25,8 +25,8 @@ use iced::{
 };
 use libghostty_vt::TerminalOptions;
 use muxtrix_control::{
-    Agent, AgentState, ControlRequest, ControlResponse, ControlServer, HookAction, HookManager,
-    HookScope, HookStatus, PaneSummary, SplitDirection,
+    Agent, AgentState, ControlRequest, ControlResponse, ControlServer, Endpoint, HookAction,
+    HookManager, HookScope, HookStatus, PaneSummary, SplitDirection,
 };
 use muxtrix_domain::{
     LaunchProfile, Pane, PaneAgent, PaneId, PaneTree, ProcessBackend, ProfileId, SessionState,
@@ -774,9 +774,8 @@ struct SessionPickerState {
     entries: Vec<SessionPickerEntry>,
     selected: usize,
     error: Option<String>,
-    /// Opened at boot because unattached sessions exist: resuming also
-    /// shuts down the throwaway session this instance just created, and
-    /// the dialog offers "Start new session" instead of "Close".
+    /// Opened before any new daemon is created because unattached sessions
+    /// exist; declining it explicitly starts a fresh session.
     startup: bool,
 }
 
@@ -1487,17 +1486,31 @@ impl Muxtrix {
             }
             return Task::none();
         }
+        self.initialize_session_host(pane_id, true)
+    }
+
+    fn start_new_session_host(&mut self, pane_id: PaneId) -> Task<Message> {
+        self.initialize_session_host(pane_id, false)
+    }
+
+    fn initialize_session_host(&self, pane_id: PaneId, offer_resume: bool) -> Task<Message> {
         perform_blocking(
             move || {
-                let host = start_session_host().ok_or_else(|| {
-                    "The terminal host did not become ready. Check WSL or the selected shell, then retry."
-                        .to_owned()
-                })?;
-                let own = host.id;
-                if let Ok(mut active) = SESSION_HOST.lock() {
-                    *active = Some(host);
-                }
-                Ok(muxtrix_sessions::resumable_sessions(Some(own)))
+                let candidates = if offer_resume {
+                    muxtrix_sessions::resumable_sessions(None)
+                } else {
+                    Vec::new()
+                };
+                start_host_unless_resumable(candidates, || {
+                    let host = start_session_host().ok_or_else(|| {
+                        "The terminal host did not become ready. Check WSL or the selected shell, then retry."
+                            .to_owned()
+                    })?;
+                    if let Ok(mut active) = SESSION_HOST.lock() {
+                        *active = Some(host);
+                    }
+                    Ok(())
+                })
             },
             move |result| {
                 Message::SessionHostInitialized(pane_id, result.and_then(std::convert::identity))
@@ -1840,7 +1853,13 @@ impl Muxtrix {
         let event_notifier: EventNotifier = Arc::new(move || {
             let _ = event_sender.try_send(());
         });
-        let (control, control_status) = start_control_server(Arc::clone(&event_notifier));
+        let initial_control_endpoint = if std::env::var_os("MUXTRIX_CONTROL_ENDPOINT").is_some() {
+            Endpoint::discover()
+        } else {
+            Endpoint::for_instance(&format!("window-{}", uuid::Uuid::new_v4()))
+        };
+        let (control, control_status) =
+            start_control_server(initial_control_endpoint, Arc::clone(&event_notifier));
         let control_endpoint = control
             .as_ref()
             .map(|server| server.endpoint_environment_value().to_owned());
@@ -1895,7 +1914,7 @@ impl Muxtrix {
             )));
         }
 
-        Self {
+        let app = Self {
             session: SessionState::new(workspace, vec![profile]),
             terminals: BTreeMap::from([(initial_pane_id, runtime)]),
             status: settings_warning
@@ -1989,7 +2008,9 @@ impl Muxtrix {
             integration_refreshing: false,
             #[cfg(feature = "e2e")]
             e2e,
-        }
+        };
+        let _ = app.publish_control_panes();
+        app
     }
 
     fn title(&self) -> String {
@@ -2114,7 +2135,14 @@ impl Muxtrix {
                         self.open_session_picker_from_records(candidates, true);
                     }
                     Ok(_) => {
-                        if let Err(error) = self.launch_terminal_for_pane(pane_id) {
+                        let panes = Self::control_pane_ids(&self.session);
+                        let launch = session_host()
+                            .ok_or_else(|| "Terminal session host is unavailable".to_owned())
+                            .and_then(|(session_id, _)| {
+                                self.bind_control_to_session(session_id, &panes)
+                            })
+                            .and_then(|()| self.launch_terminal_for_pane(pane_id));
+                        if let Err(error) = launch {
                             self.mark_terminal_launch_failed(pane_id, error);
                         }
                     }
@@ -2538,11 +2566,8 @@ impl Muxtrix {
                     .ok()
                     .and_then(|workspace| workspace.active_tab())
                     .map(|tab| tab.focused_pane_id);
-                if startup
-                    && let Some(pane_id) = pane_id
-                    && let Err(error) = self.launch_terminal_for_pane(pane_id)
-                {
-                    self.mark_terminal_launch_failed(pane_id, error);
+                if startup && let Some(pane_id) = pane_id {
+                    return self.start_new_session_host(pane_id);
                 }
                 return Task::none();
             }
@@ -4423,13 +4448,12 @@ impl Muxtrix {
             picker.error = Some("that session never reported a layout".into());
             return;
         };
-        // Resuming at startup abandons the pristine session this instance
-        // just created; left alone its live shell would keep an orphan
-        // daemon running forever.
-        if picker.startup
-            && let Some((_, previous)) = session_host()
-        {
-            let _ = previous.send(&muxtrix_sessions::Request::Shutdown);
+        let control_panes = Self::control_pane_ids(&state);
+        if let Err(error) = self.bind_control_to_session(record.id, &control_panes) {
+            if let Some(picker) = self.session_picker.as_mut() {
+                picker.error = Some(format!("could not route local control: {error}"));
+            }
+            return;
         }
         let client = Arc::new(client);
         // Register every pane, then re-attach so the daemon replays each
@@ -7392,7 +7416,55 @@ impl Muxtrix {
         )
     }
 
+    fn control_pane_ids(session: &SessionState) -> Vec<String> {
+        session
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.tabs.iter())
+            .flat_map(|tab| tab.panes.keys())
+            .map(|pane_id| pane_id.as_uuid().to_string())
+            .collect()
+    }
+
+    fn publish_control_panes(&self) -> Result<(), String> {
+        if let Some(control) = &self.control {
+            control
+                .publish_panes(Self::control_pane_ids(&self.session))
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn bind_control_to_session(
+        &mut self,
+        session_id: uuid::Uuid,
+        panes: &[String],
+    ) -> Result<(), String> {
+        if std::env::var_os("MUXTRIX_CONTROL_ENDPOINT").is_none() {
+            let endpoint = Endpoint::for_instance(&format!("session-{session_id}"))
+                .map_err(|error| error.to_string())?;
+            let server =
+                ControlServer::bind_with_notifier(endpoint, Arc::clone(&self.event_notifier))
+                    .map_err(|error| error.to_string())?;
+            server
+                .publish_panes(panes.iter().cloned())
+                .map_err(|error| error.to_string())?;
+            self.control_endpoint = Some(server.endpoint_environment_value().to_owned());
+            self.control = Some(server);
+        } else {
+            self.control
+                .as_ref()
+                .ok_or_else(|| "The configured local control endpoint is unavailable".to_owned())?
+                .publish_panes(panes.iter().cloned())
+                .map_err(|error| error.to_string())?;
+        }
+        self.global_alerts
+            .retain(|alert| alert.title != "Local control unavailable");
+        Ok(())
+    }
+
     fn poll_control(&mut self) {
+        let _ = self.publish_control_panes();
         let mut incoming = Vec::new();
         if let Some(control) = &self.control {
             while let Ok(request) = control.try_recv() {
@@ -19038,8 +19110,11 @@ fn command_executable(command: &str) -> Option<&str> {
 }
 
 #[cfg(not(test))]
-fn start_control_server(notifier: EventNotifier) -> (Option<ControlServer>, Option<String>) {
-    match ControlServer::discover_and_bind_with_notifier(notifier) {
+fn start_control_server(
+    endpoint: Result<Endpoint, muxtrix_control::ControlError>,
+    notifier: EventNotifier,
+) -> (Option<ControlServer>, Option<String>) {
+    match endpoint.and_then(|endpoint| ControlServer::bind_with_notifier(endpoint, notifier)) {
         Ok(server) => (Some(server), None),
         Err(error) => (
             None,
@@ -19049,7 +19124,10 @@ fn start_control_server(notifier: EventNotifier) -> (Option<ControlServer>, Opti
 }
 
 #[cfg(test)]
-fn start_control_server(_notifier: EventNotifier) -> (Option<ControlServer>, Option<String>) {
+fn start_control_server(
+    _endpoint: Result<Endpoint, muxtrix_control::ControlError>,
+    _notifier: EventNotifier,
+) -> (Option<ControlServer>, Option<String>) {
     (None, None)
 }
 
@@ -19454,8 +19532,19 @@ fn session_host() -> Option<(uuid::Uuid, Arc<muxtrix_sessions::SessionClient>)> 
         .map(|host| (host.id, Arc::clone(&host.client)))
 }
 
-/// Spawns and connects this instance's own session daemon. Every GUI
-/// instance gets a fresh session; resume replaces panes at the user's ask.
+fn start_host_unless_resumable(
+    candidates: Vec<muxtrix_sessions::SessionRecord>,
+    start: impl FnOnce() -> Result<(), String>,
+) -> Result<Vec<muxtrix_sessions::SessionRecord>, String> {
+    if !candidates.is_empty() {
+        return Ok(candidates);
+    }
+    start()?;
+    Ok(Vec::new())
+}
+
+/// Spawns and connects a new session daemon after the user has declined every
+/// resumable session. Startup discovery must happen before this function runs.
 fn start_session_host() -> Option<SessionHost> {
     if std::env::var_os("MUXTRIX_NO_SESSIOND").is_some()
         || std::env::var_os("MUXTRIX_E2E_REPORT").is_some()
@@ -19955,6 +20044,46 @@ mod tests {
             resolved,
             current_directory.join("installed/bin/muxtrix"),
             "the saved path must keep pointing at the package-managed entry after its target changes"
+        );
+    }
+
+    #[test]
+    fn startup_offers_resumable_sessions_before_spawning_a_daemon() {
+        let session_id = uuid::Uuid::new_v4();
+        let candidate = muxtrix_sessions::SessionRecord {
+            id: session_id,
+            name: "existing".into(),
+            endpoint: "existing-session".into(),
+            process_id: 42,
+            created_unix: 1,
+            layout: Some("{}".into()),
+            attached: false,
+            version: env!("CARGO_PKG_VERSION").into(),
+        };
+        let started = std::cell::Cell::new(false);
+        let offered = start_host_unless_resumable(vec![candidate], || {
+            started.set(true);
+            Ok(())
+        })
+        .expect("startup decision should succeed");
+
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].id, session_id);
+        assert!(
+            !started.get(),
+            "discovering a resumable session must not create a throwaway daemon"
+        );
+
+        let started = std::cell::Cell::new(false);
+        let offered = start_host_unless_resumable(Vec::new(), || {
+            started.set(true);
+            Ok(())
+        })
+        .expect("fresh session startup should succeed");
+        assert!(offered.is_empty());
+        assert!(
+            started.get(),
+            "an explicit fresh start must create its daemon"
         );
     }
 

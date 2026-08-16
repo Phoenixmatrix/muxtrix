@@ -158,10 +158,13 @@ keyed by globally unique pane identity and are never serialized. Schema v2
 migrates the former workspace-owned tree into a default `Tab 1`. State is
 written using an atomic replace and versioned schema.
 
-A user-local IPC endpoint exposes the same typed commands used by keyboard
-actions. Unix sockets with private permissions are used on Unix and local named
-pipes on Windows. Newline-delimited JSON is an internal first-version protocol;
-remote transport requires authentication and version negotiation first.
+A session-stable local IPC endpoint exposes the same typed commands used by
+keyboard actions. Each attached GUI owns a different Unix socket or Windows
+named pipe and publishes its pane IDs in a private per-user route registry.
+Pane identity selects the correct window; commands without pane context are
+accepted only when one window is active. Newline-delimited JSON remains an
+internal protocol, and remote transport requires authentication and version
+negotiation first.
 
 Agent hook configuration is an adapter boundary rather than application state.
 Each installed handler has a Muxtrix marker, and uninstall selectively removes

@@ -1,10 +1,10 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -13,11 +13,13 @@ use interprocess::local_socket::{
     ToFsName as _, ToNsName as _,
     traits::{Listener as _, Stream as _},
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{ControlRequest, ControlResponse};
 
 const ENDPOINT_OVERRIDE: &str = "MUXTRIX_CONTROL_ENDPOINT";
+const CONTROL_REGISTRY_OVERRIDE: &str = "MUXTRIX_CONTROL_REGISTRY";
 
 pub type ControlNotifier = Arc<dyn Fn() + Send + Sync>;
 
@@ -29,24 +31,40 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub fn discover() -> Result<Self, ControlError> {
-        if let Some(address) = std::env::var_os(ENDPOINT_OVERRIDE) {
-            return Ok(Self::platform(address.to_string_lossy().into_owned()));
+        Self::discover_for_pane(None)
+    }
+
+    pub fn discover_for_pane(pane_id: Option<&str>) -> Result<Self, ControlError> {
+        let endpoint_override = std::env::var_os(ENDPOINT_OVERRIDE)
+            .map(|address| Self::platform(address.to_string_lossy().into_owned()));
+        let routes = active_control_routes(&control_registry_directory())?;
+        if let Some(pane_id) = pane_id
+            && let Some(endpoint) = registered_endpoint_for_pane(&routes, pane_id)?
+        {
+            return Ok(endpoint);
+        }
+        if let Some(endpoint) = endpoint_override {
+            return Ok(endpoint);
+        }
+        sole_registered_endpoint(&routes)?.ok_or(ControlError::NoActiveWindow)
+    }
+
+    pub fn for_instance(instance: &str) -> Result<Self, ControlError> {
+        if instance.is_empty()
+            || !instance.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+        {
+            return Err(ControlError::InvalidInstanceName(instance.into()));
         }
 
         #[cfg(unix)]
         {
-            let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
-            let base = runtime_dir
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| std::env::temp_dir().join(user_endpoint_suffix()));
-            std::fs::create_dir_all(&base)?;
-            if runtime_dir.is_none() {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))?;
-            }
             Ok(Self {
-                address: base.join("muxtrix.sock").to_string_lossy().into_owned(),
+                address: control_runtime_directory()?
+                    .join(format!("muxtrix-{instance}.sock"))
+                    .to_string_lossy()
+                    .into_owned(),
                 namespaced: false,
             })
         }
@@ -54,13 +72,14 @@ impl Endpoint {
         #[cfg(windows)]
         {
             Ok(Self {
-                address: format!("muxtrix-{}", user_endpoint_suffix()),
+                address: format!("{}-{instance}", user_endpoint_suffix()),
                 namespaced: true,
             })
         }
 
         #[cfg(not(any(unix, windows)))]
         {
+            let _ = instance;
             Err(ControlError::UnsupportedPlatform)
         }
     }
@@ -99,6 +118,194 @@ impl Endpoint {
                 .to_fs_name::<GenericFilePath>()
                 .map_err(ControlError::Io)
         }
+    }
+}
+
+#[cfg(unix)]
+fn control_runtime_directory() -> Result<PathBuf, ControlError> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
+    let directory = runtime_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(user_endpoint_suffix()));
+    std::fs::create_dir_all(&directory)?;
+    if runtime_dir.is_none() {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(directory)
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct ControlRouteRecord {
+    endpoint: String,
+    process_id: u32,
+    panes: Vec<String>,
+}
+
+struct ControlRegistration {
+    path: PathBuf,
+    record: Mutex<ControlRouteRecord>,
+}
+
+impl ControlRegistration {
+    fn create(endpoint: &Endpoint, directory: &Path) -> io::Result<Self> {
+        create_private_directory(directory)?;
+        let record = ControlRouteRecord {
+            endpoint: endpoint.environment_value().into(),
+            process_id: std::process::id(),
+            panes: Vec::new(),
+        };
+        let path = control_route_path(directory, &record.endpoint);
+        write_control_route(&path, &record)?;
+        Ok(Self {
+            path,
+            record: Mutex::new(record),
+        })
+    }
+
+    fn publish_panes(&self, panes: impl IntoIterator<Item = String>) -> io::Result<()> {
+        let mut panes: Vec<String> = panes.into_iter().collect();
+        panes.sort_unstable();
+        panes.dedup();
+        let mut record = self
+            .record
+            .lock()
+            .map_err(|_| io::Error::other("control route lock poisoned"))?;
+        if record.panes == panes && self.path.exists() {
+            return Ok(());
+        }
+        let updated = ControlRouteRecord {
+            panes,
+            ..record.clone()
+        };
+        write_control_route(&self.path, &updated)?;
+        *record = updated;
+        Ok(())
+    }
+}
+
+impl Drop for ControlRegistration {
+    fn drop(&mut self) {
+        let expected = self
+            .record
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        let _ = remove_control_route_if_unchanged(&self.path, expected);
+    }
+}
+
+fn control_registry_directory() -> PathBuf {
+    if let Some(directory) = std::env::var_os(CONTROL_REGISTRY_OVERRIDE) {
+        return directory.into();
+    }
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(user_endpoint_suffix()))
+        .join(".muxtrix")
+        .join("control")
+}
+
+fn create_private_directory(directory: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn control_route_path(directory: &Path, endpoint: &str) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    endpoint.hash(&mut hasher);
+    directory.join(format!("{:016x}.json", hasher.finish()))
+}
+
+fn write_control_route(path: &Path, record: &ControlRouteRecord) -> io::Result<()> {
+    let contents = serde_json::to_vec(record).map_err(io::Error::other)?;
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn remove_control_route_if_unchanged(
+    path: &Path,
+    expected: &ControlRouteRecord,
+) -> io::Result<bool> {
+    let current = match std::fs::read(path) {
+        Ok(contents) => serde_json::from_slice::<ControlRouteRecord>(&contents).ok(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if current.as_ref() != Some(expected) {
+        return Ok(false);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+fn active_control_routes(directory: &Path) -> Result<Vec<ControlRouteRecord>, ControlError> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(ControlError::Io(error)),
+    };
+    let mut routes = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(contents) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(route) = serde_json::from_slice::<ControlRouteRecord>(&contents) else {
+            continue;
+        };
+        let endpoint = Endpoint::platform(route.endpoint.clone());
+        let live = endpoint
+            .name()
+            .ok()
+            .and_then(|name| Stream::connect(name).ok())
+            .is_some();
+        if live {
+            routes.push(route);
+        } else {
+            let _ = remove_control_route_if_unchanged(&path, &route);
+        }
+    }
+    Ok(routes)
+}
+
+fn registered_endpoint_for_pane(
+    routes: &[ControlRouteRecord],
+    pane_id: &str,
+) -> Result<Option<Endpoint>, ControlError> {
+    let mut matching = routes
+        .iter()
+        .filter(|route| route.panes.iter().any(|pane| pane == pane_id));
+    let Some(route) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err(ControlError::AmbiguousWindows(routes.len()));
+    }
+    Ok(Some(Endpoint::platform(route.endpoint.clone())))
+}
+
+fn sole_registered_endpoint(
+    routes: &[ControlRouteRecord],
+) -> Result<Option<Endpoint>, ControlError> {
+    match routes {
+        [] => Ok(None),
+        [route] => Ok(Some(Endpoint::platform(route.endpoint.clone()))),
+        _ => Err(ControlError::AmbiguousWindows(routes.len())),
     }
 }
 
@@ -176,16 +383,25 @@ pub struct ControlServer {
     endpoint: Endpoint,
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    registration: Option<ControlRegistration>,
 }
 
 impl ControlServer {
     pub fn bind(endpoint: Endpoint) -> Result<Self, ControlError> {
-        Self::bind_inner(endpoint, None)
+        Self::bind_inner(endpoint, None, None)
+    }
+
+    pub fn bind_with_notifier(
+        endpoint: Endpoint,
+        notifier: ControlNotifier,
+    ) -> Result<Self, ControlError> {
+        Self::bind_inner(endpoint, Some(notifier), Some(control_registry_directory()))
     }
 
     fn bind_inner(
         endpoint: Endpoint,
         notifier: Option<ControlNotifier>,
+        registration_directory: Option<PathBuf>,
     ) -> Result<Self, ControlError> {
         let create_listener = || -> Result<_, ControlError> {
             ListenerOptions::new()
@@ -194,7 +410,7 @@ impl ControlServer {
                 .create_sync()
                 .map_err(ControlError::Io)
         };
-        let mut listener = match create_listener() {
+        let listener = match create_listener() {
             Ok(listener) => listener,
             #[cfg(unix)]
             Err(ControlError::Io(bind_error)) if bind_error.kind() == io::ErrorKind::AddrInUse => {
@@ -230,6 +446,8 @@ impl ControlServer {
             }
             Err(error) => return Err(error),
         };
+        #[cfg(unix)]
+        let mut listener = listener;
 
         #[cfg(unix)]
         let socket_path = {
@@ -246,6 +464,11 @@ impl ControlServer {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&endpoint.address, std::fs::Permissions::from_mode(0o600))?;
         }
+
+        let registration = registration_directory
+            .as_deref()
+            .map(|directory| ControlRegistration::create(&endpoint, directory))
+            .transpose()?;
 
         let (sender, receiver) = mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
@@ -281,17 +504,18 @@ impl ControlServer {
             endpoint,
             running,
             thread: Some(thread),
+            registration,
         })
     }
 
-    pub fn discover_and_bind() -> Result<Self, ControlError> {
-        Self::bind(Endpoint::discover()?)
-    }
-
-    pub fn discover_and_bind_with_notifier(
-        notifier: ControlNotifier,
-    ) -> Result<Self, ControlError> {
-        Self::bind_inner(Endpoint::discover()?, Some(notifier))
+    pub fn publish_panes(
+        &self,
+        panes: impl IntoIterator<Item = String>,
+    ) -> Result<(), ControlError> {
+        if let Some(registration) = &self.registration {
+            registration.publish_panes(panes)?;
+        }
+        Ok(())
     }
 
     pub fn try_recv(&self) -> Result<IncomingRequest, mpsc::TryRecvError> {
@@ -391,6 +615,14 @@ pub enum ControlError {
     Json(#[from] serde_json::Error),
     #[error("local control transport is unsupported on this platform")]
     UnsupportedPlatform,
+    #[error("no active Muxtrix window is registered")]
+    NoActiveWindow,
+    #[error(
+        "{0} Muxtrix windows are active; run muxtrixctl inside the target pane or set MUXTRIX_CONTROL_ENDPOINT"
+    )]
+    AmbiguousWindows(usize),
+    #[error("invalid local control instance name {0:?}")]
+    InvalidInstanceName(String),
 }
 
 #[cfg(test)]
@@ -407,6 +639,14 @@ mod tests {
                 std::thread::current().id()
             )))
         }
+    }
+
+    fn test_registry(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "muxtrix-control-registry-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
     }
 
     #[test]
@@ -504,6 +744,74 @@ mod tests {
         );
         drop(replacement);
         std::fs::remove_file(path).expect("test endpoint should be removable");
+    }
+
+    #[test]
+    fn concurrent_windows_route_requests_by_pane() {
+        let registry = test_registry("concurrent-windows");
+        let _ = std::fs::remove_dir_all(&registry);
+        let first_endpoint = test_endpoint("window-one");
+        let second_endpoint = test_endpoint("window-two");
+        let notifier: ControlNotifier = Arc::new(|| {});
+        let first = ControlServer::bind_inner(
+            first_endpoint.clone(),
+            Some(Arc::clone(&notifier)),
+            Some(registry.clone()),
+        )
+        .expect("first window should bind");
+        let second = ControlServer::bind_inner(
+            second_endpoint.clone(),
+            Some(notifier),
+            Some(registry.clone()),
+        )
+        .expect("second window should bind");
+        first
+            .publish_panes(["pane-one".into()])
+            .expect("first route should publish");
+        second
+            .publish_panes(["pane-two".into()])
+            .expect("second route should publish");
+
+        let routes = active_control_routes(&registry).expect("routes should be readable");
+        assert_eq!(routes.len(), 2);
+        assert_eq!(
+            registered_endpoint_for_pane(&routes, "pane-one")
+                .expect("pane route should be unambiguous")
+                .expect("pane route should exist")
+                .environment_value(),
+            first_endpoint.environment_value()
+        );
+        assert_eq!(
+            registered_endpoint_for_pane(&routes, "pane-two")
+                .expect("pane route should be unambiguous")
+                .expect("pane route should exist")
+                .environment_value(),
+            second_endpoint.environment_value()
+        );
+        assert!(matches!(
+            sole_registered_endpoint(&routes),
+            Err(ControlError::AmbiguousWindows(2))
+        ));
+
+        drop(first);
+        drop(second);
+        assert!(
+            active_control_routes(&registry)
+                .expect("empty registry should be readable")
+                .is_empty()
+        );
+        std::fs::remove_dir(registry).expect("test registry should be removable");
+    }
+
+    #[test]
+    fn instance_endpoints_are_stable_and_distinct() {
+        let first = Endpoint::for_instance("window-one").expect("instance name should be valid");
+        let first_again =
+            Endpoint::for_instance("window-one").expect("instance name should remain valid");
+        let second = Endpoint::for_instance("window-two").expect("instance name should be valid");
+
+        assert_eq!(first, first_again);
+        assert_ne!(first, second);
     }
 
     #[test]

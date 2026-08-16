@@ -97,7 +97,9 @@ fn run(arguments: &[String]) -> Result<(), String> {
         _ => return Err(usage()),
     };
 
-    let endpoint = Endpoint::discover().map_err(|error| error.to_string())?;
+    let environment_pane = pane_from_environment();
+    let route_pane = request_pane_id(&request).or(environment_pane.as_deref());
+    let endpoint = Endpoint::discover_for_pane(route_pane).map_err(|error| error.to_string())?;
     let response = send_request(&endpoint, &request).map_err(|error| error.to_string())?;
     println!(
         "{}",
@@ -228,6 +230,7 @@ fn run_hook_event(arguments: &[String]) {
         })
         .map(short_body)
         .unwrap_or_else(|| default_body(&agent, state).into());
+    let endpoint = Endpoint::discover_for_pane(Some(&pane_id)).ok();
     let request = ControlRequest::AgentEvent {
         agent,
         state,
@@ -244,7 +247,7 @@ fn run_hook_event(arguments: &[String]) {
             .and_then(Value::as_str)
             .map(str::to_owned),
     };
-    if let Ok(endpoint) = Endpoint::discover() {
+    if let Some(endpoint) = endpoint {
         let _ = send_request(&endpoint, &request);
     }
 }
@@ -255,6 +258,21 @@ fn run_hook_event(arguments: &[String]) {
 /// stable across versions, so no hook repair is required.
 fn event_changes_pane_state(event: &str) -> bool {
     !matches!(event, "TeammateIdle" | "SubagentStop")
+}
+
+fn request_pane_id(request: &ControlRequest) -> Option<&str> {
+    match request {
+        ControlRequest::Notify { pane_id, .. }
+        | ControlRequest::AgentEvent { pane_id, .. }
+        | ControlRequest::Close { pane_id }
+        | ControlRequest::SendText { pane_id, .. }
+        | ControlRequest::Capture { pane_id } => pane_id.as_deref(),
+        ControlRequest::Focus { pane_id } => Some(pane_id),
+        ControlRequest::Ping
+        | ControlRequest::LaunchAgent { .. }
+        | ControlRequest::Split { .. }
+        | ControlRequest::ListPanes => None,
+    }
 }
 
 fn option(arguments: &[String], name: &str) -> Option<String> {
