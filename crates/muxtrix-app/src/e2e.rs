@@ -6,13 +6,13 @@ use iced::Task;
 use muxtrix_domain::{PaneId, SplitAxis, TabId};
 use serde_json::json;
 
-use muxtrix_control::AgentState;
+use muxtrix_control::{AgentState, ControlRequest};
 
 use super::{
     ActiveView, Agent, AgentPaneStatus, CommandAction, GitHubDiffSource, GitHubDiffState,
     GitHubPanelState, GitHubPanelTab, HookScope, HookStatus, Message, Muxtrix, PaneRepository,
     TerminalLaunchState, TerminalMouseButton, WorktreeManagerEntry, WorktreeManagerMode,
-    WorktreeManagerState, github,
+    WorktreeManagerState, agent_screen, github,
 };
 use crate::settings::{FleetScope, FleetView};
 
@@ -1032,6 +1032,40 @@ impl Scenario {
             );
             app.settings.fleet_scope = FleetScope::AllWorkspaces;
             app.settings.fleet_view = FleetView::Tabs;
+        } else if self.capturing("pi-active-lifecycle") {
+            let pane = Some(self.initial_pane.as_uuid().to_string());
+            let revision = app.terminals[&self.initial_pane].snapshot_revision;
+            let response = app.handle_control_request(ControlRequest::AgentEvent {
+                agent: "pi".into(),
+                state: AgentState::Running,
+                event: Some("agent_start".into()),
+                title: "Oh My Pi".into(),
+                body: "Running delegated checks".into(),
+                pane_id: pane,
+                session_id: Some("pi-session".into()),
+                cwd: Some("/home/user/dev/muxtrix".into()),
+            });
+            if !response.ok {
+                return Err("Pi lifecycle capture could not start its agent".into());
+            }
+            app.apply_agent_screen_classification(
+                self.initial_pane,
+                "pi",
+                revision.wrapping_add(1),
+                agent_screen::Classification {
+                    state: agent_screen::ScreenState::Idle,
+                    rule: "pi.osc_title_idle",
+                },
+            );
+            let status = app
+                .agent_statuses
+                .get_mut(&self.initial_pane)
+                .ok_or_else(|| "Pi lifecycle capture lost its agent state".to_owned())?;
+            if status.state != AgentState::Running {
+                return Err("Pi idle title demoted an active lifecycle".into());
+            }
+            status.display_name = Some("oh-my-pi-release-audit".into());
+            app.settings.fleet_view = FleetView::Agents;
         } else if self.capturing("fleet-agents") {
             // Stage different harnesses across both tabs so the capture
             // proves Agents is one flat selected-workspace projection.

@@ -9,7 +9,7 @@ use thiserror::Error;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 const MANAGED_MARKER: &str = "muxtrix-hook-v1";
-const PI_EXTENSION_VERSION: u32 = 3;
+const PI_EXTENSION_VERSION: u32 = 4;
 const WORKTREE_HOME_FOLDER: &str = ".muxtrix/worktrees";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -766,9 +766,9 @@ fn hook_events(agent: Agent) -> &'static [(&'static str, &'static str)] {
             ("tool_approval_requested", "waiting"),
             ("tool_approval_resolved", "running"),
             ("session.compacting", "running"),
-            ("session_compact", "completed"),
+            ("session_compact", "running"),
             ("auto_compaction_start", "running"),
-            ("auto_compaction_end", "completed"),
+            ("auto_compaction_end", "running"),
             ("agent_end", "completed"),
             ("session_shutdown", "stopped"),
         ],
@@ -1121,7 +1121,7 @@ fn pi_extension_registrations(agent: &str) -> String {
                     default_body(agent, state)
                 )
             }
-            ("auto_compaction_end", "completed") => {
+            ("auto_compaction_end", "running") => {
                 format!(
                     "    onLifecycle(\"{event}\", \"{state}\", \"{}\", (payload) => !payload?.skipped && !payload?.willRetry);",
                     default_body(agent, state)
@@ -1380,9 +1380,9 @@ mod tests {
         assert!(pi_events.contains(&("tool_approval_requested", "waiting")));
         assert!(pi_events.contains(&("tool_approval_resolved", "running")));
         assert!(pi_events.contains(&("session.compacting", "running")));
-        assert!(pi_events.contains(&("session_compact", "completed")));
+        assert!(pi_events.contains(&("session_compact", "running")));
         assert!(pi_events.contains(&("auto_compaction_start", "running")));
-        assert!(pi_events.contains(&("auto_compaction_end", "completed")));
+        assert!(pi_events.contains(&("auto_compaction_end", "running")));
     }
 
     #[test]
@@ -1463,6 +1463,8 @@ mod tests {
         assert!(source.contains("Approval needed: ${payload.toolName}"));
         assert!(source.contains("Preparing handoff"));
         assert!(source.contains("onLifecycle(\"auto_compaction_start\", \"running\""));
+        assert!(source.contains("onLifecycle(\"session_compact\", \"running\""));
+        assert!(source.contains("onLifecycle(\"auto_compaction_end\", \"running\""));
         assert!(source.contains("!payload?.skipped && !payload?.willRetry"));
         assert!(source.contains("sendLifecycle(event, \"running\""));
         assert!(source.contains("setStatus?.(\"muxtrix\", undefined)"));
