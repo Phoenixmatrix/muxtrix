@@ -1217,8 +1217,8 @@ enum Message {
     CloseGitHubPanel,
     RefreshGitHubPanel,
     RefreshGitHubPullRequestsAfterAgentTurn,
-    RefreshGitHubFocusedPane,
     GitHubFocusedPaneLoaded(
+        PaneId,
         u64,
         Box<Result<(github::Repository, github::PanelData), String>>,
     ),
@@ -2039,12 +2039,6 @@ impl Muxtrix {
                     .map(|_| Message::AnimateGitHubLoading),
             );
         }
-        if self.github_pane_refresh_pending {
-            subscriptions.push(
-                iced::time::every(std::time::Duration::from_millis(1))
-                    .map(|_| Message::RefreshGitHubFocusedPane),
-            );
-        }
         if self.github_pull_requests_refresh_pending {
             subscriptions.push(
                 iced::time::every(std::time::Duration::from_millis(1))
@@ -2125,7 +2119,14 @@ impl Muxtrix {
             Message::PollTerminal => {
                 self.poll_terminal();
                 self.poll_control();
-                return self.refresh_background_metadata();
+                let metadata = self.refresh_background_metadata();
+                let github = if self.github_pane_refresh_pending {
+                    self.github_pane_refresh_pending = false;
+                    self.refresh_github_focused_pane()
+                } else {
+                    Task::none()
+                };
+                return Task::batch([metadata, github]);
             }
             Message::AgentsRosterLoaded(result) => {
                 self.agents_roster_pending = false;
@@ -2739,12 +2740,12 @@ impl Muxtrix {
                 self.github_pull_requests_refresh_pending = false;
                 return self.refresh_github_pull_requests();
             }
-            Message::RefreshGitHubFocusedPane => {
-                self.github_pane_refresh_pending = false;
-                return self.refresh_github_focused_pane();
-            }
-            Message::GitHubFocusedPaneLoaded(generation, result) => {
+            Message::GitHubFocusedPaneLoaded(pane_id, generation, result) => {
                 if generation != self.github_context_generation {
+                    return Task::none();
+                }
+                if self.control_pane_id(None).ok() != Some(pane_id) {
+                    self.queue_github_pane_refresh();
                     return Task::none();
                 }
                 let (repository, data) = match *result {
@@ -3731,8 +3732,8 @@ impl Muxtrix {
         self.maximized_pane = None;
         self.pane_menu = None;
         self.hovered_terminal = None;
-        if changed && self.github_panel.is_some() {
-            self.github_pane_refresh_pending = true;
+        if changed {
+            self.queue_github_pane_refresh();
         }
         Ok(())
     }
@@ -4646,8 +4647,8 @@ impl Muxtrix {
         self.maximized_pane = None;
         self.pane_menu = None;
         self.hovered_terminal = None;
-        if changed && self.github_panel.is_some() {
-            self.github_pane_refresh_pending = true;
+        if changed {
+            self.queue_github_pane_refresh();
         }
         Ok(())
     }
@@ -5754,6 +5755,23 @@ impl Muxtrix {
         )
     }
 
+    fn queue_github_pane_refresh(&mut self) {
+        let Some(panel) = self.github_panel.as_ref() else {
+            return;
+        };
+        let repository_may_change = self
+            .focused_pane_directory()
+            .is_none_or(|directory| !directory.starts_with(&panel.repository.root));
+        let context_loading = panel.active_tab == GitHubPanelTab::Local || repository_may_change;
+        if context_loading {
+            let panel = self.github_panel.as_mut().expect("panel checked above");
+            panel.context_loading = true;
+            panel.loading_phase = 0;
+        }
+        self.github_pane_refresh_pending = true;
+        (self.event_notifier)();
+    }
+
     fn queue_github_pull_request_refresh(&mut self, pane_id: PaneId) {
         if self.control_pane_id(None).ok() != Some(pane_id) {
             return;
@@ -5885,7 +5903,10 @@ impl Muxtrix {
     }
 
     fn refresh_github_focused_pane(&mut self) -> Task<Message> {
-        let Some(directory) = self.focused_pane_directory() else {
+        let Ok(pane_id) = self.control_pane_id(None) else {
+            return Task::none();
+        };
+        let Some(directory) = self.pane_working_directory(pane_id) else {
             return Task::none();
         };
         let wsl_distribution = self.settings.wsl_distribution.clone();
@@ -5909,6 +5930,7 @@ impl Muxtrix {
             },
             move |result| {
                 Message::GitHubFocusedPaneLoaded(
+                    pane_id,
                     generation,
                     Box::new(result.and_then(std::convert::identity)),
                 )
@@ -7747,8 +7769,8 @@ impl Muxtrix {
         };
         if focus_changed {
             self.pane_resize_history.remove(&tab_id);
-            if self.github_panel.is_some() && self.pane_working_directory(pane_id).is_some() {
-                self.github_pane_refresh_pending = true;
+            if self.pane_working_directory(pane_id).is_some() {
+                self.queue_github_pane_refresh();
             }
         }
         self.clear_pane_attention(pane_id);
@@ -20127,26 +20149,126 @@ mod tests {
     }
 
     #[test]
-    fn pane_focus_queues_one_local_repository_refresh() {
+    fn pane_focus_invalidates_local_diff_and_wakes_refresh_subscription() {
         let mut app = Muxtrix::new();
         let original = active_pane_id(&app);
         app.split_terminal(SplitAxis::Horizontal)
             .expect("second pane should open");
         let second = active_pane_id(&app);
         assert_ne!(original, second);
-        app.github_panel = Some(GitHubPanelState::loading(github::Repository {
+        let mut panel = GitHubPanelState::loading(github::Repository {
             root: std::env::temp_dir(),
             name: "muxtrix".into(),
             owner_and_name: Some("example/muxtrix".into()),
             host: "github.com".into(),
             branch: "main".into(),
             wsl_distribution: String::new(),
-        }));
+        });
+        panel.context_loading = false;
+        panel.loading = false;
+        app.github_panel = Some(panel);
         app.github_pane_refresh_pending = false;
+        while app.event_receiver.try_recv().is_ok() {}
 
         app.focus_pane(original)
             .expect("original pane should focus");
 
+        assert!(app.github_pane_refresh_pending);
+        assert!(
+            app.github_panel
+                .as_ref()
+                .is_some_and(|panel| panel.context_loading)
+        );
+        app.event_receiver
+            .try_recv()
+            .expect("focus change should wake the stable app subscription");
+    }
+
+    #[test]
+    fn workspace_switch_invalidates_local_diff_and_wakes_refresh_subscription() {
+        let mut app = Muxtrix::new();
+        let first_workspace = app.session.active_workspace_id;
+        let first_pane = active_pane_id(&app);
+        create_test_workspace(&mut app);
+        assert_ne!(first_workspace, app.session.active_workspace_id);
+        let mut panel = GitHubPanelState::loading(github::Repository {
+            root: std::env::temp_dir(),
+            name: "muxtrix".into(),
+            owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
+            branch: "main".into(),
+            wsl_distribution: String::new(),
+        });
+        panel.context_loading = false;
+        panel.loading = false;
+        app.github_panel = Some(panel);
+        app.github_pane_refresh_pending = false;
+        while app.event_receiver.try_recv().is_ok() {}
+
+        app.switch_workspace(first_workspace)
+            .expect("first workspace should activate");
+
+        assert_eq!(active_pane_id(&app), first_pane);
+        assert!(app.github_pane_refresh_pending);
+        assert!(
+            app.github_panel
+                .as_ref()
+                .is_some_and(|panel| panel.context_loading)
+        );
+        app.event_receiver
+            .try_recv()
+            .expect("workspace switch should wake the stable app subscription");
+    }
+
+    #[test]
+    fn stale_local_diff_result_cannot_overwrite_newly_focused_pane() {
+        let mut app = Muxtrix::new();
+        let original = active_pane_id(&app);
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("second pane should open");
+        let second = active_pane_id(&app);
+        assert_ne!(original, second);
+        let current_root = std::env::temp_dir();
+        let mut panel = GitHubPanelState::loading(github::Repository {
+            root: current_root.clone(),
+            name: "muxtrix".into(),
+            owner_and_name: Some("example/muxtrix".into()),
+            host: "github.com".into(),
+            branch: "main".into(),
+            wsl_distribution: String::new(),
+        });
+        panel.context_loading = false;
+        panel.loading = false;
+        app.github_panel = Some(panel);
+        app.github_context_generation = 7;
+        app.github_pane_refresh_pending = false;
+
+        let stale_root = current_root.join("stale-pane");
+        drop(app.update(Message::GitHubFocusedPaneLoaded(
+            original,
+            7,
+            Box::new(Ok((
+                github::Repository {
+                    root: stale_root,
+                    name: "stale".into(),
+                    owner_and_name: Some("example/stale".into()),
+                    host: "github.com".into(),
+                    branch: "stale".into(),
+                    wsl_distribution: String::new(),
+                },
+                github::PanelData {
+                    branch: "stale".into(),
+                    files: Vec::new(),
+                    additions: 0,
+                    deletions: 0,
+                },
+            ))),
+        )));
+
+        let panel = app.github_panel.as_ref().expect("panel should remain open");
+        assert_eq!(active_pane_id(&app), second);
+        assert_eq!(panel.repository.root, current_root);
+        assert!(panel.context_loading);
         assert!(app.github_pane_refresh_pending);
     }
 
