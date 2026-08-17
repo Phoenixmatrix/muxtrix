@@ -1,6 +1,5 @@
 //! Console subprocesses that stay out of sight on Windows.
 
-#[cfg(not(target_os = "windows"))]
 use std::process::Child;
 use std::{
     ffi::OsStr,
@@ -109,19 +108,16 @@ pub(crate) fn command_output_limited(
         command.process_group(0);
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = spawn_managed(command)?;
-    #[cfg(not(target_os = "windows"))]
+    // `console_command` owns the Windows creation flags. Spawn that same
+    // `std::process::Command` directly: wrapping or rebuilding it here is where
+    // the v0.1.56 path diverged from the known-windowless runner.
+    let mut child = command.spawn()?;
     let stdout = child.stdout.take();
-    #[cfg(target_os = "windows")]
-    let stdout = child.stdout().take();
     let Some(stdout) = stdout else {
         terminate_process_tree(&mut child);
         return Err(io::Error::other("child stdout was not captured"));
     };
-    #[cfg(not(target_os = "windows"))]
     let stderr = child.stderr.take();
-    #[cfg(target_os = "windows")]
-    let stderr = child.stderr().take();
     let Some(stderr) = stderr else {
         drop(stdout);
         terminate_process_tree(&mut child);
@@ -188,30 +184,7 @@ pub(crate) fn command_output_limited(
     })
 }
 
-#[cfg(not(target_os = "windows"))]
-type ManagedChild = Child;
-
-#[cfg(target_os = "windows")]
-type ManagedChild = Box<dyn process_wrap::std::ChildWrapper>;
-
-#[cfg(not(target_os = "windows"))]
-fn spawn_managed(command: &mut Command) -> io::Result<ManagedChild> {
-    command.spawn()
-}
-
-#[cfg(target_os = "windows")]
-fn spawn_managed(command: &mut Command) -> io::Result<ManagedChild> {
-    use process_wrap::std::{CommandWrap, CreationFlags, JobObject};
-    use windows::Win32::System::Threading::CREATE_NO_WINDOW;
-
-    let owned = std::mem::replace(command, Command::new(""));
-    let mut command = CommandWrap::from(owned);
-    command.wrap(CreationFlags(CREATE_NO_WINDOW));
-    command.wrap(JobObject);
-    command.spawn()
-}
-
-fn terminate_process_tree(child: &mut ManagedChild) {
+fn terminate_process_tree(child: &mut Child) {
     #[cfg(unix)]
     {
         let process_id = child.id().to_string();
@@ -259,6 +232,32 @@ mod tests {
         assert_eq!(stored.len(), 64 * 1024);
         assert!(truncated);
     }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn console_command_detaches_console_children() {
+        let script = concat!(
+            "$signature = '[DllImport(\"kernel32.dll\")] ",
+            "public static extern IntPtr GetConsoleWindow();'; ",
+            "Add-Type -MemberDefinition $signature -Name NativeMethods -Namespace Win32; ",
+            "if ([Win32.NativeMethods]::GetConsoleWindow() -ne [IntPtr]::Zero) { exit 1 }"
+        );
+        let output = console_command("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .output()
+            .expect("console probe should run");
+        assert!(
+            output.status.success(),
+            "console child inherited or created a console: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn command_output_stops_at_its_deadline() {

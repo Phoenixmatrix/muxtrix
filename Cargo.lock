@@ -2180,12 +2180,10 @@ dependencies = [
  "muxtrix-sessions",
  "muxtrix-terminal",
  "png 0.17.16",
- "process-wrap",
  "serde",
  "serde_json",
  "ttf-parser",
  "uuid",
- "windows 0.62.2",
  "winreg 0.56.0",
  "winresource",
  "x11rb",
@@ -2314,18 +2312,6 @@ dependencies = [
  "bitflags 2.13.1",
  "cfg-if",
  "cfg_aliases 0.1.1",
- "libc",
-]
-
-[[package]]
-name = "nix"
-version = "0.31.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
-dependencies = [
- "bitflags 2.13.1",
- "cfg-if",
- "cfg_aliases 0.2.2",
  "libc",
 ]
 
@@ -3015,7 +3001,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "log",
- "nix 0.28.0",
+ "nix",
  "serial2",
  "shared_library",
  "shell-words",
@@ -3066,17 +3052,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "version_check",
-]
-
-[[package]]
-name = "process-wrap"
-version = "9.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e842efad9119158434d193c6682e2ebee4b44d6ad801d7b349623b3f57cdf55"
-dependencies = [
- "indexmap",
- "nix 0.31.3",
- "windows 0.62.2",
 ]
 
 [[package]]
