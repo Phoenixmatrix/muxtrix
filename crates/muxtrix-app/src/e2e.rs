@@ -11,8 +11,8 @@ use muxtrix_control::{AgentState, ControlRequest};
 use super::{
     ActiveView, Agent, AgentPaneStatus, CommandAction, GitHubDiffSource, GitHubDiffState,
     GitHubPanelState, GitHubPanelTab, HookScope, HookStatus, Message, Muxtrix, PaneRepository,
-    TerminalLaunchState, TerminalMouseButton, WorktreeManagerEntry, WorktreeManagerMode,
-    WorktreeManagerState, agent_screen, github,
+    ProcessCancellation, TerminalLaunchState, TerminalMouseButton, WorktreeManagerEntry,
+    WorktreeManagerMode, WorktreeManagerState, agent_screen, github,
 };
 use crate::settings::{FleetScope, FleetView};
 
@@ -1012,6 +1012,7 @@ impl Scenario {
                         .capturing("github-diff-error")
                         .then(|| "Git could not read this file's diff.".into()),
                     generation: 1,
+                    cancellation: ProcessCancellation::default(),
                     scroll_offset: 0.0,
                     wrap_columns,
                     line_starts,
@@ -1193,8 +1194,26 @@ impl Scenario {
                     pane_id,
                     PaneRepository {
                         directory,
+                        root: Some("/home/user/dev/muxtrix".into()),
                         name: Some("muxtrix".into()),
                         worktree_name: worktree_name.map(str::to_owned),
+                        branch: Some(
+                            if pane_id == self.initial_pane {
+                                "github-support"
+                            } else {
+                                "main"
+                            }
+                            .into(),
+                        ),
+                        head_oid: Some("4d3c2b1a".into()),
+                        pull_request: (pane_id == self.initial_pane).then(|| {
+                            github::CurrentPullRequest {
+                                number: 391,
+                                url: "https://github.com/Phoenixmatrix/muxtrix/pull/391".into(),
+                                state: github::CurrentPullRequestState::Open,
+                            }
+                        }),
+                        checked_at: std::time::Instant::now(),
                     },
                 );
             }
@@ -1448,28 +1467,54 @@ impl Scenario {
             let tab_pane = self
                 .tab_pane
                 .ok_or_else(|| "new-tab pane was not recorded".to_owned())?;
+            let initial_directory = app
+                .pane_working_directory(self.initial_pane)
+                .ok_or_else(|| "initial pane has no working directory".to_owned())?;
             app.pane_repositories.insert(
                 self.initial_pane,
                 PaneRepository {
-                    directory: "/home/user/dev/muxtrix".into(),
+                    directory: initial_directory,
+                    root: Some("/home/user/dev/muxtrix".into()),
                     name: Some("muxtrix".into()),
                     worktree_name: None,
+                    branch: Some("github-support".into()),
+                    head_oid: Some("4d3c2b1a".into()),
+                    pull_request: Some(github::CurrentPullRequest {
+                        number: 391,
+                        url: "https://github.com/Phoenixmatrix/muxtrix/pull/391".into(),
+                        state: github::CurrentPullRequestState::Open,
+                    }),
+                    checked_at: std::time::Instant::now(),
                 },
             );
             app.pane_repositories.insert(
                 second,
                 PaneRepository {
                     directory: "/home/user/.muxtrix/worktrees/muxtrix/feature-ui".into(),
+                    root: Some("/home/user/.muxtrix/worktrees/muxtrix/feature-ui".into()),
                     name: Some("muxtrix".into()),
                     worktree_name: Some("feature-ui".into()),
+                    branch: Some("feature-ui".into()),
+                    head_oid: Some("5e4d3c2b".into()),
+                    pull_request: Some(github::CurrentPullRequest {
+                        number: 412,
+                        url: "https://github.com/Phoenixmatrix/muxtrix/pull/412".into(),
+                        state: github::CurrentPullRequestState::Draft,
+                    }),
+                    checked_at: std::time::Instant::now(),
                 },
             );
             app.pane_repositories.insert(
                 tab_pane,
                 PaneRepository {
                     directory: "/home/user/dev/impeccable".into(),
+                    root: Some("/home/user/dev/impeccable".into()),
                     name: Some("impeccable".into()),
                     worktree_name: None,
+                    branch: Some("main".into()),
+                    head_oid: Some("6f5e4d3c".into()),
+                    pull_request: None,
+                    checked_at: std::time::Instant::now(),
                 },
             );
             app.agent_statuses.insert(
@@ -1511,9 +1556,14 @@ impl Scenario {
                     app.pane_repositories.insert(
                         pane_id,
                         PaneRepository {
+                            root: Some(directory.clone()),
                             directory,
                             name: Some("muxtrix".into()),
                             worktree_name: Some(worktree.into()),
+                            branch: Some(worktree.into()),
+                            head_oid: Some("7a6b5c4d".into()),
+                            pull_request: None,
+                            checked_at: std::time::Instant::now(),
                         },
                     );
                     let pane = app
@@ -2097,6 +2147,7 @@ fn staged_repository() -> github::Repository {
         owner_and_name: Some("Phoenixmatrix/muxtrix".into()),
         host: "github.com".into(),
         branch: "github-support".into(),
+        head_oid: "4d3c2b1a".into(),
         wsl_distribution: "Ubuntu-24.04".into(),
     }
 }
@@ -2198,6 +2249,11 @@ fn staged_github_panel() -> GitHubPanelState {
         additions,
         deletions,
         files: files.clone(),
+        current_pull_request: Some(github::CurrentPullRequest {
+            number: 391,
+            url: "https://github.com/Phoenixmatrix/muxtrix/pull/391".into(),
+            state: github::CurrentPullRequestState::Open,
+        }),
     });
     panel.loading = false;
     panel.pull_requests = Some(pull_requests);
