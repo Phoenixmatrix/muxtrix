@@ -604,11 +604,11 @@ impl Scenario {
                     self.tab_pane_identity_replaced = true;
                     return Ok(TickAction::Wait);
                 }
+                // Redraw and the E2E clock are independent subscriptions. On a
+                // loaded runner, another tick can arrive before the sensor's
+                // key-change redraw publishes the replacement viewport.
                 if app.terminals[&tab_pane].viewport.is_none() {
-                    return Err(
-                        "a same-sized terminal replacing the previous pane was never measured"
-                            .into(),
-                    );
+                    return Ok(TickAction::Wait);
                 }
                 let workspace = app.active_workspace()?;
                 if workspace.tabs.len() != 2
