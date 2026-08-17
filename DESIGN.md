@@ -82,9 +82,9 @@ the raised fill and its own border. Scope and projection persist as settings
 preferences without visiting the settings screen.
 
 Fleet rows show only what is true for their pane. Every expanded row uses two
-lines: state signal and linked-worktree name (or repository name, falling back
-to the live directory) first; pane title and truthful state second. Agent panes
-carry their reported lifecycle. Plain terminal panes use their real terminal
+lines: state signal and pane title first; linked-worktree, repository, or live
+directory context second. Truthful lifecycle state trails the context line.
+Agent panes carry their reported lifecycle. Plain terminal panes use their real
 state such as Shell, Starting, Exited, or Unavailable rather than fabricating an
 agent lifecycle. Shortcut numbers follow the currently displayed order — and
 workspace session order in All scope — in every projection.
@@ -171,25 +171,25 @@ interface size. The rail stays 272 px at every interface size; a larger size
 truncates sooner rather than demanding a wider rail.
 
 Expanded fleet entries are 52 px two-line rows. The first line carries the
-pane's truthful state pip and linked-worktree name, falling back to repository
-name and then the live directory. The second line aligns under that identity
-and carries the pane title plus a trailing textual state; when an automatic
-pane title repeats the first-line worktree/repository/directory identity, the
-row spends that lane on truthful activity or command copy instead. Unread count
-sits immediately before state when present. Both flexible text lanes are shaped
-in the configured interface face and ellipsized to the measured width left
-after fixed trailing content claims its space. Direct pane navigation remains
+pane's truthful state pip and pane title. The second line aligns under that
+identity and carries linked-worktree context, falling back to repository name
+and then the live directory, plus a trailing textual state. When an automatic
+pane title repeats that context, the row spends the title lane on truthful
+activity or command copy instead. Both flexible text lanes are shaped in the
+configured interface face and ellipsized to the measured width left after fixed
+trailing content claims its space. Direct pane navigation remains
 keyboard-only: expanded rows never print Ctrl/Cmd+1 through 9 hints. Workspaces,
 tabs, and repositories group under recessed uppercase bands that carry an amber
 rollup dot when a visible pane inside needs a person. Repos uses workspace and
 repository bands only, with no nested tab grouping. The workspace cards above
 the fleet keep their roll-ups: name, state, counts, and the live mono path.
 
-When a pane's checked-out branch has a linked GitHub pull request, the row
-ends with its state-specific pull-request mark and number. Open, draft, closed,
-and merged remain distinguishable by icon shape as well as semantic color; the
-tooltip names the state, and activating only that compact marker opens the
-pull request in GitHub without changing pane focus. The selected/cursor surface
+When a pane's checked-out branch has a linked GitHub pull request, its
+state-specific mark and hash-prefixed number trail the title line, with the
+pane's lifecycle state aligned directly beneath them. Open, draft, closed, and
+merged remain distinguishable by icon shape as well as semantic color; the
+tooltip names the state, and activating only that compact marker opens the pull
+request in GitHub without changing pane focus. The selected/cursor surface
 continues beneath the marker so it remains visibly owned by the pane row.
 
 A rail row never changes type weight with its state. Weight is the one property

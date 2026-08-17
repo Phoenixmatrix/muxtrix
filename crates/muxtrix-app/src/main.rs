@@ -11882,35 +11882,31 @@ impl Muxtrix {
         } else {
             pane_state
         };
-        let state: Element<'_, Message> = text(state_label.clone())
-            .size(self.settings.ui_pixels(9.0))
-            .color(if is_agent || state_label != "Needs input" {
-                signal_kind.label_color(tokens)
-            } else {
-                tokens.warning
-            })
-            .wrapping(iced::widget::text::Wrapping::None)
-            .into();
-        // The first line answers where the pane belongs; the second answers
-        // which pane it is and what it is doing. Trailing state claims its
-        // natural width before the measured title ellipsis is fitted.
+        let state_color = if is_agent || state_label != "Needs input" {
+            signal_kind.label_color(tokens)
+        } else {
+            tokens.warning
+        };
+        // The title is the row's primary identity, so linked PR metadata shares
+        // its first-line baseline. Context and lifecycle state form the second
+        // line, with state directly beneath the PR marker when one is present.
         let dot = self.pane_pip(pane_id, signal, 7.0);
         // Weight is the one property here that changes text metrics, so it never
         // varies with state: a row that thickened under focus or the cursor
         // re-fitted its own ellipsis and slid every glyph sideways as the
         // selection moved. Emphasis rides on colour and the leading marker
         // instead, neither of which costs a single pixel of layout.
-        let location_font = font_with_style(
+        let title_font = font_with_style(
             self.settings.ui_font(),
             self.ui_weight(FontWeight::Medium),
             font::Style::Normal,
         );
-        let location_line = row![
+        let title_line = row![
             dot,
             EllipsizedText::owned(
-                location,
+                title,
                 self.settings.ui_pixels(10.5),
-                location_font,
+                title_font,
                 if targeted { tokens.accent } else { tokens.text },
             ),
         ]
@@ -11918,17 +11914,17 @@ impl Muxtrix {
         .width(Fill)
         .clip(true)
         .align_y(Alignment::Center);
-        let title_font = font_with_style(
+        let context_font = font_with_style(
             self.settings.ui_font(),
             self.ui_weight(FontWeight::Normal),
             font::Style::Normal,
         );
-        let pane_identity = row![
+        let context_line = row![
             container("").width(15),
             EllipsizedText::owned(
-                title,
+                location,
                 self.settings.ui_pixels(9.0),
-                title_font,
+                context_font,
                 if focused || targeted {
                     tokens.text
                 } else {
@@ -11943,15 +11939,25 @@ impl Muxtrix {
         // No unread tally. The pip and the state label already say a pane wants
         // the user; the count only said how many times it said so while they
         // were elsewhere, which never changes what they do next.
-        let pane_line = row![pane_identity, state]
-            .spacing(10)
-            .align_y(Alignment::Center);
-        let details = column![location_line, pane_line].spacing(3).width(Fill);
         let pull_request = self
             .pane_repositories
             .get(&pane_id)
             .and_then(|repository| repository.pull_request.clone());
         let has_pull_request = pull_request.is_some();
+        let context_line: Element<'_, Message> = if has_pull_request {
+            context_line.into()
+        } else {
+            let state: Element<'_, Message> = text(state_label.clone())
+                .size(self.settings.ui_pixels(9.0))
+                .color(state_color)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into();
+            row![context_line, state]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .into()
+        };
+        let details = column![title_line, context_line].spacing(3).width(Fill);
         let mut row = row![
             rail_marker(focused, targeted, tokens),
             button(centered_button_content(details))
@@ -11970,9 +11976,9 @@ impl Muxtrix {
         ]
         .align_y(Alignment::Center);
         if let Some(pull_request) = pull_request {
-            let (state_label, icon_kind, color) = match pull_request.state {
+            let (pull_request_state, icon_kind, color) = match pull_request.state {
                 github::CurrentPullRequestState::Open => {
-                    ("Open", IconKind::PullRequestOpen, tokens.accent)
+                    ("Open", IconKind::PullRequestOpen, tokens.github_open)
                 }
                 github::CurrentPullRequestState::Draft => {
                     ("Draft", IconKind::PullRequestDraft, tokens.muted)
@@ -11988,7 +11994,7 @@ impl Muxtrix {
                 button(
                     row![
                         icon(icon_kind, color, self.settings.ui_pixels(9.0)),
-                        text(pull_request.number.to_string())
+                        text(format!("#{}", pull_request.number))
                             .size(self.settings.ui_pixels(8.5))
                             .font(self.settings.terminal_font.iced())
                             .color(color),
@@ -12001,18 +12007,33 @@ impl Muxtrix {
                 .padding([0, 3])
                 .style(move |_, status| quiet_button_style(tokens, false, status)),
                 format!(
-                    "Pull request #{} · {state_label}\nOpen in GitHub",
+                    "Pull request #{} · {pull_request_state}\nOpen in GitHub",
                     pull_request.number
                 ),
                 tooltip::Position::Right,
                 tokens,
                 self.settings.ui_pixels(9.0),
             );
-            row = row.push(
-                container(column![iced::widget::Space::new().height(22), marker])
-                    .height(52)
-                    .padding([0, 2]),
-            );
+            let state = text(state_label)
+                .size(self.settings.ui_pixels(9.0))
+                .color(state_color)
+                .wrapping(iced::widget::text::Wrapping::None);
+            let marker_layer = container(marker).height(52).padding(Padding {
+                top: 5.0,
+                right: 2.0,
+                bottom: 17.0,
+                left: 2.0,
+            });
+            let state_layer = container(state)
+                .height(52)
+                .padding(Padding {
+                    top: 29.0,
+                    right: 2.0,
+                    bottom: 5.0,
+                    left: 2.0,
+                })
+                .align_x(iced::alignment::Horizontal::Right);
+            row = row.push(stack([marker_layer.into(), state_layer.into()]));
             return container(row)
                 .width(Fill)
                 .style(move |_| {
