@@ -370,6 +370,15 @@ impl Scenario {
                                 .into(),
                         );
                     }
+                    if app
+                        .toast
+                        .as_ref()
+                        .is_none_or(|(message, _)| message != "Copied to clipboard")
+                    {
+                        return Err(
+                            "releasing a genuine text selection did not show copy feedback".into(),
+                        );
+                    }
                     self.selection_dragged = true;
                     return Ok(TickAction::Wait);
                 }
