@@ -2316,7 +2316,8 @@ impl Muxtrix {
                 }
                 self.split_drag = None;
                 self.terminal_scroll_drag = None;
-                return selected_text.map_or_else(Task::none, iced::clipboard::write);
+                return selected_text
+                    .map_or_else(Task::none, |text| self.copy_terminal_selection(text));
             }
             Message::EnterTerminal(pane_id) => {
                 self.hovered_terminal = Some(pane_id);
@@ -2405,7 +2406,8 @@ impl Muxtrix {
                 if let Err(error) = self.end_terminal_mouse(pane_id, button) {
                     self.status = format!("Terminal mouse release failed: {error}");
                 }
-                return selected_text.map_or_else(Task::none, iced::clipboard::write);
+                return selected_text
+                    .map_or_else(Task::none, |text| self.copy_terminal_selection(text));
             }
             Message::OpenPaneContextMenu(pane_id) => {
                 let _ = self.focus_pane(pane_id);
@@ -2417,7 +2419,7 @@ impl Muxtrix {
                 let Some(text) = self.selected_terminal_text(pane_id) else {
                     return Task::none();
                 };
-                return iced::clipboard::write(text);
+                return self.copy_terminal_selection(text);
             }
             Message::PastePane(pane_id) => {
                 self.pane_menu = None;
@@ -4288,6 +4290,11 @@ impl Muxtrix {
         self.toast = Some((message.into(), std::time::Instant::now()));
     }
 
+    fn copy_terminal_selection(&mut self, text: String) -> Task<Message> {
+        self.show_toast("Copied to clipboard");
+        iced::clipboard::write(text)
+    }
+
     /// `weight` snapped to a face the configured interface family installs.
     ///
     /// Emphasis levels in the rail are derived, not configured, so nothing
@@ -5207,14 +5214,9 @@ impl Muxtrix {
             // Both shortcuts are consumed even when they have nothing to do,
             // matching Ghostty: an empty copy never reaches the shell as ^C.
             return match action {
-                ClipboardAction::Copy => match self.selected_terminal_text(pane_id) {
-                    Some(text) => {
-                        self.toast =
-                            Some(("Copied to clipboard".into(), std::time::Instant::now()));
-                        iced::clipboard::write(text)
-                    }
-                    None => Task::none(),
-                },
+                ClipboardAction::Copy => self
+                    .selected_terminal_text(pane_id)
+                    .map_or_else(Task::none, |text| self.copy_terminal_selection(text)),
                 ClipboardAction::Paste => iced::clipboard::read()
                     .map(move |contents| Message::ClipboardPasted(pane_id, contents)),
             };
@@ -6383,7 +6385,7 @@ impl Muxtrix {
                     && let Some(tab) = workspace.active_tab()
                 {
                     if let Some(text) = self.selected_terminal_text(tab.focused_pane_id) {
-                        return iced::clipboard::write(text);
+                        return self.copy_terminal_selection(text);
                     }
                     self.status = "Nothing is selected in the focused terminal".into();
                 }
