@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
-use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +60,7 @@ mod e2e;
 use commands::CommandAction;
 use ellipsized_text::EllipsizedText;
 use popover::Popover;
-use process::{ProcessCancellation, command_output, console_command};
+use process::{HELPER_COMMAND_TIMEOUT, ProcessCancellation, command_output, console_command};
 #[cfg(any(target_os = "windows", test))]
 use settings::WindowsShellBackend;
 use settings::{
@@ -15953,10 +15952,14 @@ fn worktree_failure_message(probed: Option<&std::path::Path>, wsl_distribution: 
     #[cfg(target_os = "windows")]
     if path_is_wsl_side(directory) {
         let probe = |args: &[&str]| {
-            wsl_command(wsl_distribution)
-                .args(args)
-                .output()
-                .is_ok_and(|output| output.status.success())
+            let mut command = wsl_command(wsl_distribution);
+            command.args(args);
+            command_output(
+                &mut command,
+                HELPER_COMMAND_TIMEOUT,
+                &ProcessCancellation::default(),
+            )
+            .is_ok_and(|output| output.status.success())
         };
         if !probe(&["--exec", "test", "-d", "/"]) {
             let distribution = wsl_distribution.trim();
@@ -16004,7 +16007,7 @@ fn worktree_failure_message(probed: Option<&std::path::Path>, wsl_distribution: 
 /// A hidden wsl.exe invocation targeting the configured distribution, or
 /// the default distribution when the setting is empty.
 #[cfg(target_os = "windows")]
-fn wsl_command(wsl_distribution: &str) -> Command {
+fn wsl_command(wsl_distribution: &str) -> std::process::Command {
     let mut command = console_command("wsl.exe");
     let distribution = wsl_distribution.trim();
     if !distribution.is_empty() {
@@ -16016,10 +16019,14 @@ fn wsl_command(wsl_distribution: &str) -> Command {
 /// The Linux-side home directory, asked of the distribution itself.
 #[cfg(target_os = "windows")]
 fn wsl_home_directory(wsl_distribution: &str) -> Option<String> {
-    let output = wsl_command(wsl_distribution)
-        .args(["--exec", "sh", "-c", "printf %s \"$HOME\""])
-        .output()
-        .ok()?;
+    let mut command = wsl_command(wsl_distribution);
+    command.args(["--exec", "sh", "-c", "printf %s \"$HOME\""]);
+    let output = command_output(
+        &mut command,
+        HELPER_COMMAND_TIMEOUT,
+        &ProcessCancellation::default(),
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -16244,20 +16251,23 @@ fn worktree_destination(base: &std::path::Path, name: &str) -> std::path::PathBu
 fn worktree_taken_names(base: &std::path::Path, wsl_distribution: &str) -> BTreeSet<String> {
     #[cfg(target_os = "windows")]
     if path_is_wsl_side(base) {
-        return wsl_command(wsl_distribution)
-            .args(["--exec", "ls", "-1"])
-            .arg(base)
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| {
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .map(|line| line.trim().to_owned())
-                    .filter(|line| !line.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut command = wsl_command(wsl_distribution);
+        command.args(["--exec", "ls", "-1"]).arg(base);
+        return command_output(
+            &mut command,
+            HELPER_COMMAND_TIMEOUT,
+            &ProcessCancellation::default(),
+        )
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|line| line.trim().to_owned())
+                .filter(|line| !line.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
     }
     let _ = wsl_distribution;
     std::fs::read_dir(base)
@@ -16629,10 +16639,13 @@ fn create_git_worktree(
         // The destination is on the Linux side, unreachable via std::fs.
         #[cfg(target_os = "windows")]
         if let Some(parent) = destination.parent() {
-            let _ = wsl_command(wsl_distribution)
-                .args(["--exec", "mkdir", "-p"])
-                .arg(parent)
-                .output();
+            let mut command = wsl_command(wsl_distribution);
+            command.args(["--exec", "mkdir", "-p"]).arg(parent);
+            let _ = command_output(
+                &mut command,
+                HELPER_COMMAND_TIMEOUT,
+                &ProcessCancellation::default(),
+            );
         }
     } else if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -16642,10 +16655,13 @@ fn create_git_worktree(
         if let Some(app_folder) = home_directory().map(|home| home.join(".muxtrix"))
             && app_folder.is_dir()
         {
-            let _ = console_command("attrib")
-                .arg("+h")
-                .arg(&app_folder)
-                .output();
+            let mut command = console_command("attrib");
+            command.arg("+h").arg(&app_folder);
+            let _ = command_output(
+                &mut command,
+                HELPER_COMMAND_TIMEOUT,
+                &ProcessCancellation::default(),
+            );
         }
     }
     // A hand-deleted worktree folder leaves a stale registration behind that
@@ -18780,19 +18796,19 @@ fn open_web_url(uri: &str) -> std::io::Result<()> {
 
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = Command::new("rundll32.exe");
+        let mut command = console_command("rundll32.exe");
         command.args(["url.dll,FileProtocolHandler", uri]);
         command
     };
     #[cfg(target_os = "macos")]
     let mut command = {
-        let mut command = Command::new("open");
+        let mut command = console_command("open");
         command.arg(uri);
         command
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut command = {
-        let mut command = Command::new("xdg-open");
+        let mut command = console_command("xdg-open");
         command.arg(uri);
         command
     };
@@ -19873,10 +19889,14 @@ fn probe_installed_versions(
 }
 
 fn probe_binary_version(path: &std::path::Path, binary_name: &str) -> Result<String, String> {
-    let output = console_command(path)
-        .arg("--version")
-        .output()
-        .map_err(|error| format!("could not run {}: {error}", path.display()))?;
+    let mut command = console_command(path);
+    command.arg("--version");
+    let output = command_output(
+        &mut command,
+        HELPER_COMMAND_TIMEOUT,
+        &ProcessCancellation::default(),
+    )
+    .map_err(|error| format!("could not run {}: {error}", path.display()))?;
     if !output.status.success() {
         return Err(format!(
             "{} --version exited with {}",
@@ -20005,7 +20025,7 @@ fn wsl_hook_manager(settings: &AppSettings) -> Result<HookManager, String> {
     if !settings.wsl_distribution.trim().is_empty() {
         identity.args(["--distribution", settings.wsl_distribution.trim()]);
     }
-    let identity = identity
+    identity
         .args([
             "--exec",
             "sh",
@@ -20013,11 +20033,13 @@ fn wsl_hook_manager(settings: &AppSettings) -> Result<HookManager, String> {
             "printf '%s\\n%s\\n' \"$WSL_DISTRO_NAME\" \"$HOME\"; wslpath -u \"$1\"",
             "muxtrix-hook-context",
         ])
-        .arg(&windows_executable)
-        .output()
-        .map_err(|error| {
-            format!("could not query the selected WSL integration context: {error}")
-        })?;
+        .arg(&windows_executable);
+    let identity = command_output(
+        &mut identity,
+        HELPER_COMMAND_TIMEOUT,
+        &ProcessCancellation::default(),
+    )
+    .map_err(|error| format!("could not query the selected WSL integration context: {error}"))?;
     if !identity.status.success() {
         return Err(format!(
             "could not query the selected WSL integration context: {}",

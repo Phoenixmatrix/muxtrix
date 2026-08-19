@@ -1199,6 +1199,11 @@ impl Scenario {
                 let directory = app
                     .pane_working_directory(pane_id)
                     .ok_or_else(|| "capture pane has no working directory".to_owned())?;
+                let branch = if pane_id == self.initial_pane {
+                    "github-support"
+                } else {
+                    "main"
+                };
                 app.pane_repositories.insert(
                     pane_id,
                     PaneRepository {
@@ -1206,14 +1211,11 @@ impl Scenario {
                         root: Some("/home/user/dev/muxtrix".into()),
                         name: Some("muxtrix".into()),
                         worktree_name: worktree_name.map(str::to_owned),
-                        branch: Some(
-                            if pane_id == self.initial_pane {
-                                "github-support"
-                            } else {
-                                "main"
-                            }
-                            .into(),
-                        ),
+                        branch: Some(branch.into()),
+                        // A staged pane stands for one whose probe already
+                        // answered the branch its hook reported, so the cache
+                        // it seeds reads as settled rather than stale.
+                        reported_branch: Some(branch.into()),
                         head_oid: Some("4d3c2b1a".into()),
                         pull_request: (pane_id == self.initial_pane).then(|| {
                             github::CurrentPullRequest {
@@ -1487,6 +1489,7 @@ impl Scenario {
                     name: Some("muxtrix".into()),
                     worktree_name: None,
                     branch: Some("github-support".into()),
+                    reported_branch: Some("github-support".into()),
                     head_oid: Some("4d3c2b1a".into()),
                     pull_request: Some(github::CurrentPullRequest {
                         number: 391,
@@ -1504,6 +1507,7 @@ impl Scenario {
                     name: Some("muxtrix".into()),
                     worktree_name: Some("feature-ui".into()),
                     branch: Some("feature-ui".into()),
+                    reported_branch: Some("feature-ui".into()),
                     head_oid: Some("5e4d3c2b".into()),
                     pull_request: Some(github::CurrentPullRequest {
                         number: 412,
@@ -1521,6 +1525,7 @@ impl Scenario {
                     name: Some("impeccable".into()),
                     worktree_name: None,
                     branch: Some("main".into()),
+                    reported_branch: Some("main".into()),
                     head_oid: Some("6f5e4d3c".into()),
                     pull_request: None,
                     checked_at: std::time::Instant::now(),
@@ -1570,6 +1575,7 @@ impl Scenario {
                             name: Some("muxtrix".into()),
                             worktree_name: Some(worktree.into()),
                             branch: Some(worktree.into()),
+                            reported_branch: Some(worktree.into()),
                             head_oid: Some("7a6b5c4d".into()),
                             pull_request: None,
                             checked_at: std::time::Instant::now(),

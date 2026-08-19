@@ -9,7 +9,9 @@
 
 use serde::Deserialize;
 
-use crate::process::console_command;
+use crate::process::{
+    HELPER_COMMAND_TIMEOUT, ProcessCancellation, command_output, console_command,
+};
 
 /// Ranked worst-first: a roster reports the single most important thing
 /// happening inside it.
@@ -174,12 +176,19 @@ fn executable(command: &str) -> Option<&str> {
 /// Blocking: callers run this off the UI thread.
 pub(crate) fn load(claude_command: &str) -> Result<AgentsRoster, String> {
     let program = executable(claude_command).ok_or("no Claude Code command is configured")?;
-    let output = console_command(program)
+    let mut command = console_command(program);
+    command
         .args(["agents", "--json"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map_err(|error| format!("could not run `{program} agents --json`: {error}"))?;
+        .stdin(std::process::Stdio::null());
+    // This one is paced rather than one-shot, so an unbounded wait would not
+    // just leak a thread: it would strand the harness — and the console
+    // Windows gave it — with nothing left to notice.
+    let output = command_output(
+        &mut command,
+        HELPER_COMMAND_TIMEOUT,
+        &ProcessCancellation::default(),
+    )
+    .map_err(|error| format!("could not run `{program} agents --json`: {error}"))?;
     if !output.status.success() {
         return Err(format!(
             "`{program} agents --json` failed: {}",
