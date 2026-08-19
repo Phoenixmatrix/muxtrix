@@ -298,6 +298,18 @@ pub struct TerminalMouseEvent {
 struct TerminalCore {
     terminal: Terminal<'static, 'static>,
     mouse_encoder: MouseEncoder<'static>,
+    /// The host's exact cell metrics in pixels. The encoder only takes whole
+    /// pixels per cell, so pointer positions are rescaled from these into its
+    /// integer grid before encoding; otherwise every row of fractional cell
+    /// height drifts the reported cell a little further from the pointer.
+    mouse_cell_width: f32,
+    mouse_cell_height: f32,
+    /// The whole-pixel cell the encoder was configured with, and its screen
+    /// in those cells.
+    mouse_encoder_cell_width: u32,
+    mouse_encoder_cell_height: u32,
+    mouse_encoder_screen_width: u32,
+    mouse_encoder_screen_height: u32,
     render_state: RenderState<'static>,
     row_iterator: RowIterator<'static>,
     cell_iterator: CellIterator<'static>,
@@ -359,6 +371,12 @@ impl TerminalCore {
         Ok(Self {
             terminal,
             mouse_encoder,
+            mouse_cell_width: 1.0,
+            mouse_cell_height: 1.0,
+            mouse_encoder_cell_width: 1,
+            mouse_encoder_cell_height: 1,
+            mouse_encoder_screen_width: u32::from(options.cols),
+            mouse_encoder_screen_height: u32::from(options.rows),
             render_state: RenderState::new().map_err(ghostty_error)?,
             row_iterator: RowIterator::new().map_err(ghostty_error)?,
             cell_iterator: CellIterator::new().map_err(ghostty_error)?,
@@ -552,23 +570,55 @@ impl TerminalCore {
         ]
     }
 
-    fn set_mouse_geometry(
-        &mut self,
-        screen_width: u32,
-        screen_height: u32,
-        cell_width: u32,
-        cell_height: u32,
-    ) {
+    /// Configures pointer-to-cell mapping from the grid and the host's exact
+    /// cell metrics. The encoder's screen is exactly `cols × rows` of its
+    /// whole-pixel cells, so its clamping agrees with the grid rather than
+    /// with a content area that may end in a partial row.
+    fn set_mouse_geometry(&mut self, cols: u16, rows: u16, cell_width: f32, cell_height: f32) {
+        let cell_width = if cell_width.is_finite() && cell_width > 0.0 {
+            cell_width
+        } else {
+            1.0
+        };
+        let cell_height = if cell_height.is_finite() && cell_height > 0.0 {
+            cell_height
+        } else {
+            1.0
+        };
+        let encoder_cell_width = (cell_width.round() as u32).max(1);
+        let encoder_cell_height = (cell_height.round() as u32).max(1);
+        self.mouse_cell_width = cell_width;
+        self.mouse_cell_height = cell_height;
+        self.mouse_encoder_cell_width = encoder_cell_width;
+        self.mouse_encoder_cell_height = encoder_cell_height;
+        self.mouse_encoder_screen_width = u32::from(cols.max(1)) * encoder_cell_width;
+        self.mouse_encoder_screen_height = u32::from(rows.max(1)) * encoder_cell_height;
         self.mouse_encoder.set_size(MouseEncoderSize {
-            screen_width,
-            screen_height,
-            cell_width: cell_width.max(1),
-            cell_height: cell_height.max(1),
+            screen_width: self.mouse_encoder_screen_width,
+            screen_height: self.mouse_encoder_screen_height,
+            cell_width: encoder_cell_width,
+            cell_height: encoder_cell_height,
             padding_top: 0,
             padding_bottom: 0,
             padding_right: 0,
             padding_left: 0,
         });
+    }
+
+    /// A host pointer position in the encoder's whole-pixel grid: the same
+    /// fractional cell, so the encoder names the cell under the pointer. The
+    /// encoder drops positions outside its screen, so a pointer in the host's
+    /// padding — or dragged past the grid — is held at the nearest edge cell.
+    fn mouse_encoder_position(&self, x: f32, y: f32) -> GhosttyMousePosition {
+        let x = x / self.mouse_cell_width * self.mouse_encoder_cell_width as f32;
+        let y = y / self.mouse_cell_height * self.mouse_encoder_cell_height as f32;
+        GhosttyMousePosition {
+            x: x.clamp(0.0, (self.mouse_encoder_screen_width as f32 - 1.0).max(0.0)),
+            y: y.clamp(
+                0.0,
+                (self.mouse_encoder_screen_height as f32 - 1.0).max(0.0),
+            ),
+        }
     }
 
     fn encode_mouse(&mut self, event: TerminalMouseEvent) -> Result<Vec<u8>, TerminalActorError> {
@@ -592,10 +642,7 @@ impl TerminalCore {
             .set_action(action)
             .set_button(button)
             .set_mods(modifiers)
-            .set_position(GhosttyMousePosition {
-                x: event.x,
-                y: event.y,
-            });
+            .set_position(self.mouse_encoder_position(event.x, event.y));
         self.mouse_encoder.set_any_button_pressed(
             event.action != TerminalMouseAction::Release && event.button.is_some(),
         );
@@ -1581,8 +1628,8 @@ enum LiveCommand {
     ApplyTheme(TerminalTheme),
     Resize {
         size: PtySize,
-        cell_width_px: u32,
-        cell_height_px: u32,
+        cell_width_px: f32,
+        cell_height_px: f32,
     },
     ScrollViewport(isize),
     ScrollViewportTo(usize),
@@ -1825,11 +1872,14 @@ impl LiveSession {
         self.send(LiveCommand::ApplyTheme(theme))
     }
 
+    /// Resizes the grid. The cell metrics are the host's exact pixel cell —
+    /// they size the terminal's pixel reports and map pointer positions to
+    /// cells, so a fractional value must reach here unrounded.
     pub fn resize(
         &self,
         size: PtySize,
-        cell_width_px: u32,
-        cell_height_px: u32,
+        cell_width_px: f32,
+        cell_height_px: f32,
     ) -> Result<(), LiveSessionError> {
         self.send(LiveCommand::Resize {
             size,
@@ -1949,10 +1999,10 @@ fn run_live_session(
     let mut terminal = match TerminalCore::new(options) {
         Ok(mut terminal) => {
             terminal.set_mouse_geometry(
-                u32::from(size.pixel_width),
-                u32::from(size.pixel_height),
-                (u32::from(size.pixel_width) / u32::from(size.cols).max(1)).max(1),
-                (u32::from(size.pixel_height) / u32::from(size.rows).max(1)).max(1),
+                size.cols,
+                size.rows,
+                f32::from(size.pixel_width) / f32::from(size.cols.max(1)),
+                f32::from(size.pixel_height) / f32::from(size.rows.max(1)),
             );
             if let Some(theme) = theme
                 && let Err(error) = terminal.apply_theme(theme)
@@ -2131,19 +2181,15 @@ fn run_live_session(
                 if let Err(error) = session.resize(size) {
                     events.push(LiveSessionEvent::Error(error.to_string()));
                 }
-                if let Err(error) =
-                    terminal
-                        .terminal
-                        .resize(size.cols, size.rows, cell_width_px, cell_height_px)
-                {
+                if let Err(error) = terminal.terminal.resize(
+                    size.cols,
+                    size.rows,
+                    (cell_width_px.round() as u32).max(1),
+                    (cell_height_px.round() as u32).max(1),
+                ) {
                     events.push(LiveSessionEvent::Error(error.to_string()));
                 }
-                terminal.set_mouse_geometry(
-                    u32::from(size.pixel_width),
-                    u32::from(size.pixel_height),
-                    cell_width_px,
-                    cell_height_px,
-                );
+                terminal.set_mouse_geometry(size.cols, size.rows, cell_width_px, cell_height_px);
                 terminal.sync_output_started_at = None;
                 match terminal.snapshot() {
                     Ok(snapshot) => events.push(LiveSessionEvent::Frame(snapshot)),
@@ -2442,6 +2488,53 @@ mod tests {
                 Some(TerminalMouseButton::Right)
             ))?,
             [0x1b, b'[', b'M', 34, 37, 35]
+        );
+        Ok(())
+    }
+
+    /// The host lays the grid out with fractional cell metrics — 14pt at a
+    /// 1.15 line height is a 21.47px row — while the encoder only takes whole
+    /// pixels per cell. Feeding it raw positions against a rounded cell made
+    /// the reported row drift below the pointer by nearly half a pixel per
+    /// row: two thirds of a row by the middle of a tall pane, a whole row at
+    /// its foot. Claude Code selects its own text from these reports, so its
+    /// selection landed under the pointer instead of on it.
+    #[test]
+    fn reported_mouse_cells_follow_fractional_cell_metrics() -> Result<(), TerminalActorError> {
+        let mut terminal = TerminalCore::new(TerminalOptions {
+            cols: 120,
+            rows: 60,
+            max_scrollback: 100,
+        })?;
+        terminal.feed(b"\x1b[?1000h\x1b[?1006h");
+        let (cell_width, cell_height) = (11.2_f32, 21.47_f32);
+        terminal.set_mouse_geometry(120, 60, cell_width, cell_height);
+        let press = |column: u16, row: u16| TerminalMouseEvent {
+            action: TerminalMouseAction::Press,
+            button: Some(TerminalMouseButton::Left),
+            // The middle of the cell the pointer is over.
+            x: (f32::from(column) + 0.5) * cell_width,
+            y: (f32::from(row) + 0.5) * cell_height,
+            shift: false,
+            alt: false,
+            control: false,
+        };
+        for (column, row) in [(0, 0), (40, 30), (100, 45), (119, 59)] {
+            assert_eq!(
+                String::from_utf8_lossy(&terminal.encode_mouse(press(column, row))?),
+                format!("\x1b[<0;{};{}M", column + 1, row + 1),
+                "pointer over column {column}, row {row}"
+            );
+        }
+        // Positions past the grid clamp to its last cell rather than to a
+        // content area that ends in a partial row.
+        assert_eq!(
+            String::from_utf8_lossy(&terminal.encode_mouse(TerminalMouseEvent {
+                x: 200.0 * cell_width,
+                y: 90.0 * cell_height,
+                ..press(0, 0)
+            })?),
+            "\x1b[<0;120;60M"
         );
         Ok(())
     }
@@ -3248,7 +3341,7 @@ mod tests {
             pixel_width: 310,
             pixel_height: 140,
         };
-        session.resize(resized, 10, 20)?;
+        session.resize(resized, 10.0, 20.0)?;
 
         let snapshot = match session.recv_timeout(Duration::from_secs(2))? {
             LiveSessionEvent::Frame(snapshot) => snapshot,
@@ -3297,7 +3390,7 @@ mod tests {
             pixel_height: 140,
         };
         let session = LiveSession::spawn(plan, initial_size, options())?;
-        session.resize(resized, 10, 20)?;
+        session.resize(resized, 10.0, 20.0)?;
         session.input(b"after-resize\r".to_vec())?;
         let mut observed = String::new();
 

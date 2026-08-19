@@ -110,7 +110,7 @@ fn utf8_spaces_styles_cursor_and_resize_survive_the_full_stack()
         pixel_width: 520,
         pixel_height: 180,
     };
-    session.resize(resized, 10, 20)?;
+    session.resize(resized, 10.0, 20.0)?;
     let resized_snapshot = wait_for_grid(&session, resized)?;
     assert_eq!(resized_snapshot.cells.len(), usize::from(resized.rows));
     assert!(
