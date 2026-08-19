@@ -30,6 +30,12 @@ ttf-parser.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56.0"
+# Windows has no process group, so ending a console command's whole tree — and
+# with it the console it holds open — needs a job object. This is a safe wrapper
+# around that one kernel object; the workspace denies `unsafe_code`, and the
+# spawn path stays untouched, which is what keeps commands windowless.
+# See `process.rs::ProcessTree`.
+win32job = "2.0.3"
 
 # Plain build-dependency: cfg(windows) here would gate on the HOST, which
 # breaks icon embedding when cross-compiling the Windows binary from WSL.
