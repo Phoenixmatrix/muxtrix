@@ -23960,6 +23960,39 @@ mod tests {
     }
 
     #[test]
+    fn a_working_claude_frame_with_a_status_line_and_no_title_stays_running() {
+        // A configured status line replaces the footer hints and the title
+        // may carry nothing at all; the progress line above the composer is
+        // still there, and it is enough.
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 100,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .expect("terminal actor should start");
+        actor
+            .feed(
+                "\u{1b}[2J\u{1b}[H· Bunning… (1m 44s · ↓ 3.6k tokens)\n\n────────────────────────\n❯\n────────────────────────\n  main ⎇ · 61% ctx · ← for agents"
+                    .as_bytes()
+                    .to_vec(),
+            )
+            .expect("terminal should accept Claude chrome");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        actor.shutdown().expect("terminal actor should stop");
+        let runtime = app.terminals.get_mut(&pane_id).expect("terminal runtime");
+        runtime.session = None;
+        runtime.snapshot = Some(snapshot);
+        runtime.snapshot_revision += 1;
+        app.agent_statuses.clear();
+        app.poll_terminal();
+        let status = &app.agent_statuses[&pane_id];
+        assert_eq!(status.agent, "claude");
+        assert_eq!(status.state, AgentState::Running);
+    }
+
+    #[test]
     fn a_nested_tool_run_never_relabels_a_live_agent_pane() {
         // Claude Code's own chrome stays on screen while a tool inside it
         // prints another harness's prompt glyph; the pane is still Claude's.

@@ -440,6 +440,14 @@ fn classify_claude(title: &str, rows: &[String]) -> Option<Classification> {
     if bottom_lower.contains("esc to interrupt") {
         return classification(ScreenState::Running, "claude.footer_interrupt");
     }
+    // The footer hint is optional too — a configured status line suppresses
+    // it — but the harness always paints its progress line above the
+    // composer while a turn runs: a spinner glyph, one verb ending in an
+    // ellipsis, and usually the elapsed time in parentheses. The finished
+    // turn's `✻ Brewed for 1m 58s` shares the glyph but not the ellipsis.
+    if has_claude_progress_line(rows) {
+        return classification(ScreenState::Running, "claude.progress_line");
+    }
     // Screen-visible idle, ranked below every blocking rule above so it can
     // never clear a wait that is still painted. This is the only idle evidence
     // that survives Claude Code emitting a non-`✳` title — notably the
@@ -452,6 +460,44 @@ fn classify_claude(title: &str, rows: &[String]) -> Option<Classification> {
         return classification(ScreenState::Idle, "claude.osc_title_idle");
     }
     None
+}
+
+/// Claude Code's live progress line — `✶ Sock-hopping… (1m 28s · ↓ 4.9k
+/// tokens)`, `· Bunning… (1m 44s · ↓ 3.6k tokens)`, `✻ Thinking…` — in the
+/// rows just above the composer. Only the working line ends its verb with an
+/// ellipsis; the finished turn's `✻ Brewed for 1m 58s` does not.
+fn has_claude_progress_line(rows: &[String]) -> bool {
+    let painted = painted_rows(rows);
+    let above_composer = prompt_box_open(painted).map_or(painted, |open| &painted[..open]);
+    above_composer
+        .iter()
+        .rev()
+        .take(6)
+        .any(|row| is_claude_progress_line(row))
+}
+
+fn is_claude_progress_line(row: &str) -> bool {
+    const SPINNERS: [char; 7] = ['·', '✢', '*', '✶', '✻', '✽', '✳'];
+    let row = row.trim();
+    let mut characters = row.chars();
+    if !characters
+        .next()
+        .is_some_and(|glyph| SPINNERS.contains(&glyph))
+        || characters.next() != Some(' ')
+    {
+        return false;
+    }
+    let rest = characters.as_str().trim_start();
+    let (verb, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+    let verb = verb
+        .strip_suffix('…')
+        .or_else(|| verb.strip_suffix("..."))
+        .unwrap_or_default();
+    !verb.is_empty()
+        && verb
+            .chars()
+            .all(|character| character.is_alphabetic() || matches!(character, '-' | '\''))
+        && (tail.is_empty() || tail.starts_with('('))
 }
 
 /// The empty composer between the last two horizontal rules. A rendered prompt
@@ -517,10 +563,16 @@ fn prompt_box_body(rows: &[String]) -> &[String] {
     let Some(close) = rows.iter().rposition(|row| is_horizontal_rule(row)) else {
         return &[];
     };
+    prompt_box_open(rows).map_or(&[], |open| &rows[open + 1..close])
+}
+
+/// The index of the composer's opening rule: the second-to-last horizontal
+/// rule of the frame, when the frame draws a closed box at all.
+fn prompt_box_open(rows: &[String]) -> Option<usize> {
+    let close = rows.iter().rposition(|row| is_horizontal_rule(row))?;
     rows[..close]
         .iter()
         .rposition(|row| is_horizontal_rule(row))
-        .map_or(&[], |open| &rows[open + 1..close])
 }
 
 fn is_horizontal_rule(row: &str) -> bool {
@@ -700,6 +752,73 @@ mod tests {
         blocked.push("  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt".into());
         assert_eq!(
             classify_text("claude", "Claude", &blocked),
+            classification(ScreenState::Waiting, "claude.permission_prompt")
+        );
+    }
+
+    #[test]
+    fn claude_progress_line_keeps_a_working_frame_running_without_title_or_footer() {
+        // Neither the title spinner nor the footer hint is guaranteed chrome:
+        // the title prefix is optional and a configured status line hides the
+        // footer hint. The progress line above the composer is what every
+        // working frame paints.
+        for progress in [
+            "✶ Sock-hopping… (1m 28s · ↓ 4.9k tokens)",
+            "· Bunning… (1m 44s · ↓ 3.6k tokens)",
+            "✢ Quantumizing… (13m 13s · ↓ 27.2k tokens)",
+            "✻ Thinking…",
+            "* Spelunking… (3s)",
+        ] {
+            let frame = rows(&[
+                "● Bash(cargo test)",
+                progress,
+                "  ⎿  Tip: Ask Claude to create a todo list when working on complex tasks",
+                "",
+                "────────────────────────────────────────────────────────",
+                "❯ queued follow-up",
+                "────────────────────────────────────────────────────────",
+                "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+            ]);
+            assert_eq!(
+                classify_text("claude", "Fleet sidebar Running to Idle", &frame),
+                classification(ScreenState::Running, "claude.progress_line"),
+                "{progress}"
+            );
+        }
+        // The finished turn's summary shares the glyph, not the ellipsis, and
+        // a bulleted line of prose is not a progress line either.
+        for done in [
+            "✻ Brewed for 1m 58s",
+            "✻ Crunched for 30s",
+            "* Deploying the fix… see the notes below for the caveats",
+        ] {
+            let frame = rows(&[
+                done,
+                "",
+                "────────────────────────────────────────────────────────",
+                "❯",
+                "────────────────────────────────────────────────────────",
+                "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+            ]);
+            assert_eq!(
+                classify_text("claude", "Fleet sidebar Running to Idle", &frame),
+                classification(ScreenState::Idle, "claude.live_prompt_box"),
+                "{done}"
+            );
+        }
+        // Prose above the composer never counts once a dialog is painted.
+        assert_eq!(
+            classify_text(
+                "claude",
+                "Claude",
+                &rows(&[
+                    "✶ Sock-hopping… (4s)",
+                    "Do you want to proceed?",
+                    "❯ 1. Yes",
+                    "  2. No",
+                    "Esc to cancel",
+                ]),
+            ),
             classification(ScreenState::Waiting, "claude.permission_prompt")
         );
     }
