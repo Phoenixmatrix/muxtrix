@@ -965,6 +965,9 @@ struct PaneRepository {
     name: Option<String>,
     worktree_name: Option<String>,
     branch: Option<String>,
+    /// The agent-reported branch this probe was answering, so a
+    /// later report of a different branch can invalidate it.
+    reported_branch: Option<String>,
     head_oid: Option<String>,
     pull_request: Option<github::CurrentPullRequest>,
     checked_at: std::time::Instant,
@@ -7596,11 +7599,20 @@ impl Muxtrix {
                 .is_some_and(|repository| {
                     repository.directory == directory
                         && repository.checked_at.elapsed() < PANE_REPOSITORY_INTERVAL
-                        && self
-                            .agent_statuses
-                            .get(&pane_id)
-                            .and_then(|status| status.git_branch.as_deref())
-                            .is_none_or(|branch| repository.branch.as_deref() == Some(branch))
+                        // A hook that reports a *different* branch than the one
+                        // the cached probe answered means the pane moved, so the
+                        // entry is stale ahead of its interval. Comparing the
+                        // report against git's own answer instead would never
+                        // settle when the two disagree — an unreachable branch,
+                        // a probe that failed, a detached HEAD — and this runs
+                        // on every terminal event, so a permanent disagreement
+                        // becomes an unbounded probe loop, one that costs six
+                        // console subprocesses per pane per turn of it.
+                        && repository.reported_branch.as_deref()
+                            == self
+                                .agent_statuses
+                                .get(&pane_id)
+                                .and_then(|status| status.git_branch.as_deref())
                 });
             let pending = self.pending_repository_directories.get(&pane_id) == Some(&directory);
             if !cached && !pending {
@@ -7635,6 +7647,12 @@ impl Muxtrix {
         let wsl_distribution = self.settings.wsl_distribution.clone();
         let github_host = self.settings.github_host.clone();
         Task::batch(probes.into_iter().map(|(pane_id, directory)| {
+            // Recorded with the answer so the next pass can tell "the hook has
+            // since reported a move" apart from "git and the hook disagree".
+            let reported_branch = self
+                .agent_statuses
+                .get(&pane_id)
+                .and_then(|status| status.git_branch.clone());
             let cancellation = self.pane_repository_cancellation.clone();
             let wsl_distribution = wsl_distribution.clone();
             let github_host = github_host.clone();
@@ -7673,6 +7691,7 @@ impl Muxtrix {
                             branch: repository
                                 .as_ref()
                                 .map(|repository| repository.branch.clone()),
+                            reported_branch,
                             head_oid: repository
                                 .as_ref()
                                 .map(|repository| repository.head_oid.clone()),
@@ -21163,9 +21182,99 @@ mod tests {
                 name: Some("muxtrix".into()),
                 worktree_name: None,
                 branch: Some("main".into()),
+                reported_branch: None,
                 head_oid: Some("old-head".into()),
                 pull_request: None,
                 checked_at: std::time::Instant::now() - PANE_REPOSITORY_INTERVAL,
+            },
+        );
+
+        drop(app.refresh_pane_repositories());
+
+        assert_eq!(
+            app.pending_repository_directories.get(&pane_id),
+            Some(&directory)
+        );
+        assert_eq!(app.pane_repository_generation, 1);
+    }
+
+    /// A probe that cannot confirm the branch the hook reported — an
+    /// unreachable checkout, a detached HEAD, a git call that failed — used to
+    /// leave the entry permanently stale. This refresh runs on every terminal
+    /// event, so that re-probed without pause and spent six console
+    /// subprocesses per pane on each pass; on Windows every one of those is a
+    /// `conhost.exe`.
+    #[test]
+    fn a_branch_the_probe_could_not_confirm_does_not_reprobe_forever() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let directory = app
+            .pane_working_directory(pane_id)
+            .expect("active pane should have a working directory");
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "claude".into(),
+                display_name: None,
+                state: AgentState::Running,
+                activity: None,
+                session_id: None,
+                cwd: None,
+                git_branch: Some("feature".into()),
+            },
+        );
+        app.pane_repositories.insert(
+            pane_id,
+            PaneRepository {
+                directory: directory.clone(),
+                root: None,
+                name: None,
+                worktree_name: None,
+                branch: None,
+                reported_branch: Some("feature".into()),
+                head_oid: None,
+                pull_request: None,
+                checked_at: std::time::Instant::now(),
+            },
+        );
+
+        drop(app.refresh_pane_repositories());
+
+        assert!(app.pending_repository_directories.is_empty());
+        assert_eq!(app.pane_repository_generation, 0);
+    }
+
+    #[test]
+    fn a_newly_reported_branch_invalidates_the_cached_repository() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let directory = app
+            .pane_working_directory(pane_id)
+            .expect("active pane should have a working directory");
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "claude".into(),
+                display_name: None,
+                state: AgentState::Running,
+                activity: None,
+                session_id: None,
+                cwd: None,
+                git_branch: Some("feature".into()),
+            },
+        );
+        app.pane_repositories.insert(
+            pane_id,
+            PaneRepository {
+                directory: directory.clone(),
+                root: Some(directory.clone()),
+                name: Some("muxtrix".into()),
+                worktree_name: None,
+                branch: Some("main".into()),
+                reported_branch: Some("main".into()),
+                head_oid: Some("old-head".into()),
+                pull_request: None,
+                checked_at: std::time::Instant::now(),
             },
         );
 
@@ -21195,6 +21304,7 @@ mod tests {
                 name: Some("muxtrix".into()),
                 worktree_name: None,
                 branch: Some("feature".into()),
+                reported_branch: None,
                 head_oid: Some("old-head".into()),
                 pull_request: None,
                 checked_at: std::time::Instant::now(),
@@ -21661,6 +21771,7 @@ mod tests {
                 name: Some("muxtrix".into()),
                 worktree_name: None,
                 branch: Some("feature".into()),
+                reported_branch: None,
                 head_oid: Some(String::new()),
                 pull_request: Some(current),
                 checked_at: std::time::Instant::now(),
@@ -25298,6 +25409,7 @@ mod tests {
                     name: name.map(str::to_owned),
                     worktree_name: None,
                     branch: None,
+                    reported_branch: None,
                     head_oid: None,
                     pull_request: None,
                     checked_at: std::time::Instant::now(),
@@ -25365,6 +25477,7 @@ mod tests {
                     name: Some("muxtrix".into()),
                     worktree_name: None,
                     branch: None,
+                    reported_branch: None,
                     head_oid: None,
                     pull_request: None,
                     checked_at: std::time::Instant::now(),
@@ -25601,6 +25714,7 @@ mod tests {
                 name: Some("muxtrix".into()),
                 worktree_name: Some("fleet-two-line-rows".into()),
                 branch: None,
+                reported_branch: None,
                 head_oid: None,
                 pull_request: None,
                 checked_at: std::time::Instant::now(),
@@ -25652,6 +25766,7 @@ mod tests {
                 name: Some("muxtrix".into()),
                 worktree_name: Some(duplicate.into()),
                 branch: None,
+                reported_branch: None,
                 head_oid: None,
                 pull_request: None,
                 checked_at: std::time::Instant::now(),
@@ -25710,6 +25825,7 @@ mod tests {
                 name: Some("muxtrix".into()),
                 worktree_name: Some(duplicate.into()),
                 branch: None,
+                reported_branch: None,
                 head_oid: None,
                 pull_request: None,
                 checked_at: std::time::Instant::now(),
