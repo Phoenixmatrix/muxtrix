@@ -376,8 +376,8 @@ struct TerminalLaunchRequest {
     notifier: EventNotifier,
     control_endpoint: Option<String>,
     target_size: PtySize,
-    cell_width_px: u32,
-    cell_height_px: u32,
+    cell_width_px: f32,
+    cell_height_px: f32,
     previous_session: Option<LiveSession>,
 }
 
@@ -1652,8 +1652,8 @@ impl Muxtrix {
             notifier: Arc::clone(&self.event_notifier),
             control_endpoint: self.control_endpoint.clone(),
             target_size,
-            cell_width_px: self.settings.terminal_cell_width().round() as u32,
-            cell_height_px: self.settings.terminal_cell_height().round() as u32,
+            cell_width_px: self.settings.terminal_cell_width(),
+            cell_height_px: self.settings.terminal_cell_height(),
             previous_session,
         };
         if !self.launch_in_background {
@@ -18439,8 +18439,8 @@ impl TerminalRuntime {
         session
             .resize(
                 size,
-                settings.terminal_cell_width().round() as u32,
-                settings.terminal_cell_height().round() as u32,
+                settings.terminal_cell_width(),
+                settings.terminal_cell_height(),
             )
             .map_err(|error| error.to_string())?;
         self.size = size;
