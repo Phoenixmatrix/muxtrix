@@ -163,6 +163,28 @@ pub(crate) fn identify(snapshot: &GridSnapshot) -> Option<Identification> {
     identify_text(title, &rows)
 }
 
+/// Whether the live frame carries `agent`'s own chrome — the same
+/// agent-specific signatures `identify` recovers identity from. Unknown agent
+/// names have no signature and therefore never match.
+pub(crate) fn carries_signature(agent: &str, snapshot: &GridSnapshot) -> bool {
+    let title = snapshot.title.as_deref().unwrap_or_default();
+    let rows = snapshot
+        .rows
+        .iter()
+        .map(|row| row.trim_end().to_owned())
+        .collect::<Vec<_>>();
+    carries_signature_text(agent, title, &rows)
+}
+
+fn carries_signature_text(agent: &str, title: &str, rows: &[String]) -> bool {
+    match agent.to_ascii_lowercase().as_str() {
+        "claude" | "claude-code" => has_claude_signature(title, rows),
+        "codex" => has_codex_signature(title, rows),
+        "pi" | "omp" | "oh-my-pi" => parse_pi_title(title).is_some(),
+        _ => false,
+    }
+}
+
 fn identify_text(title: &str, rows: &[String]) -> Option<Identification> {
     if has_claude_signature(title, rows) {
         return Some(Identification {
@@ -373,7 +395,7 @@ fn classify_claude(title: &str, rows: &[String]) -> Option<Classification> {
     let recent_lower = recent.to_ascii_lowercase();
     let form = recent_text(after_last_horizontal_rule(rows), 24);
     let form_lower = form.to_ascii_lowercase();
-    let bottom = recent_text(rows, 5);
+    let bottom = recent_text(painted_rows(rows), 5);
     let bottom_lower = bottom.to_ascii_lowercase();
     if bottom_lower.contains("showing detailed transcript")
         && ["ctrl+o", "ctrl+e", "↑↓ scroll", "? for shortcuts"]
@@ -408,6 +430,15 @@ fn classify_claude(title: &str, rows: &[String]) -> Option<Classification> {
         && recent_lower.lines().any(is_numbered_answer)
     {
         return classification(ScreenState::Waiting, "claude.permission_prompt");
+    }
+    // Claude Code prints `esc to interrupt` in its footer exactly while a
+    // turn is loading, and it keeps the empty composer painted underneath
+    // that footer the whole time. The footer therefore outranks the composer:
+    // without it, a working session whose title carries no spinner — the
+    // prefix is optional harness chrome — would read as idle from its own
+    // prompt box. Every blocking rule above still wins over it.
+    if bottom_lower.contains("esc to interrupt") {
+        return classification(ScreenState::Running, "claude.footer_interrupt");
     }
     // Screen-visible idle, ranked below every blocking rule above so it can
     // never clear a wait that is still painted. This is the only idle evidence
@@ -452,6 +483,16 @@ fn classification(state: ScreenState, rule: &'static str) -> Option<Classificati
 
 fn recent_text(rows: &[String], count: usize) -> String {
     rows[rows.len().saturating_sub(count)..].join("\n")
+}
+
+/// The frame without its trailing blank rows, so footer rules read the last
+/// painted lines rather than the empty bottom of a taller grid.
+fn painted_rows(rows: &[String]) -> &[String] {
+    let end = rows
+        .iter()
+        .rposition(|row| !row.trim().is_empty())
+        .map_or(0, |index| index + 1);
+    &rows[..end]
 }
 
 fn after_last_codex_prompt(rows: &[String]) -> &[String] {
@@ -612,6 +653,95 @@ mod tests {
             ),
             classification(ScreenState::Waiting, "claude.permission_prompt")
         );
+    }
+
+    /// Verbatim tail of a Claude Code 2.1.235 frame mid-turn: the spinner
+    /// line, the still-painted empty composer, and the loading footer.
+    fn working_frame() -> Vec<String> {
+        rows(&[
+            "✶ Sock-hopping… (1m 28s · ↓ 4.9k tokens)",
+            "",
+            "────────────────────────────────────────────────────────",
+            "❯",
+            "────────────────────────────────────────────────────────",
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents",
+        ])
+    }
+
+    #[test]
+    fn claude_loading_footer_outranks_the_empty_composer() {
+        // A spinner-free title cannot make a working session idle: the
+        // composer stays painted while Claude Code works, so the footer's
+        // interrupt hint is what says the turn is still running.
+        assert_eq!(
+            classify_text("claude", "Fleet sidebar Running to Idle", &working_frame()),
+            classification(ScreenState::Running, "claude.footer_interrupt")
+        );
+        assert_eq!(
+            classify_text("claude", "", &working_frame()),
+            classification(ScreenState::Running, "claude.footer_interrupt")
+        );
+        // The same composer without the interrupt hint is the idle prompt.
+        assert_eq!(
+            classify_text(
+                "claude",
+                "Fleet sidebar Running to Idle",
+                &conversation_frame("❯")
+            ),
+            classification(ScreenState::Idle, "claude.live_prompt_box")
+        );
+        // A painted dialog still wins over the loading footer.
+        let mut blocked = rows(&[
+            "Do you want to proceed?",
+            "❯ 1. Yes",
+            "  2. No",
+            "Esc to cancel",
+        ]);
+        blocked.push("  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt".into());
+        assert_eq!(
+            classify_text("claude", "Claude", &blocked),
+            classification(ScreenState::Waiting, "claude.permission_prompt")
+        );
+    }
+
+    #[test]
+    fn signatures_are_agent_specific() {
+        let working = working_frame();
+        assert!(carries_signature_text(
+            "claude",
+            "◑ Fleet sidebar Running to Idle",
+            &working
+        ));
+        assert!(carries_signature_text(
+            "claude",
+            "current session",
+            &conversation_frame("❯")
+        ));
+        // The frame of one agent never vouches for another: a Pi identity
+        // needs Pi's own title, and Codex its own prompt or blocker.
+        assert!(!carries_signature_text(
+            "pi",
+            "◑ Fleet sidebar Running to Idle",
+            &working
+        ));
+        assert!(!carries_signature_text(
+            "codex",
+            "◑ Fleet sidebar Running to Idle",
+            &working
+        ));
+        assert!(carries_signature_text("oh-my-pi", "π : Fix Pi state", &[]));
+        assert!(carries_signature_text("omp", "π: Fix Pi state", &[]));
+        assert!(!carries_signature_text("claude", "π : Fix Pi state", &[]));
+        assert!(carries_signature_text(
+            "codex",
+            "Fix resume status",
+            &rows(&["› "])
+        ));
+        assert!(!carries_signature_text(
+            "build",
+            "◑ build watcher",
+            &working
+        ));
     }
 
     #[test]

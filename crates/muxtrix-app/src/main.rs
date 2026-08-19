@@ -7419,6 +7419,37 @@ impl Muxtrix {
                 },
             );
         }
+        // A pane changes hands when a different agent starts in it — Pi
+        // launched into a worktree and later replaced by Claude Code, or an
+        // identity restored from a session that predates the switch. Nothing
+        // downstream can recover on its own: the old agent's rules cannot
+        // read the new agent's frames, and the new agent's hooks are refused
+        // as strays from a descendant shell. Only positive evidence moves
+        // identity — the frame must carry the new agent's chrome and none of
+        // the current agent's, so a nested tool run inside a live agent
+        // (whose own chrome stays on screen) never re-labels the pane.
+        let handovers = self
+            .agent_statuses
+            .iter()
+            .filter_map(|(pane_id, status)| {
+                let snapshot = self.terminals.get(pane_id)?.snapshot.as_ref()?;
+                let identification = agent_screen::identify(snapshot)?;
+                if pane_agent(identification.agent) == pane_agent(&status.agent)
+                    || agent_screen::carries_signature(&status.agent, snapshot)
+                {
+                    return None;
+                }
+                let display_name = snapshot
+                    .title
+                    .as_deref()
+                    .and_then(|title| harness_terminal_title(title, identification.agent))
+                    .or_else(|| self.agent_worktree_name(*pane_id));
+                Some((*pane_id, identification, display_name))
+            })
+            .collect::<Vec<_>>();
+        for (pane_id, identification, display_name) in handovers {
+            self.hand_over_agent_pane(pane_id, identification, display_name);
+        }
         // Re-evaluate the retained latest frame as well as newly received
         // frames. Agent identity may arrive from a hook just after the TUI
         // painted a stable prompt, with no reason for another repaint.
@@ -8071,6 +8102,55 @@ impl Muxtrix {
                     body: activity.into(),
                 },
             );
+        }
+    }
+
+    /// Re-labels a pane whose live frame belongs to a different agent than
+    /// its status names. The previous agent's lifecycle bookkeeping goes with
+    /// it; the pane keeps its directory context, which describes the pane
+    /// rather than the agent, until the new agent's own hooks refresh it.
+    fn hand_over_agent_pane(
+        &mut self,
+        pane_id: PaneId,
+        identification: agent_screen::Identification,
+        display_name: Option<String>,
+    ) {
+        let Some(previous) = self.agent_statuses.get(&pane_id) else {
+            return;
+        };
+        let cwd = previous.cwd.clone();
+        let git_branch = previous.git_branch.clone();
+        let screen = identification
+            .classification
+            .map_or(agent_screen::ScreenState::Idle, |classification| {
+                classification.state
+            });
+        let state = screen_state(screen);
+        let frame_revision = self
+            .terminals
+            .get(&pane_id)
+            .map_or(0, |runtime| runtime.snapshot_revision);
+        self.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: identification.agent.into(),
+                display_name,
+                state,
+                activity: Some(agent_state_activity(screen).into()),
+                session_id: None,
+                cwd,
+                git_branch,
+            },
+        );
+        self.pi_active_lifecycles.remove(&pane_id);
+        if state == AgentState::Running {
+            self.agent_running_frame_revisions
+                .insert(pane_id, frame_revision);
+        } else {
+            self.agent_running_frame_revisions.remove(&pane_id);
+        }
+        if state != AgentState::Waiting {
+            self.clear_pane_attention(pane_id);
         }
     }
 
@@ -23769,6 +23849,160 @@ mod tests {
             .expect("replayed Claude chrome should restore agent status");
         assert_eq!(status.agent, "claude");
         assert_eq!(status.state, AgentState::Idle);
+    }
+
+    /// A Claude Code frame mid-turn, as painted by 2.1.235: the harness
+    /// keeps its empty composer under the loading footer while it works.
+    fn claude_working_snapshot(title: &str) -> GridSnapshot {
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 100,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .expect("terminal actor should start");
+        actor
+            .feed(
+                format!(
+                    "\u{1b}]0;{title}\u{7}\u{1b}[2J\u{1b}[H✶ Sock-hopping… (1m 28s · ↓ 4.9k tokens)\n\n────────────────────────\n❯\n────────────────────────\n  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents"
+                )
+                .into_bytes(),
+            )
+            .expect("terminal should accept Claude chrome");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        actor.shutdown().expect("terminal actor should stop");
+        snapshot
+    }
+
+    #[test]
+    fn a_pane_hands_over_to_the_agent_its_screen_belongs_to() {
+        // The pane was opened for Pi — a worktree launched with the default
+        // agent, or an identity restored from a persisted session — and Claude
+        // Code was started in it later. Pi's rules cannot read Claude's
+        // frames and Claude's hooks were refused as another agent's strays,
+        // so the row stayed on Idle for the whole session.
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "pi".into(),
+                display_name: Some("pi-2".into()),
+                state: AgentState::Idle,
+                activity: Some("Ready for input".into()),
+                session_id: Some("pi-session".into()),
+                cwd: Some("/work/pi-2".into()),
+                git_branch: Some("pi-2".into()),
+            },
+        );
+        app.pi_active_lifecycles.insert(pane_id);
+        let runtime = app.terminals.get_mut(&pane_id).expect("terminal runtime");
+        runtime.session = None;
+        runtime.snapshot = Some(claude_working_snapshot(
+            "◑ Fleet sidebar Running to Idle transition",
+        ));
+        runtime.snapshot_revision += 1;
+
+        app.poll_terminal();
+
+        let status = &app.agent_statuses[&pane_id];
+        assert_eq!(status.agent, "claude");
+        assert_eq!(status.state, AgentState::Running);
+        assert_eq!(
+            status.display_name.as_deref(),
+            Some("Fleet sidebar Running to Idle transition"),
+            "the row takes the new agent's title, without its progress glyph"
+        );
+        assert_eq!(
+            status.session_id, None,
+            "the old agent's session does not carry over"
+        );
+        assert_eq!(
+            status.cwd.as_deref(),
+            Some("/work/pi-2"),
+            "pane context stays"
+        );
+        assert!(!app.pi_active_lifecycles.contains(&pane_id));
+
+        // The new agent's own lifecycle is accepted from here on.
+        let stopped = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "claude".into(),
+            state: AgentState::Completed,
+            event: Some("Stop".into()),
+            title: "Claude Code · Stop".into(),
+            body: "Turn complete".into(),
+            pane_id: Some(pane_id.as_uuid().to_string()),
+            session_id: Some("claude-session".into()),
+            cwd: Some("/work/pi-2".into()),
+        });
+        assert!(stopped.ok);
+        assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Completed);
+        assert_eq!(
+            app.agent_statuses[&pane_id].session_id.as_deref(),
+            Some("claude-session")
+        );
+    }
+
+    #[test]
+    fn a_working_claude_frame_without_a_title_spinner_stays_running() {
+        // The title prefix is optional harness chrome; the loading footer is
+        // what the working frame always carries.
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let runtime = app.terminals.get_mut(&pane_id).expect("terminal runtime");
+        runtime.session = None;
+        runtime.snapshot = Some(claude_working_snapshot("Fleet sidebar Running to Idle"));
+        runtime.snapshot_revision += 1;
+        app.agent_statuses.clear();
+        app.poll_terminal();
+        let status = &app.agent_statuses[&pane_id];
+        assert_eq!(status.agent, "claude");
+        assert_eq!(status.state, AgentState::Running);
+    }
+
+    #[test]
+    fn a_nested_tool_run_never_relabels_a_live_agent_pane() {
+        // Claude Code's own chrome stays on screen while a tool inside it
+        // prints another harness's prompt glyph; the pane is still Claude's.
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "claude".into(),
+                display_name: None,
+                state: AgentState::Running,
+                activity: None,
+                session_id: Some("claude-session".into()),
+                cwd: None,
+                git_branch: None,
+            },
+        );
+        let actor = TerminalActor::spawn(TerminalOptions {
+            cols: 100,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .expect("terminal actor should start");
+        actor
+            .feed(
+                "\u{1b}]0;◐ Probe codex\u{7}\u{1b}[2J\u{1b}[H● Bash(codex exec)\n  ⎿  › \n\n────────────────────────\n❯\n────────────────────────\n  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents"
+                    .as_bytes()
+                    .to_vec(),
+            )
+            .expect("terminal should accept Claude chrome");
+        let snapshot = actor.snapshot().expect("snapshot should render");
+        actor.shutdown().expect("terminal actor should stop");
+        let runtime = app.terminals.get_mut(&pane_id).expect("terminal runtime");
+        runtime.session = None;
+        runtime.snapshot = Some(snapshot);
+        runtime.snapshot_revision += 1;
+
+        app.poll_terminal();
+
+        let status = &app.agent_statuses[&pane_id];
+        assert_eq!(status.agent, "claude");
+        assert_eq!(status.session_id.as_deref(), Some("claude-session"));
+        assert_eq!(status.state, AgentState::Running);
     }
 
     #[test]
