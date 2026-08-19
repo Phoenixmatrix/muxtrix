@@ -44,7 +44,9 @@ jobs:
 
       - name: Install Linux build and headless-rendering dependencies
         run: |
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=15 \
+            -o Acquire::https::Timeout=15 update
           sudo apt-get install --yes --no-install-recommends \
             libgl1-mesa-dev \
             libvulkan-dev \
@@ -112,7 +114,9 @@ jobs:
       - name: Install Linux release dependencies
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=15 \
+            -o Acquire::https::Timeout=15 update
           sudo apt-get install --yes --no-install-recommends \
             desktop-file-utils \
             file \
@@ -673,8 +677,6 @@ jobs:
           VERSION: ${{ needs.publish_tag.outputs.version }}
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends dpkg-dev apt-utils
           remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           if git -C source ls-remote --exit-code origin apt-repo > /dev/null 2>&1; then
             git clone --branch apt-repo --single-branch "${remote}" apt-repo
