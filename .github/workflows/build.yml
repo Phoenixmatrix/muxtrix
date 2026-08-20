@@ -44,9 +44,17 @@ jobs:
 
       - name: Install Linux build and headless-rendering dependencies
         run: |
-          sudo apt-get -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=15 \
-            -o Acquire::https::Timeout=15 update
+          for attempt in 1 2 3; do
+            if sudo timeout --kill-after=30 300 \
+              apt-get -o Acquire::Retries=0 update; then
+              break
+            fi
+            if [[ "${attempt}" -eq 3 ]]; then
+              echo "::error::apt-get update did not complete after 3 attempts"
+              exit 1
+            fi
+            echo "apt-get update stalled (attempt ${attempt}/3); retrying"
+          done
           sudo apt-get install --yes --no-install-recommends \
             libgl1-mesa-dev \
             libvulkan-dev \
@@ -114,9 +122,17 @@ jobs:
       - name: Install Linux release dependencies
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=15 \
-            -o Acquire::https::Timeout=15 update
+          for attempt in 1 2 3; do
+            if sudo timeout --kill-after=30 300 \
+              apt-get -o Acquire::Retries=0 update; then
+              break
+            fi
+            if [[ "${attempt}" -eq 3 ]]; then
+              echo "::error::apt-get update did not complete after 3 attempts"
+              exit 1
+            fi
+            echo "apt-get update stalled (attempt ${attempt}/3); retrying"
+          done
           sudo apt-get install --yes --no-install-recommends \
             desktop-file-utils \
             file \
