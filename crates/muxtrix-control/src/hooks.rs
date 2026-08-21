@@ -9,7 +9,7 @@ use thiserror::Error;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 const MANAGED_MARKER: &str = "muxtrix-hook-v1";
-const PI_EXTENSION_VERSION: u32 = 4;
+const PI_EXTENSION_VERSION: u32 = 5;
 const WORKTREE_HOME_FOLDER: &str = ".muxtrix/worktrees";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1018,22 +1018,31 @@ function sendLifecycle(event, state, message, payload) {{
         cwd: process.cwd(),
     }});
     return new Promise((resolve) => {{
-        const child = spawn(MUXTRIXCTL, [
-            "hook-event",
-            "--managed-by",
-            MANAGED_BY,
-            "--agent",
-            "{agent_slug}",
-            "--state",
-            state,
-        ], {{
-            env: process.env,
-            stdio: ["pipe", "ignore", "ignore"],
-            windowsHide: true,
-        }});
-        child.on("error", resolve);
-        child.on("close", resolve);
-        child.stdin.end(body);
+        try {{
+            const child = spawn(MUXTRIXCTL, [
+                "hook-event",
+                "--managed-by",
+                MANAGED_BY,
+                "--agent",
+                "{agent_slug}",
+                "--state",
+                state,
+            ], {{
+                env: process.env,
+                stdio: ["pipe", "ignore", "ignore"],
+                windowsHide: true,
+            }});
+            child.on("error", resolve);
+            child.on("close", resolve);
+            if (!child.stdin) {{
+                resolve();
+                return;
+            }}
+            child.stdin.on("error", resolve);
+            child.stdin.end(body);
+        }} catch {{
+            resolve();
+        }}
     }});
 }}
 
@@ -1437,6 +1446,16 @@ mod tests {
         assert!(source.contains(&format!(
             "const MUXTRIX_EXTENSION_VERSION = {PI_EXTENSION_VERSION};"
         )));
+        // A broken WSL interop handler makes Bun throw synchronously on
+        // spawn and the pipe fail on write; lifecycle reporting is
+        // best-effort and must resolve through every one of those paths.
+        assert!(source.contains("child.on(\"error\", resolve);"));
+        assert!(source.contains("if (!child.stdin) {"));
+        assert!(source.contains("resolve();\n                return;"));
+        assert!(source.contains(
+            "child.stdin.on(\"error\", resolve);\n            child.stdin.end(body);"
+        ));
+        assert!(source.contains("} catch {\n            resolve();\n        }"));
 
         let removed = manager
             .apply(Agent::Pi, HookScope::User, HookAction::Remove)
@@ -1781,8 +1800,8 @@ mod tests {
         let current = std::fs::read_to_string(&target).expect("extension should exist");
         let stale = current
             .replace(
-                &format!("const MUXTRIX_EXTENSION_VERSION = {PI_EXTENSION_VERSION};\n"),
-                "",
+                &format!("const MUXTRIX_EXTENSION_VERSION = {PI_EXTENSION_VERSION};"),
+                "const MUXTRIX_EXTENSION_VERSION = 4;",
             )
             .replace(
                 "await sendLifecycle(event, state, body, payload);",
@@ -1804,6 +1823,11 @@ mod tests {
         assert!(extension_version_is_current(&migrated, Agent::Pi));
         assert!(migrated.contains("setStatus?.(\"muxtrix\", undefined)"));
         assert!(!migrated.contains("`Muxtrix: ${body}`"));
+        assert!(!migrated.contains("const MUXTRIX_EXTENSION_VERSION = 4;"));
+        assert!(migrated.contains(
+            "child.stdin.on(\"error\", resolve);\n            child.stdin.end(body);"
+        ));
+        assert!(migrated.contains("} catch {\n            resolve();\n        }"));
         let _ = std::fs::remove_dir_all(root);
     }
 
