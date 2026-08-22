@@ -14,15 +14,14 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use iced::advanced::image::Handle as ImageHandle;
 use iced::futures::StreamExt as _;
-use iced::keyboard::{self, Key, Modifiers, key::Named};
-use iced::mouse::{self, ScrollDelta};
+use iced::mouse;
 use iced::widget::{
     button, canvas, column, container, mouse_area, rich_text, row, scrollable, span, stack, svg,
     text, tooltip,
 };
 use iced::{
-    Alignment, Border, Color, Element, Fill, Font, Length, Padding, Pixels, Point, Shadow, Size,
-    Subscription, Task, Theme, Vector, font,
+    Alignment, Border, Color, Element, Fill, Font, Length, Padding, Pixels, Shadow, Subscription,
+    Task, Theme, Vector, font,
 };
 use libghostty_vt::TerminalOptions;
 use muxtrix_control::{
@@ -46,7 +45,9 @@ mod box_drawing;
 mod commands;
 mod doctor;
 mod ellipsized_text;
+mod geom;
 mod github;
+mod input;
 mod layout;
 mod metrics;
 mod popover;
@@ -62,6 +63,8 @@ mod views;
 mod e2e;
 
 use commands::CommandAction;
+use geom::{Point, ScrollDelta, Size};
+use input::{Key, KeyEvent, KeyInput, Modifiers, Named};
 #[cfg(test)]
 use layout::expanded_stack_pane;
 use layout::{
@@ -150,8 +153,8 @@ pub fn main() -> iced::Result {
 
 fn muxtrix_window_settings() -> iced::window::Settings {
     let mut settings = iced::window::Settings {
-        size: Size::new(1_280.0, 800.0),
-        min_size: Some(Size::new(720.0, 480.0)),
+        size: iced::Size::new(1_280.0, 800.0),
+        min_size: Some(iced::Size::new(720.0, 480.0)),
         icon: muxtrix_window_icon(),
         ..iced::window::Settings::default()
     };
@@ -1222,7 +1225,7 @@ enum Message {
     PaneRepositoriesLoaded(u64, Result<Vec<(PaneId, PaneRepository)>, String>),
     BlinkCursor,
     AnimateGitHubLoading,
-    Keyboard(keyboard::Event),
+    Keyboard(KeyEvent),
     ResizePane(PaneId, Size),
     ResizeSplit(SplitKey, Size),
     BeginSplitDrag(SplitKey, SplitAxis),
@@ -3578,7 +3581,7 @@ impl Muxtrix {
         ) else {
             return Task::none();
         };
-        iced::window::set_resize_increments(window_id, Some(increments))
+        iced::window::set_resize_increments(window_id, Some(increments.into()))
     }
 
     fn default_terminal_profile(&self) -> Result<LaunchProfile, String> {
@@ -5011,19 +5014,15 @@ impl Muxtrix {
         self.request_terminal_launch(profile, pane_id, fallback_title)
     }
 
-    fn handle_keyboard(&mut self, event: keyboard::Event) -> Task<Message> {
-        self.keyboard_modifiers = match &event {
-            keyboard::Event::KeyPressed { modifiers, .. }
-            | keyboard::Event::KeyReleased { modifiers, .. }
-            | keyboard::Event::ModifiersChanged(modifiers) => *modifiers,
-        };
-        let keyboard::Event::KeyPressed {
+    fn handle_keyboard(&mut self, event: KeyEvent) -> Task<Message> {
+        self.keyboard_modifiers = event.modifiers();
+        let KeyEvent::Pressed(KeyInput {
             key,
             modified_key,
             modifiers,
             text,
             ..
-        } = event
+        }) = event
         else {
             return Task::none();
         };
@@ -5588,7 +5587,7 @@ impl Muxtrix {
         }
         if panel.active_tab == GitHubPanelTab::PullRequests
             && panel.selected_pull_request_number.is_none()
-            && character_key_is(key.clone(), "/")
+            && character_key_is(key, "/")
         {
             return Some(iced::widget::operation::focus(iced::widget::Id::new(
                 GITHUB_PULL_REQUEST_QUERY_ID,
@@ -9044,7 +9043,7 @@ fn clipboard_shortcut_for(
     if !chord {
         return None;
     }
-    if character_key_is(key.clone(), "c") {
+    if character_key_is(key, "c") {
         Some(ClipboardAction::Copy)
     } else if character_key_is(key, "v") {
         Some(ClipboardAction::Paste)
@@ -12138,7 +12137,7 @@ fn terminal_scrollbar(
                 left: 0.0,
             }),
     )
-    .on_move(move |position| Message::TerminalScrollbarMoved(pane_id, position))
+    .on_move(move |position| Message::TerminalScrollbarMoved(pane_id, position.into()))
     .on_press(Message::BeginTerminalScroll(pane_id))
     // A scrollbar is not a draggable object: the grab interaction renders as
     // the four-direction move cross on some platforms. Plain arrow.
@@ -12195,20 +12194,23 @@ fn app_event(
         // Text inputs and focused buttons own captured keys. Forwarding them
         // to the global keyboard handler as well would type into the terminal
         // underneath the GitHub search field or double-trigger controls.
-        iced::Event::Keyboard(event)
-            if status == iced::event::Status::Ignored
-                || matches!(
-                    &event,
-                    keyboard::Event::KeyPressed {
-                        modified_key: Key::Named(Named::Tab | Named::Escape),
-                        ..
-                    }
-                ) =>
-        {
-            Some(Message::Keyboard(event))
+        iced::Event::Keyboard(event) => {
+            let event = input::from_iced(&event);
+            // Tab and Escape are claimed even when a widget captured them:
+            // they close the palette and move pane focus, and a focused text
+            // input would otherwise swallow both.
+            let always_ours = matches!(
+                &event,
+                KeyEvent::Pressed(KeyInput {
+                    modified_key: Key::Named(Named::Tab | Named::Escape),
+                    ..
+                })
+            );
+            (status == iced::event::Status::Ignored || always_ours)
+                .then_some(Message::Keyboard(event))
         }
         iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
-            Some(Message::PointerMoved(position))
+            Some(Message::PointerMoved(position.into()))
         }
         iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
             Some(Message::EndPointerInteraction)
@@ -12216,13 +12218,13 @@ fn app_event(
         iced::Event::Mouse(mouse::Event::WheelScrolled { delta })
             if status == iced::event::Status::Ignored =>
         {
-            Some(Message::ScrollHoveredTerminal(delta))
+            Some(Message::ScrollHoveredTerminal(delta.into()))
         }
         iced::Event::Window(iced::window::Event::Opened { size, .. }) => {
-            Some(Message::WindowOpened(window, size))
+            Some(Message::WindowOpened(window, size.into()))
         }
         iced::Event::Window(iced::window::Event::Resized(size)) => {
-            Some(Message::WindowResized(size))
+            Some(Message::WindowResized(size.into()))
         }
         iced::Event::Window(iced::window::Event::Focused) => {
             Some(Message::WindowFocusChanged(true))
@@ -15273,10 +15275,16 @@ mod tests {
 
     #[test]
     fn captured_keyboard_events_do_not_reach_the_global_terminal_handler() {
-        let event = iced::Event::Keyboard(key_press(
-            Key::Character("search text".into()),
-            Modifiers::empty(),
-        ));
+        // This one drives the iced boundary itself, so it has to speak iced.
+        let event = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character("search text".into()),
+            modified_key: iced::keyboard::Key::Character("search text".into()),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyS),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::default(),
+            text: None,
+            repeat: false,
+        });
 
         assert!(
             app_event(
@@ -15692,16 +15700,14 @@ mod tests {
         app.create_workspace().expect("workspace should be created");
     }
 
-    fn key_press(modified_key: Key, modifiers: Modifiers) -> keyboard::Event {
-        keyboard::Event::KeyPressed {
+    fn key_press(modified_key: Key, modifiers: Modifiers) -> KeyEvent {
+        KeyEvent::Pressed(KeyInput {
             key: modified_key.clone(),
             modified_key,
-            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyG),
-            location: keyboard::Location::Standard,
             modifiers,
             text: None,
             repeat: false,
-        }
+        })
     }
 
     #[test]
@@ -16948,15 +16954,13 @@ mod tests {
     fn rename_prompt_keystrokes_never_reach_the_terminal() {
         let mut app = Muxtrix::new();
         app.rename_prompt = Some(RenameTarget::Workspace(app.session.active_workspace_id));
-        let _ = app.handle_keyboard(keyboard::Event::KeyPressed {
+        let _ = app.handle_keyboard(KeyEvent::Pressed(KeyInput {
             key: Key::Character("x".into()),
             modified_key: Key::Character("x".into()),
-            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyX),
-            location: keyboard::Location::Standard,
             modifiers: Modifiers::empty(),
             text: Some("x".into()),
             repeat: false,
-        });
+        }));
         assert!(app.terminal_command_buffers.is_empty());
     }
 
@@ -18772,17 +18776,16 @@ mod tests {
         let second_workspace_name = app.session.workspaces[1].name.clone();
         assert_ne!(app.session.active_workspace_id, second_workspace);
 
-        let _ = app.handle_keyboard(keyboard::Event::KeyPressed {
+        let _ = app.handle_keyboard(KeyEvent::Pressed(KeyInput {
             key: Key::Character("2".into()),
-            // Iced applies Shift to `modified_key`; shortcut matching must use
-            // the unmodified key or Shift+2 becomes "@" on a US layout.
+            // The platform applies Shift to `modified_key`; shortcut matching
+            // must use the unmodified key or Shift+2 becomes "@" on a US
+            // layout.
             modified_key: Key::Character("@".into()),
-            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit2),
-            location: keyboard::Location::Standard,
             modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
             text: Some("@".into()),
             repeat: false,
-        });
+        }));
 
         assert_eq!(app.session.active_workspace_id, second_workspace);
         assert_eq!(app.workspace_name_draft, second_workspace_name);

@@ -114,7 +114,7 @@ impl Muxtrix {
                 };
                 sensor(content)
                     .key(key.clone())
-                    .on_resize(move |size| Message::ResizeSplit(key.clone(), size))
+                    .on_resize(move |size| Message::ResizeSplit(key.clone(), size.into()))
                     .into()
             }
         }
@@ -336,7 +336,7 @@ impl Muxtrix {
         let terminal_view = mouse_area(stack([terminal_canvas, scrollbar]))
             .on_enter(Message::EnterTerminal(pane_id))
             .on_exit(Message::LeaveTerminal(pane_id))
-            .on_move(move |position| Message::TerminalPointerMoved(pane_id, position))
+            .on_move(move |position| Message::TerminalPointerMoved(pane_id, position.into()))
             .on_press(Message::TerminalMousePressed(
                 pane_id,
                 TerminalMouseButton::Left,
@@ -361,7 +361,7 @@ impl Muxtrix {
                 pane_id,
                 TerminalMouseButton::Right,
             ))
-            .on_scroll(move |delta| Message::ScrollTerminal(pane_id, delta))
+            .on_scroll(move |delta| Message::ScrollTerminal(pane_id, delta.into()))
             .interaction(terminal_mouse_interaction(hovered_link.is_some()));
         // A restored session can replace a terminal at the same tree position
         // without changing its bounds. `on_resize` alone retains the previous
@@ -369,8 +369,8 @@ impl Muxtrix {
         // replay that unchanged viewport into the replacement runtime.
         let terminal_view = sensor(terminal_view)
             .key(pane_id)
-            .on_show(move |size| Message::ResizePane(pane_id, size))
-            .on_resize(move |size| Message::ResizePane(pane_id, size));
+            .on_show(move |size| Message::ResizePane(pane_id, size.into()))
+            .on_resize(move |size| Message::ResizePane(pane_id, size.into()));
         let header_button = |kind: IconKind,
                              label: &'static str,
                              message: Message,

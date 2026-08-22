@@ -36,17 +36,15 @@ const TERMINAL_HEAVY_BOX_WIDTH_PIXELS: usize = 120;
 const TERMINAL_HEAVY_BOX_HEIGHT_PIXELS: usize = 30;
 
 /// A bare Down press, shaped exactly as the window delivers one.
-fn arrow_down() -> iced::keyboard::Event {
-    let key = iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown);
-    iced::keyboard::Event::KeyPressed {
+fn arrow_down() -> crate::input::KeyEvent {
+    let key = crate::input::Key::Named(crate::input::Named::ArrowDown);
+    crate::input::KeyEvent::Pressed(crate::input::KeyInput {
         key: key.clone(),
         modified_key: key,
-        physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::ArrowDown),
-        location: iced::keyboard::Location::Standard,
-        modifiers: iced::keyboard::Modifiers::default(),
+        modifiers: crate::input::Modifiers::empty(),
         text: None,
         repeat: false,
-    }
+    })
 }
 
 /// Printed by the `terminal-palette` capture so a terminal theme is legible
@@ -348,7 +346,7 @@ impl Scenario {
                     let cell_width = app.settings.terminal_cell_width();
                     let cell_height = app.settings.terminal_cell_height();
                     let point = |column: usize, row: usize| {
-                        iced::Point::new(
+                        crate::geom::Point::new(
                             8.0 + cell_width * (column as f32 + 0.5),
                             8.0 + cell_height * (row as f32 + 0.5),
                         )
