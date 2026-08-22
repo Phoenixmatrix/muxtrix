@@ -2262,9 +2262,18 @@ impl Muxtrix {
                         == Some(&repository.directory)
                     {
                         self.pending_repository_directories.remove(&pane_id);
+                        let reported_branch_matches = repository.reported_branch.as_deref()
+                            == self
+                                .agent_statuses
+                                .get(&pane_id)
+                                .and_then(|status| status.git_branch.as_deref());
                         if self.pane_working_directory(pane_id).as_ref()
                             == Some(&repository.directory)
+                            && reported_branch_matches
                         {
+                            // A branch may change while this probe is in
+                            // flight. Do not let that stale answer restore the
+                            // previous branch's pull-request marker.
                             self.pane_repositories.insert(pane_id, repository);
                         }
                     }
@@ -21501,6 +21510,63 @@ mod tests {
                 .get(&pane_id)
                 .is_none_or(|repository| repository.pull_request.is_none()),
             "the prior branch's PR must disappear before the new probe lands"
+        );
+    }
+
+    #[test]
+    fn an_in_flight_probe_cannot_restore_the_previous_branch_pr() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let directory = app
+            .pane_working_directory(pane_id)
+            .expect("active pane should have a working directory");
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "claude".into(),
+                display_name: None,
+                state: AgentState::Running,
+                activity: None,
+                session_id: None,
+                cwd: None,
+                git_branch: Some("feature".into()),
+            },
+        );
+        app.pending_repository_directories
+            .insert(pane_id, directory.clone());
+        app.pane_repository_generation = 7;
+
+        drop(app.update(Message::PaneRepositoriesLoaded(
+            7,
+            Ok(vec![(
+                pane_id,
+                PaneRepository {
+                    directory,
+                    root: None,
+                    name: Some("muxtrix".into()),
+                    worktree_name: None,
+                    branch: Some("main".into()),
+                    reported_branch: Some("main".into()),
+                    head_oid: Some("old-head".into()),
+                    pull_request: Some(github::CurrentPullRequest {
+                        number: 173,
+                        url: "https://github.com/example/muxtrix/pull/173".into(),
+                        state: github::CurrentPullRequestState::Open,
+                    }),
+                    checked_at: std::time::Instant::now(),
+                },
+            )]),
+        )));
+
+        assert!(
+            app.pane_repositories
+                .get(&pane_id)
+                .is_none_or(|repository| repository.pull_request.is_none()),
+            "an old in-flight answer must not restore the previous branch's PR"
+        );
+        assert!(
+            app.pending_repository_directories.get(&pane_id).is_none(),
+            "dropping the stale answer must leave the replacement probe unblocked"
         );
     }
 
