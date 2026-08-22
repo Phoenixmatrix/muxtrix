@@ -341,7 +341,9 @@ pub(crate) struct Muxtrix {
     pub(crate) sidebar_collapsed: bool,
     pub(crate) maximized_pane: Option<PaneId>,
     pub(crate) pane_menu: Option<PaneId>,
-    pub(crate) window_id: Option<iced::window::Id>,
+    /// Whether a window exists yet. Some effects — constraining resizes to
+    /// whole cells — are meaningless before one does.
+    pub(crate) window_open: bool,
     pub(crate) window_size: Size,
     pub(crate) window_focused: bool,
     pub(crate) cursor_position: Point,
@@ -1327,7 +1329,7 @@ pub(crate) enum Message {
     TerminalLinkOpened(String, Result<(), String>),
     ScrollTerminal(PaneId, ScrollDelta),
     ScrollHoveredTerminal(ScrollDelta),
-    WindowOpened(iced::window::Id, Size),
+    WindowOpened(Size),
     WindowResized(Size),
     WindowFocusChanged(bool),
     CloseCommandPalette,
@@ -1985,7 +1987,7 @@ impl Muxtrix {
             sidebar_collapsed: false,
             maximized_pane: None,
             pane_menu: None,
-            window_id: None,
+            window_open: false,
             window_size: Size::new(1_280.0, 800.0),
             window_focused: true,
             cursor_position: Point::ORIGIN,
@@ -2094,6 +2096,14 @@ impl Muxtrix {
             subscriptions
         };
         Subscription::batch(subscriptions)
+    }
+
+    /// The pane the keyboard is currently aimed at, if a workspace is open.
+    pub(crate) fn focused_pane_id(&self) -> Option<PaneId> {
+        self.active_workspace()
+            .ok()
+            .and_then(Workspace::active_tab)
+            .map(|tab| tab.focused_pane_id)
     }
 
     /// Whether the GitHub panel's loading animation should be stepping.
@@ -2463,8 +2473,8 @@ impl Muxtrix {
                 }
                 return Vec::new();
             }
-            Message::WindowOpened(window_id, size) => {
-                self.window_id = Some(window_id);
+            Message::WindowOpened(size) => {
+                self.window_open = true;
                 self.window_size = size;
                 let resize = self.window_resize_increment_task();
                 let terminal = self
@@ -3587,7 +3597,7 @@ impl Muxtrix {
     pub(crate) fn window_resize_increment_task(&self) -> Vec<Effect> {
         // Before the window exists there is nothing to constrain; the effect
         // is re-issued once it opens.
-        if self.window_id.is_none() {
+        if !self.window_open {
             return Vec::new();
         }
         let Some(increments) = wsl_wayland_resize_increments(
@@ -12223,7 +12233,7 @@ pub(crate) fn event_subscription(
 pub(crate) fn app_event(
     event: iced::Event,
     status: iced::event::Status,
-    window: iced::window::Id,
+    _window: iced::window::Id,
 ) -> Option<Message> {
     match event {
         // Text inputs and focused buttons own captured keys. Forwarding them
@@ -12256,7 +12266,7 @@ pub(crate) fn app_event(
             Some(Message::ScrollHoveredTerminal(delta.into()))
         }
         iced::Event::Window(iced::window::Event::Opened { size, .. }) => {
-            Some(Message::WindowOpened(window, size.into()))
+            Some(Message::WindowOpened(size.into()))
         }
         iced::Event::Window(iced::window::Event::Resized(size)) => {
             Some(Message::WindowResized(size.into()))

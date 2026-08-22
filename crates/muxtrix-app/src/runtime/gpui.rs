@@ -14,6 +14,7 @@ use gpui::{
 
 use crate::app::{Message, Muxtrix};
 use crate::effect::Effect;
+use crate::terminal::element::TerminalElement;
 use crate::theme::DesignTokens;
 
 /// How often the cursor blink phase flips.
@@ -66,6 +67,12 @@ impl Root {
         root.spawn_terminal_wakeups(cx);
         root.observe_window(window, cx);
         root.run_effects(effects, window, cx);
+        // The startup terminal is launched by `WindowOpened`, which iced
+        // delivered as a window event. There is a window by the time this
+        // runs, so say so directly.
+        let bounds = window.bounds();
+        let size = crate::geom::Size::new(bounds.size.width.into(), bounds.size.height.into());
+        root.dispatch(Message::WindowOpened(size), window, cx);
         root
     }
 
@@ -222,11 +229,33 @@ where
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = DesignTokens::for_appearance(self.app.settings.appearance);
+        let theme = self.app.settings.terminal_theme.preset();
+
+        // Phase 2 renders the focused pane only. The sidebar, tab strip and
+        // the rest of the shell arrive in Phase 3; until then the point is a
+        // terminal that genuinely works, not a shell around an empty one.
+        let terminal = self.app.focused_pane_id().and_then(|pane_id| {
+            let hovered_link = self.app.hovered_terminal_link(pane_id);
+            let runtime = self.app.terminals.get(&pane_id)?;
+            let snapshot = runtime.snapshot.clone()?;
+            Some(TerminalElement::new(
+                snapshot,
+                self.app.settings.clone(),
+                theme,
+                self.app.window_focused,
+                self.app.cursor_phase_visible,
+                hovered_link,
+                runtime.viewport.unwrap_or_default(),
+            ))
+        });
+
         div()
             .size_full()
+            .flex()
+            .flex_col()
             .bg(color(tokens.app))
             .text_color(color(tokens.text))
-            .child(self.app.title())
+            .children(terminal)
     }
 }
 

@@ -2026,6 +2026,9 @@ fn key_press(modified_key: Key, modifiers: Modifiers) -> KeyEvent {
     })
 }
 
+// The window icon is an iced-runtime concern: GPUI has no runtime icon API and
+// takes the icon from the desktop file or the executable's resources instead.
+#[cfg(not(feature = "gpui"))]
 #[test]
 fn embedded_window_icon_has_the_expected_rgba_shape() {
     assert_eq!(
@@ -2035,7 +2038,7 @@ fn embedded_window_icon_has_the_expected_rgba_shape() {
     assert!(crate::runtime::iced::muxtrix_window_icon().is_some());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "gpui")))]
 #[test]
 fn linux_application_id_matches_the_desktop_file() {
     assert_eq!(
