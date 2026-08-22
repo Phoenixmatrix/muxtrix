@@ -12919,10 +12919,23 @@ impl Muxtrix {
         let changed = settings_have_changes(&self.settings, &self.settings_draft)
             || self.settings_scrollback_lines_input
                 != self.settings.terminal_scrollback_lines.to_string();
-        let terminal_label = if changed {
+        let full_terminal_label = if changed {
             "Discard changes and return"
         } else {
             "Back to terminal"
+        };
+        // Everything the bar holds — this label, the title, the switch — is
+        // typeset from one size, so what the bar can hold is a width measured
+        // in that size, not in pixels. A window that clears the threshold at
+        // the default type size stops clearing it once the interface type is
+        // scaled up, which is exactly when the sentence has to give way to the
+        // word; the arrow already carries the direction, and the tooltip keeps
+        // the sentence one hover away.
+        let crowded = settings_nav_is_crowded(self.window_size.width, &self.settings_draft);
+        let terminal_label = match (crowded, changed) {
+            (true, true) => "Discard changes",
+            (true, false) => "Terminal",
+            (false, _) => full_terminal_label,
         };
         // Returning to the terminal is navigation, not one of the page's
         // actions, so it wears the quiet role: no fill competing with Refresh,
@@ -12931,7 +12944,7 @@ impl Muxtrix {
             row![
                 icon(IconKind::Back, tokens.muted, 12.0),
                 text(terminal_label)
-                    .size(self.settings_draft.ui_pixels(9.5))
+                    .size(self.settings_draft.ui_pixels(SETTINGS_NAV_LABEL_POINTS))
                     .wrapping(iced::widget::text::Wrapping::None),
             ]
             .spacing(7)
@@ -12939,28 +12952,63 @@ impl Muxtrix {
         ))
         .on_press(Message::CancelSettings)
         .height(30)
-        .padding([0, 10])
+        .padding([0.0, SETTINGS_NAV_QUIET_PADDING_X])
         .style(move |_, status| settings_button_style(tokens, SettingsButtonKind::Quiet, status));
+        // Only the shortened label needs explaining, and only it gets a
+        // tooltip: repeating a label the eye can already read is noise.
+        let back: Element<'_, Message> = if crowded {
+            app_tooltip(
+                back,
+                full_terminal_label,
+                tooltip::Position::Bottom,
+                tokens,
+                self.settings_draft.ui_pixels(9.0),
+            )
+        } else {
+            back.into()
+        };
+        // The rule owns the gap on both of its sides rather than inheriting one
+        // row spacing, because its neighbours are not the same kind of thing:
+        // the button carries its own trailing padding and the title carries
+        // none, so a single spacing pushed the rule visibly off centre.
+        let nav_rule = container(
+            container("")
+                .width(1)
+                .height(16)
+                .style(move |_| container::Style::default().background(tokens.line_strong)),
+        )
+        .padding(Padding {
+            top: 0.0,
+            bottom: 0.0,
+            left: SETTINGS_NAV_RULE_GAP - SETTINGS_NAV_QUIET_PADDING_X,
+            right: SETTINGS_NAV_RULE_GAP,
+        });
         let nav = container(
             row![
                 back,
-                container("")
-                    .width(1)
-                    .height(16)
-                    .style(move |_| container::Style::default().background(tokens.line_strong)),
+                nav_rule,
                 // The window's own title while settings owns it. The page name
                 // belongs to the toggle and the page heading, not here.
+                //
+                // It shares one type size with the return label beside it and
+                // separates itself by weight and colour instead. Iced centres
+                // each label's line box rather than aligning baselines, so a
+                // second size on this line would sit its words a fraction of a
+                // pixel off its neighbour's baseline — a drift that grows with
+                // the interface type-size setting and changes with the chosen
+                // interface family, and one the rule between them makes plain.
                 text("Settings")
-                    .size(self.settings_draft.ui_pixels(11.0))
+                    .size(self.settings_draft.ui_pixels(SETTINGS_NAV_LABEL_POINTS))
                     .font(Font {
                         weight: font::Weight::Semibold,
                         ..Font::DEFAULT
                     })
-                    .color(tokens.text),
+                    .color(tokens.text)
+                    .wrapping(iced::widget::text::Wrapping::None),
                 container("").width(Fill),
                 settings_page_toggle(self.settings_page, &self.settings_draft),
             ]
-            .spacing(12)
+            .spacing(0)
             .align_y(Alignment::Center),
         )
         .height(52)
@@ -12971,7 +13019,7 @@ impl Muxtrix {
         .padding(Padding {
             top: 0.0,
             bottom: 0.0,
-            left: SETTINGS_PAGE_PADDING_X - 10.0,
+            left: SETTINGS_PAGE_PADDING_X - SETTINGS_NAV_QUIET_PADDING_X,
             right: SETTINGS_PAGE_PADDING_X,
         })
         .style(move |_| ruled_surface(tokens.rail, tokens.line));
@@ -17705,6 +17753,15 @@ fn settings_action_button_maybe(
         .into()
 }
 
+/// Whether the settings top bar has to shorten its return label.
+///
+/// The bar's label, title, and page switch are all typeset from one size, so
+/// the width the bar needs scales with the interface type size: a window wide
+/// enough at the default size can be too narrow once the type is scaled up.
+fn settings_nav_is_crowded(window_width: f32, settings: &AppSettings) -> bool {
+    window_width < SETTINGS_NAV_LABEL_WIDTHS * settings.ui_pixels(SETTINGS_NAV_LABEL_POINTS)
+}
+
 /// The Preferences/Worktrees page switcher, built on the same recessed-well
 /// toggle the fleet heading uses: a dark track with one raised thumb, so the
 /// current page is unambiguous without inventing a second selection idiom.
@@ -17838,6 +17895,27 @@ const WORKTREE_ROW_PADDING_X: f32 = 14.0;
 /// bodies, and both footers share it, so every leading and trailing edge in
 /// the surface lines up on the same two rules.
 const SETTINGS_PAGE_PADDING_X: f32 = 28.0;
+/// Horizontal padding inside the top bar's quiet return button. The bar's own
+/// leading inset is short by exactly this, so the button's glyph rather than
+/// its hit area lands on `SETTINGS_PAGE_PADDING_X`.
+const SETTINGS_NAV_QUIET_PADDING_X: f32 = 10.0;
+/// The type size shared by the settings top bar's return label and its title.
+/// The two sit on one line either side of a rule, so they are read against each
+/// other and must share a baseline; one size is the only way to hold that at
+/// every interface family, weight, and type-size setting.
+const SETTINGS_NAV_LABEL_POINTS: f32 = 11.0;
+/// How many of those labels wide the settings window has to be before its top
+/// bar keeps the long form of the return label. Below it the sentence would
+/// close the gap between the title and the page switch, so the label shortens
+/// to its noun and hands the sentence to a tooltip. Expressed in label widths
+/// rather than pixels because every item on the bar grows with the interface
+/// type size, so the width the bar needs grows with it too.
+const SETTINGS_NAV_LABEL_WIDTHS: f32 = 38.0;
+/// The gap the top bar's rule keeps from the words on either side of it. The
+/// rule sits between a padded button and bare text, so the two sides cannot
+/// share one row spacing: the leading gap is this minus the button's own
+/// padding, and only then does the rule read as centred between the words.
+const SETTINGS_NAV_RULE_GAP: f32 = 14.0;
 /// The inventory reads as a table, so it takes the window's width rather than
 /// a column measure. The cap only stops the action lane from drifting a whole
 /// screen away from the identity it acts on.
@@ -26225,6 +26303,33 @@ mod tests {
 
         assert_eq!(app.active_view, ActiveView::Workspace);
         assert_eq!(app.settings_draft.ui_font_size, app.settings.ui_font_size);
+    }
+
+    /// The settings top bar's crowding is judged in label widths, not pixels:
+    /// the same window that comfortably holds the long return label at the
+    /// default interface type size cannot hold it once the type is scaled up.
+    #[test]
+    fn settings_nav_crowding_follows_the_interface_type_size() {
+        // The narrowest supported window keeps the sentence at the sizes the
+        // bar was drawn for.
+        let mut settings = AppSettings::default();
+        assert!(!settings_nav_is_crowded(720.0, &settings));
+
+        // Scaled-up interface type crowds that same window, so the label
+        // shortens rather than closing the gap to the page switch.
+        settings.ui_font_size = 20.0;
+        assert!(settings_nav_is_crowded(720.0, &settings));
+
+        // Width still buys the sentence back at that type size.
+        assert!(!settings_nav_is_crowded(1440.0, &settings));
+
+        // The threshold moves with the type size rather than sitting on a
+        // fixed pixel width.
+        settings.ui_font_size = 12.0;
+        let small = settings.ui_pixels(SETTINGS_NAV_LABEL_POINTS) * SETTINGS_NAV_LABEL_WIDTHS;
+        settings.ui_font_size = 20.0;
+        let large = settings.ui_pixels(SETTINGS_NAV_LABEL_POINTS) * SETTINGS_NAV_LABEL_WIDTHS;
+        assert!(large > small);
     }
 
     /// Lanes are derived once and shared by the header, every row, and the

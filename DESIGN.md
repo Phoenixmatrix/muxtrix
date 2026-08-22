@@ -298,6 +298,17 @@ glyph and trailing edge on the page's own content margin. Every fixed-height
 band in settings centers its content: a band that sets a height without
 centering renders flush against its top edge and clips the controls inside it.
 
+The return label and the title sit on one line either side of that rule, so
+they are read against each other and share a baseline. Iced centers each
+label's line box rather than aligning baselines, so the two hold that baseline
+by sharing one type size and separating themselves by weight and color; a
+second size on the line would drift with the interface type-size setting. The
+rule keeps an equal optical gap from the words on both sides, which is not one
+row spacing: the button carries its own trailing padding and the title carries
+none. What the bar can hold is a width measured in that shared type size, not
+in pixels — below it the return label drops to its noun and hands its sentence
+to a tooltip, rather than closing the gap to the page switch.
+
 Preferences keeps Cancel and the accent Apply action in a persistent footer
 while its content scrolls independently. Worktrees is a ruled, responsive
 inventory rather than a modal: identity, branch, protection/usage,
