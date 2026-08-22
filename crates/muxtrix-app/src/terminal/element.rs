@@ -18,7 +18,9 @@ use gpui::{
 };
 use muxtrix_terminal::TerminalMouseButton;
 
-use crate::app::{Message, TERMINAL_PADDING, TerminalLink, terminal_link_modifiers};
+use crate::app::{
+    Message, TERMINAL_PADDING, TerminalLink, terminal_link_modifiers, terminal_scrollbar_geometry,
+};
 use crate::geom::{Point as AppPoint, ScrollDelta, Size};
 use crate::runtime::gpui::Root;
 use crate::runtime::gpui::color;
@@ -27,9 +29,15 @@ use crate::terminal::box_painter::GpuiBoxPainter;
 use crate::terminal::runs::{
     TerminalRunGeometry, TerminalStyleRun, rgb, terminal_row_style_runs, terminal_run_geometry,
 };
+use crate::theme::DesignTokens;
 use crate::themes::TerminalThemePreset;
 use muxtrix_domain::PaneId;
 use muxtrix_terminal::GridSnapshot;
+
+/// The scrollbar's lane down the right edge, and the thumb inside it.
+const SCROLLBAR_WIDTH: f32 = 12.0;
+const SCROLLBAR_INSET: f32 = 3.0;
+const SCROLLBAR_THUMB_WIDTH: f32 = 3.0;
 
 /// What the element needs to draw one pane, gathered before layout.
 pub(crate) struct TerminalElement {
@@ -51,6 +59,8 @@ pub(crate) struct TerminalElement {
     /// Whether the modifiers that turn a hovered link into a clickable one are
     /// currently held, which decides the cursor over a link.
     link_modifiers: bool,
+    /// The scrollback position, when there is scrollback to show.
+    scrollbar: Option<muxtrix_terminal::ScrollbarSnapshot>,
 }
 
 /// What `prepaint` worked out and `paint` consumes.
@@ -112,6 +122,11 @@ impl TerminalElement {
             pane_id,
             root,
             link_modifiers: terminal_link_modifiers(app.keyboard_modifiers),
+            scrollbar: runtime
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.scrollbar)
+                .filter(|scrollbar| scrollbar.is_scrollable()),
         })
     }
 
@@ -295,11 +310,39 @@ impl Element for TerminalElement {
             }
         });
 
+        self.paint_scrollbar(bounds, window);
         self.paint_mouse(bounds, origin, prepared, window);
     }
 }
 
 impl TerminalElement {
+    /// The scrollback indicator down the right edge.
+    ///
+    /// Drawn only when there is scrollback, matching the iced pane: a track
+    /// that is always empty is noise on a terminal that has never scrolled.
+    fn paint_scrollbar(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+        let Some(scrollbar) = self.scrollbar else {
+            return;
+        };
+        let tokens = DesignTokens::for_appearance(self.settings.appearance);
+        let geometry = terminal_scrollbar_geometry(scrollbar, f32::from(bounds.size.height));
+        let thumb = Bounds {
+            origin: point(
+                bounds.origin.x + bounds.size.width - px(SCROLLBAR_WIDTH - SCROLLBAR_INSET),
+                bounds.origin.y + px(geometry.track_top + geometry.thumb_top),
+            ),
+            size: size(px(SCROLLBAR_THUMB_WIDTH), px(geometry.thumb_height)),
+        };
+        window.paint_quad(gpui::quad(
+            thumb,
+            px(2.),
+            color(tokens.line_strong),
+            px(0.),
+            gpui::transparent_black(),
+            gpui::BorderStyle::default(),
+        ));
+    }
+
     /// Register the mouse handlers for this pane.
     ///
     /// Hit-tested against the pane's own bounds rather than relying on
