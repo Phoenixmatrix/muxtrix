@@ -125,12 +125,14 @@ originating fleet entry.
 For Codex and Claude Code, hooks are not the authority for live interactive
 state. Codex emits `PermissionRequest` before its automatic reviewer decides,
 and `PostToolUse` arrives only after a successful tool finishes. Muxtrix treats
-those callbacks as metadata and derives `Running`, `Idle`, or `Needs input`
-from the current terminal screen and OSC title. Only a recognized, visible
-approval or answer surface can create `Needs input`; only newer screen evidence
-can clear it. `Done` preserves the previous completion while the composer is
-idle, but a positively recognized working frame starts the next turn even when
-its prompt hook was delayed or unavailable.
+those callbacks as metadata. Codex derives `Running`, `Idle`, or `Needs input`
+from the current terminal screen and OSC title. Claude combines that screen
+with the exact interactive-session `busy`/`idle` status from
+`claude agents --json`. Only a recognized, visible approval or answer surface
+can create `Needs input`; structured busy state may clear stale attention but
+never override a blocker still visible on screen. `Done` preserves the previous
+completion while the composer is idle, but positive working evidence starts
+the next turn even when its prompt hook was delayed or unavailable.
 
 Oh My Pi keeps exact approval and active-turn lifecycle events. From
 `agent_start` through terminal `agent_end`, an idle title cannot demote the
@@ -147,11 +149,11 @@ Typing a configured `codex`, `claude`, or `omp` launch command assigns that
 pane's agent before any managed hook or extension callback can arrive, which
 makes the fleet identity useful before the first callback. It is deliberately
 pane-local. Linux process-tree detection can also identify configured agent
-executables while hooks are absent; hooks take ownership of identity and coarse
-lifecycle metadata once the agent starts. The live screen or OSC title remains
-the interactive-state authority. Oh My Pi's approval extension events are exact
-observability events, so they can report `Needs input` immediately without
-waiting for the matching title paint.
+executables while hooks are absent. Claude's structured records associate by
+hook session ID, exact Linux process PID, or a cwd that is unique on both sides;
+ambiguous records never repaint a pane. Oh My Pi's approval extension events
+are exact observability events, so they can report `Needs input` immediately
+without waiting for the matching title paint.
 
 Agent pane names follow the same pane-local rule. A user rename wins first,
 then a meaningful terminal title emitted by the harness (including a named

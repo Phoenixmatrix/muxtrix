@@ -1452,9 +1452,11 @@ mod tests {
         assert!(source.contains("child.on(\"error\", resolve);"));
         assert!(source.contains("if (!child.stdin) {"));
         assert!(source.contains("resolve();\n                return;"));
-        assert!(source.contains(
-            "child.stdin.on(\"error\", resolve);\n            child.stdin.end(body);"
-        ));
+        assert!(
+            source.contains(
+                "child.stdin.on(\"error\", resolve);\n            child.stdin.end(body);"
+            )
+        );
         assert!(source.contains("} catch {\n            resolve();\n        }"));
 
         let removed = manager
@@ -1824,9 +1826,11 @@ mod tests {
         assert!(migrated.contains("setStatus?.(\"muxtrix\", undefined)"));
         assert!(!migrated.contains("`Muxtrix: ${body}`"));
         assert!(!migrated.contains("const MUXTRIX_EXTENSION_VERSION = 4;"));
-        assert!(migrated.contains(
-            "child.stdin.on(\"error\", resolve);\n            child.stdin.end(body);"
-        ));
+        assert!(
+            migrated.contains(
+                "child.stdin.on(\"error\", resolve);\n            child.stdin.end(body);"
+            )
+        );
         assert!(migrated.contains("} catch {\n            resolve();\n        }"));
         let _ = std::fs::remove_dir_all(root);
     }

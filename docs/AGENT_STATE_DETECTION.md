@@ -2,11 +2,15 @@
 
 ## Decision
 
-For Codex and Claude Code, the live terminal screen is authoritative for
-`Running`, `Idle`, and `Needs input`. Oh My Pi supplies exact active-turn and
-approval transitions through its managed extension, while OMP's documented
-state-bearing OSC title supplies the correction and recovery layer. `π >`
-means idle, `π !` means attention, and `π` followed by a supported Braille
+Codex uses its live terminal screen for `Running`, `Idle`, and `Needs input`.
+Claude Code combines that screen with the structured interactive-session status
+published by `claude agents --json`: a visible blocker remains strongest,
+structured `busy` outranks an idle-looking composer, positive working chrome
+outranks a lagging structured `idle`, and either an idle screen or an exact
+structured idle record can clear stale running state. Oh My Pi supplies exact
+active-turn and approval transitions through its managed extension, while OMP's
+documented state-bearing OSC title supplies the correction and recovery layer.
+`π >` means idle, `π !` means attention, and `π` followed by a supported Braille
 spinner means working; ConPTY uses the static working form `π :`.
 
 Other lifecycle hooks still identify the agent, session, working directory,
@@ -18,8 +22,9 @@ interval, an idle title cannot demote the pane; this covers older OMP releases
 that briefly published `π >` while an async job or scheduled continuation still
 owned the turn.
 
-An unrecognized screen or title preserves the last trusted state. This favors a
-missed new prompt over inventing activity or repeatedly telling the user that
+An unrecognized Codex screen or title preserves the last trusted state. Claude
+can additionally recover from its exact structured session record. This favors
+a missed new prompt over inventing activity or repeatedly telling the user that
 an automatic reviewer needs them.
 
 ## Why the hook-only model was wrong
@@ -50,20 +55,22 @@ approval-request events. That confirms the cause of the observed sequence.
 Direct app-server integration could be exact later, but would tightly couple
 Muxtrix to a different transport than the real terminal process it hosts.
 
-The implemented change adopts a screen-authoritative, conservative matching
-model: session-integration hooks are separated from state authority, and
-`Needs input` requires visible evidence on the live screen.
+The implemented change adopts a conservative, evidence-ranked matching model:
+session-integration hooks are separated from live state authority, Claude's
+structured status corrects screen false negatives, and `Needs input` still
+requires visible evidence on the live screen.
 
 ## Implemented model
 
 On each terminal poll, the application evaluates each pane's latest Ghostty
 grid snapshot and OSC title. Retained frames are re-evaluated so an identity
 hook arriving just after a stable prompt paint cannot miss it on the next poll.
-Codex and Claude Code use their live screen and title. Oh My Pi uses its
-state-bearing title except that its exact `agent_start` through terminal
-`agent_end` lifecycle bracket prevents an idle title from ending active work.
-Pi also retains exact session switch/branch, approval-request, context
-compaction/handoff, and shutdown events from the managed extension.
+Codex uses its live screen and title. Claude Code combines those frames with a
+paced machine-readable session query. Oh My Pi uses its state-bearing title
+except that its exact `agent_start` through terminal `agent_end` lifecycle
+bracket prevents an idle title from ending active work. Pi also retains exact
+session switch/branch, approval-request, context compaction/handoff, and
+shutdown events from the managed extension.
 
 - Codex `Action Required` OSC titles and strong live confirmation/answer forms
   create `Needs input`.
@@ -84,6 +91,11 @@ compaction/handoff, and shutdown events from the managed extension.
   rules, with no menu over it — creates `Idle`. It is ranked below every
   blocking rule so it can never clear a wait that is still painted, and it
   ignores a `❯ 1. Yes` answer line.
+- Claude's structured interactive records are associated one-to-one by hook
+  session ID, then by an exact Linux process PID, then by a cwd that is unique
+  on both sides. Ambiguous records are ignored. A visible blocker outranks
+  structured `busy`; structured `busy` outranks the still-painted idle composer;
+  and a visible working frame outranks structured `idle`.
 - Transcript viewers return no classification so historical text cannot
   repaint the pane.
 - Loose prose such as "do you want to proceed?" is insufficient without the
@@ -114,10 +126,11 @@ original uninstall backup and removes the old Pi-footer status writes.
 
 Agent identity is part of the daemon-owned serialized pane layout. A new
 Muxtrix instance restores that identity before attaching the pane's byte
-stream, then applies the same screen-authoritative classifier to the terminal
-grid rebuilt from backlog replay. Current `Running`, `Idle`, or `Needs input`
-therefore does not depend on an already-running agent emitting a new hook into
-the new application instance.
+stream, then applies the screen classifier to the terminal grid rebuilt from
+backlog replay. Claude additionally re-associates its structured session by
+unique cwd when neither a new hook nor a host-visible process PID is available.
+Current state therefore does not depend on an already-running agent emitting a
+new hook into the replacement application instance.
 
 Layouts created before durable identity was added remain recoverable. Once the
 replayed grid arrives, Muxtrix accepts only agent-specific signatures: Codex's
@@ -171,34 +184,39 @@ composer from being read as this conversation going idle.
 `<n> awaiting input` is deliberately **not** used as attention evidence: a
 freshly idle session with an empty composer is counted in it. Roster attention
 comes from `claude agents --json` instead, whose per-session `state` separates
-`blocked` and `failed` from `working` and `done`. That read costs a short-lived
-subprocess (~0.25 s), so it runs off the UI thread, at most one at a time, at
-most every two seconds, and only while a pane is actually projecting the
-roster — immediately on entering it. Leaving the roster needs no read at all:
-the conversation's own screen evidence is available on the next frame.
+`blocked` and `failed` from `working` and `done`. The same payload reports every
+interactive session's stable session ID, PID, cwd, and coarse `busy`/`idle`
+status. That is the structured correction layer for each ordinary Claude pane.
 
-`--json` reports more than the view does: every interactive Claude Code on the
-machine appears in it with `"kind": "interactive"`, while the Agents view lists
-background sessions only. Counting the interactive ones made the row disagree
-with the screen beside it — a machine whose view read `1 working · 3 completed`
-rolled up as `1 working · 5 idle` — and counted the very session doing the
-viewing. The roll-up therefore skips `interactive` entries, and keeps entries
-whose `kind` it does not recognise so a field that disappears degrades to
-over-reporting rather than to an empty roster. `done` is counted and named
-`completed`, matching the harness's own vocabulary for a finished session.
+The read costs a short-lived subprocess (~0.25 s), so it runs off the UI thread,
+at most one at a time and at most every two seconds while any Claude pane
+exists. Entering the Agents view forces an immediate read. Windows panes using
+the WSL backend run the query inside the configured distribution, with hidden
+console creation.
+
+The Agents-view roll-up still skips `interactive` entries: every interactive
+Claude Code already owns the fleet row of the pane it runs in, including the
+pane doing the viewing. Unknown kinds remain in the aggregate so a field that
+disappears degrades to over-reporting rather than to an empty roster. Interactive
+records are retained separately for exact pane correction and never added to
+the aggregate counts. A failed query preserves already-visible aggregate counts
+but drops pane-local structured state immediately, so stale `busy` evidence
+cannot pin a pane to Running.
 
 ## Benefits
 
 - Automatic approvals never flash or accumulate false human attention.
 - Manual approvals still turn amber from the UI the user can actually act on.
-- State clears as soon as an authoritative working/idle frame is rendered
-  instead of waiting for tool completion; Pi's active lifecycle is the exception.
+- Claude remains Running when the harness reports `busy` even if optional title,
+  footer, and progress chrome are absent or its idle composer remains painted.
+- State clears from newer screen evidence or an exact structured idle record;
+  Pi's active lifecycle remains the exception.
 - Historical transcript questions and parallel tool completions cannot own the
   current attention state.
 - Hooks remain useful for pane/session attribution and terminal-independent
   completion events.
-- The classifier is deterministic, offline, and covered by headless unit and
-  native application tests.
+- The screen classifier and structured-record matcher are deterministic and
+  covered by headless unit and native application tests.
 
 ## Costs and limitations
 
@@ -217,6 +235,10 @@ over-reporting rather than to an empty roster. `done` is counted and named
   this to primary-screen programs.
 - A brand-new prompt shape may not raise attention. The terminal itself remains
   fully usable and visible; only the sidebar projection can be incomplete.
+- Structured correction requires `claude agents --json` to remain available.
+  Failed reads discard pane-local records, and ambiguous session/PID/cwd matches
+  are ignored rather than guessed, so the system falls back to screen and hook
+  evidence without pinning stale state.
 - Rollout parsing could later add tool names, subagent activity, transcript
   recovery, and richer summaries. It should remain descriptive metadata unless
   records are request-correlated and prove that a person currently has an
@@ -228,7 +250,7 @@ over-reporting rather than to an empty roster. `done` is counted and named
 
 ## Validation contract
 
-Regression coverage pins five cases:
+Regression coverage pins the original five attention cases:
 
 1. repeated Codex `PermissionRequest` / `PostToolUse` automatic-review cycles
    never create unread attention;
@@ -238,5 +260,9 @@ Regression coverage pins five cases:
 5. a Pi idle title cannot override an active lifecycle, while the same title
    can still clear a stale screen- or process-detected `Running` state.
 
-Classifier fixtures also cover OSC precedence, transcript-viewer suppression,
-Claude blocked/working/idle forms, and rejection of narrative questions.
+Claude fixtures additionally pin the structured precedence contract: exact
+`busy` overrides an idle-looking composer, a visible blocker overrides `busy`,
+a visible working frame overrides structured `idle`, exact idle clears stale
+running state without positive screen evidence, and ambiguous cwd matches are
+rejected while exact PID matching succeeds. Parser fixtures retain interactive
+session ID, PID, cwd, and status separately from the Agents-view aggregate.
