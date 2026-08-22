@@ -31,7 +31,13 @@ iced = { version = "0.14.0", features = ["advanced", "canvas", "image", "tokio",
 # Cargo.lock does not carry over to a dependent workspace, so the pin has to
 # live in ours: the exact revisions are recorded in Cargo.lock, and
 # `cargo update -p gpui` is how they move.
-gpui = { git = "https://github.com/zed-industries/zed" }
+# `windows-manifest` is a gpui default. It shells out to a resource compiler
+# with a path relative to gpui's own source directory, which native `rc.exe`
+# resolves and `llvm-rc` (what cargo-xwin uses to cross-build from Linux) does
+# not. It is off here so a Windows binary can be produced from this machine;
+# a native Windows CI build should turn it back on, because the manifest is
+# what makes the app DPI-aware.
+gpui = { git = "https://github.com/zed-industries/zed", default-features = false, features = ["font-kit", "wayland", "x11"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "5a5e2abc837b6d927e2b38e2097d2fbf39ebee77" }
 fontdb = "0.23.0"

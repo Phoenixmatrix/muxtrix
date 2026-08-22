@@ -129,22 +129,98 @@ image as well.
 
 ### Platform matrix
 
-Filled in as each leg is run. "Adapter" is what GPUI logs as
-`Selected GPU adapter`.
+Measured with `crates/muxtrix-gpui-spike`: a 200x60 monospace grid, one
+`shape_line` per row per frame, beside the stock `gpui-component` widgets.
+"Adapter" is what GPUI logs as `Selected GPU adapter`. "Shape" is the cost of
+shaping all 60 rows for one frame; the plan's budget is under 1 ms.
 
-| Platform | Backend | Adapter | Result |
-|---|---|---|---|
-| Linux, build + link | — | — | compiles; link needs the packages above |
-| Linux X11 (native) | | | not yet run |
-| Linux Wayland (native) | | | not yet run |
-| WSLg, NVIDIA | | | not yet run |
-| WSLg, no NVIDIA | | | not yet run |
-| Xvfb + llvmpipe (CI path) | | | not yet run |
-| Windows 11 | DirectX | | not yet run |
-| macOS | Metal | | not yet run |
+| Platform | Adapter | Backend | Frames | Shape |
+|---|---|---|---|---|
+| Xvfb + llvmpipe (the CI path) | llvmpipe | Vulkan | 54 fps | 310 us |
+| WSLg Wayland, `gpu.rs` defaults | **NVIDIA RTX 4080 via D3D12** | GL | 58 fps | 341 us |
+| WSLg XWayland, `gpu.rs` defaults | **NVIDIA RTX 4080 via D3D12** | GL | 57 fps | 333 us |
+| WSLg Wayland, no `GALLIUM_DRIVER` | llvmpipe (software) | Vulkan | 59 fps | 330 us |
+| WSLg Wayland, `d3d12` but no adapter-name hint | llvmpipe (software) | Vulkan | 59 fps | 334 us |
+| Windows 11, D3D 11.1 | **NVIDIA RTX 4080** | DirectX | rendered; rate not measured | — |
+| Linux X11/Wayland on bare metal | | | not run — no such machine here | |
+| macOS | Metal | | built in CI only; not testable here | |
 
-The open risk is unchanged and is what the remaining rows exist to settle: on
-WSLg, GPUI scores adapters by device type and then backend (Vulkan over GL),
-and there is no environment variable that forces GL. That is the opposite of
-what `gpu.rs` does today, and Mesa's `dzn` Vulkan driver under WSLg is the
-reason it does it.
+Frame rate is capped by the spike's own 16 ms repaint timer, so ~59 fps is the
+ceiling and every row is hitting it. The number that matters is the shaping
+cost, and at ~330 us for a full 200x60 grid it is comfortably inside budget
+even on the software adapter.
+
+### WSLg: the plan's biggest risk did not materialise
+
+The plan expected GPUI to prefer a `dzn` Vulkan adapter over the working D3D12
+GL one, and reserved a patch to `gpui_wgpu` — carried as a vendored fork — to
+force the GL backend.
+
+**No patch is needed.** On this machine there is no `dzn` adapter at all. What
+actually happens:
+
+- With no `GALLIUM_DRIVER`, Mesa cannot initialise a hardware driver under WSLg
+  (`eglInitialize ... DRI2: failed to get driver name`, `ZINK: failed to choose
+  pdev`), GPUI enumerates only llvmpipe, and rendering is software.
+- With `GALLIUM_DRIVER=d3d12` and `MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA` —
+  exactly what `gpu.rs` already sets on WSL — the D3D12 adapter appears and
+  GPUI's own scoring picks it, because a non-CPU adapter outranks llvmpipe
+  regardless of backend.
+
+So `gpu.rs`'s WSL re-exec carries over to GPUI unchanged and is still
+load-bearing. `WGPU_BACKEND=gl` turns out to be unnecessary for adapter choice
+— GPUI reaches the right answer on device type alone — but it is harmless and
+there is no reason to remove it.
+
+One gap: the adapter-name hint is what rescues hardware selection here, and
+`gpu.rs` only sets it when the WSL NVIDIA driver is mounted. Whether Mesa's
+automatic D3D12 selection works on an AMD/Intel-only WSL host is untested; this
+machine has an NVIDIA GPU.
+
+### Windows
+
+A binary cross-built from this machine with `cargo xwin` runs on Windows 11,
+creates its DirectX device on the NVIDIA RTX 4080 at Direct3D 11.1 feature
+level, opens a window and renders. The `0x887A002D` error on startup is benign
+— it is the DXGI *debug* interface, which needs the optional Graphics Tools
+feature installed, and GPUI carries on without it.
+
+Sustained frame rate was not measured there: launched from WSL the process
+drew its first frame and then no more. That is consistent with the repaint
+behaviour noted below rather than with anything about DirectX, but it means the
+Windows shaping cost is still unmeasured. Running the binary from a normal
+Windows session, or measuring in CI, would settle it.
+
+Three build constraints found on the way, all of which matter for Phase 7
+packaging:
+
+- **A debug GPUI Windows build is not portable off the machine that built it.**
+  In debug, `gpui_windows` compiles its HLSL at runtime from
+  `env!("CARGO_MANIFEST_DIR")/src/shaders.hlsl` and canonicalises it, so the
+  binary carries the build machine's absolute path. Off that machine it fails
+  with `Error creating DirectWriteTextSystem ... The system cannot find the
+  path specified`, which reads like a font problem and is not one.
+- **Shader precompilation is gated on the host OS, not the target.**
+  `gpui_windows/build.rs` guards it with `#[cfg(target_os = "windows")]`, which
+  in a build script means the machine doing the building. Cross-compiling a
+  release Windows binary from Linux therefore never precompiles the shaders.
+  Windows releases should keep being built on Windows.
+- **`windows-manifest`, a gpui default feature, breaks cross-compilation.** It
+  compiles a resource whose manifest path is relative to gpui's own source
+  directory; native `rc.exe` resolves that, `llvm-rc` does not. Feature
+  unification means it cannot be switched off from this workspace either, since
+  `gpui-component` pulls gpui in with default features. A native Windows build
+  is unaffected.
+
+### Rendering under Xvfb
+
+GPUI renders under Xvfb on llvmpipe and an X11 `GetImage` of the window returns
+the frame — sampled pixels match the colours the spike paints. That is the
+mechanism Phase 6 depends on, and it works.
+
+One behaviour to carry into the port: **`cx.notify()` from inside `render` does
+not by itself drive a repaint loop.** Under Xvfb the first frame was the only
+one until repaints were driven from a timer. Muxtrix already repaints on timers
+(cursor blink, the e2e tick), so this costs nothing, but an e2e scenario that
+expects a frame purely because state changed needs a tick behind it.
+

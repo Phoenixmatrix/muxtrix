@@ -11,6 +11,9 @@ publish = false
 description = "Platform spike: proves GPUI renders on every target before the port begins"
 
 [dependencies]
+# GPUI reports its adapter choice through `log`, and that choice is the whole
+# point of the spike, so the spike needs a logger to see it.
+env_logger = "0.11"
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true

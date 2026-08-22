@@ -11,6 +11,8 @@
 
 use std::time::Instant;
 
+use std::time::Duration;
+
 use gpui::{
     App, AppContext, Bounds, Context, Font, FontFeatures, FontStyle, FontWeight,
     Hsla, IntoElement, ParentElement, Pixels, Render, SharedString, Styled, TextAlign, TextRun,
@@ -23,6 +25,11 @@ const GRID_COLUMNS: usize = 200;
 const GRID_ROWS: usize = 60;
 
 fn main() {
+    // GPUI names the adapter it picked at info level, and on Linux it also
+    // lists every adapter it considered and why. That log *is* the spike's
+    // result, so it has to be visible.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     // The platform crate picks the backend for the host: Metal, DirectX, or
     // wgpu over Vulkan/GL on Linux.
     gpui_platform::application().run(|cx: &mut App| {
@@ -34,7 +41,27 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| Spike::new()),
+            |_, cx| {
+                cx.new(|cx| {
+                    let spike = Spike::new();
+                    // `cx.notify()` from inside `render` does not drive a
+                    // repaint loop on its own — under Xvfb the first frame is
+                    // the only one. Muxtrix repaints on a timer anyway (cursor
+                    // blink, e2e tick), so the spike measures that same shape.
+                    cx.spawn(async move |this, cx| {
+                        loop {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(16))
+                                .await;
+                            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .detach();
+                    spike
+                })
+            },
         )
         .expect("the spike could not open a window");
     });
@@ -46,6 +73,9 @@ struct Spike {
     rows: Vec<SharedString>,
     frames: u32,
     started: Instant,
+    /// Frames to draw before quitting. Set so a headless run under Xvfb
+    /// terminates on its own instead of needing to be killed.
+    frame_budget: Option<u32>,
 }
 
 impl Spike {
@@ -64,16 +94,23 @@ impl Spike {
                 SharedString::from(text)
             })
             .collect();
+        let frame_budget = std::env::var("MUXTRIX_SPIKE_FRAMES")
+            .ok()
+            .and_then(|value| value.parse().ok());
         Self {
             rows,
             frames: 0,
             started: Instant::now(),
+            frame_budget,
         }
     }
 }
 
 impl Render for Spike {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.frames == 0 {
+            eprintln!("spike: first render entered");
+        }
         let font_size = px(14.);
         let line_height = px(16.);
         let font = Font {
@@ -117,9 +154,15 @@ impl Render for Spike {
         let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
         let fps = f64::from(self.frames) / elapsed;
 
-        // Keep repainting: a single static frame would not show whether the
-        // grid stays cheap, which is the number worth reporting.
-        cx.notify();
+        if self.frame_budget.is_some_and(|budget| self.frames >= budget) {
+            let frames = self.frames;
+            println!(
+                "spike: {frames} frames in {elapsed:.2}s ({fps:.0} fps), \
+                 last shape {shape_micros}us for {GRID_ROWS} rows x {GRID_COLUMNS} cols, \
+                 cell width {cell_width:?}"
+            );
+            cx.quit();
+        }
 
         div()
             .flex()
