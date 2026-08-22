@@ -16,7 +16,6 @@ use gpui::{
 use crate::app::{Message, Muxtrix};
 use crate::effect::Effect;
 use crate::input::KeyEvent;
-use crate::terminal::element::TerminalElement;
 use crate::theme::DesignTokens;
 
 /// How often the cursor blink phase flips.
@@ -29,27 +28,29 @@ const E2E_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Start the application and run it until the window closes.
 pub(crate) fn run() -> iced::Result {
-    gpui_platform::application().run(|cx: &mut App| {
-        gpui_component::init(cx);
+    gpui_platform::application()
+        .with_assets(crate::assets::Assets)
+        .run(|cx: &mut App| {
+            gpui_component::init(cx);
 
-        let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
-        let opened = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(720.), px(480.))),
-                app_id: Some("muxtrix".into()),
-                ..Default::default()
-            },
-            |window, cx| cx.new(|cx| Root::new(window, cx)),
-        );
-        match opened {
-            Ok(_) => cx.activate(true),
-            Err(error) => {
-                eprintln!("muxtrix: could not open a window: {error}");
-                cx.quit();
+            let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+            let opened = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(720.), px(480.))),
+                    app_id: Some("muxtrix".into()),
+                    ..Default::default()
+                },
+                |window, cx| cx.new(|cx| Root::new(window, cx)),
+            );
+            match opened {
+                Ok(_) => cx.activate(true),
+                Err(error) => {
+                    eprintln!("muxtrix: could not open a window: {error}");
+                    cx.quit();
+                }
             }
-        }
-    });
+        });
     Ok(())
 }
 
@@ -67,6 +68,11 @@ pub(crate) struct Root {
 }
 
 impl Root {
+    /// The application state the views read.
+    pub(crate) fn app(&self) -> &Muxtrix {
+        &self.app
+    }
+
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (app, effects) = Muxtrix::boot();
         let focus = cx.focus_handle();
@@ -269,28 +275,9 @@ where
 }
 
 impl Render for Root {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = DesignTokens::for_appearance(self.app.settings.appearance);
-        let theme = self.app.settings.terminal_theme.preset();
-
-        // Phase 2 renders the focused pane only. The sidebar, tab strip and
-        // the rest of the shell arrive in Phase 3; until then the point is a
-        // terminal that genuinely works, not a shell around an empty one.
-        let terminal = self.app.focused_pane_id().and_then(|pane_id| {
-            let hovered_link = self.app.hovered_terminal_link(pane_id);
-            let runtime = self.app.terminals.get(&pane_id)?;
-            let snapshot = runtime.snapshot.clone()?;
-            Some(TerminalElement::new(
-                snapshot,
-                self.app.settings.clone(),
-                theme,
-                self.app.window_focused,
-                self.app.cursor_phase_visible,
-                hovered_link,
-                runtime.viewport.unwrap_or_default(),
-            ))
-        });
-
+        let workspace = self.view_workspace(window, cx);
         div()
             .track_focus(&self.focus)
             .key_context("Muxtrix")
@@ -302,7 +289,13 @@ impl Render for Root {
             .flex_col()
             .bg(color(tokens.app))
             .text_color(color(tokens.text))
-            .children(terminal)
+            .child(workspace)
+    }
+}
+
+impl Focusable for Root {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
     }
 }
 
@@ -316,11 +309,5 @@ pub(crate) fn color(value: iced::Color) -> gpui::Rgba {
         g: value.g,
         b: value.b,
         a: value.a,
-    }
-}
-
-impl Focusable for Root {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus.clone()
     }
 }

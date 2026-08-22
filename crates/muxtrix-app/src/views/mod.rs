@@ -6,6 +6,9 @@
 //! split mirrors the screens: shell, sidebar, workspace, panes, dialogs,
 //! palette, GitHub panel and settings.
 
+#[cfg(feature = "gpui")]
+pub(crate) mod gpui;
+
 pub(crate) mod dialogs;
 pub(crate) mod github;
 pub(crate) mod palette;

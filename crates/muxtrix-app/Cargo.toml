@@ -13,11 +13,14 @@ e2e = []
 # The GPUI runtime, off by default while the port is in progress. Both runtimes
 # compile; `runtime/mod.rs` picks one, and the application core underneath is
 # the same either way.
-gpui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component"]
+gpui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component", "dep:anyhow"]
 
 [dependencies]
 async-channel.workspace = true
 bytes.workspace = true
+# GPUI's AssetSource trait is defined in terms of anyhow::Result, so serving
+# icons to it means speaking that dialect at the boundary.
+anyhow = { version = "1.0", optional = true }
 gpui = { workspace = true, optional = true }
 gpui_platform = { workspace = true, optional = true }
 gpui-component = { workspace = true, optional = true }

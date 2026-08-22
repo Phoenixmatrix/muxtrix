@@ -16,6 +16,8 @@ use std::sync::atomic::Ordering;
 mod agent_screen;
 mod agents_roster;
 mod app;
+#[cfg(feature = "gpui")]
+mod assets;
 mod box_drawing;
 mod commands;
 mod doctor;
