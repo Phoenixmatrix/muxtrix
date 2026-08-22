@@ -2,7 +2,6 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use iced::Task;
 use muxtrix_domain::{PaneId, SplitAxis, TabId};
 use serde_json::json;
 
@@ -14,6 +13,7 @@ use super::{
     ProcessCancellation, TerminalLaunchState, TerminalMouseButton, WorktreeManagerEntry,
     WorktreeManagerMode, WorktreeManagerState, agent_screen, github,
 };
+use crate::effect::{Effect, ScrollTarget};
 use crate::settings::{FleetScope, FleetView};
 
 const REPORT_ENV: &str = "MUXTRIX_E2E_REPORT";
@@ -362,7 +362,7 @@ impl Scenario {
                         second,
                         TerminalMouseButton::Left,
                     ));
-                    if copy_task.units() == 0 {
+                    if copy_task.is_empty() {
                         return Err(
                             "releasing a genuine text selection did not schedule a clipboard copy"
                                 .into(),
@@ -2078,76 +2078,53 @@ fn next_patch_version(version: &str) -> String {
 }
 
 impl Muxtrix {
-    pub(super) fn drive_e2e(&mut self) -> Task<Message> {
+    pub(super) fn drive_e2e(&mut self) -> Vec<Effect> {
         let Some(mut scenario) = self.e2e.take() else {
-            return Task::none();
+            return Vec::new();
         };
-        match scenario.tick(self) {
-            Ok(TickAction::Wait) => {
-                self.e2e = Some(scenario);
-                Task::none()
-            }
+        let action = scenario.tick(self);
+        if let Err(error) = &action {
+            scenario.failure_report(error);
+            return vec![Effect::Exit];
+        }
+        self.e2e = Some(scenario);
+        match action {
+            Ok(TickAction::Wait) => Vec::new(),
             Ok(TickAction::ScrollSettingsToEnd) => {
-                self.e2e = Some(scenario);
-                iced::widget::operation::snap_to_end(iced::widget::Id::new(
-                    super::SETTINGS_SCROLL_ID,
-                ))
+                vec![Effect::ScrollToEnd(ScrollTarget::Settings)]
             }
             Ok(TickAction::ScrollSettingsToTerminal) => {
-                self.e2e = Some(scenario);
-                iced::widget::operation::snap_to(
-                    iced::widget::Id::new(super::SETTINGS_SCROLL_ID),
-                    iced::widget::operation::RelativeOffset { x: 0.0, y: 0.45 },
-                )
+                vec![Effect::ScrollToRatio(ScrollTarget::Settings, 0.45)]
             }
             Ok(TickAction::ScrollSettingsToGitHub) => {
-                self.e2e = Some(scenario);
-                iced::widget::operation::snap_to(
-                    iced::widget::Id::new(super::SETTINGS_SCROLL_ID),
-                    iced::widget::operation::RelativeOffset { x: 0.0, y: 0.65 },
-                )
+                vec![Effect::ScrollToRatio(ScrollTarget::Settings, 0.65)]
             }
             Ok(TickAction::ScrollGitHubToEnd) => {
-                self.e2e = Some(scenario);
-                iced::widget::operation::snap_to_end(iced::widget::Id::new(
-                    super::GITHUB_FILE_SCROLL_ID,
-                ))
+                vec![Effect::ScrollToEnd(ScrollTarget::GitHubFiles)]
             }
             Ok(TickAction::ScrollGitHubPullRequestsToEnd) => {
-                self.e2e = Some(scenario);
-                iced::widget::operation::snap_to_end(iced::widget::Id::new(
-                    super::GITHUB_PULL_REQUEST_SCROLL_ID,
-                ))
+                vec![Effect::ScrollToEnd(ScrollTarget::GitHubPullRequests)]
             }
-            Ok(TickAction::Capture) => {
-                self.e2e = Some(scenario);
-                iced::window::latest().then(|window| match window {
-                    Some(window) => iced::window::screenshot(window).map(Message::E2eScreenshot),
-                    None => Task::done(Message::E2eWindowMissing),
-                })
-            }
-            Err(error) => {
-                scenario.failure_report(&error);
-                iced::exit()
-            }
+            Ok(TickAction::Capture) => vec![Effect::Capture],
+            Err(_) => unreachable!("the error case returned above"),
         }
     }
 
-    pub(super) fn finish_e2e(&mut self, screenshot: iced::window::Screenshot) -> Task<Message> {
+    pub(super) fn finish_e2e(&mut self, screenshot: iced::window::Screenshot) -> Vec<Effect> {
         let Some(scenario) = self.e2e.take() else {
-            return iced::exit();
+            return vec![Effect::Exit];
         };
         if let Err(error) = scenario.success_report(&screenshot) {
             scenario.failure_report(&error);
         }
-        iced::exit()
+        vec![Effect::Exit]
     }
 
-    pub(super) fn fail_e2e(&mut self, error: &str) -> Task<Message> {
+    pub(super) fn fail_e2e(&mut self, error: &str) -> Vec<Effect> {
         if let Some(scenario) = self.e2e.take() {
             scenario.failure_report(error);
         }
-        iced::exit()
+        vec![Effect::Exit]
     }
 }
 

@@ -44,6 +44,7 @@ mod agents_roster;
 mod box_drawing;
 mod commands;
 mod doctor;
+mod effect;
 mod ellipsized_text;
 mod geom;
 mod github;
@@ -63,6 +64,7 @@ mod views;
 mod e2e;
 
 use commands::CommandAction;
+use effect::{Effect, FocusTarget, ScrollTarget};
 use geom::{Point, ScrollDelta, Size};
 use input::{Key, KeyEvent, KeyInput, Modifiers, Named};
 #[cfg(test)]
@@ -138,17 +140,24 @@ pub fn main() -> iced::Result {
     NO_TERMINAL_STARTUP.store(no_terminal_requested(&arguments), Ordering::Relaxed);
 
     let (startup_settings, _) = AppSettings::load();
-    iced::application(Muxtrix::boot, Muxtrix::update, Muxtrix::view)
-        .title(Muxtrix::title)
-        .theme(Muxtrix::theme)
-        .subscription(Muxtrix::subscription)
-        .window(muxtrix_window_settings())
-        .settings(iced::Settings {
-            antialiasing: true,
-            default_font: startup_settings.ui_font(),
-            ..iced::Settings::default()
-        })
-        .run()
+    iced::application(
+        || {
+            let (app, effects) = Muxtrix::boot();
+            (app, run_effects(effects))
+        },
+        |app: &mut Muxtrix, message| run_effects(app.update(message)),
+        Muxtrix::view,
+    )
+    .title(Muxtrix::title)
+    .theme(Muxtrix::theme)
+    .subscription(Muxtrix::subscription)
+    .window(muxtrix_window_settings())
+    .settings(iced::Settings {
+        antialiasing: true,
+        default_font: startup_settings.ui_font(),
+        ..iced::Settings::default()
+    })
+    .run()
 }
 
 fn muxtrix_window_settings() -> iced::window::Settings {
@@ -1452,6 +1461,9 @@ const PALETTE_SCROLL_ID: &str = "muxtrix-command-palette-scroll";
 const GITHUB_FILE_SCROLL_ID: &str = "muxtrix-github-file-scroll";
 const GITHUB_PULL_REQUEST_SCROLL_ID: &str = "muxtrix-github-pull-request-scroll";
 const GITHUB_PULL_REQUEST_QUERY_ID: &str = "muxtrix-github-pull-request-query";
+/// Deliberately not attached to any widget. Focusing it takes focus away from
+/// the search field so list keys reach the panel handler.
+const GITHUB_KEYBOARD_SINK_ID: &str = "muxtrix-github-keyboard-sink";
 const GITHUB_DIFF_LINE_HEIGHT: f32 = 24.0;
 const GITHUB_DIFF_OVERSCAN: usize = 16;
 const GITHUB_DIFF_CHROME_WIDTH: f32 = 122.0;
@@ -1467,7 +1479,7 @@ const NO_REPO_GROUP: &str = "No Repo";
 const WORKTREE_HOME_FOLDER: &str = ".muxtrix/worktrees";
 
 impl Muxtrix {
-    fn boot() -> (Self, Task<Message>) {
+    fn boot() -> (Self, Vec<Effect>) {
         let mut app = Self::new();
         let discovery = app.refresh_integrations();
         let github_host = app.settings.github_host.clone();
@@ -1483,10 +1495,10 @@ impl Muxtrix {
                 )
             },
         );
-        (app, Task::batch([discovery, github_auth]))
+        (app, effect::batch([discovery, github_auth]))
     }
 
-    fn prepare_session_host(&mut self, pane_id: PaneId) -> Task<Message> {
+    fn prepare_session_host(&mut self, pane_id: PaneId) -> Vec<Effect> {
         if let Some(runtime) = self.terminals.get_mut(&pane_id) {
             runtime.launch_state = TerminalLaunchState::PreparingHost;
             runtime.preview =
@@ -1496,16 +1508,16 @@ impl Muxtrix {
             if let Err(error) = self.launch_terminal_for_pane(pane_id) {
                 self.mark_terminal_launch_failed(pane_id, error);
             }
-            return Task::none();
+            return Vec::new();
         }
         self.initialize_session_host(pane_id, true)
     }
 
-    fn start_new_session_host(&mut self, pane_id: PaneId) -> Task<Message> {
+    fn start_new_session_host(&mut self, pane_id: PaneId) -> Vec<Effect> {
         self.initialize_session_host(pane_id, false)
     }
 
-    fn initialize_session_host(&self, pane_id: PaneId, offer_resume: bool) -> Task<Message> {
+    fn initialize_session_host(&self, pane_id: PaneId, offer_resume: bool) -> Vec<Effect> {
         perform_blocking(
             move || {
                 let candidates = if offer_resume {
@@ -2099,7 +2111,7 @@ impl Muxtrix {
         Subscription::batch(subscriptions)
     }
 
-    fn update(&mut self, message: Message) -> Task<Message> {
+    fn update(&mut self, message: Message) -> Vec<Effect> {
         let result = match message {
             #[cfg(test)]
             Message::Split(axis) => self.split_terminal(axis),
@@ -2135,14 +2147,14 @@ impl Muxtrix {
                         "Terminal launch cancelled. The workspace is still usable.".into();
                     self.status = "Terminal launch cancelled".into();
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::SessionHostInitialized(pane_id, result) => {
                 let still_waiting = self.terminals.get(&pane_id).is_some_and(|runtime| {
                     matches!(runtime.launch_state, TerminalLaunchState::PreparingHost)
                 });
                 if !still_waiting {
-                    return Task::none();
+                    return Vec::new();
                 }
                 match result {
                     Ok(candidates) if !candidates.is_empty() => {
@@ -2162,7 +2174,7 @@ impl Muxtrix {
                     }
                     Err(error) => self.mark_terminal_launch_failed(pane_id, error),
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::PollTerminal => {
                 self.poll_terminal();
@@ -2172,9 +2184,9 @@ impl Muxtrix {
                     self.github_pane_refresh_pending = false;
                     self.refresh_github_focused_pane()
                 } else {
-                    Task::none()
+                    Vec::new()
                 };
-                return Task::batch([metadata, github]);
+                return effect::batch([metadata, github]);
             }
             Message::AgentsRosterLoaded(result) => {
                 self.agents_roster_pending = false;
@@ -2189,18 +2201,18 @@ impl Muxtrix {
                     }
                     Err(error) => self.agents_roster_error = Some(error),
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::PaneRepositoriesLoaded(generation, result) => {
                 if generation != self.pane_repository_generation {
-                    return Task::none();
+                    return Vec::new();
                 }
                 let repositories = match result {
                     Ok(repositories) => repositories,
                     Err(error) => {
                         self.pending_repository_directories.clear();
                         self.status = format!("Repository grouping unavailable: {error}");
-                        return Task::none();
+                        return Vec::new();
                     }
                 };
                 for (pane_id, repository) in repositories {
@@ -2215,7 +2227,7 @@ impl Muxtrix {
                         }
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::BlinkCursor => {
                 self.cursor_phase_visible = !self.cursor_phase_visible;
@@ -2242,7 +2254,7 @@ impl Muxtrix {
                 {
                     panel.loading_phase = (panel.loading_phase + 1) % GITHUB_LOADING_DOT_COUNT;
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::Keyboard(event) => {
                 return self.handle_keyboard(event);
@@ -2251,17 +2263,17 @@ impl Muxtrix {
                 if let Err(error) = self.resize_terminal(pane_id, size) {
                     self.status = format!("Terminal resize failed: {error}");
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::ResizeSplit(key, size) => {
                 self.split_sizes.insert(key, size);
-                return Task::none();
+                return Vec::new();
             }
             Message::BeginSplitDrag(key, axis) => {
                 if let Err(error) = self.begin_split_drag(key, axis) {
                     self.status = error;
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::PointerMoved(position) => {
                 self.cursor_position = position;
@@ -2273,7 +2285,7 @@ impl Muxtrix {
                     self.status = error;
                     self.terminal_scroll_drag = None;
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::EndPointerInteraction => {
                 let selected_text = self
@@ -2288,17 +2300,17 @@ impl Muxtrix {
                 self.split_drag = None;
                 self.terminal_scroll_drag = None;
                 return selected_text
-                    .map_or_else(Task::none, |text| self.copy_terminal_selection(text));
+                    .map_or_else(Vec::new, |text| self.copy_terminal_selection(text));
             }
             Message::EnterTerminal(pane_id) => {
                 self.hovered_terminal = Some(pane_id);
-                return Task::none();
+                return Vec::new();
             }
             Message::LeaveTerminal(pane_id) => {
                 if self.hovered_terminal == Some(pane_id) {
                     self.hovered_terminal = None;
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::TerminalPointerMoved(pane_id, position) => {
                 self.terminal_pointer_positions.insert(pane_id, position);
@@ -2347,11 +2359,11 @@ impl Muxtrix {
                         self.status = format!("Terminal mouse motion failed: {error}");
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::TerminalScrollbarMoved(pane_id, position) => {
                 self.terminal_scrollbar_positions.insert(pane_id, position);
-                return Task::none();
+                return Vec::new();
             }
             Message::BeginTerminalScroll(pane_id) => {
                 if let Err(error) = self.begin_terminal_scroll(pane_id) {
@@ -2362,7 +2374,7 @@ impl Muxtrix {
                         scenario.observe_terminal_scrollbar();
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::TerminalMousePressed(pane_id, button) => {
                 return self.begin_terminal_mouse(pane_id, button);
@@ -2378,25 +2390,26 @@ impl Muxtrix {
                     self.status = format!("Terminal mouse release failed: {error}");
                 }
                 return selected_text
-                    .map_or_else(Task::none, |text| self.copy_terminal_selection(text));
+                    .map_or_else(Vec::new, |text| self.copy_terminal_selection(text));
             }
             Message::OpenPaneContextMenu(pane_id) => {
                 let _ = self.focus_pane(pane_id);
                 self.pane_menu = Some(pane_id);
-                return Task::none();
+                return Vec::new();
             }
             Message::CopyTerminalSelection(pane_id) => {
                 self.pane_menu = None;
                 let Some(text) = self.selected_terminal_text(pane_id) else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 return self.copy_terminal_selection(text);
             }
             Message::PastePane(pane_id) => {
                 self.pane_menu = None;
                 let _ = self.focus_pane(pane_id);
-                return iced::clipboard::read()
-                    .map(move |contents| Message::ClipboardPasted(pane_id, contents));
+                return vec![Effect::ClipboardRead(Arc::new(move |contents| {
+                    Message::ClipboardPasted(pane_id, contents)
+                }))];
             }
             Message::ClipboardPasted(pane_id, contents) => {
                 if let Some(text) = contents.filter(|text| !text.is_empty()) {
@@ -2405,14 +2418,14 @@ impl Muxtrix {
                         self.status = format!("Paste failed: {error}");
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::TerminalLinkOpened(uri, result) => {
                 self.status = match result {
                     Ok(()) => format!("Opened {uri}"),
                     Err(error) => format!("Could not open {uri}: {error}"),
                 };
-                return Task::none();
+                return Vec::new();
             }
             Message::ScrollTerminal(pane_id, delta) => {
                 match self.scroll_terminal(pane_id, delta) {
@@ -2425,11 +2438,11 @@ impl Muxtrix {
                     }
                     Err(error) => self.status = format!("Terminal scroll failed: {error}"),
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::ScrollHoveredTerminal(delta) => {
                 let Some(pane_id) = self.hovered_terminal else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 let result = self.scroll_terminal(pane_id, delta);
                 match result {
@@ -2442,7 +2455,7 @@ impl Muxtrix {
                     }
                     Err(error) => self.status = format!("Terminal scroll failed: {error}"),
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::WindowOpened(window_id, size) => {
                 self.window_id = Some(window_id);
@@ -2451,21 +2464,21 @@ impl Muxtrix {
                 let terminal = self
                     .startup_terminal_pending
                     .take()
-                    .map_or_else(Task::none, |pane_id| self.prepare_session_host(pane_id));
-                return Task::batch([resize, terminal]);
+                    .map_or_else(Vec::new, |pane_id| self.prepare_session_host(pane_id));
+                return effect::batch([resize, terminal]);
             }
             Message::WindowResized(size) => {
                 self.window_size = size;
                 self.reflow_github_diff();
-                return Task::none();
+                return Vec::new();
             }
             Message::WindowFocusChanged(focused) => {
                 self.window_focused = focused;
-                return Task::none();
+                return Vec::new();
             }
             Message::CloseCommandPalette => {
                 self.close_command_palette();
-                return Task::none();
+                return Vec::new();
             }
             Message::ToggleCommandPalette => return self.toggle_command_palette(),
             Message::CommandQueryChanged(query) => {
@@ -2476,7 +2489,7 @@ impl Muxtrix {
                     .map(|command| self.command_enabled(command.action))
                     .collect();
                 self.palette.selected = first_enabled_palette_command(&enabled);
-                return Task::none();
+                return Vec::new();
             }
             Message::CommandSelected(index) => {
                 let commands = commands::filtered(&self.palette.query);
@@ -2486,23 +2499,23 @@ impl Muxtrix {
                 {
                     return self.run_command(command.action);
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::RunCommand(action) => return self.run_command(action),
             Message::NewWorkspace => return self.open_workspace_create(),
             Message::CreateWorkspace => self.create_workspace(),
             Message::CancelWorkspaceCreate => {
                 self.workspace_create_visible = false;
-                return Task::none();
+                return Vec::new();
             }
             Message::SwitchWorkspace(workspace_id) => self.switch_workspace(workspace_id),
             Message::WorkspaceNameChanged(name) => {
                 self.workspace_name_draft = name;
-                return Task::none();
+                return Vec::new();
             }
             Message::RenameDraftChanged(name) => {
                 self.rename_draft = name;
-                return Task::none();
+                return Vec::new();
             }
             Message::ConfirmRename => {
                 let result = self.apply_rename();
@@ -2513,16 +2526,16 @@ impl Muxtrix {
             }
             Message::CancelRename => {
                 self.rename_prompt = None;
-                return Task::none();
+                return Vec::new();
             }
             Message::WorktreeNameChanged(name) => {
                 self.worktree_name_draft = name;
-                return Task::none();
+                return Vec::new();
             }
             Message::ConfirmWorktree => return self.confirm_worktree(),
             Message::CancelWorktree => {
                 self.worktree_prompt = None;
-                return Task::none();
+                return Vec::new();
             }
             Message::WorktreeCreated(target, result) => {
                 match result.and_then(|path| {
@@ -2573,7 +2586,7 @@ impl Muxtrix {
                         }
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::NewTab => self.new_tab(),
             Message::CloseTab(workspace_id, tab_id) => self.close_tab(workspace_id, tab_id),
@@ -2595,15 +2608,15 @@ impl Muxtrix {
                 if startup && let Some(pane_id) = pane_id {
                     return self.start_new_session_host(pane_id);
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::SessionPickerResume(index) => {
                 self.resume_session(index);
-                return Task::none();
+                return Vec::new();
             }
             Message::SessionPickerKill(index) => {
                 self.kill_picked_session(index);
-                return Task::none();
+                return Vec::new();
             }
             Message::SessionPickerKillAll => {
                 let count = self
@@ -2613,7 +2626,7 @@ impl Muxtrix {
                 for index in (0..count).rev() {
                     self.kill_picked_session(index);
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::CloseWorktreeManager => {
                 self.worktree_manager = None;
@@ -2622,7 +2635,7 @@ impl Muxtrix {
                 {
                     self.active_view = ActiveView::Workspace;
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::WorktreeManagerLoaded(generation, result) => {
                 let current = self
@@ -2630,7 +2643,7 @@ impl Muxtrix {
                     .as_ref()
                     .is_some_and(|manager| manager.generation == generation);
                 if !current {
-                    return Task::none();
+                    return Vec::new();
                 }
                 match result {
                     Ok(mut discovery) => {
@@ -2657,7 +2670,7 @@ impl Muxtrix {
                         }
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::RefreshWorktreeManager => {
                 let Some(pane_id) = self
@@ -2666,7 +2679,7 @@ impl Muxtrix {
                     .and_then(Workspace::active_tab)
                     .map(|tab| tab.focused_pane_id)
                 else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 return self.open_worktree_list(WorktreeManagerMode::Manage, pane_id);
             }
@@ -2687,17 +2700,17 @@ impl Muxtrix {
                     manager.restart_target = Some(index);
                     manager.error = None;
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::ConfirmWorktreeManagerRestart => {
                 self.confirm_worktree_restart();
-                return Task::none();
+                return Vec::new();
             }
             Message::CancelWorktreeManagerRestart => {
                 if let Some(manager) = self.worktree_manager.as_mut() {
                     manager.restart_target = None;
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::WorktreeManagerDeleted(removed, result) => {
                 if let Some(manager) = self.worktree_manager.as_mut() {
@@ -2717,11 +2730,11 @@ impl Muxtrix {
                         };
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::CancelCloseWorkspace => {
                 self.close_workspace_prompt = None;
-                return Task::none();
+                return Vec::new();
             }
             Message::BeginTabDrag(workspace_id, tab_id, index) => {
                 let _ = self.switch_workspace(workspace_id);
@@ -2731,14 +2744,14 @@ impl Muxtrix {
                     target_workspace_id: workspace_id,
                     target_index: index,
                 });
-                return Task::none();
+                return Vec::new();
             }
             Message::TabDragOver(workspace_id, index) => {
                 if let Some(drag) = &mut self.tab_drag {
                     drag.target_workspace_id = workspace_id;
                     drag.target_index = index;
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::OpenSettings => return self.open_settings(),
             Message::InstalledVersionsLoaded(result) => {
@@ -2746,7 +2759,7 @@ impl Muxtrix {
                     Ok(versions) => InstalledVersionsState::Ready(versions),
                     Err(_) => InstalledVersionsState::Unavailable,
                 };
-                return Task::none();
+                return Vec::new();
             }
             Message::GitHubStatusPressed => {
                 return self.open_github_panel();
@@ -2754,7 +2767,7 @@ impl Muxtrix {
             Message::BeginGitHubAuth => return self.begin_github_auth(),
             Message::GitHubAuthChecked(generation, status) => {
                 if generation != self.github_auth_generation {
-                    return Task::none();
+                    return Vec::new();
                 }
                 let authenticated = matches!(status, github::AuthStatus::Authenticated { .. });
                 self.github_auth = status;
@@ -2765,7 +2778,7 @@ impl Muxtrix {
                     let panel = if self.github_panel_visible() {
                         self.refresh_github_focused_pane()
                     } else {
-                        Task::none()
+                        Vec::new()
                     };
                     let pull_requests = if self
                         .github_panel
@@ -2774,15 +2787,15 @@ impl Muxtrix {
                     {
                         self.refresh_github_pull_requests()
                     } else {
-                        Task::none()
+                        Vec::new()
                     };
-                    return Task::batch([repositories, panel, pull_requests]);
+                    return effect::batch([repositories, panel, pull_requests]);
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::GitHubAuthFinished(generation, result) => {
                 if generation != self.github_auth_generation {
-                    return Task::none();
+                    return Vec::new();
                 }
                 self.github_auth_busy = false;
                 match result {
@@ -2795,7 +2808,7 @@ impl Muxtrix {
                         let context = if self.github_panel_visible() {
                             self.refresh_github_focused_pane()
                         } else {
-                            Task::none()
+                            Vec::new()
                         };
                         let pull_requests =
                             if self.github_panel.as_ref().is_some_and(|panel| {
@@ -2803,9 +2816,9 @@ impl Muxtrix {
                             }) {
                                 self.refresh_github_pull_requests()
                             } else {
-                                Task::none()
+                                Vec::new()
                             };
-                        return Task::batch([repositories, context, pull_requests]);
+                        return effect::batch([repositories, context, pull_requests]);
                     }
                     Err(error) => {
                         self.github_auth = github::AuthStatus::NeedsAuthentication;
@@ -2815,7 +2828,7 @@ impl Muxtrix {
                         self.status = error;
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::CloseGitHubPanel => {
                 self.github_context_cancellation.cancel();
@@ -2829,7 +2842,7 @@ impl Muxtrix {
                 if self.active_view == ActiveView::GitHubDiff {
                     self.active_view = ActiveView::Workspace;
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::RefreshGitHubPanel => return self.refresh_github_panel(),
             Message::RefreshGitHubPullRequestsAfterAgentTurn => {
@@ -2841,17 +2854,17 @@ impl Muxtrix {
                     });
                 let pull_requests = self.refresh_github_pull_requests();
                 return if selected_pull_request_visible {
-                    Task::batch([pull_requests, self.refresh_selected_github_pull_request()])
+                    effect::batch([pull_requests, self.refresh_selected_github_pull_request()])
                 } else {
                     pull_requests
                 };
             }
             Message::GitHubFocusedPaneLoaded(pane_id, generation, purpose, result) => {
                 if generation != self.github_context_generation {
-                    return Task::none();
+                    return Vec::new();
                 }
                 if purpose == GitHubContextLoad::Open && self.github_panel.is_none() {
-                    return Task::none();
+                    return Vec::new();
                 }
                 if self.control_pane_id(None).ok() != Some(pane_id) {
                     if purpose == GitHubContextLoad::Open {
@@ -2859,10 +2872,10 @@ impl Muxtrix {
                         return self.open_github_panel();
                     }
                     self.queue_github_pane_refresh();
-                    return Task::none();
+                    return Vec::new();
                 }
                 if self.github_panel.is_none() {
-                    return Task::none();
+                    return Vec::new();
                 }
                 let (repository, data) = match *result {
                     Ok(loaded) => loaded,
@@ -2876,7 +2889,7 @@ impl Muxtrix {
                         self.active_view = ActiveView::Workspace;
                         self.status = error.clone();
                         self.show_toast(&error);
-                        return Task::none();
+                        return Vec::new();
                     }
                 };
                 let same_repository = self
@@ -2929,10 +2942,10 @@ impl Muxtrix {
                     panel.loading = false;
                     panel.error = None;
                     let diff_task =
-                        reload_diff.map_or_else(Task::none, |path| self.open_github_diff(path));
-                    return Task::batch([
+                        reload_diff.map_or_else(Vec::new, |path| self.open_github_diff(path));
+                    return effect::batch([
                         diff_task,
-                        github_scroll_to(GITHUB_FILE_SCROLL_ID, clamped),
+                        github_scroll_to(ScrollTarget::GitHubFiles, clamped),
                     ]);
                 }
                 if let Some(panel) = self.github_panel.take() {
@@ -2950,19 +2963,19 @@ impl Muxtrix {
                 return if active_tab == GitHubPanelTab::PullRequests {
                     self.refresh_github_pull_requests()
                 } else {
-                    Task::none()
+                    Vec::new()
                 };
             }
             Message::SelectGitHubPanelTab(tab) => {
                 let Some(panel) = self.github_panel.as_mut() else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 if panel.active_loading() {
-                    return Task::none();
+                    return Vec::new();
                 }
                 panel.keyboard_focus = Some(GitHubPanelKeyboardFocus::Tabs);
                 if panel.active_tab == tab {
-                    return Task::none();
+                    return Vec::new();
                 }
                 panel.active_tab = tab;
                 panel.merge_confirmation = false;
@@ -2980,14 +2993,14 @@ impl Muxtrix {
                     GitHubPanelTab::PullRequests if panel.pull_requests.is_none() => {
                         self.refresh_github_pull_requests()
                     }
-                    _ => Task::none(),
+                    _ => Vec::new(),
                 };
             }
             Message::GitHubPullRequestsLoaded(root, generation, result) => {
                 let Some(panel) = self.github_panel.as_mut().filter(|panel| {
                     panel.repository.root == root && panel.pull_request_generation == generation
                 }) else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 panel.pull_requests_loading = false;
                 let mut scroll_offset = None;
@@ -3019,8 +3032,8 @@ impl Muxtrix {
                     }
                     Err(error) => panel.pull_requests_error = Some(error),
                 }
-                return scroll_offset.map_or_else(Task::none, |offset| {
-                    github_scroll_to(GITHUB_PULL_REQUEST_SCROLL_ID, offset)
+                return scroll_offset.map_or_else(Vec::new, |offset| {
+                    github_scroll_to(ScrollTarget::GitHubPullRequests, offset)
                 });
             }
             Message::GitHubPullRequestQueryChanged(query) => {
@@ -3030,13 +3043,13 @@ impl Muxtrix {
                     panel.pull_request_keyboard_cursor = None;
                     panel.keyboard_focus = Some(GitHubPanelKeyboardFocus::Search);
                 }
-                return github_scroll_to(GITHUB_PULL_REQUEST_SCROLL_ID, 0.0);
+                return github_scroll_to(ScrollTarget::GitHubPullRequests, 0.0);
             }
             Message::GitHubPullRequestScrolled(offset) => {
                 if let Some(panel) = self.github_panel.as_mut() {
                     panel.pull_request_scroll_offset = offset.max(0.0);
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::SelectGitHubPullRequest(number) => {
                 return self.select_github_pull_request(number);
@@ -3055,7 +3068,7 @@ impl Muxtrix {
                     }
                     self.active_view = ActiveView::Workspace;
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::GitHubPullRequestLoaded(root, number, generation, result) => {
                 let Some(panel) = self.github_panel.as_mut().filter(|panel| {
@@ -3063,7 +3076,7 @@ impl Muxtrix {
                         && panel.selected_pull_request_number == Some(number)
                         && panel.pull_request_detail_generation == generation
                 }) else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 panel.selected_pull_request_loading = false;
                 let mut reload_diff = None;
@@ -3108,11 +3121,11 @@ impl Muxtrix {
                     Err(error) => panel.selected_pull_request_error = Some(error),
                 }
                 let diff_task =
-                    reload_diff.map_or_else(Task::none, |path| self.open_github_diff(path));
-                let scroll_task = scroll_offset.map_or_else(Task::none, |offset| {
-                    github_scroll_to(GITHUB_FILE_SCROLL_ID, offset)
+                    reload_diff.map_or_else(Vec::new, |path| self.open_github_diff(path));
+                let scroll_task = scroll_offset.map_or_else(Vec::new, |offset| {
+                    github_scroll_to(ScrollTarget::GitHubFiles, offset)
                 });
-                return Task::batch([diff_task, scroll_task]);
+                return effect::batch([diff_task, scroll_task]);
             }
             Message::GitHubFileScrolled(offset) => {
                 if let Some(panel) = self.github_panel.as_mut() {
@@ -3124,7 +3137,7 @@ impl Muxtrix {
                         panel.file_scroll_offset = offset.max(0.0);
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::OpenGitHubDiff(path) => {
                 if let Some(panel) = self.github_panel.as_mut() {
@@ -3134,7 +3147,7 @@ impl Muxtrix {
             }
             Message::RetryGitHubDiff => {
                 let Some(path) = self.github_diff.as_ref().map(|diff| diff.path.clone()) else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 return self.open_github_diff(path);
             }
@@ -3143,7 +3156,7 @@ impl Muxtrix {
                     diff.cancellation.cancel();
                 }
                 self.active_view = ActiveView::Workspace;
-                return Task::none();
+                return Vec::new();
             }
             Message::GitHubDiffLoaded(root, path, generation, result) => {
                 let wrap_columns = github_diff_wrap_columns(
@@ -3155,14 +3168,14 @@ impl Muxtrix {
                     .as_mut()
                     .filter(|diff| diff.path == path && diff.generation == generation)
                 else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 if self
                     .github_panel
                     .as_ref()
                     .is_none_or(|panel| panel.repository.root != root)
                 {
-                    return Task::none();
+                    return Vec::new();
                 }
                 diff.loading = false;
                 match *result {
@@ -3174,20 +3187,20 @@ impl Muxtrix {
                     }
                     Err(error) => diff.error = Some(error),
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::GitHubDiffScrolled(offset) => {
                 if let Some(diff) = self.github_diff.as_mut() {
                     diff.scroll_offset = offset.max(0.0);
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::OpenGitHubPullRequest(url) => {
                 let target = url.clone();
-                return Task::perform(
-                    async move { open_web_url(&target).map_err(|error| error.to_string()) },
-                    move |result| Message::TerminalLinkOpened(url.clone(), result),
-                );
+                return vec![Effect::Perform(Box::new(move || {
+                    let result = open_web_url(&target).map_err(|error| error.to_string());
+                    Message::TerminalLinkOpened(url, result)
+                }))];
             }
             Message::ToggleGitHubPullRequestDraft => {
                 return self.toggle_github_pull_request_draft();
@@ -3196,7 +3209,7 @@ impl Muxtrix {
                 let Some(panel) = self.github_panel.as_mut().filter(|panel| {
                     panel.repository.root == root && panel.action_generation == generation
                 }) else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 panel.draft_state_updating = false;
                 match result {
@@ -3218,7 +3231,7 @@ impl Muxtrix {
                         self.status = error;
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::RequestGitHubMerge => {
                 if let Some(panel) = self.github_panel.as_mut()
@@ -3231,20 +3244,20 @@ impl Muxtrix {
                     panel.merge_confirmation = true;
                     panel.pull_request_action_error = None;
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::CancelGitHubMerge => {
                 if let Some(panel) = self.github_panel.as_mut() {
                     panel.merge_confirmation = false;
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::ConfirmGitHubMerge => return self.confirm_github_merge(),
             Message::GitHubMergeFinished(root, number, generation, result) => {
                 let Some(panel) = self.github_panel.as_mut().filter(|panel| {
                     panel.repository.root == root && panel.action_generation == generation
                 }) else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 panel.merging = false;
                 panel.merge_confirmation = false;
@@ -3275,11 +3288,11 @@ impl Muxtrix {
                         self.status = error;
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::OpenSettingsPage(SettingsPage::Preferences) => {
                 self.settings_page = SettingsPage::Preferences;
-                return Task::none();
+                return Vec::new();
             }
             Message::OpenSettingsPage(SettingsPage::Worktrees) => {
                 self.settings_page = SettingsPage::Worktrees;
@@ -3289,13 +3302,13 @@ impl Muxtrix {
                     .and_then(Workspace::active_tab)
                     .map(|tab| tab.focused_pane_id)
                 else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 return self.open_worktree_list(WorktreeManagerMode::Manage, pane_id);
             }
             Message::ToggleSidebar => {
                 self.sidebar_collapsed = !self.sidebar_collapsed;
-                return Task::none();
+                return Vec::new();
             }
             Message::ToggleMaximize(pane_id) => {
                 self.maximized_pane = if self.maximized_pane == Some(pane_id) {
@@ -3304,7 +3317,7 @@ impl Muxtrix {
                     Some(pane_id)
                 };
                 let _ = self.focus_pane(pane_id);
-                return Task::none();
+                return Vec::new();
             }
             Message::ToggleMaximizeFromPaneMenu(pane_id) => {
                 self.pane_menu = None;
@@ -3319,17 +3332,17 @@ impl Muxtrix {
                     let _ = self.focus_pane(pane_id);
                     self.pane_menu = Some(pane_id);
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::DismissPaneMenu => {
                 self.pane_menu = None;
-                return Task::none();
+                return Vec::new();
             }
             Message::DismissGlobalAlert(index) => {
                 if index < self.global_alerts.len() {
                     self.global_alerts.remove(index);
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::ManageHooks(agent, action) => {
                 return self.manage_hooks(agent, action);
@@ -3339,7 +3352,7 @@ impl Muxtrix {
             }
             Message::IntegrationDiscoveryFinished(generation, result) => {
                 if generation != self.integration_generation {
-                    return Task::none();
+                    return Vec::new();
                 }
                 self.integration_refreshing = false;
                 match result {
@@ -3361,11 +3374,11 @@ impl Muxtrix {
                         self.status = format!("Could not inspect agent integrations: {error}");
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::HookOperationFinished(generation, result) => {
                 if generation != self.integration_generation {
-                    return Task::none();
+                    return Vec::new();
                 }
                 self.integration_refreshing = false;
                 match result {
@@ -3376,7 +3389,7 @@ impl Muxtrix {
                     }
                     Err(error) => self.status = format!("Could not update agent hooks: {error}"),
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsTerminalFont(font) => {
                 self.settings_draft.terminal_font = font;
@@ -3394,23 +3407,23 @@ impl Muxtrix {
                     self.settings_draft.terminal_font_weight =
                         self.available_terminal_font_weights[0];
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsTerminalFontWeight(weight) => {
                 self.settings_draft.terminal_font_weight = weight;
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsTerminalTheme(theme) => {
                 self.settings_draft.terminal_theme = theme;
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsAppearance(appearance) => {
                 self.settings_draft.appearance = appearance;
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsShowStatusBar(show) => {
                 self.settings_draft.show_status_bar = show;
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsUiFont(font) => {
                 self.settings_draft.ui_font = font;
@@ -3426,19 +3439,19 @@ impl Muxtrix {
                 {
                     self.settings_draft.ui_font_weight = self.available_ui_font_weights[0];
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsUiFontWeight(weight) => {
                 self.settings_draft.ui_font_weight = weight;
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsTerminalFontSize(size) => {
                 self.settings_draft.terminal_font_size = size;
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsLineHeight(height) => {
                 self.settings_draft.terminal_line_height = height;
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsScrollbackLimit(limit) => {
                 if limit
@@ -3452,11 +3465,11 @@ impl Muxtrix {
                         self.settings_draft.terminal_scrollback_lines = lines;
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsUiFontSize(size) => {
                 self.settings_draft.ui_font_size = size;
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsShowAllWorkspaces(show_all) => {
                 self.settings_draft.fleet_scope = if show_all {
@@ -3464,14 +3477,14 @@ impl Muxtrix {
                 } else {
                     FleetScope::CurrentWorkspace
                 };
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsDefaultAgent(choice) => {
                 self.settings_draft.default_agent = match choice {
                     DefaultAgentChoice::None => None,
                     DefaultAgentChoice::Agent(agent) => Some(agent),
                 };
-                return Task::none();
+                return Vec::new();
             }
             Message::SetFleetView(view) => {
                 self.set_fleet_view(view);
@@ -3479,19 +3492,19 @@ impl Muxtrix {
             }
             Message::SettingsGitHubHost(host) => {
                 self.settings_draft.github_host = host;
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsCodexCommand(command) => {
                 self.settings_draft.codex_command = command;
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsClaudeCommand(command) => {
                 self.settings_draft.claude_command = command;
-                return Task::none();
+                return Vec::new();
             }
             Message::SettingsPiCommand(command) => {
                 self.settings_draft.pi_command = command;
-                return Task::none();
+                return Vec::new();
             }
             #[cfg(target_os = "windows")]
             Message::SettingsWindowsShellBackend(backend) => {
@@ -3512,11 +3525,11 @@ impl Muxtrix {
             }
             Message::OpenThemeGallery => {
                 self.active_view = ActiveView::ThemeGallery;
-                return Task::none();
+                return Vec::new();
             }
             Message::CloseThemeGallery => {
                 self.active_view = ActiveView::Settings;
-                return Task::none();
+                return Vec::new();
             }
             Message::GalleryThemeChosen(theme) => {
                 // The gallery's accent ring reads as a commitment, so the
@@ -3530,28 +3543,25 @@ impl Muxtrix {
                         let _ = session.apply_theme(terminal_theme);
                     }
                 }
-                return Task::none();
+                return Vec::new();
             }
             Message::CancelSettings => {
                 self.reset_settings_draft();
                 self.pending_default_agent_command = None;
                 self.active_view = ActiveView::Workspace;
                 self.status = "Settings changes discarded".into();
-                return Task::none();
+                return Vec::new();
             }
             Message::CloseDefaultAgentPrompt => {
                 self.default_agent_prompt = false;
                 self.pending_default_agent_command = None;
-                return Task::none();
+                return Vec::new();
             }
             Message::OpenDefaultAgentSettings => {
                 self.default_agent_prompt = false;
                 let version_task = self.open_settings();
-                let scroll_task = iced::widget::operation::snap_to(
-                    iced::widget::Id::new(SETTINGS_SCROLL_ID),
-                    iced::widget::operation::RelativeOffset { x: 0.0, y: 1.0 },
-                );
-                return Task::batch([version_task, scroll_task]);
+                let scroll_task = vec![Effect::ScrollToRatio(ScrollTarget::Settings, 1.0)];
+                return effect::batch([version_task, scroll_task]);
             }
             #[cfg(feature = "e2e")]
             Message::E2eTick => return self.drive_e2e(),
@@ -3565,13 +3575,15 @@ impl Muxtrix {
             Ok(()) => "Workspace updated".into(),
             Err(error) => error,
         };
-        Task::none()
+        Vec::new()
     }
 
-    fn window_resize_increment_task(&self) -> Task<Message> {
-        let Some(window_id) = self.window_id else {
-            return Task::none();
-        };
+    fn window_resize_increment_task(&self) -> Vec<Effect> {
+        // Before the window exists there is nothing to constrain; the effect
+        // is re-issued once it opens.
+        if self.window_id.is_none() {
+            return Vec::new();
+        }
         let Some(increments) = wsl_wayland_resize_increments(
             muxtrix::gpu::is_wsl(),
             std::env::var_os("WAYLAND_DISPLAY").is_some(),
@@ -3579,9 +3591,9 @@ impl Muxtrix {
                 .is_some_and(|backend| backend.to_string_lossy().eq_ignore_ascii_case("x11")),
             &self.settings,
         ) else {
-            return Task::none();
+            return Vec::new();
         };
-        iced::window::set_resize_increments(window_id, Some(increments.into()))
+        vec![Effect::SetResizeIncrements(increments)]
     }
 
     fn default_terminal_profile(&self) -> Result<LaunchProfile, String> {
@@ -3800,12 +3812,12 @@ impl Muxtrix {
         }
     }
 
-    fn open_workspace_create(&mut self) -> Task<Message> {
+    fn open_workspace_create(&mut self) -> Vec<Effect> {
         self.workspace_name_draft = format!("Workspace {}", self.session.workspaces.len() + 1);
         self.workspace_create_visible = true;
         self.rename_prompt = None;
         self.close_command_palette();
-        iced::widget::operation::focus(iced::widget::Id::new(WORKSPACE_CREATE_INPUT_ID))
+        vec![Effect::Focus(FocusTarget::WorkspaceCreate)]
     }
 
     fn create_workspace(&mut self) -> Result<(), String> {
@@ -3893,11 +3905,11 @@ impl Muxtrix {
         Ok(())
     }
 
-    fn open_rename_prompt(&mut self, target: RenameTarget, current_name: String) -> Task<Message> {
+    fn open_rename_prompt(&mut self, target: RenameTarget, current_name: String) -> Vec<Effect> {
         self.rename_prompt = Some(target);
         self.rename_draft = current_name;
         self.active_view = ActiveView::Workspace;
-        iced::widget::operation::focus(iced::widget::Id::new(RENAME_INPUT_ID))
+        vec![Effect::Focus(FocusTarget::Rename)]
     }
 
     /// The directory the focused pane is working in, best effort: agent
@@ -3977,15 +3989,15 @@ impl Muxtrix {
         self.focused_pane_directory()
     }
 
-    fn confirm_worktree(&mut self) -> Task<Message> {
+    fn confirm_worktree(&mut self) -> Vec<Effect> {
         let Some(prompt) = self.worktree_prompt.clone() else {
-            return Task::none();
+            return Vec::new();
         };
         if prompt.busy {
-            return Task::none();
+            return Vec::new();
         }
         let Some(repo_root) = prompt.repo_root else {
-            return Task::none();
+            return Vec::new();
         };
         let set_error = |this: &mut Self, message: String| {
             if let Some(prompt) = this.worktree_prompt.as_mut() {
@@ -3995,15 +4007,15 @@ impl Muxtrix {
         let name = worktree_name(&self.worktree_name_draft);
         if name.is_empty() {
             set_error(self, "Worktree names cannot be empty".into());
-            return Task::none();
+            return Vec::new();
         }
         let Some(base) = prompt.base_directory.clone() else {
             set_error(self, "The home directory could not be discovered".into());
-            return Task::none();
+            return Vec::new();
         };
         if prompt.taken_names.contains(&name) {
             set_error(self, format!("{name} already exists for this repository"));
-            return Task::none();
+            return Vec::new();
         }
         let destination = worktree_destination(&base, &name);
         if let Some(prompt) = self.worktree_prompt.as_mut() {
@@ -4019,7 +4031,7 @@ impl Muxtrix {
         )
     }
 
-    fn open_worktree_prompt(&mut self, target: WorktreePromptTarget) -> Task<Message> {
+    fn open_worktree_prompt(&mut self, target: WorktreePromptTarget) -> Vec<Effect> {
         self.active_view = ActiveView::Workspace;
         let pane_id = match target {
             WorktreePromptTarget::Open(_) | WorktreePromptTarget::OpenWithAgent(_, _) => self
@@ -4069,37 +4081,37 @@ impl Muxtrix {
             error: None,
             busy: false,
         });
-        iced::widget::operation::focus(iced::widget::Id::new(WORKTREE_INPUT_ID))
+        vec![Effect::Focus(FocusTarget::Worktree)]
     }
 
     /// Opens the worktree manager for the focused pane's repository,
     /// listing every linked worktree with who is using it.
-    fn open_worktree_manager(&mut self) -> Task<Message> {
+    fn open_worktree_manager(&mut self) -> Vec<Effect> {
         let Some(pane_id) = self
             .active_workspace()
             .ok()
             .and_then(Workspace::active_tab)
             .map(|tab| tab.focused_pane_id)
         else {
-            return Task::none();
+            return Vec::new();
         };
         let version_task = self.open_settings();
         self.settings_page = SettingsPage::Worktrees;
-        Task::batch([
+        effect::batch([
             version_task,
             self.open_worktree_list(WorktreeManagerMode::Manage, pane_id),
         ])
     }
 
-    fn open_worktree_switcher(&mut self, pane_id: PaneId) -> Task<Message> {
+    fn open_worktree_switcher(&mut self, pane_id: PaneId) -> Vec<Effect> {
         if let Err(error) = self.focus_pane(pane_id) {
             self.status = error;
-            return Task::none();
+            return Vec::new();
         }
         self.open_worktree_list(WorktreeManagerMode::RestartPane(pane_id), pane_id)
     }
 
-    fn open_worktree_list(&mut self, mode: WorktreeManagerMode, pane_id: PaneId) -> Task<Message> {
+    fn open_worktree_list(&mut self, mode: WorktreeManagerMode, pane_id: PaneId) -> Vec<Effect> {
         if matches!(
             mode,
             WorktreeManagerMode::RestartPane(_) | WorktreeManagerMode::RestartPaneWithAgent(_, _)
@@ -4138,27 +4150,27 @@ impl Muxtrix {
         None
     }
 
-    fn delete_worktree_entry(&mut self, index: usize) -> Task<Message> {
+    fn delete_worktree_entry(&mut self, index: usize) -> Vec<Effect> {
         let Some(manager) = self.worktree_manager.as_mut() else {
-            return Task::none();
+            return Vec::new();
         };
         if manager.busy || !matches!(manager.mode, WorktreeManagerMode::Manage) {
-            return Task::none();
+            return Vec::new();
         }
         let Some(repo_root) = manager.repo_root.clone() else {
-            return Task::none();
+            return Vec::new();
         };
         let Some(entry) = manager.entries.get(index).cloned() else {
-            return Task::none();
+            return Vec::new();
         };
         let name = worktree_display_name(&entry.path);
         if let Some(blocker) = entry.deletion_blocker {
             manager.error = Some(format!("{name} is the {blocker} and cannot be deleted"));
-            return Task::none();
+            return Vec::new();
         }
         if entry.used_by.is_some() {
             manager.error = Some(format!("{name} is in use by a pane and cannot be deleted"));
-            return Task::none();
+            return Vec::new();
         }
         manager.busy = true;
         manager.error = None;
@@ -4167,19 +4179,19 @@ impl Muxtrix {
         self.remove_worktrees_task(repo_root, vec![entry.path])
     }
 
-    fn delete_unused_worktrees(&mut self) -> Task<Message> {
+    fn delete_unused_worktrees(&mut self) -> Vec<Effect> {
         let Some(manager) = self.worktree_manager.as_mut() else {
-            return Task::none();
+            return Vec::new();
         };
         if manager.busy || !matches!(manager.mode, WorktreeManagerMode::Manage) {
-            return Task::none();
+            return Vec::new();
         }
         let Some(repo_root) = manager.repo_root.clone() else {
-            return Task::none();
+            return Vec::new();
         };
         let paths = unused_worktree_paths(&manager.entries);
         if paths.is_empty() {
-            return Task::none();
+            return Vec::new();
         }
         manager.busy = true;
         manager.error = None;
@@ -4198,7 +4210,7 @@ impl Muxtrix {
         &self,
         repo_root: std::path::PathBuf,
         paths: Vec<std::path::PathBuf>,
-    ) -> Task<Message> {
+    ) -> Vec<Effect> {
         let wsl_distribution = self.settings.wsl_distribution.clone();
         perform_blocking(
             move || remove_git_worktrees(&repo_root, paths, &wsl_distribution),
@@ -4261,9 +4273,9 @@ impl Muxtrix {
         self.toast = Some((message.into(), std::time::Instant::now()));
     }
 
-    fn copy_terminal_selection(&mut self, text: String) -> Task<Message> {
+    fn copy_terminal_selection(&mut self, text: String) -> Vec<Effect> {
         self.show_toast("Copied to clipboard");
-        iced::clipboard::write(text)
+        vec![Effect::ClipboardWrite(text)]
     }
 
     /// `weight` snapped to a face the configured interface family installs.
@@ -5014,7 +5026,7 @@ impl Muxtrix {
         self.request_terminal_launch(profile, pane_id, fallback_title)
     }
 
-    fn handle_keyboard(&mut self, event: KeyEvent) -> Task<Message> {
+    fn handle_keyboard(&mut self, event: KeyEvent) -> Vec<Effect> {
         self.keyboard_modifiers = event.modifiers();
         let KeyEvent::Pressed(KeyInput {
             key,
@@ -5024,12 +5036,12 @@ impl Muxtrix {
             ..
         }) = event
         else {
-            return Task::none();
+            return Vec::new();
         };
 
         if self.pane_menu.is_some() && matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
             self.pane_menu = None;
-            return Task::none();
+            return Vec::new();
         }
 
         // Zellij-style prefix: Ctrl+G unlocks an action layer that persists
@@ -5044,7 +5056,7 @@ impl Muxtrix {
         {
             self.prefix_armed = true;
             self.rail_nav = None;
-            return Task::none();
+            return Vec::new();
         }
         if self.prefix_armed {
             if character_key_is(modified_key.as_ref(), "w") {
@@ -5066,7 +5078,7 @@ impl Muxtrix {
             }
             // Unrecognized keys leave the prefix armed and are consumed so
             // partial chords never leak into panes.
-            return Task::none();
+            return Vec::new();
         }
         if let Some(current) = self.rail_nav {
             match modified_key.as_ref() {
@@ -5132,7 +5144,7 @@ impl Muxtrix {
                 // cannot silently dismiss it or leak into the terminal.
                 _ => {}
             }
-            return Task::none();
+            return Vec::new();
         }
 
         if modifiers == Modifiers::COMMAND | Modifiers::SHIFT
@@ -5147,7 +5159,7 @@ impl Muxtrix {
             {
                 self.status = error;
             }
-            return Task::none();
+            return Vec::new();
         }
         if modifiers.command() && character_key_is(modified_key.as_ref(), "p") {
             return self.toggle_command_palette();
@@ -5163,7 +5175,7 @@ impl Muxtrix {
                 let _ = self.switch_workspace(workspace_id);
                 let _ = self.focus_pane(pane_id);
             }
-            return Task::none();
+            return Vec::new();
         }
         if let Some(action) = clipboard_shortcut(modified_key.as_ref(), modifiers)
             && self.active_view == ActiveView::Workspace
@@ -5183,9 +5195,10 @@ impl Muxtrix {
             return match action {
                 ClipboardAction::Copy => self
                     .selected_terminal_text(pane_id)
-                    .map_or_else(Task::none, |text| self.copy_terminal_selection(text)),
-                ClipboardAction::Paste => iced::clipboard::read()
-                    .map(move |contents| Message::ClipboardPasted(pane_id, contents)),
+                    .map_or_else(Vec::new, |text| self.copy_terminal_selection(text)),
+                ClipboardAction::Paste => vec![Effect::ClipboardRead(Arc::new(move |contents| {
+                    Message::ClipboardPasted(pane_id, contents)
+                }))],
             };
         }
         // Workspace chords advertised in the pane menu and tab bar. Consumed
@@ -5208,14 +5221,14 @@ impl Muxtrix {
                     Ok(()) => "Opened a new terminal pane".into(),
                     Err(error) => error,
                 };
-                return Task::none();
+                return Vec::new();
             }
             if character_key_is(modified_key.as_ref(), "o") {
                 self.status = match self.split_terminal(SplitAxis::Vertical) {
                     Ok(()) => "Opened a new terminal pane".into(),
                     Err(error) => error,
                 };
-                return Task::none();
+                return Vec::new();
             }
             if character_key_is(modified_key.as_ref(), "m")
                 && let Ok(workspace) = self.active_workspace()
@@ -5229,7 +5242,7 @@ impl Muxtrix {
                     Ok(()) => "Created a new tab".into(),
                     Err(error) => error,
                 };
-                return Task::none();
+                return Vec::new();
             }
         }
         if self.palette.visible {
@@ -5259,7 +5272,7 @@ impl Muxtrix {
                 }
                 _ => {}
             }
-            return Task::none();
+            return Vec::new();
         }
 
         if let Some(task) = self.handle_github_panel_keyboard(modified_key.as_ref(), modifiers) {
@@ -5273,7 +5286,7 @@ impl Muxtrix {
             if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
                 self.active_view = ActiveView::Settings;
             }
-            return Task::none();
+            return Vec::new();
         }
 
         if self.active_view == ActiveView::GitHubDiff {
@@ -5283,7 +5296,7 @@ impl Muxtrix {
                 }
                 self.active_view = ActiveView::Workspace;
             }
-            return Task::none();
+            return Vec::new();
         }
 
         // The Worktrees settings page is a keyboard-operable inventory, not a
@@ -5299,14 +5312,14 @@ impl Muxtrix {
                 self.reset_settings_draft();
                 self.active_view = ActiveView::Workspace;
             }
-            return Task::none();
+            return Vec::new();
         }
 
         if self.workspace_create_visible {
             if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
                 self.workspace_create_visible = false;
             }
-            return Task::none();
+            return Vec::new();
         }
 
         if let Some(workspace_id) = self.close_workspace_prompt {
@@ -5324,14 +5337,14 @@ impl Muxtrix {
                 }
                 _ => {}
             }
-            return Task::none();
+            return Vec::new();
         }
 
         if self.rename_prompt.is_some() {
             if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
                 self.rename_prompt = None;
             }
-            return Task::none();
+            return Vec::new();
         }
 
         if self.default_agent_prompt {
@@ -5339,7 +5352,7 @@ impl Muxtrix {
                 self.default_agent_prompt = false;
                 self.pending_default_agent_command = None;
             }
-            return Task::none();
+            return Vec::new();
         }
 
         if let Some(picker) = &mut self.session_picker {
@@ -5373,7 +5386,7 @@ impl Muxtrix {
                 }
                 _ => {}
             }
-            return Task::none();
+            return Vec::new();
         }
 
         let worktree_manager_is_active = self.worktree_manager.as_ref().is_some_and(|manager| {
@@ -5392,7 +5405,7 @@ impl Muxtrix {
                     Key::Named(Named::Enter) => self.confirm_worktree_restart(),
                     _ => {}
                 }
-                return Task::none();
+                return Vec::new();
             }
             match modified_key.as_ref() {
                 Key::Named(Named::Escape) => {
@@ -5436,7 +5449,7 @@ impl Muxtrix {
                 }
                 _ => {}
             }
-            return Task::none();
+            return Vec::new();
         }
 
         if let Some(prompt) = &self.worktree_prompt {
@@ -5451,7 +5464,7 @@ impl Muxtrix {
                 Key::Named(Named::Enter) => self.worktree_prompt = None,
                 _ => {}
             }
-            return Task::none();
+            return Vec::new();
         }
 
         if modifiers.control() && !modifiers.alt() && !modifiers.logo() {
@@ -5469,7 +5482,7 @@ impl Muxtrix {
                     Ok(status) => status.into(),
                     Err(error) => error,
                 };
-                return Task::none();
+                return Vec::new();
             }
         }
 
@@ -5488,7 +5501,7 @@ impl Muxtrix {
                 };
                 let toast = self.status.clone();
                 self.show_toast(&toast);
-                return Task::none();
+                return Vec::new();
             }
         }
 
@@ -5504,20 +5517,20 @@ impl Muxtrix {
                 if let Err(error) = self.focus_neighbor_pane(direction) {
                     self.status = error;
                 }
-                return Task::none();
+                return Vec::new();
             }
         }
 
         let Some(bytes) = encode_terminal_key(modified_key.as_ref(), modifiers, text.as_deref())
         else {
-            return Task::none();
+            return Vec::new();
         };
 
         self.cursor_phase_visible = true;
         if let Err(error) = self.send_terminal_input(bytes) {
             self.status = format!("Terminal input failed: {error}");
         }
-        Task::none()
+        Vec::new()
     }
 
     /// Keyboard ownership for the GitHub ledger. The panel opts in through a
@@ -5527,7 +5540,7 @@ impl Muxtrix {
         &mut self,
         key: Key<&str>,
         modifiers: Modifiers,
-    ) -> Option<Task<Message>> {
+    ) -> Option<Vec<Effect>> {
         let panel = self.github_panel.as_ref()?;
         if self.active_view != ActiveView::Workspace
             || self.palette.visible
@@ -5550,17 +5563,10 @@ impl Muxtrix {
             let next = github_keyboard_focus_step(panel, focus, !modifiers.shift());
             let panel = self.github_panel.as_mut().expect("panel checked above");
             panel.keyboard_focus = Some(next);
-            return Some(match next {
-                GitHubPanelKeyboardFocus::Search => iced::widget::operation::focus(
-                    iced::widget::Id::new(GITHUB_PULL_REQUEST_QUERY_ID),
-                ),
-                // Focusing an ID that is not present intentionally unfocuses
-                // the text input so subsequent list keys return to the global
-                // panel handler instead of remaining captured by the editor.
-                _ => iced::widget::operation::focus(iced::widget::Id::new(
-                    "muxtrix-github-keyboard-sink",
-                )),
-            });
+            return Some(vec![Effect::Focus(match next {
+                GitHubPanelKeyboardFocus::Search => FocusTarget::GitHubPullRequestQuery,
+                _ => FocusTarget::GitHubKeyboardSink,
+            })]);
         }
         if !modifiers.is_empty() {
             return None;
@@ -5570,7 +5576,7 @@ impl Muxtrix {
                 return Some(self.update(Message::CancelGitHubMerge));
             }
             if panel.merging || panel.draft_state_updating {
-                return Some(Task::none());
+                return Some(Vec::new());
             }
             if panel.selected_pull_request_number.is_some() {
                 return Some(self.update(Message::CloseGitHubPullRequest));
@@ -5580,18 +5586,16 @@ impl Muxtrix {
                 panel.pull_request_keyboard_cursor = None;
                 panel.file_keyboard_cursor = None;
             }
-            return Some(Task::none());
+            return Some(Vec::new());
         }
         if panel.active_loading() {
-            return Some(Task::none());
+            return Some(Vec::new());
         }
         if panel.active_tab == GitHubPanelTab::PullRequests
             && panel.selected_pull_request_number.is_none()
             && character_key_is(key, "/")
         {
-            return Some(iced::widget::operation::focus(iced::widget::Id::new(
-                GITHUB_PULL_REQUEST_QUERY_ID,
-            )));
+            return Some(vec![Effect::Focus(FocusTarget::GitHubPullRequestQuery)]);
         }
 
         if focus == GitHubPanelKeyboardFocus::Tabs {
@@ -5643,7 +5647,7 @@ impl Muxtrix {
                 .collect::<Vec<_>>();
             if let Some(move_down) = direction {
                 if matching_numbers.is_empty() {
-                    return Some(Task::none());
+                    return Some(Vec::new());
                 }
                 let panel = self.github_panel.as_mut().expect("panel checked above");
                 let current = panel.pull_request_keyboard_cursor.unwrap_or(0);
@@ -5663,7 +5667,7 @@ impl Muxtrix {
                     GITHUB_PULL_REQUEST_ROW_HEIGHT,
                 );
                 panel.pull_request_scroll_offset = offset;
-                return Some(github_scroll_to(GITHUB_PULL_REQUEST_SCROLL_ID, offset));
+                return Some(github_scroll_to(ScrollTarget::GitHubPullRequests, offset));
             }
             if matches!(key, Key::Named(Named::Enter))
                 && let Some(number) = panel
@@ -5673,7 +5677,7 @@ impl Muxtrix {
             {
                 return Some(self.select_github_pull_request(number));
             }
-            return matches!(key, Key::Named(Named::Enter)).then_some(Task::none());
+            return matches!(key, Key::Named(Named::Enter)).then_some(Vec::new());
         }
 
         if focus != GitHubPanelKeyboardFocus::Files {
@@ -5694,7 +5698,7 @@ impl Muxtrix {
         };
         if let Some(move_down) = direction {
             if files.is_empty() {
-                return Some(Task::none());
+                return Some(Vec::new());
             }
             let count = files.len();
             let pull_request_detail = panel.selected_pull_request_number.is_some();
@@ -5724,7 +5728,7 @@ impl Muxtrix {
             } else {
                 panel.file_scroll_offset = offset;
             }
-            return Some(github_scroll_to(GITHUB_FILE_SCROLL_ID, offset));
+            return Some(github_scroll_to(ScrollTarget::GitHubFiles, offset));
         }
         if matches!(key, Key::Named(Named::Enter))
             && let Some(path) = panel
@@ -5734,10 +5738,10 @@ impl Muxtrix {
         {
             return Some(self.open_github_diff(path));
         }
-        matches!(key, Key::Named(Named::Enter)).then_some(Task::none())
+        matches!(key, Key::Named(Named::Enter)).then_some(Vec::new())
     }
 
-    fn move_palette_selection(&mut self, direction: PaletteMove) -> Task<Message> {
+    fn move_palette_selection(&mut self, direction: PaletteMove) -> Vec<Effect> {
         let commands = commands::filtered(&self.palette.query);
         let enabled: Vec<_> = commands
             .iter()
@@ -5751,19 +5755,16 @@ impl Muxtrix {
         } else {
             0.0
         };
-        Task::batch([
-            iced::widget::operation::focus(iced::widget::Id::new(PALETTE_INPUT_ID)),
-            iced::widget::operation::snap_to(
-                iced::widget::Id::new(PALETTE_SCROLL_ID),
-                iced::widget::operation::RelativeOffset { x: 0.0, y: offset },
-            ),
-        ])
+        vec![
+            Effect::Focus(FocusTarget::CommandPalette),
+            Effect::ScrollToRatio(ScrollTarget::CommandPalette, offset),
+        ]
     }
 
-    fn toggle_command_palette(&mut self) -> Task<Message> {
+    fn toggle_command_palette(&mut self) -> Vec<Effect> {
         if self.palette.visible {
             self.close_command_palette();
-            Task::none()
+            Vec::new()
         } else {
             self.palette.visible = true;
             self.palette.query.clear();
@@ -5773,7 +5774,7 @@ impl Muxtrix {
                 .map(|command| self.command_enabled(command.action))
                 .collect();
             self.palette.selected = first_enabled_palette_command(&enabled);
-            iced::widget::operation::focus(iced::widget::Id::new(PALETTE_INPUT_ID))
+            vec![Effect::Focus(FocusTarget::CommandPalette)]
         }
     }
 
@@ -5821,20 +5822,20 @@ impl Muxtrix {
         self.github_request_generation
     }
 
-    fn open_github_panel(&mut self) -> Task<Message> {
+    fn open_github_panel(&mut self) -> Vec<Effect> {
         self.close_command_palette();
         let Ok(pane_id) = self.control_pane_id(None) else {
             self.status = "The focused pane is unavailable.".into();
-            return Task::none();
+            return Vec::new();
         };
         let Some(directory) = self.pane_working_directory(pane_id) else {
             self.status = "The focused pane has no working directory.".into();
             self.show_toast("The focused pane has no working directory");
-            return Task::none();
+            return Vec::new();
         };
         if let Some(panel) = self.github_panel.as_ref() {
             return if panel.active_loading() {
-                Task::none()
+                Vec::new()
             } else {
                 self.refresh_github_focused_pane()
             };
@@ -5853,9 +5854,9 @@ impl Muxtrix {
         self.load_github_focused_pane(GitHubContextLoad::Open)
     }
 
-    fn begin_github_auth(&mut self) -> Task<Message> {
+    fn begin_github_auth(&mut self) -> Vec<Effect> {
         if self.github_auth_busy {
-            return Task::none();
+            return Vec::new();
         }
         self.github_auth_busy = true;
         self.github_auth_generation = self.github_auth_generation.wrapping_add(1);
@@ -5926,9 +5927,9 @@ impl Muxtrix {
         }
     }
 
-    fn refresh_github_panel(&mut self) -> Task<Message> {
+    fn refresh_github_panel(&mut self) -> Vec<Effect> {
         let Some(panel) = self.github_panel.as_ref() else {
-            return Task::none();
+            return Vec::new();
         };
         match panel.active_tab {
             GitHubPanelTab::Local => self.refresh_github_focused_pane(),
@@ -5939,13 +5940,13 @@ impl Muxtrix {
         }
     }
 
-    fn refresh_github_pull_requests(&mut self) -> Task<Message> {
+    fn refresh_github_pull_requests(&mut self) -> Vec<Effect> {
         if !matches!(self.github_auth, github::AuthStatus::Authenticated { .. }) {
-            return Task::none();
+            return Vec::new();
         }
         let generation = self.next_github_request_generation();
         let Some(panel) = self.github_panel.as_mut() else {
-            return Task::none();
+            return Vec::new();
         };
         panel.pull_requests_loading = true;
         panel.pull_requests_error = None;
@@ -5968,9 +5969,9 @@ impl Muxtrix {
         )
     }
 
-    fn select_github_pull_request(&mut self, number: u64) -> Task<Message> {
+    fn select_github_pull_request(&mut self, number: u64) -> Vec<Effect> {
         let Some(panel) = self.github_panel.as_mut() else {
-            return Task::none();
+            return Vec::new();
         };
         panel.selected_pull_request_number = Some(number);
         panel.selected_pull_request = None;
@@ -5980,10 +5981,10 @@ impl Muxtrix {
         self.load_github_pull_request(number)
     }
 
-    fn load_github_pull_request(&mut self, number: u64) -> Task<Message> {
+    fn load_github_pull_request(&mut self, number: u64) -> Vec<Effect> {
         let generation = self.next_github_request_generation();
         let Some(panel) = self.github_panel.as_mut() else {
-            return Task::none();
+            return Vec::new();
         };
         panel.selected_pull_request_loading = true;
         panel.selected_pull_request_error = None;
@@ -6010,27 +6011,27 @@ impl Muxtrix {
         )
     }
 
-    fn refresh_selected_github_pull_request(&mut self) -> Task<Message> {
+    fn refresh_selected_github_pull_request(&mut self) -> Vec<Effect> {
         let Some(number) = self
             .github_panel
             .as_ref()
             .and_then(|panel| panel.selected_pull_request_number)
         else {
-            return Task::none();
+            return Vec::new();
         };
         self.load_github_pull_request(number)
     }
 
-    fn refresh_github_focused_pane(&mut self) -> Task<Message> {
+    fn refresh_github_focused_pane(&mut self) -> Vec<Effect> {
         self.load_github_focused_pane(GitHubContextLoad::Refresh)
     }
 
-    fn load_github_focused_pane(&mut self, purpose: GitHubContextLoad) -> Task<Message> {
+    fn load_github_focused_pane(&mut self, purpose: GitHubContextLoad) -> Vec<Effect> {
         let Ok(pane_id) = self.control_pane_id(None) else {
-            return Task::none();
+            return Vec::new();
         };
         let Some(directory) = self.pane_working_directory(pane_id) else {
-            return Task::none();
+            return Vec::new();
         };
         let load_current_pull_request =
             matches!(self.github_auth, github::AuthStatus::Authenticated { .. });
@@ -6077,7 +6078,7 @@ impl Muxtrix {
         )
     }
 
-    fn open_github_diff(&mut self, path: String) -> Task<Message> {
+    fn open_github_diff(&mut self, path: String) -> Vec<Effect> {
         let Some((file, source, pull_request, repository)) =
             self.github_panel.as_ref().and_then(|panel| {
                 let selection = match panel.active_tab {
@@ -6110,7 +6111,7 @@ impl Muxtrix {
             })
         else {
             self.status = "The selected file is no longer in the change set.".into();
-            return Task::none();
+            return Vec::new();
         };
         let generation = self.next_github_request_generation();
         if let Some(diff) = self.github_diff.take() {
@@ -6180,20 +6181,20 @@ impl Muxtrix {
         diff.wrap_columns = wrap_columns;
     }
 
-    fn toggle_github_pull_request_draft(&mut self) -> Task<Message> {
+    fn toggle_github_pull_request_draft(&mut self) -> Vec<Effect> {
         let generation = self.next_github_request_generation();
         let Some(panel) = self.github_panel.as_mut() else {
-            return Task::none();
+            return Vec::new();
         };
         if panel.draft_state_updating || panel.merging {
-            return Task::none();
+            return Vec::new();
         }
         let Some(pull_request) = panel
             .selected_pull_request
             .as_ref()
             .map(|details| &details.pull_request)
         else {
-            return Task::none();
+            return Vec::new();
         };
         let number = pull_request.number;
         let draft = !pull_request.draft;
@@ -6221,14 +6222,14 @@ impl Muxtrix {
         )
     }
 
-    fn confirm_github_merge(&mut self) -> Task<Message> {
+    fn confirm_github_merge(&mut self) -> Vec<Effect> {
         let generation = self.next_github_request_generation();
         let Some(panel) = self.github_panel.as_mut() else {
-            return Task::none();
+            return Vec::new();
         };
         if panel.merging {
             panel.merge_confirmation = false;
-            return Task::none();
+            return Vec::new();
         }
         let Some(pull_request) = panel
             .selected_pull_request
@@ -6236,13 +6237,13 @@ impl Muxtrix {
             .map(|details| &details.pull_request)
         else {
             panel.merge_confirmation = false;
-            return Task::none();
+            return Vec::new();
         };
         if pull_request.readiness() != github::MergeReadiness::Ready {
             panel.merge_confirmation = false;
             panel.selected_pull_request_error =
                 Some("This pull request is not ready to merge yet.".into());
-            return Task::none();
+            return Vec::new();
         }
         let number = pull_request.number;
         let head_oid = pull_request.head_oid.clone();
@@ -6270,10 +6271,10 @@ impl Muxtrix {
         )
     }
 
-    fn run_command(&mut self, action: CommandAction) -> Task<Message> {
+    fn run_command(&mut self, action: CommandAction) -> Vec<Effect> {
         if !self.command_enabled(action) {
             self.status = "Restore panes before changing their layout".into();
-            return Task::none();
+            return Vec::new();
         }
         self.close_command_palette();
         match action {
@@ -6368,8 +6369,9 @@ impl Muxtrix {
                     && let Some(tab) = workspace.active_tab()
                 {
                     let pane_id = tab.focused_pane_id;
-                    return iced::clipboard::read()
-                        .map(move |contents| Message::ClipboardPasted(pane_id, contents));
+                    return vec![Effect::ClipboardRead(Arc::new(move |contents| {
+                        Message::ClipboardPasted(pane_id, contents)
+                    }))];
                 }
             }
             CommandAction::RenameWorkspace => {
@@ -6406,7 +6408,7 @@ impl Muxtrix {
             CommandAction::NewWorktreeWithAgent(kind) => {
                 let action = CommandAction::NewWorktreeWithAgent(kind);
                 let Some(agent) = self.default_agent_for_worktree_command(action) else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 return self.open_worktree_prompt(WorktreePromptTarget::OpenWithAgent(kind, agent));
             }
@@ -6429,7 +6431,7 @@ impl Muxtrix {
             CommandAction::RestartPaneInWorktreeWithAgent => {
                 let action = CommandAction::RestartPaneInWorktreeWithAgent;
                 let Some(agent) = self.default_agent_for_worktree_command(action) else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 if let Ok(workspace) = self.active_workspace()
                     && let Some(tab) = workspace.active_tab()
@@ -6443,7 +6445,7 @@ impl Muxtrix {
             CommandAction::RestartPaneInExistingWorktreeWithAgent => {
                 let action = CommandAction::RestartPaneInExistingWorktreeWithAgent;
                 let Some(agent) = self.default_agent_for_worktree_command(action) else {
-                    return Task::none();
+                    return Vec::new();
                 };
                 if let Ok(workspace) = self.active_workspace()
                     && let Some(tab) = workspace.active_tab()
@@ -6458,7 +6460,7 @@ impl Muxtrix {
             CommandAction::ManageWorktrees => return self.open_worktree_manager(),
             CommandAction::ManageSessions => {
                 self.open_session_picker(false);
-                return Task::none();
+                return Vec::new();
             }
             CommandAction::FleetToggleAllWorkspaces => {
                 let scope = if self.settings.fleet_scope == FleetScope::AllWorkspaces {
@@ -6498,7 +6500,7 @@ impl Muxtrix {
             }
             CommandAction::ReturnToWorkspace => self.active_view = ActiveView::Workspace,
         }
-        Task::none()
+        Vec::new()
     }
 
     fn launch_agent(&mut self, agent: Agent) -> Result<(), String> {
@@ -6585,7 +6587,7 @@ impl Muxtrix {
         self.settings_scrollback_lines_input = self.settings.terminal_scrollback_lines.to_string();
     }
 
-    fn open_settings(&mut self) -> Task<Message> {
+    fn open_settings(&mut self) -> Vec<Effect> {
         self.reset_settings_draft();
         self.workspace_name_draft = self
             .active_workspace()
@@ -6620,7 +6622,7 @@ impl Muxtrix {
         )
     }
 
-    fn refresh_integrations(&mut self) -> Task<Message> {
+    fn refresh_integrations(&mut self) -> Vec<Effect> {
         self.integration_generation = self.integration_generation.wrapping_add(1);
         let generation = self.integration_generation;
         self.integration_refreshing = true;
@@ -6645,7 +6647,7 @@ impl Muxtrix {
         )
     }
 
-    fn manage_hooks(&mut self, agent: Agent, action: HookAction) -> Task<Message> {
+    fn manage_hooks(&mut self, agent: Agent, action: HookAction) -> Vec<Effect> {
         self.integration_generation = self.integration_generation.wrapping_add(1);
         let generation = self.integration_generation;
         self.integration_refreshing = true;
@@ -6718,9 +6720,9 @@ impl Muxtrix {
         self.agent_is_configured(agent).then_some(agent)
     }
 
-    fn resume_pending_default_agent_command(&mut self) -> Task<Message> {
+    fn resume_pending_default_agent_command(&mut self) -> Vec<Effect> {
         let Some(action) = self.pending_default_agent_command.take() else {
-            return Task::none();
+            return Vec::new();
         };
         if self.configured_default_agent().is_some() {
             return self.run_command(action);
@@ -6728,17 +6730,17 @@ impl Muxtrix {
         self.pending_default_agent_command = Some(action);
         self.default_agent_prompt = true;
         self.status = "Choose a configured default agent to continue the worktree command".into();
-        Task::none()
+        Vec::new()
     }
 
-    fn save_settings(&mut self) -> Task<Message> {
+    fn save_settings(&mut self) -> Vec<Effect> {
         let scrollback_lines = match settings::parse_terminal_scrollback_lines(
             &self.settings_scrollback_lines_input,
         ) {
             Ok(lines) => lines,
             Err(error) => {
                 self.status = format!("Could not save settings: {error}");
-                return Task::none();
+                return Vec::new();
             }
         };
         self.settings_draft.terminal_scrollback_lines = scrollback_lines;
@@ -6747,7 +6749,7 @@ impl Muxtrix {
             Ok(host) => host,
             Err(error) => {
                 self.status = format!("Could not save settings: {error}");
-                return Task::none();
+                return Vec::new();
             }
         };
         self.settings_draft.github_host = github_host;
@@ -6776,7 +6778,7 @@ impl Muxtrix {
         for (pane_id, viewport) in viewports {
             if let Err(error) = self.resize_terminal(pane_id, viewport) {
                 self.status = format!("Font saved, but terminal resize failed: {error}");
-                return Task::none();
+                return Vec::new();
             }
         }
         let save_result = self.settings.save();
@@ -6828,7 +6830,7 @@ impl Muxtrix {
         if saved && self.pending_default_agent_command.is_some() {
             tasks.push(self.resume_pending_default_agent_command());
         }
-        Task::batch(tasks)
+        effect::batch(tasks)
     }
 
     fn send_terminal_input(&mut self, bytes: Vec<u8>) -> Result<(), String> {
@@ -7046,7 +7048,7 @@ impl Muxtrix {
         &mut self,
         pane_id: PaneId,
         button: TerminalMouseButton,
-    ) -> Task<Message> {
+    ) -> Vec<Effect> {
         let _ = self.focus_pane(pane_id);
         let position = self
             .terminal_pointer_positions
@@ -7084,7 +7086,7 @@ impl Muxtrix {
                 }
                 Err(error) => self.status = format!("Terminal mouse press failed: {error}"),
             }
-            return Task::none();
+            return Vec::new();
         }
 
         match button {
@@ -7094,10 +7096,10 @@ impl Muxtrix {
                 {
                     let uri = link.uri;
                     let target = uri.clone();
-                    return Task::perform(
-                        async move { open_web_url(&target).map_err(|error| error.to_string()) },
-                        move |result| Message::TerminalLinkOpened(uri.clone(), result),
-                    );
+                    return vec![Effect::Perform(Box::new(move || {
+                        let result = open_web_url(&target).map_err(|error| error.to_string());
+                        Message::TerminalLinkOpened(uri, result)
+                    }))];
                 }
                 let cell = self.terminal_grid_cell_at(pane_id, position);
                 if let Some(runtime) = self.terminals.get_mut(&pane_id)
@@ -7115,7 +7117,7 @@ impl Muxtrix {
             TerminalMouseButton::Right => self.pane_menu = Some(pane_id),
             TerminalMouseButton::Middle => {}
         }
-        Task::none()
+        Vec::new()
     }
 
     /// Commits a genuine text-selection drag and returns its pane exactly once.
@@ -7501,20 +7503,20 @@ impl Muxtrix {
     /// The read costs a short-lived subprocess, so it is paced rather than run
     /// per frame, and only one may be in flight. Entering the view clears the
     /// timestamp, making that first read immediate.
-    fn refresh_agents_roster(&mut self) -> Task<Message> {
+    fn refresh_agents_roster(&mut self) -> Vec<Effect> {
         if self.agents_view_panes.is_empty() {
             // Nothing projects it any more; drop it so a later view cannot
             // paint a stale count before its own read lands.
             self.agents_roster = None;
             self.agents_roster_error = None;
             self.agents_roster_checked = None;
-            return Task::none();
+            return Vec::new();
         }
         let due = self
             .agents_roster_checked
             .is_none_or(|read| read.elapsed() >= AGENTS_ROSTER_INTERVAL);
         if self.agents_roster_pending || !due {
-            return Task::none();
+            return Vec::new();
         }
         self.agents_roster_pending = true;
         self.agents_roster_checked = Some(std::time::Instant::now());
@@ -7525,16 +7527,16 @@ impl Muxtrix {
         )
     }
 
-    fn refresh_background_metadata(&mut self) -> Task<Message> {
+    fn refresh_background_metadata(&mut self) -> Vec<Effect> {
         let roster = self.refresh_agents_roster();
         let repositories = self.refresh_pane_repositories();
-        Task::batch([roster, repositories])
+        effect::batch([roster, repositories])
     }
 
     /// Resolves repository, branch, HEAD, and linked pull-request identity for
     /// each fleet pane. Every subprocess runs off the UI thread and each pane
     /// probes independently so one slow remote cannot hold the fleet hostage.
-    fn refresh_pane_repositories(&mut self) -> Task<Message> {
+    fn refresh_pane_repositories(&mut self) -> Vec<Effect> {
         let live_panes = self
             .session
             .workspaces
@@ -7612,7 +7614,7 @@ impl Muxtrix {
             }
         }
         if probes.is_empty() {
-            return Task::none();
+            return Vec::new();
         }
         for (pane_id, directory) in self.pending_repository_directories.clone() {
             if live_panes.contains(&pane_id)
@@ -7636,7 +7638,7 @@ impl Muxtrix {
         let authenticated = matches!(self.github_auth, github::AuthStatus::Authenticated { .. });
         let wsl_distribution = self.settings.wsl_distribution.clone();
         let github_host = self.settings.github_host.clone();
-        Task::batch(probes.into_iter().map(|(pane_id, directory)| {
+        effect::batch(probes.into_iter().map(|(pane_id, directory)| {
             // Recorded with the answer so the next pass can tell "the hook has
             // since reported a move" apart from "git and the hook disagree".
             let reported_branch = self
@@ -8874,11 +8876,8 @@ fn github_file_viewport_height(window_size: Size, pull_request_detail: bool) -> 
     (window_size.height - if pull_request_detail { 380.0 } else { 142.0 }).max(140.0)
 }
 
-fn github_scroll_to(id: &'static str, offset: f32) -> Task<Message> {
-    iced::widget::operation::scroll_to(
-        iced::widget::Id::new(id),
-        scrollable::AbsoluteOffset { x: 0.0, y: offset },
-    )
+fn github_scroll_to(target: ScrollTarget, offset: f32) -> Vec<Effect> {
+    vec![Effect::ScrollToOffset(target, offset)]
 }
 
 fn github_keyboard_focus_step(
@@ -12179,6 +12178,93 @@ fn pane_title_char_budget(available: f32, character_width: f32) -> usize {
     ((available.max(0.0) / character_width.max(1.0)).floor() as usize).max(1)
 }
 
+/// The iced half of the effect protocol.
+///
+/// `update` decides *what* should happen and says so as data; this is the only
+/// place that knows how to make it happen in iced's terms. Swapping the UI
+/// framework means rewriting this function, not the eight thousand lines of
+/// logic behind it.
+fn run_effects(effects: Vec<Effect>) -> Task<Message> {
+    Task::batch(effects.into_iter().map(run_effect))
+}
+
+fn focus_widget_id(target: FocusTarget) -> iced::widget::Id {
+    iced::widget::Id::new(match target {
+        FocusTarget::CommandPalette => PALETTE_INPUT_ID,
+        FocusTarget::WorkspaceCreate => WORKSPACE_CREATE_INPUT_ID,
+        FocusTarget::Rename => RENAME_INPUT_ID,
+        FocusTarget::Worktree => WORKTREE_INPUT_ID,
+        FocusTarget::GitHubPullRequestQuery => GITHUB_PULL_REQUEST_QUERY_ID,
+        FocusTarget::GitHubKeyboardSink => GITHUB_KEYBOARD_SINK_ID,
+    })
+}
+
+fn scroll_widget_id(target: ScrollTarget) -> iced::widget::Id {
+    iced::widget::Id::new(match target {
+        ScrollTarget::Settings => SETTINGS_SCROLL_ID,
+        ScrollTarget::CommandPalette => PALETTE_SCROLL_ID,
+        ScrollTarget::GitHubFiles => GITHUB_FILE_SCROLL_ID,
+        ScrollTarget::GitHubPullRequests => GITHUB_PULL_REQUEST_SCROLL_ID,
+    })
+}
+
+fn run_effect(effect: Effect) -> Task<Message> {
+    match effect {
+        Effect::Perform(work) => {
+            // Kept off the executor: this work shells out to git and gh, and
+            // blocking an async worker on a subprocess stalls every other
+            // pending task. The closure is handed back if the thread cannot
+            // start, so the caller still gets its answer rather than waiting
+            // on a message that will never arrive.
+            let (sender, receiver) = async_channel::bounded(1);
+            let work = Arc::new(Mutex::new(Some(work)));
+            let claimed = Arc::clone(&work);
+            let spawned = std::thread::Builder::new()
+                .name("muxtrix-effect".into())
+                .spawn(move || {
+                    let job = claimed.lock().ok().and_then(|mut slot| slot.take());
+                    if let Some(job) = job {
+                        let _ = sender.send_blocking(job());
+                    }
+                });
+            if spawned.is_err() {
+                let job = work.lock().ok().and_then(|mut slot| slot.take());
+                return job.map_or_else(Task::none, |job| Task::done(job()));
+            }
+            // The channel carries exactly one message and then closes, so
+            // running it as a stream also covers the thread dying early.
+            Task::run(receiver, |message| message)
+        }
+        Effect::Focus(target) => iced::widget::operation::focus(focus_widget_id(target)),
+        Effect::ScrollToRatio(target, ratio) => iced::widget::operation::snap_to(
+            scroll_widget_id(target),
+            iced::widget::operation::RelativeOffset { x: 0.0, y: ratio },
+        ),
+        Effect::ScrollToOffset(target, offset) => iced::widget::operation::scroll_to(
+            scroll_widget_id(target),
+            scrollable::AbsoluteOffset { x: 0.0, y: offset },
+        ),
+        #[cfg(feature = "e2e")]
+        Effect::ScrollToEnd(target) => {
+            iced::widget::operation::snap_to_end(scroll_widget_id(target))
+        }
+        Effect::ClipboardWrite(text) => iced::clipboard::write(text),
+        Effect::ClipboardRead(map) => iced::clipboard::read().map(move |contents| map(contents)),
+        Effect::SetResizeIncrements(increments) => iced::window::latest().then(move |window| {
+            window.map_or_else(Task::none, |window| {
+                iced::window::set_resize_increments(window, Some(increments.into()))
+            })
+        }),
+        #[cfg(feature = "e2e")]
+        Effect::Capture => iced::window::latest().then(|window| match window {
+            Some(window) => iced::window::screenshot(window).map(Message::E2eScreenshot),
+            None => Task::done(Message::E2eWindowMissing),
+        }),
+        #[cfg(feature = "e2e")]
+        Effect::Exit => iced::exit(),
+    }
+}
+
 fn event_subscription(
     subscription: &EventSubscription,
 ) -> impl iced::futures::Stream<Item = Message> + use<> {
@@ -12928,33 +13014,20 @@ fn parse_binary_version(output: &str, binary_name: &str) -> Result<String, Strin
     Ok(version.to_owned())
 }
 
+/// Run `work` off the UI thread and turn its result into a message.
+///
+/// The runtime owns the thread, so this is now just the shape of the request:
+/// the work runs to completion somewhere else, and `map` decides what the
+/// answer means. `Result` is kept in the signature because callers already
+/// phrase failure that way, even though the effect itself cannot fail.
 fn perform_blocking<T>(
     work: impl FnOnce() -> T + Send + 'static,
     map: impl FnOnce(Result<T, String>) -> Message + Send + 'static,
-) -> Task<Message>
+) -> Vec<Effect>
 where
     T: Send + 'static,
 {
-    let (sender, receiver) = async_channel::bounded(1);
-    let spawn = std::thread::Builder::new()
-        .name("muxtrix-integration-discovery".into())
-        .spawn(move || {
-            let _ = sender.send_blocking(work());
-        });
-    if let Err(error) = spawn {
-        return Task::done(map(Err(format!(
-            "could not start background discovery: {error}"
-        ))));
-    }
-    Task::perform(
-        async move {
-            receiver
-                .recv()
-                .await
-                .map_err(|_| "background discovery stopped before returning a result".into())
-        },
-        map,
-    )
+    vec![Effect::Perform(Box::new(move || map(Ok(work()))))]
 }
 
 fn hook_manager(settings: &AppSettings) -> Result<HookManager, String> {
