@@ -4,6 +4,7 @@
 //! The state they read is the same `Muxtrix` value; only the element tree
 //! differs. Phase 7 deletes the iced views and flattens these up a level.
 
+pub(crate) mod overlays;
 pub(crate) mod panes;
 pub(crate) mod sidebar;
 pub(crate) mod workspace;
