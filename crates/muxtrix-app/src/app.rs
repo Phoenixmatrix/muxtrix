@@ -344,6 +344,8 @@ pub(crate) struct Muxtrix {
     /// Whether a window exists yet. Some effects — constraining resizes to
     /// whole cells — are meaningless before one does.
     pub(crate) window_open: bool,
+    /// Set when the control socket asks the process to end.
+    pub(crate) quit_requested: bool,
     pub(crate) window_size: Size,
     pub(crate) window_focused: bool,
     pub(crate) cursor_position: Point,
@@ -1988,6 +1990,7 @@ impl Muxtrix {
             maximized_pane: None,
             pane_menu: None,
             window_open: false,
+            quit_requested: false,
             window_size: Size::new(1_280.0, 800.0),
             window_focused: true,
             cursor_position: Point::ORIGIN,
@@ -2195,6 +2198,9 @@ impl Muxtrix {
             Message::PollTerminal => {
                 self.poll_terminal();
                 self.poll_control();
+                if self.quit_requested {
+                    return vec![Effect::Exit];
+                }
                 let metadata = self.refresh_background_metadata();
                 let github = if self.github_pane_refresh_pending {
                     self.github_pane_refresh_pending = false;
@@ -7812,9 +7818,43 @@ impl Muxtrix {
         }
     }
 
+    /// Assert the scenario's state and write its half of the report.
+    #[cfg(feature = "e2e")]
+    pub(crate) fn report_e2e_capture(&self) -> Result<(), String> {
+        self.e2e
+            .as_ref()
+            .map_or(Ok(()), crate::e2e::Scenario::capture_state)
+    }
+
+    /// Whether an e2e scenario has reached the frame it wants captured.
+    ///
+    /// Always false without the harness, so a normal run answers the probe
+    /// truthfully rather than not at all.
+    pub(crate) fn capture_ready(&self) -> bool {
+        #[cfg(feature = "e2e")]
+        {
+            self.e2e
+                .as_ref()
+                .is_some_and(crate::e2e::Scenario::capture_ready)
+        }
+        #[cfg(not(feature = "e2e"))]
+        {
+            false
+        }
+    }
+
     pub(crate) fn handle_control_request(&mut self, request: ControlRequest) -> ControlResponse {
         match request {
             ControlRequest::Ping => ControlResponse::success("pong"),
+            // GPUI renders to an image only on its test platform, so a
+            // headless capture is taken from outside the process. The harness
+            // polls this to know the scenario has settled, grabs the frame
+            // itself, and then sends `Quit`.
+            ControlRequest::E2eStatus => ControlResponse::e2e_status(self.capture_ready()),
+            ControlRequest::Quit => {
+                self.quit_requested = true;
+                ControlResponse::success("quitting")
+            }
             ControlRequest::Notify {
                 title,
                 body,
@@ -8063,6 +8103,7 @@ impl Muxtrix {
                             message: None,
                             text: Some(snapshot.text()),
                             panes: Vec::new(),
+                            capture_ready: false,
                         },
                     ),
                 Err(error) => ControlResponse::error(error),
@@ -8094,6 +8135,7 @@ impl Muxtrix {
                     message: Some(format!("{} panes", panes.len())),
                     text: None,
                     panes,
+                    capture_ready: false,
                 }
             }
         }

@@ -271,7 +271,9 @@ fn request_pane_id(request: &ControlRequest) -> Option<&str> {
         ControlRequest::Ping
         | ControlRequest::LaunchAgent { .. }
         | ControlRequest::Split { .. }
-        | ControlRequest::ListPanes => None,
+        | ControlRequest::ListPanes
+        | ControlRequest::E2eStatus
+        | ControlRequest::Quit => None,
     }
 }
 

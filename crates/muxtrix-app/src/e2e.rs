@@ -182,6 +182,39 @@ enum TickAction {
 }
 
 impl Scenario {
+    /// Assert everything about state and write the state half of the report.
+    ///
+    /// The GPUI path: the frame itself is captured by the harness process, so
+    /// the pixel checks and their metrics are merged in there. Failing here
+    /// still fails the run, because a wrong state produces a wrong frame no
+    /// matter who photographs it.
+    pub(crate) fn capture_state(&self) -> Result<(), String> {
+        self.state_report()?;
+        self.write_report(json!({
+            "ok": true,
+            "capture": self.capture.clone(),
+            "checks": {
+                "palette_open_observed": self.palette_open_observed,
+                "palette_navigation_observed": self.palette_navigation_observed,
+                "settings_open_observed": self.settings_open_observed,
+                "fleet_collapse_observed": self.fleet_collapse_observed,
+                "pane_maximize_observed": self.pane_maximize_observed,
+                "pane_menu_observed": self.pane_menu_observed,
+                "terminal_mouse_reporting_observed": self.terminal_mouse_reporting_observed,
+                "tab_lifecycle_observed": self.tab_lifecycle_observed
+            },
+            "metrics": {
+                "initial_columns": self.initial_cols,
+                "initial_rows": self.initial_rows
+            }
+        }))
+    }
+
+    /// Whether this scenario has settled on the frame it wants captured.
+    pub(crate) fn capture_ready(&self) -> bool {
+        matches!(self.stage, Stage::Screenshot)
+    }
+
     pub(super) fn from_environment(initial_pane: PaneId) -> Option<Self> {
         let report_path = std::env::var_os(REPORT_ENV).map(PathBuf::from)?;
         Some(Self {
@@ -1891,7 +1924,13 @@ impl Scenario {
             .ok_or_else(|| "third pane was not recorded".into())
     }
 
-    fn success_report(&self, screenshot: &iced::window::Screenshot) -> Result<(), String> {
+    /// Everything the scenario asserts about application state.
+    ///
+    /// Separate from the pixel checks because the two now run in different
+    /// places: GPUI cannot render a window to an image outside its test
+    /// platform, so the frame is captured by the harness process while these
+    /// assertions stay with the state that produced them.
+    fn state_report(&self) -> Result<(), String> {
         if !self.palette_open_observed {
             return Err("Ctrl+P did not open the command palette".into());
         }
@@ -1929,6 +1968,11 @@ impl Scenario {
         if !self.tab_lifecycle_observed {
             return Err("workspace tab creation was not observed".into());
         }
+        Ok(())
+    }
+
+    fn success_report(&self, screenshot: &iced::window::Screenshot) -> Result<(), String> {
+        self.state_report()?;
         let expected_bytes = screenshot.size.width as usize * screenshot.size.height as usize * 4;
         if screenshot.rgba.len() != expected_bytes {
             return Err("GPU screenshot byte length did not match its dimensions".into());

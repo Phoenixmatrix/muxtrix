@@ -152,8 +152,16 @@ impl Root {
             #[cfg(feature = "e2e")]
             Effect::ScrollToEnd(_) => {}
             #[cfg(feature = "e2e")]
-            Effect::Capture => {}
-            #[cfg(feature = "e2e")]
+            Effect::Capture => {
+                // The frame is grabbed from outside this process; all that
+                // happens here is asserting state and saying so on the control
+                // socket, which `capture_ready` already reports. The window
+                // deliberately stays up until the harness sends `Quit`.
+                if let Err(error) = self.app.report_e2e_capture() {
+                    eprintln!("muxtrix: e2e capture failed: {error}");
+                    cx.quit();
+                }
+            }
             Effect::Exit => cx.quit(),
         }
     }

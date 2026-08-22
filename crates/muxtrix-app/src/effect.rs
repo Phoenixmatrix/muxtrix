@@ -35,9 +35,8 @@ pub(crate) enum Effect {
     /// Grab the window's pixels. Only the e2e harness asks for this.
     #[cfg(feature = "e2e")]
     Capture,
-    /// Quit the application. Only the e2e harness ends the process this way;
-    /// a user closing the window goes through the platform instead.
-    #[cfg(feature = "e2e")]
+    /// Quit the application. Reached when the control socket asks for it; a
+    /// user closing the window goes through the platform instead.
     Exit,
 }
 

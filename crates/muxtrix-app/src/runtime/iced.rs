@@ -149,7 +149,6 @@ fn run_effect(effect: Effect) -> Task<Message> {
             Some(window) => iced::window::screenshot(window).map(Message::E2eScreenshot),
             None => Task::done(Message::E2eWindowMissing),
         }),
-        #[cfg(feature = "e2e")]
         Effect::Exit => iced::exit(),
     }
 }
