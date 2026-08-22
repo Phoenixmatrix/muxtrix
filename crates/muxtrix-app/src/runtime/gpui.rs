@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, ParentElement, Render, Styled,
-    Window, WindowBounds, WindowOptions, div, px, size,
+    IntoElement, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    ParentElement, Point, Render, Styled, Window, WindowBounds, WindowOptions, div, point, px,
+    size,
 };
 
 use crate::app::{Message, Muxtrix};
@@ -278,6 +279,30 @@ impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = DesignTokens::for_appearance(self.app.settings.appearance);
         let workspace = self.view_workspace(window, cx);
+        // The menu floats above the shell and any press outside it dismisses
+        // and is consumed — the behaviour the iced `Popover` had, and what
+        // `pane_menu_click_away_observed` asserts.
+        let menu = self.pane_menu(cx).map(|menu| {
+            div()
+                .absolute()
+                .inset_0()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|root, _: &MouseDownEvent, window, cx| {
+                        root.dispatch(Message::DismissPaneMenu, window, cx);
+                    }),
+                )
+                .child(
+                    gpui::deferred(
+                        gpui::anchored()
+                            .position(root_menu_anchor(window))
+                            .anchor(gpui::Anchor::TopRight)
+                            .snap_to_window_with_margin(px(6.))
+                            .child(menu),
+                    )
+                    .with_priority(1),
+                )
+        });
         div()
             .track_focus(&self.focus)
             .key_context("Muxtrix")
@@ -290,6 +315,7 @@ impl Render for Root {
             .bg(color(tokens.app))
             .text_color(color(tokens.text))
             .child(workspace)
+            .children(menu)
     }
 }
 
@@ -310,4 +336,15 @@ pub(crate) fn color(value: iced::Color) -> gpui::Rgba {
         b: value.b,
         a: value.a,
     }
+}
+
+/// Where the pane menu hangs from.
+///
+/// The iced popover anchored to the overflow button, 6 px in and 38 px below
+/// its top. GPUI elements do not report their painted bounds back to the view
+/// that built them, so this places the menu against the window's top-right
+/// instead, which is where that button sits in every layout the header has.
+fn root_menu_anchor(window: &Window) -> Point<gpui::Pixels> {
+    let bounds = window.bounds();
+    point(bounds.size.width - px(6.), px(38.))
 }
