@@ -81,6 +81,16 @@ use crate::themes::{TerminalThemeId, TerminalThemePreset};
 
 pub(crate) static NO_TERMINAL_STARTUP: AtomicBool = AtomicBool::new(false);
 
+/// What draws the window, for the diagnostics that report it.
+///
+/// The compositor is a real thing users are told about when a GPU goes wrong,
+/// so it has to name the one actually in the binary rather than whichever was
+/// there when the string was written.
+#[cfg(feature = "gpui")]
+pub(crate) const COMPOSITOR_NAME: &str = "GPUI/wgpu";
+#[cfg(not(feature = "gpui"))]
+pub(crate) const COMPOSITOR_NAME: &str = "Iced/wgpu";
+
 pub(crate) const TERMINAL_PADDING: f32 = 16.0;
 
 /// Ignore the tiny pointer movement desktop toolkits can report during an
@@ -1758,7 +1768,7 @@ impl Muxtrix {
                         let _ = self.send_terminal_input_to(completion.pane_id, input);
                     }
                 }
-                self.status = "Live terminal — GPU compositor: Iced/wgpu".into();
+                self.status = format!("Live terminal — GPU compositor: {COMPOSITOR_NAME}");
                 // A pane measured while its launch was still in flight had no
                 // session to resize, and the launch just restored the size it
                 // was requested with. Replay the pane's own viewport so the
@@ -11673,7 +11683,7 @@ impl TerminalRuntime {
                     None,
                     TerminalLaunchState::Running,
                 ),
-                "Live terminal — GPU compositor: Iced/wgpu".into(),
+                format!("Live terminal — GPU compositor: {COMPOSITOR_NAME}"),
             ),
             Err(error) => {
                 let preview = ghostty_preview().unwrap_or_else(|preview_error| {
@@ -13261,7 +13271,10 @@ pub(crate) fn ghostty_preview() -> Result<String, String> {
     .map_err(|error| error.to_string())?;
     actor
         .feed(
-            b"\x1b[1;36mMuxtrix\x1b[0m terminal surface\r\n\r\nGhostty VT is parsing this grid.\r\nIced/wgpu will render terminal snapshots on the GPU.\r\n\r\n$ ".to_vec(),
+            format!(
+                "\x1b[1;36mMuxtrix\x1b[0m terminal surface\r\n\r\nGhostty VT is parsing this grid.\r\n{COMPOSITOR_NAME} will render terminal snapshots on the GPU.\r\n\r\n$ "
+            )
+            .into_bytes(),
         )
         .map_err(|error| error.to_string())?;
     let snapshot = actor.snapshot().map_err(|error| error.to_string())?;

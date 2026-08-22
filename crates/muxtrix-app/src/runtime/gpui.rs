@@ -308,6 +308,14 @@ impl Render for Root {
             }
         }
         let tokens = DesignTokens::for_appearance(self.app.settings.appearance);
+        // Settings and the theme gallery replace the whole shell, as they do
+        // under iced: they are screens, not panels.
+        let screen = match self.app.active_view {
+            crate::app::ActiveView::Settings | crate::app::ActiveView::ThemeGallery => {
+                Some(self.view_settings(cx))
+            }
+            _ => None,
+        };
         let sidebar = self.view_sidebar(cx);
         let palette = self.command_palette(cx);
         let dialog = self.dialog(cx);
@@ -349,15 +357,16 @@ impl Render for Root {
             .flex_col()
             .bg(color(tokens.app))
             .text_color(color(tokens.text))
-            .child(
-                div()
+            .child(match screen {
+                Some(screen) => div().flex_grow(1.0).overflow_hidden().child(screen),
+                None => div()
                     .flex()
                     .flex_row()
                     .flex_grow(1.0)
                     .overflow_hidden()
                     .child(sidebar)
                     .child(div().flex_grow(1.0).overflow_hidden().child(workspace)),
-            )
+            })
             .children(status_bar)
             .children(menu)
             .children(dialog)
