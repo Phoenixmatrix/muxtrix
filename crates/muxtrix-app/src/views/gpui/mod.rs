@@ -5,6 +5,7 @@
 //! differs. Phase 7 deletes the iced views and flattens these up a level.
 
 pub(crate) mod dialogs;
+pub(crate) mod inputs;
 pub(crate) mod overlays;
 pub(crate) mod panes;
 pub(crate) mod sidebar;

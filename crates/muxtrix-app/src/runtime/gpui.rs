@@ -60,7 +60,10 @@ pub(crate) fn run() -> iced::Result {
 /// Owns the single [`Muxtrix`] value and turns messages into state changes and
 /// effects — what `iced::application` does for the other runtime.
 pub(crate) struct Root {
-    app: Muxtrix,
+    pub(crate) app: Muxtrix,
+    pub(crate) inputs: crate::views::gpui::inputs::Inputs,
+    /// A focus request waiting for a frame to apply it against.
+    pending_focus: Option<crate::effect::FocusTarget>,
     /// The window's keyboard focus. Held by the root rather than by any
     /// surface: Muxtrix routes every key through one handler and decides there
     /// whether it belongs to a shortcut, a dialog or the terminal, and that
@@ -78,7 +81,13 @@ impl Root {
         let (app, effects) = Muxtrix::boot();
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        let mut root = Self { app, focus };
+        let inputs = crate::views::gpui::inputs::Inputs::new(window, cx);
+        let mut root = Self {
+            app,
+            inputs,
+            pending_focus: None,
+            focus,
+        };
         root.spawn_timers(cx);
         root.spawn_terminal_wakeups(cx);
         root.observe_window(window, cx);
@@ -101,6 +110,7 @@ impl Root {
     ) {
         let effects = self.app.update(message);
         self.run_effects(effects, window, cx);
+        self.sync_inputs(window, cx);
         window.set_window_title(&self.app.title());
         cx.notify();
     }
@@ -148,7 +158,11 @@ impl Root {
             // GPUI has no resize-increment API. Documented as an accepted loss
             // in docs/GPU.md; WSLg and Wayland lose whole-cell resizing.
             Effect::SetResizeIncrements(_) => {}
-            Effect::Focus(_) | Effect::ScrollToRatio(..) | Effect::ScrollToOffset(..) => {}
+            // Focusing needs a window, and effects run without one — a timer
+            // can produce them. Recorded here and applied on the next frame,
+            // which is soon enough for a caret to appear.
+            Effect::Focus(target) => self.pending_focus = Some(target),
+            Effect::ScrollToRatio(..) | Effect::ScrollToOffset(..) => {}
             #[cfg(feature = "e2e")]
             Effect::ScrollToEnd(_) => {}
             #[cfg(feature = "e2e")]
@@ -285,6 +299,14 @@ where
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(target) = self.pending_focus.take() {
+            match self.inputs.get(target).cloned() {
+                Some(field) => field.update(cx, |state, cx| state.focus(window, cx)),
+                // The GitHub keyboard sink: taking focus off the search field
+                // is done by giving it back to the root.
+                None => self.focus.focus(window, cx),
+            }
+        }
         let tokens = DesignTokens::for_appearance(self.app.settings.appearance);
         let sidebar = self.view_sidebar(cx);
         let palette = self.command_palette(cx);

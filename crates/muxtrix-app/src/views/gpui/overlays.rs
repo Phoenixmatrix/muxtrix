@@ -19,10 +19,6 @@ const TOAST_LIFETIME: std::time::Duration = std::time::Duration::from_secs(4);
 
 impl Root {
     /// The command palette, when it is open.
-    ///
-    /// The query is shown rather than edited in place: keys reach it through
-    /// the same global handler as everything else, which is what keeps a
-    /// palette keystroke from being swallowed by a focused text input.
     pub(crate) fn command_palette(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let app = self.app();
         if !app.palette.visible {
@@ -94,13 +90,6 @@ impl Root {
             list = list.child(row);
         }
 
-        let query = if app.palette.query.is_empty() {
-            "Type a command…".to_owned()
-        } else {
-            app.palette.query.clone()
-        };
-        let dimmed = app.palette.query.is_empty();
-
         Some(
             div()
                 .absolute()
@@ -131,14 +120,12 @@ impl Root {
                         .child(
                             div()
                                 .h(px(34.))
-                                .px(px(10.))
+                                .px(px(6.))
                                 .flex()
                                 .items_center()
                                 .rounded(px(6.))
                                 .bg(color(tokens.panel))
-                                .text_size(px(app.settings.ui_pixels(12.0)))
-                                .text_color(color(if dimmed { tokens.faint } else { tokens.text }))
-                                .child(query),
+                                .child(gpui_component::input::Input::new(&self.inputs.palette)),
                         )
                         .child(list),
                 )

@@ -28,8 +28,7 @@ impl Root {
                 self.text_prompt(
                     "New workspace",
                     "Name the workspace before its first tab and terminal are created.",
-                    &app.workspace_name_draft,
-                    "Workspace name",
+                    &self.inputs.workspace_create,
                     ("Cancel", Message::CancelWorkspaceCreate),
                     ("Create", Message::CreateWorkspace),
                     tokens,
@@ -47,8 +46,7 @@ impl Root {
                 self.text_prompt(
                     title,
                     "The new name applies immediately.",
-                    &app.rename_draft,
-                    "Name",
+                    &self.inputs.rename,
                     ("Cancel", Message::CancelRename),
                     ("Rename", Message::ConfirmRename),
                     tokens,
@@ -67,8 +65,7 @@ impl Root {
                 self.text_prompt(
                     "New worktree",
                     &body,
-                    &app.worktree_name_draft,
-                    "Worktree name",
+                    &self.inputs.worktree,
                     ("Cancel", Message::CancelWorktree),
                     ("Create", Message::ConfirmWorktree),
                     tokens,
@@ -117,44 +114,31 @@ impl Root {
     }
 
     /// A dialog with a single text field.
-    ///
-    /// The draft is shown rather than edited in place, for the same reason the
-    /// palette does: keys arrive through the one global handler, so a focused
-    /// widget cannot swallow a chord the application binds.
     #[allow(clippy::too_many_arguments, reason = "a dialog is its parts")]
     fn text_prompt(
         &self,
         title: &str,
         body: &str,
-        draft: &str,
-        placeholder: &str,
+        field: &gpui::Entity<gpui_component::input::InputState>,
         cancel: (&str, Message),
         confirm: (&str, Message),
         tokens: DesignTokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let app = self.app();
-        let empty = draft.is_empty();
         self.card(
             title,
             body,
             vec![
                 div()
                     .h(px(32.))
-                    .px(px(10.))
+                    .px(px(6.))
                     .flex()
                     .items_center()
                     .rounded(px(6.))
                     .bg(color(tokens.panel))
                     .border_1()
                     .border_color(color(tokens.line))
-                    .text_size(px(app.settings.ui_pixels(11.0)))
-                    .text_color(color(if empty { tokens.faint } else { tokens.text }))
-                    .child(if empty {
-                        placeholder.to_owned()
-                    } else {
-                        draft.to_owned()
-                    })
+                    .child(gpui_component::input::Input::new(field))
                     .into_any_element(),
             ],
             cancel,
