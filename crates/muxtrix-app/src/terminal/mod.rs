@@ -5,5 +5,7 @@
 //! parsed grid is drawn.
 
 #[cfg(feature = "gpui")]
+pub(crate) mod box_painter;
+#[cfg(feature = "gpui")]
 pub(crate) mod element;
 pub(crate) mod runs;

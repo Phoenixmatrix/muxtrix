@@ -10,7 +10,7 @@
 
 use iced::mouse;
 use iced::widget::canvas::{self, Geometry, Path, Stroke};
-use iced::{Color, Point, Rectangle, Renderer, Size, Theme, Vector};
+use iced::{Color, Point, Rectangle, Renderer, Size, Theme};
 
 use crate::app::Message;
 
@@ -33,6 +33,34 @@ impl BoxDrawingRun {
     }
 }
 
+/// What drawing box glyphs needs from a renderer.
+///
+/// The geometry in this module is the whole point — arms end exactly on cell
+/// edges so adjacent cells join into one unbroken line — and it must not be
+/// rewritten per framework. This is the entire surface it draws through, in
+/// cell-local coordinates with the origin at the glyph's top-left.
+pub(crate) trait BoxPainter {
+    /// A filled axis-aligned rectangle. Used for every solid arm and block.
+    fn fill_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32);
+
+    /// A stroked polyline through `points`, for diagonals.
+    fn stroke_polyline(&mut self, points: &[(f32, f32)], width: f32);
+
+    /// A stroked path that starts at `start`, runs to the corner arc, sweeps
+    /// it as a cubic, and ends at `end`. Rounded corners are the only curve
+    /// the set needs.
+    fn stroke_rounded_corner(
+        &mut self,
+        start: (f32, f32),
+        arc: [(f32, f32); 4],
+        end: (f32, f32),
+        width: f32,
+    );
+
+    /// Move the origin to the given cell, so each glyph draws at (0, 0).
+    fn with_cell<F: FnOnce(&mut Self)>(&mut self, offset_x: f32, draw: F);
+}
+
 impl canvas::Program<Message> for BoxDrawingRun {
     type State = ();
 
@@ -44,17 +72,89 @@ impl canvas::Program<Message> for BoxDrawingRun {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let mut painter = IcedPainter {
+            frame: canvas::Frame::new(renderer, bounds.size()),
+            color: self.color,
+            offset_x: 0.0,
+        };
         let metrics = BoxMetrics::new(self.cell_width, self.cell_height);
-
         for (column, character) in self.text.chars().enumerate() {
-            frame.with_save(|frame| {
-                frame.translate(Vector::new(column as f32 * self.cell_width, 0.0));
-                draw_character(frame, metrics, character, self.color);
-            });
+            draw_cell(
+                &mut painter,
+                metrics,
+                character,
+                column as f32 * self.cell_width,
+            );
         }
+        vec![painter.frame.into_geometry()]
+    }
+}
 
-        vec![frame.into_geometry()]
+/// Draws box geometry into an iced canvas frame.
+struct IcedPainter {
+    frame: canvas::Frame<Renderer>,
+    color: Color,
+    /// The current cell's left edge. Applied here rather than through the
+    /// frame's transform stack so both painters share one notion of
+    /// cell-local coordinates.
+    offset_x: f32,
+}
+
+impl IcedPainter {
+    fn stroke(&self) -> Stroke<'static> {
+        Stroke::default().with_color(self.color)
+    }
+}
+
+impl BoxPainter for IcedPainter {
+    fn fill_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
+        self.frame.fill_rectangle(
+            Point::new(x0 + self.offset_x, y0),
+            Size::new(x1 - x0, y1 - y0),
+            self.color,
+        );
+    }
+
+    fn stroke_polyline(&mut self, points: &[(f32, f32)], width: f32) {
+        let Some((first, rest)) = points.split_first() else {
+            return;
+        };
+        let offset = self.offset_x;
+        let path = Path::new(|path| {
+            path.move_to(Point::new(first.0 + offset, first.1));
+            for point in rest {
+                path.line_to(Point::new(point.0 + offset, point.1));
+            }
+        });
+        self.frame.stroke(&path, self.stroke().with_width(width));
+    }
+
+    fn stroke_rounded_corner(
+        &mut self,
+        start: (f32, f32),
+        arc: [(f32, f32); 4],
+        end: (f32, f32),
+        width: f32,
+    ) {
+        let offset = self.offset_x;
+        let path = Path::new(|path| {
+            path.move_to(Point::new(start.0 + offset, start.1));
+            path.line_to(Point::new(arc[0].0 + offset, arc[0].1));
+            path.bezier_curve_to(
+                Point::new(arc[1].0 + offset, arc[1].1),
+                Point::new(arc[2].0 + offset, arc[2].1),
+                Point::new(arc[3].0 + offset, arc[3].1),
+            );
+            path.line_to(Point::new(end.0 + offset, end.1));
+        });
+        self.frame.stroke(&path, self.stroke().with_width(width));
+    }
+
+    fn with_cell<F: FnOnce(&mut Self)>(&mut self, offset_x: f32, draw: F) {
+        let previous = self.offset_x;
+        self.offset_x = offset_x;
+        draw(self);
+        self.offset_x = previous;
     }
 }
 
@@ -326,7 +426,7 @@ fn glyph(character: char) -> Option<Glyph> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct BoxMetrics {
+pub(crate) struct BoxMetrics {
     width: f32,
     height: f32,
     light: f32,
@@ -334,9 +434,10 @@ struct BoxMetrics {
 }
 
 impl BoxMetrics {
-    fn new(width: f32, height: f32) -> Self {
-        // Iced works in logical pixels, so one logical pixel scales with the
-        // display and matches Ghostty's one-pixel base sprite thickness.
+    pub(crate) fn new(width: f32, height: f32) -> Self {
+        // Both renderers work in logical pixels, so one logical pixel scales
+        // with the display and matches Ghostty's one-pixel base sprite
+        // thickness.
         Self {
             width,
             height,
@@ -353,34 +454,24 @@ impl BoxMetrics {
     }
 }
 
-fn draw_character(
-    frame: &mut canvas::Frame<Renderer>,
-    metrics: BoxMetrics,
-    character: char,
-    color: Color,
-) {
+fn draw_character(painter: &mut impl BoxPainter, metrics: BoxMetrics, character: char) {
     let Some(glyph) = glyph(character) else {
         return;
     };
     match glyph {
-        Glyph::Lines(lines) => draw_lines(frame, metrics, lines, color),
+        Glyph::Lines(lines) => draw_lines(painter, metrics, lines),
         Glyph::Dashes {
             axis,
             count,
             style,
             gap,
-        } => draw_dashes(frame, metrics, axis, count, style, gap, color),
-        Glyph::Arc(corner) => draw_arc(frame, metrics, corner, color),
-        Glyph::Diagonal(diagonal) => draw_diagonal(frame, metrics, diagonal, color),
+        } => draw_dashes(painter, metrics, axis, count, style, gap),
+        Glyph::Arc(corner) => draw_arc(painter, metrics, corner),
+        Glyph::Diagonal(diagonal) => draw_diagonal(painter, metrics, diagonal),
     }
 }
 
-fn draw_lines(
-    frame: &mut canvas::Frame<Renderer>,
-    metrics: BoxMetrics,
-    lines: Lines,
-    color: Color,
-) {
+fn draw_lines(painter: &mut impl BoxPainter, metrics: BoxMetrics, lines: Lines) {
     let light = metrics.light;
     let heavy = metrics.heavy;
     let h_light_top = (metrics.height - light).max(0.0) / 2.0;
@@ -451,8 +542,8 @@ fn draw_lines(
 
     match lines.up {
         N => {}
-        L => fill_box(frame, v_light_left, 0.0, v_light_right, up_bottom, color),
-        H => fill_box(frame, v_heavy_left, 0.0, v_heavy_right, up_bottom, color),
+        L => fill_box(painter, v_light_left, 0.0, v_light_right, up_bottom),
+        H => fill_box(painter, v_heavy_left, 0.0, v_heavy_right, up_bottom),
         D => {
             let left_bottom = if lines.left == D {
                 h_light_top
@@ -464,34 +555,25 @@ fn draw_lines(
             } else {
                 up_bottom
             };
-            fill_box(frame, v_double_left, 0.0, v_light_left, left_bottom, color);
-            fill_box(
-                frame,
-                v_light_right,
-                0.0,
-                v_double_right,
-                right_bottom,
-                color,
-            );
+            fill_box(painter, v_double_left, 0.0, v_light_left, left_bottom);
+            fill_box(painter, v_light_right, 0.0, v_double_right, right_bottom);
         }
     }
     match lines.right {
         N => {}
         L => fill_box(
-            frame,
+            painter,
             right_left,
             h_light_top,
             metrics.width,
             h_light_bottom,
-            color,
         ),
         H => fill_box(
-            frame,
+            painter,
             right_left,
             h_heavy_top,
             metrics.width,
             h_heavy_bottom,
-            color,
         ),
         D => {
             let top_left = if lines.up == D {
@@ -504,41 +586,31 @@ fn draw_lines(
             } else {
                 right_left
             };
+            fill_box(painter, top_left, h_double_top, metrics.width, h_light_top);
             fill_box(
-                frame,
-                top_left,
-                h_double_top,
-                metrics.width,
-                h_light_top,
-                color,
-            );
-            fill_box(
-                frame,
+                painter,
                 bottom_left,
                 h_light_bottom,
                 metrics.width,
                 h_double_bottom,
-                color,
             );
         }
     }
     match lines.down {
         N => {}
         L => fill_box(
-            frame,
+            painter,
             v_light_left,
             down_top,
             v_light_right,
             metrics.height,
-            color,
         ),
         H => fill_box(
-            frame,
+            painter,
             v_heavy_left,
             down_top,
             v_heavy_right,
             metrics.height,
-            color,
         ),
         D => {
             let left_top = if lines.left == D {
@@ -552,27 +624,25 @@ fn draw_lines(
                 down_top
             };
             fill_box(
-                frame,
+                painter,
                 v_double_left,
                 left_top,
                 v_light_left,
                 metrics.height,
-                color,
             );
             fill_box(
-                frame,
+                painter,
                 v_light_right,
                 right_top,
                 v_double_right,
                 metrics.height,
-                color,
             );
         }
     }
     match lines.left {
         N => {}
-        L => fill_box(frame, 0.0, h_light_top, left_right, h_light_bottom, color),
-        H => fill_box(frame, 0.0, h_heavy_top, left_right, h_heavy_bottom, color),
+        L => fill_box(painter, 0.0, h_light_top, left_right, h_light_bottom),
+        H => fill_box(painter, 0.0, h_heavy_top, left_right, h_heavy_bottom),
         D => {
             let top_right = if lines.up == D {
                 v_light_left
@@ -584,27 +654,19 @@ fn draw_lines(
             } else {
                 left_right
             };
-            fill_box(frame, 0.0, h_double_top, top_right, h_light_top, color);
-            fill_box(
-                frame,
-                0.0,
-                h_light_bottom,
-                bottom_right,
-                h_double_bottom,
-                color,
-            );
+            fill_box(painter, 0.0, h_double_top, top_right, h_light_top);
+            fill_box(painter, 0.0, h_light_bottom, bottom_right, h_double_bottom);
         }
     }
 }
 
 fn draw_dashes(
-    frame: &mut canvas::Frame<Renderer>,
+    painter: &mut impl BoxPainter,
     metrics: BoxMetrics,
     axis: Axis,
     count: u8,
     style: Style,
     gap: DashGap,
-    color: Color,
 ) {
     let count = f32::from(count);
     let thickness = metrics.thickness(style);
@@ -618,7 +680,7 @@ fn draw_dashes(
         Axis::Vertical => metrics.height,
     };
     if span < count * 2.0 {
-        draw_solid_axis(frame, metrics, axis, metrics.light, color);
+        draw_solid_axis(painter, metrics, axis, metrics.light);
         return;
     }
     let gap = desired_gap.min(span / (2.0 * count));
@@ -629,7 +691,7 @@ fn draw_dashes(
             let y = (metrics.height - thickness).max(0.0) / 2.0;
             let mut x = gap / 2.0;
             for _ in 0..count as usize {
-                fill_box(frame, x, y, x + dash, y + thickness, color);
+                fill_box(painter, x, y, x + dash, y + thickness);
                 x += dash + gap;
             }
         }
@@ -637,126 +699,123 @@ fn draw_dashes(
             let x = (metrics.width - thickness).max(0.0) / 2.0;
             let mut y = 0.0;
             for _ in 0..count as usize {
-                fill_box(frame, x, y, x + thickness, y + dash, color);
+                fill_box(painter, x, y, x + thickness, y + dash);
                 y += dash + gap;
             }
         }
     }
 }
 
-fn draw_solid_axis(
-    frame: &mut canvas::Frame<Renderer>,
-    metrics: BoxMetrics,
-    axis: Axis,
-    thickness: f32,
-    color: Color,
-) {
+fn draw_solid_axis(painter: &mut impl BoxPainter, metrics: BoxMetrics, axis: Axis, thickness: f32) {
     match axis {
         Axis::Horizontal => {
             let y = (metrics.height - thickness).max(0.0) / 2.0;
-            fill_box(frame, 0.0, y, metrics.width, y + thickness, color);
+            fill_box(painter, 0.0, y, metrics.width, y + thickness);
         }
         Axis::Vertical => {
             let x = (metrics.width - thickness).max(0.0) / 2.0;
-            fill_box(frame, x, 0.0, x + thickness, metrics.height, color);
+            fill_box(painter, x, 0.0, x + thickness, metrics.height);
         }
     }
 }
 
-fn draw_arc(
-    frame: &mut canvas::Frame<Renderer>,
-    metrics: BoxMetrics,
-    corner: Corner,
-    color: Color,
-) {
+fn draw_arc(painter: &mut impl BoxPainter, metrics: BoxMetrics, corner: Corner) {
     let center_x = metrics.width / 2.0;
     let center_y = metrics.height / 2.0;
     let radius = metrics.width.min(metrics.height) / 2.0;
     let control = radius * 0.25;
-    let path = Path::new(|path| match corner {
-        Corner::TopLeft => {
-            path.move_to(Point::new(center_x, metrics.height));
-            path.line_to(Point::new(center_x, center_y + radius));
-            path.bezier_curve_to(
-                Point::new(center_x, center_y + control),
-                Point::new(center_x + control, center_y),
-                Point::new(center_x + radius, center_y),
-            );
-            path.line_to(Point::new(metrics.width, center_y));
-        }
-        Corner::TopRight => {
-            path.move_to(Point::new(center_x, metrics.height));
-            path.line_to(Point::new(center_x, center_y + radius));
-            path.bezier_curve_to(
-                Point::new(center_x, center_y + control),
-                Point::new(center_x - control, center_y),
-                Point::new(center_x - radius, center_y),
-            );
-            path.line_to(Point::new(0.0, center_y));
-        }
-        Corner::BottomLeft => {
-            path.move_to(Point::new(center_x, 0.0));
-            path.line_to(Point::new(center_x, center_y - radius));
-            path.bezier_curve_to(
-                Point::new(center_x, center_y - control),
-                Point::new(center_x + control, center_y),
-                Point::new(center_x + radius, center_y),
-            );
-            path.line_to(Point::new(metrics.width, center_y));
-        }
-        Corner::BottomRight => {
-            path.move_to(Point::new(center_x, 0.0));
-            path.line_to(Point::new(center_x, center_y - radius));
-            path.bezier_curve_to(
-                Point::new(center_x, center_y - control),
-                Point::new(center_x - control, center_y),
-                Point::new(center_x - radius, center_y),
-            );
-            path.line_to(Point::new(0.0, center_y));
-        }
-    });
-    frame.stroke(
-        &path,
-        Stroke::default()
-            .with_color(color)
-            .with_width(metrics.light),
-    );
+    // Each corner is: come in from one cell edge to where the curve starts,
+    // sweep a cubic through the centre, leave to the other edge. The entry and
+    // exit both land exactly on an edge midpoint, which is what lets a rounded
+    // corner meet a straight arm from the neighbouring cell without a seam.
+    let (start, arc, end) = match corner {
+        Corner::TopLeft => (
+            (center_x, metrics.height),
+            [
+                (center_x, center_y + radius),
+                (center_x, center_y + control),
+                (center_x + control, center_y),
+                (center_x + radius, center_y),
+            ],
+            (metrics.width, center_y),
+        ),
+        Corner::TopRight => (
+            (center_x, metrics.height),
+            [
+                (center_x, center_y + radius),
+                (center_x, center_y + control),
+                (center_x - control, center_y),
+                (center_x - radius, center_y),
+            ],
+            (0.0, center_y),
+        ),
+        Corner::BottomLeft => (
+            (center_x, 0.0),
+            [
+                (center_x, center_y - radius),
+                (center_x, center_y - control),
+                (center_x + control, center_y),
+                (center_x + radius, center_y),
+            ],
+            (metrics.width, center_y),
+        ),
+        Corner::BottomRight => (
+            (center_x, 0.0),
+            [
+                (center_x, center_y - radius),
+                (center_x, center_y - control),
+                (center_x - control, center_y),
+                (center_x - radius, center_y),
+            ],
+            (0.0, center_y),
+        ),
+    };
+    painter.stroke_rounded_corner(start, arc, end, metrics.light);
 }
 
-fn draw_diagonal(
-    frame: &mut canvas::Frame<Renderer>,
-    metrics: BoxMetrics,
-    diagonal: Diagonal,
-    color: Color,
-) {
+fn draw_diagonal(painter: &mut impl BoxPainter, metrics: BoxMetrics, diagonal: Diagonal) {
+    // Overshooting the cell by half a slope on each end is what makes a run of
+    // diagonals read as one unbroken line instead of a dashed one.
     let slope_x = (metrics.width / metrics.height).min(1.0);
     let slope_y = (metrics.height / metrics.width).min(1.0);
-    let rising = Path::line(
-        Point::new(metrics.width + 0.5 * slope_x, -0.5 * slope_y),
-        Point::new(-0.5 * slope_x, metrics.height + 0.5 * slope_y),
-    );
-    let falling = Path::line(
-        Point::new(-0.5 * slope_x, -0.5 * slope_y),
-        Point::new(
+    let rising = [
+        (metrics.width + 0.5 * slope_x, -0.5 * slope_y),
+        (-0.5 * slope_x, metrics.height + 0.5 * slope_y),
+    ];
+    let falling = [
+        (-0.5 * slope_x, -0.5 * slope_y),
+        (
             metrics.width + 0.5 * slope_x,
             metrics.height + 0.5 * slope_y,
         ),
-    );
-    let stroke = Stroke::default()
-        .with_color(color)
-        .with_width(metrics.light);
+    ];
     if matches!(diagonal, Diagonal::Rising | Diagonal::Cross) {
-        frame.stroke(&rising, stroke);
+        painter.stroke_polyline(&rising, metrics.light);
     }
     if matches!(diagonal, Diagonal::Falling | Diagonal::Cross) {
-        frame.stroke(&falling, stroke);
+        painter.stroke_polyline(&falling, metrics.light);
     }
 }
 
-fn fill_box(frame: &mut canvas::Frame<Renderer>, x0: f32, y0: f32, x1: f32, y1: f32, color: Color) {
+fn fill_box(painter: &mut impl BoxPainter, x0: f32, y0: f32, x1: f32, y1: f32) {
     if x1 > x0 && y1 > y0 {
-        frame.fill_rectangle(Point::new(x0, y0), Size::new(x1 - x0, y1 - y0), color);
+        painter.fill_rect(x0, y0, x1, y1);
     }
+}
+
+/// Draw one box-drawing character at `offset_x` within the run.
+///
+/// The entry point for renderers that paint runs themselves rather than
+/// through an iced canvas.
+pub(crate) fn draw_cell(
+    painter: &mut impl BoxPainter,
+    metrics: BoxMetrics,
+    character: char,
+    offset_x: f32,
+) {
+    painter.with_cell(offset_x, |painter| {
+        draw_character(painter, metrics, character);
+    });
 }
 
 #[cfg(test)]

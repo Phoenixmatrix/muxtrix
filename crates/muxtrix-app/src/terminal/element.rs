@@ -23,7 +23,10 @@ use crate::geom::{Point as AppPoint, ScrollDelta, Size};
 use crate::runtime::gpui::Root;
 use crate::runtime::gpui::color;
 use crate::settings::AppSettings;
-use crate::terminal::runs::{TerminalStyleRun, rgb, terminal_row_style_runs};
+use crate::terminal::box_painter::GpuiBoxPainter;
+use crate::terminal::runs::{
+    TerminalRunGeometry, TerminalStyleRun, rgb, terminal_row_style_runs, terminal_run_geometry,
+};
 use crate::themes::TerminalThemePreset;
 use muxtrix_domain::PaneId;
 use muxtrix_terminal::GridSnapshot;
@@ -66,6 +69,23 @@ struct PreparedRow {
     shaped: ShapedLine,
     /// Background spans, already in columns, so paint does no measuring.
     backgrounds: Vec<(usize, usize, Hsla)>,
+    /// Runs drawn as geometry rather than glyphs: box drawing, whose arms have
+    /// to meet exactly on cell edges, and the full block, which has to fill
+    /// its cell completely. A font gives neither reliably across faces.
+    geometry: Vec<GeometryRun>,
+}
+
+/// A run the element draws itself instead of shaping.
+struct GeometryRun {
+    start_column: usize,
+    columns: usize,
+    color: Hsla,
+    kind: GeometryKind,
+}
+
+enum GeometryKind {
+    BoxDrawing(String),
+    FullBlock,
 }
 
 impl TerminalElement {
@@ -235,6 +255,35 @@ impl Element for TerminalElement {
             }
             for (index, row) in prepared.lines.iter().enumerate() {
                 let top = origin.y + prepared.line_height * index;
+                for run in &row.geometry {
+                    let left = origin.x + prepared.cell_width * run.start_column;
+                    match &run.kind {
+                        GeometryKind::FullBlock => window.paint_quad(fill(
+                            Bounds {
+                                origin: point(left, top),
+                                size: size(prepared.cell_width * run.columns, prepared.line_height),
+                            },
+                            run.color,
+                        )),
+                        GeometryKind::BoxDrawing(text) => {
+                            let mut painter =
+                                GpuiBoxPainter::new(window, point(left, top), run.color);
+                            let metrics = crate::box_drawing::BoxMetrics::new(
+                                f32::from(prepared.cell_width),
+                                f32::from(prepared.line_height),
+                            );
+                            for (offset, character) in text.chars().enumerate() {
+                                let cell = offset as f32 * f32::from(prepared.cell_width);
+                                crate::box_drawing::draw_cell(
+                                    &mut painter,
+                                    metrics,
+                                    character,
+                                    cell,
+                                );
+                            }
+                        }
+                    }
+                }
                 let _ = row.shaped.paint(
                     point(origin.x, top),
                     prepared.line_height,
@@ -375,6 +424,7 @@ fn prepare_row(
     let mut text = String::new();
     let mut runs = Vec::with_capacity(row.len());
     let mut backgrounds = Vec::new();
+    let mut backgrounds_geometry: Vec<GeometryRun> = Vec::new();
     let mut column = 0usize;
 
     for run in row {
@@ -383,6 +433,46 @@ fn prepare_row(
         // background must fill the whole cell even where the glyph is narrow.
         if let Some(background) = run.style.overlay_background.or(run.style.background) {
             backgrounds.push((column, run.columns, color(rgb(background)).into()));
+        }
+        if run.kind == crate::terminal::runs::TerminalRunKind::BoxDrawing {
+            backgrounds_geometry.push(GeometryRun {
+                start_column: column,
+                columns: run.columns,
+                color: color(rgb(run.style.foreground)).into(),
+                kind: GeometryKind::BoxDrawing(run.text.clone()),
+            });
+            // The shaper still needs the columns accounted for, so the run is
+            // replaced by spaces rather than dropped.
+            text.push_str(&" ".repeat(run.text.chars().count()));
+            runs.push(TextRun {
+                len: run.text.chars().count(),
+                font: font.clone(),
+                color: color(rgb(run.style.foreground)).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+            column += run.columns;
+            continue;
+        }
+        if terminal_run_geometry(run) == Some(TerminalRunGeometry::FullBlock) {
+            backgrounds_geometry.push(GeometryRun {
+                start_column: column,
+                columns: run.columns,
+                color: color(rgb(run.style.foreground)).into(),
+                kind: GeometryKind::FullBlock,
+            });
+            text.push_str(&" ".repeat(run.text.chars().count()));
+            runs.push(TextRun {
+                len: run.text.chars().count(),
+                font: font.clone(),
+                color: color(rgb(run.style.foreground)).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+            column += run.columns;
+            continue;
         }
         let mut face = font.clone();
         face.weight = if run.style.bold {
@@ -412,6 +502,7 @@ fn prepare_row(
             .text_system()
             .shape_line(text.into(), font_size, &runs, Some(cell_width)),
         backgrounds,
+        geometry: backgrounds_geometry,
     }
 }
 
