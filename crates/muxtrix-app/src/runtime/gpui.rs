@@ -278,6 +278,7 @@ where
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = DesignTokens::for_appearance(self.app.settings.appearance);
+        let sidebar = self.view_sidebar(cx);
         let workspace = self.view_workspace(window, cx);
         // The menu floats above the shell and any press outside it dismisses
         // and is consumed — the behaviour the iced `Popover` had, and what
@@ -311,10 +312,11 @@ impl Render for Root {
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .size_full()
             .flex()
-            .flex_col()
+            .flex_row()
             .bg(color(tokens.app))
             .text_color(color(tokens.text))
-            .child(workspace)
+            .child(sidebar)
+            .child(div().flex_grow(1.0).overflow_hidden().child(workspace))
             .children(menu)
     }
 }

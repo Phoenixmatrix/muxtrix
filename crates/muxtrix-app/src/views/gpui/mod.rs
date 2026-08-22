@@ -5,6 +5,7 @@
 //! differs. Phase 7 deletes the iced views and flattens these up a level.
 
 pub(crate) mod panes;
+pub(crate) mod sidebar;
 pub(crate) mod workspace;
 
 use gpui::{Div, Hsla, InteractiveElement, ParentElement, Stateful, Styled, div, px, svg};
