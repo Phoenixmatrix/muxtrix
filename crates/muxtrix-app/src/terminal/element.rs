@@ -11,16 +11,21 @@
 //! glyphs drift out of their columns.
 
 use gpui::{
-    App, Bounds, Element, ElementId, GlobalElementId, Hsla, InspectorElementId, IntoElement,
-    LayoutId, Pixels, ShapedLine, Style, TextRun, Window, fill, point, px, relative, size,
+    App, Bounds, CursorStyle, Element, ElementId, Entity, GlobalElementId, Hsla,
+    InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, ScrollWheelEvent, ShapedLine, Style, TextRun, Window, fill, point, px,
+    relative, size,
 };
+use muxtrix_terminal::TerminalMouseButton;
 
-use crate::app::{TERMINAL_PADDING, TerminalLink};
-use crate::geom::Size;
+use crate::app::{Message, TERMINAL_PADDING, TerminalLink, terminal_link_modifiers};
+use crate::geom::{Point as AppPoint, ScrollDelta, Size};
+use crate::runtime::gpui::Root;
 use crate::runtime::gpui::color;
 use crate::settings::AppSettings;
 use crate::terminal::runs::{TerminalStyleRun, rgb, terminal_row_style_runs};
 use crate::themes::TerminalThemePreset;
+use muxtrix_domain::PaneId;
 use muxtrix_terminal::GridSnapshot;
 
 /// What the element needs to draw one pane, gathered before layout.
@@ -36,6 +41,13 @@ pub(crate) struct TerminalElement {
     /// itself — the PTY is the thing that has to agree, and it lives in the
     /// application.
     reported: Size,
+    pane_id: PaneId,
+    /// How the element talks back. Elements are rebuilt every frame and have
+    /// no `Context`, so the handle is what turns a click into a message.
+    root: Entity<Root>,
+    /// Whether the modifiers that turn a hovered link into a clickable one are
+    /// currently held, which decides the cursor over a link.
+    link_modifiers: bool,
 }
 
 /// What `prepaint` worked out and `paint` consumes.
@@ -46,6 +58,8 @@ pub(crate) struct PreparedGrid {
     /// Set when the bounds imply a different number of rows or columns than
     /// the runtime last reported.
     resized_to: Option<Size>,
+    /// The grid's share of the window, which scopes the pointer cursor.
+    hitbox: gpui::Hitbox,
 }
 
 struct PreparedRow {
@@ -55,24 +69,30 @@ struct PreparedRow {
 }
 
 impl TerminalElement {
-    pub(crate) fn new(
-        snapshot: GridSnapshot,
-        settings: AppSettings,
-        theme: TerminalThemePreset,
+    /// Build the element for one pane, or `None` when it has no grid yet.
+    ///
+    /// The extraction lives here rather than in the view because what the
+    /// terminal needs from the application is the terminal's business, and
+    /// gathering it at the call site made for a ten-argument constructor.
+    pub(crate) fn for_pane(
+        app: &crate::app::Muxtrix,
+        pane_id: PaneId,
         focused: bool,
-        cursor_phase_visible: bool,
-        hovered_link: Option<TerminalLink>,
-        reported: Size,
-    ) -> Self {
-        Self {
-            snapshot,
-            settings,
-            theme,
-            focused,
-            cursor_phase_visible,
-            hovered_link,
-            reported,
-        }
+        root: Entity<Root>,
+    ) -> Option<Self> {
+        let runtime = app.terminals.get(&pane_id)?;
+        Some(Self {
+            snapshot: runtime.snapshot.clone()?,
+            settings: app.settings.clone(),
+            theme: app.settings.terminal_theme.preset(),
+            focused: focused && app.window_focused,
+            cursor_phase_visible: app.cursor_phase_visible,
+            hovered_link: app.hovered_terminal_link(pane_id),
+            reported: runtime.viewport.unwrap_or_default(),
+            pane_id,
+            root,
+            link_modifiers: terminal_link_modifiers(app.keyboard_modifiers),
+        })
     }
 
     /// The size in pixels the grid occupies, which the caller compares against
@@ -123,7 +143,7 @@ impl Element for TerminalElement {
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         window: &mut Window,
-        _: &mut App,
+        cx: &mut App,
     ) -> Self::PrepaintState {
         let font = crate::terminal::element::terminal_font(&self.settings);
         let font_size = px(self.settings.terminal_font_pixels());
@@ -145,6 +165,16 @@ impl Element for TerminalElement {
             bounds.size.height.into(),
         ))
         .filter(|size| *size != self.reported);
+        if let Some(size) = resized_to {
+            // The PTY is what has to agree with the layout, and it lives in
+            // the application. Reporting rather than resizing here is what
+            // keeps this settling: the runtime records the new viewport, so
+            // the next frame's comparison matches.
+            let pane_id = self.pane_id;
+            self.root.update(cx, |root, cx| {
+                root.dispatch_detached(Message::ResizePane(pane_id, size), cx);
+            });
+        }
 
         let rows = terminal_row_style_runs(
             &self.snapshot,
@@ -165,6 +195,7 @@ impl Element for TerminalElement {
             cell_width,
             line_height,
             resized_to,
+            hitbox: window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
         }
     }
 
@@ -214,6 +245,122 @@ impl Element for TerminalElement {
                 );
             }
         });
+
+        self.paint_mouse(bounds, origin, prepared, window);
+    }
+}
+
+impl TerminalElement {
+    /// Register the mouse handlers for this pane.
+    ///
+    /// Hit-tested against the pane's own bounds rather than relying on
+    /// element containment, because these are window-level handlers: a drag
+    /// that starts inside the grid has to keep reporting after the pointer
+    /// leaves it, which is how selection past the edge works.
+    fn paint_mouse(
+        &self,
+        bounds: Bounds<Pixels>,
+        origin: gpui::Point<Pixels>,
+        prepared: &PreparedGrid,
+        window: &mut Window,
+    ) {
+        let pane_id = self.pane_id;
+        let root = self.root.clone();
+        let cell_width = prepared.cell_width;
+        let line_height = prepared.line_height;
+
+        // A hovered link only becomes clickable while the modifiers are held,
+        // and the cursor is what says so.
+        if self.hovered_link.is_some() && self.link_modifiers {
+            window.set_cursor_style(CursorStyle::PointingHand, &prepared.hitbox);
+        }
+
+        let position_in_grid = move |window_point: gpui::Point<Pixels>| {
+            AppPoint::new(
+                f32::from(window_point.x - origin.x) + TERMINAL_PADDING / 2.0,
+                f32::from(window_point.y - origin.y) + TERMINAL_PADDING / 2.0,
+            )
+        };
+
+        {
+            let root = root.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                if !phase.bubble() {
+                    return;
+                }
+                let inside = bounds.contains(&event.position);
+                let point = position_in_grid(event.position);
+                root.update(cx, |root, cx| {
+                    if inside {
+                        root.dispatch_detached(Message::EnterTerminal(pane_id), cx);
+                    }
+                    root.dispatch_detached(Message::TerminalPointerMoved(pane_id, point), cx);
+                });
+            });
+        }
+
+        {
+            let root = root.clone();
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, _window, cx| {
+                if !phase.bubble() || !bounds.contains(&event.position) {
+                    return;
+                }
+                let Some(button) = terminal_button(event.button) else {
+                    return;
+                };
+                let point = position_in_grid(event.position);
+                root.update(cx, |root, cx| {
+                    root.dispatch_detached(Message::Focus(pane_id), cx);
+                    root.dispatch_detached(Message::TerminalPointerMoved(pane_id, point), cx);
+                    root.dispatch_detached(Message::TerminalMousePressed(pane_id, button), cx);
+                });
+            });
+        }
+
+        {
+            let root = root.clone();
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+                if !phase.bubble() {
+                    return;
+                }
+                let Some(button) = terminal_button(event.button) else {
+                    return;
+                };
+                root.update(cx, |root, cx| {
+                    root.dispatch_detached(Message::TerminalMouseReleased(pane_id, button), cx);
+                });
+            });
+        }
+
+        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _window, cx| {
+            if !phase.bubble() || !bounds.contains(&event.position) {
+                return;
+            }
+            let delta = match event.delta {
+                gpui::ScrollDelta::Lines(lines) => ScrollDelta::Lines {
+                    x: lines.x,
+                    y: lines.y,
+                },
+                gpui::ScrollDelta::Pixels(pixels) => ScrollDelta::Pixels {
+                    x: pixels.x.into(),
+                    y: pixels.y.into(),
+                },
+            };
+            let _ = (cell_width, line_height);
+            root.update(cx, |root, cx| {
+                root.dispatch_detached(Message::ScrollTerminal(pane_id, delta), cx);
+            });
+        });
+    }
+}
+
+/// The emulator's name for a mouse button, for the ones it reports.
+fn terminal_button(button: MouseButton) -> Option<TerminalMouseButton> {
+    match button {
+        MouseButton::Left => Some(TerminalMouseButton::Left),
+        MouseButton::Middle => Some(TerminalMouseButton::Middle),
+        MouseButton::Right => Some(TerminalMouseButton::Right),
+        _ => None,
     }
 }
 

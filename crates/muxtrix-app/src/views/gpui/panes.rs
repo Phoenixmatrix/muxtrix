@@ -173,23 +173,9 @@ impl Root {
             && workspace.active_tab_id == tab.id
             && tab.focused_pane_id == pane_id;
         let runtime = app.terminals.get(&pane_id);
-        let theme = app.settings.terminal_theme.preset();
 
-        let body = match runtime.and_then(|runtime| runtime.snapshot.clone()) {
-            Some(snapshot) => div()
-                .size_full()
-                .child(TerminalElement::new(
-                    snapshot,
-                    app.settings.clone(),
-                    theme,
-                    focused && app.window_focused,
-                    app.cursor_phase_visible,
-                    app.hovered_terminal_link(pane_id),
-                    runtime
-                        .and_then(|runtime| runtime.viewport)
-                        .unwrap_or_default(),
-                ))
-                .into_any_element(),
+        let body = match TerminalElement::for_pane(app, pane_id, focused, cx.entity()) {
+            Some(terminal) => div().size_full().child(terminal).into_any_element(),
             // No grid yet: either the shell has not spoken or the launch
             // failed, and the preview text says which.
             None => div()

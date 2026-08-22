@@ -107,7 +107,7 @@ impl Root {
 
     /// Deliver a message from a context that has no `Window` — a timer or a
     /// channel. The window is reached through the entity's own handle.
-    fn dispatch_detached(&mut self, message: Message, cx: &mut Context<Self>) {
+    pub(crate) fn dispatch_detached(&mut self, message: Message, cx: &mut Context<Self>) {
         let effects = self.app.update(message);
         self.run_detached_effects(effects, cx);
         cx.notify();
