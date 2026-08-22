@@ -12,8 +12,7 @@ use iced::widget::column;
 
 use crate::views::prelude::*;
 
-use crate::commands::CommandAction;
-use crate::{
+use crate::app::{
     InstalledVersionsState, SETTINGS_NAV_LABEL_POINTS, SETTINGS_NAV_QUIET_PADDING_X,
     SETTINGS_NAV_RULE_GAP, SETTINGS_PAGE_PADDING_X, SettingsButtonKind, SettingsPage, app_tooltip,
     centered_button_content, installed_version_restart_copy, ruled_surface, settings_action_button,
@@ -21,6 +20,7 @@ use crate::{
     settings_nav_is_crowded, settings_page_toggle, settings_row, settings_section,
     settings_version_value, signal_dot,
 };
+use crate::commands::CommandAction;
 use iced::Font;
 use muxtrix_control::{Agent, HookAction, HookScope};
 

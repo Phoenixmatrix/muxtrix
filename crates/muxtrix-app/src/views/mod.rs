@@ -32,7 +32,7 @@ pub(crate) mod prelude {
         Alignment, Border, Color, Element, Fill, Length, Padding, Pixels, Shadow, Vector, font,
     };
 
+    pub(crate) use crate::app::{IconKind, Message, Muxtrix, icon};
     pub(crate) use crate::settings::FontWeight;
     pub(crate) use crate::theme::DesignTokens;
-    pub(crate) use crate::{IconKind, Message, Muxtrix, icon};
 }

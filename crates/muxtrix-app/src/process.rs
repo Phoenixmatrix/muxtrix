@@ -315,8 +315,10 @@ mod tests {
     fn console_programs_are_built_through_console_command() {
         // `process.rs` is where the flags are applied, and `gpu.rs` re-execs
         // this same binary through `exec` on Linux — it never spawns a child,
-        // and never runs on Windows at all.
-        const EXEMPT: [&str; 2] = ["process.rs", "gpu.rs"];
+        // and never runs on Windows at all. A whole file named `tests.rs` is
+        // fixtures end to end, the same exemption the inline `mod tests` below
+        // gets.
+        const EXEMPT: [&str; 3] = ["process.rs", "gpu.rs", "tests.rs"];
 
         let mut pending = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
         let mut offenders = Vec::new();

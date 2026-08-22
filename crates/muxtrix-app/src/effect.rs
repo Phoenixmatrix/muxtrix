@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::Message;
+use crate::app::Message;
 use crate::geom::Size;
 
 /// A side effect `update` wants performed.

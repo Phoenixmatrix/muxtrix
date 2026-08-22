@@ -8,16 +8,18 @@ use iced::widget::column;
 
 use crate::views::prelude::*;
 
-use crate::ellipsized_text::EllipsizedText;
-use crate::layout::pane_ids_in_layout;
-use crate::settings::{FleetScope, FleetView, font_with_style};
-use crate::{
+use crate::github;
+
+use crate::app::{
     COLLAPSED_SIDEBAR_WIDTH, FLEET_ENTRY_TEXT_WIDTH, FleetGroupLevel, GITHUB_STATUS_DOT_SIZE,
     GITHUB_STATUS_ICON_SIZE, GITHUB_STATUS_LABEL_WIDTH, GITHUB_STATUS_ROW_SPACING, GlobalAlert,
     PaneSignalKind, RailTarget, SIDEBAR_WIDTH, app_tooltip, centered_button_content, ellipsize,
-    ellipsize_start, fleet_group_label, fleet_toggle_style, github, quiet_button_style,
-    rail_marker, rail_row_style, roster_ring, section_label, signal_dot, single_line_ellipsize,
+    ellipsize_start, fleet_group_label, fleet_toggle_style, quiet_button_style, rail_marker,
+    rail_row_style, roster_ring, section_label, signal_dot, single_line_ellipsize,
 };
+use crate::ellipsized_text::EllipsizedText;
+use crate::layout::pane_ids_in_layout;
+use crate::settings::{FleetScope, FleetView, font_with_style};
 use iced::Font;
 use muxtrix_domain::{PaneId, Workspace};
 

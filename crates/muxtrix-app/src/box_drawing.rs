@@ -12,7 +12,7 @@ use iced::mouse;
 use iced::widget::canvas::{self, Geometry, Path, Stroke};
 use iced::{Color, Point, Rectangle, Renderer, Size, Theme, Vector};
 
-use crate::Message;
+use crate::app::Message;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BoxDrawingRun {

@@ -8,12 +8,13 @@ use iced::widget::column;
 
 use crate::views::prelude::*;
 
-use crate::{
+use crate::commands;
+
+use crate::app::{
     RENAME_INPUT_ID, RenameTarget, SettingsButtonKind, WORKSPACE_CREATE_INPUT_ID,
     WORKTREE_INPUT_ID, WorktreeManagerMode, WorktreePromptTarget, age_label, agent_display_name,
-    centered_button_label, commands, ellipsize, ellipsize_start, modal_surface,
-    settings_action_button, settings_button_style, settings_notice, status_pill,
-    worktree_display_name, worktree_name,
+    centered_button_label, ellipsize, ellipsize_start, modal_surface, settings_action_button,
+    settings_button_style, settings_notice, status_pill, worktree_display_name, worktree_name,
 };
 use iced::Font;
 use muxtrix_control::Agent;

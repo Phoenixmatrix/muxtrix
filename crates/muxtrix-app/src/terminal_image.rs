@@ -6,7 +6,7 @@ use iced::widget::canvas::{self, Geometry};
 use iced::{Element, Length, Rectangle, Renderer, Theme};
 use muxtrix_terminal::{GridSnapshot, ImageLayer, ImageSourceRect};
 
-use crate::Message;
+use crate::app::Message;
 
 pub(crate) fn layer(
     snapshot: &GridSnapshot,

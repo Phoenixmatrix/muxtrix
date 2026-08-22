@@ -7,8 +7,8 @@ use iced::widget::column;
 
 use crate::views::prelude::*;
 
+use crate::app::{SettingsButtonKind, settings_action_button, terminal_theme_preview_with_caption};
 use crate::themes::TerminalThemeId;
-use crate::{SettingsButtonKind, settings_action_button, terminal_theme_preview_with_caption};
 use iced::Font;
 
 impl Muxtrix {

@@ -8,19 +8,21 @@ use iced::widget::column;
 
 use crate::views::prelude::*;
 
+use crate::commands;
+
+use crate::app::{
+    PANE_HEADER_CHIP_PADDING, PANE_HEADER_CONTROL_SPACING, PANE_HEADER_DIVIDER,
+    PANE_HEADER_FIXED_WIDTH, PANE_HEADER_ICON_BUTTON, PANE_HEADER_LABEL_PADDING,
+    PANE_TITLE_MIN_WIDTH, PANE_TITLE_UNMEASURED_WIDTH, SPLIT_HANDLE_SIZE, SplitBranch, SplitKey,
+    TerminalLaunchState, UI_TEXT_ADVANCE_RATIO, app_tooltip, centered_button_label, ellipsize,
+    pane_header_is_compact, pane_menu_divider, pane_menu_entry, pane_title_char_budget,
+    quiet_button_style, styled_terminal, terminal_empty_state_copy, terminal_link_modifiers,
+    terminal_mouse_interaction, terminal_scrollbar, terminal_surface_background,
+};
 use crate::layout::expanded_stack_pane;
 use crate::popover::Popover;
 use crate::settings::font_with_style;
 use crate::terminal::runs::rgb;
-use crate::{
-    PANE_HEADER_CHIP_PADDING, PANE_HEADER_CONTROL_SPACING, PANE_HEADER_DIVIDER,
-    PANE_HEADER_FIXED_WIDTH, PANE_HEADER_ICON_BUTTON, PANE_HEADER_LABEL_PADDING,
-    PANE_TITLE_MIN_WIDTH, PANE_TITLE_UNMEASURED_WIDTH, SPLIT_HANDLE_SIZE, SplitBranch, SplitKey,
-    TerminalLaunchState, UI_TEXT_ADVANCE_RATIO, app_tooltip, centered_button_label, commands,
-    ellipsize, pane_header_is_compact, pane_menu_divider, pane_menu_entry, pane_title_char_budget,
-    quiet_button_style, styled_terminal, terminal_empty_state_copy, terminal_link_modifiers,
-    terminal_mouse_interaction, terminal_scrollbar, terminal_surface_background,
-};
 use iced::Font;
 use iced::mouse;
 use iced::widget::sensor;

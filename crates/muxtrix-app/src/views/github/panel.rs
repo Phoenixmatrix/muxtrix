@@ -8,10 +8,12 @@ use iced::widget::column;
 
 use crate::views::prelude::*;
 
-use crate::{
+use crate::github;
+
+use crate::app::{
     GITHUB_LOADING_DOT_COUNT, GITHUB_PANEL_WIDTH, GITHUB_PULL_REQUEST_LIST_CHROME_HEIGHT,
     GitHubPanelKeyboardFocus, GitHubPanelState, GitHubPanelTab, SettingsButtonKind, app_tooltip,
-    centered_button_label, fleet_toggle_style, github, quiet_button_style, settings_button_style,
+    centered_button_label, fleet_toggle_style, quiet_button_style, settings_button_style,
     signal_dot,
 };
 use iced::Font;

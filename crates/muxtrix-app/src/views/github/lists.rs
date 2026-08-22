@@ -8,12 +8,14 @@ use iced::widget::column;
 
 use crate::views::prelude::*;
 
-use crate::{
+use crate::github;
+
+use crate::app::{
     GITHUB_FILE_ROW_HEIGHT, GITHUB_FILE_SCROLL_ID, GITHUB_PULL_REQUEST_QUERY_ID,
     GITHUB_PULL_REQUEST_ROW_HEIGHT, GITHUB_PULL_REQUEST_SCROLL_ID,
     GITHUB_PULL_REQUEST_SEARCH_HEIGHT, GITHUB_PULL_REQUEST_SUMMARY_HEIGHT, GitHubDiffSource,
     GitHubPanelKeyboardFocus, GitHubPanelState, GitHubPanelTab, SettingsButtonKind, app_tooltip,
-    centered_button_content, centered_button_label, github, github_action_button_style,
+    centered_button_content, centered_button_label, github_action_button_style,
     github_file_viewport_height, github_merge_button_style, github_pull_request_summary_copy,
     github_pull_request_viewport_height, github_readiness_copy, github_readiness_icon,
     github_virtual_window, quiet_button_style, settings_button_style, signal_dot,

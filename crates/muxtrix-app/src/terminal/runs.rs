@@ -8,9 +8,10 @@
 use iced::Color;
 use muxtrix_terminal::GridSnapshot;
 
+use crate::app::{TerminalLink, detected_web_link_ranges, is_valid_web_url};
+use crate::metrics;
 use crate::settings::{self, AppSettings};
 use crate::themes::TerminalThemePreset;
-use crate::{TerminalLink, detected_web_link_ranges, is_valid_web_url, metrics};
 
 /// Shrinks bold text when the bold face is wider than one grid cell.
 ///

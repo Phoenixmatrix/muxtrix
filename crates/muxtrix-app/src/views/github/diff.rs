@@ -7,10 +7,12 @@ use iced::widget::column;
 
 use crate::views::prelude::*;
 
-use crate::{
+use crate::github;
+
+use crate::app::{
     GITHUB_DIFF_CHROME_WIDTH, GITHUB_DIFF_LINE_HEIGHT, GITHUB_PANEL_WIDTH, GitHubDiffState,
-    SettingsButtonKind, centered_button_content, github, github_diff_header_height,
-    github_diff_window, ruled_surface, settings_button_style, single_line_ellipsize,
+    SettingsButtonKind, centered_button_content, github_diff_header_height, github_diff_window,
+    ruled_surface, settings_button_style, single_line_ellipsize,
 };
 use iced::Font;
 

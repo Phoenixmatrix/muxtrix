@@ -7,13 +7,15 @@ use iced::widget::column;
 
 use crate::views::prelude::*;
 
+use crate::settings;
+
+use crate::app::{
+    FONT_FAMILY_MENU_MAX_HEIGHT, SETTINGS_PAGE_PADDING_X, SETTINGS_SCROLL_ID, SettingsButtonKind,
+    ruled_surface, settings_action_button, settings_action_button_maybe, settings_divider,
+    settings_row, settings_section, terminal_theme_preview,
+};
 use crate::settings::{Appearance, FleetScope, font_with_style};
 use crate::themes::TerminalThemeId;
-use crate::{
-    FONT_FAMILY_MENU_MAX_HEIGHT, SETTINGS_PAGE_PADDING_X, SETTINGS_SCROLL_ID, SettingsButtonKind,
-    ruled_surface, settings, settings_action_button, settings_action_button_maybe,
-    settings_divider, settings_row, settings_section, terminal_theme_preview,
-};
 use iced::Font;
 use muxtrix_control::Agent;
 

@@ -2,19 +2,21 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use muxtrix_control::{Agent, AgentState, ControlRequest, HookScope, HookStatus};
 use muxtrix_domain::{PaneId, SplitAxis, TabId};
+use muxtrix_terminal::TerminalMouseButton;
 use serde_json::json;
 
-use muxtrix_control::{AgentState, ControlRequest};
-
-use super::{
-    ActiveView, Agent, AgentPaneStatus, CommandAction, GitHubDiffSource, GitHubDiffState,
-    GitHubPanelState, GitHubPanelTab, HookScope, HookStatus, Message, Muxtrix, PaneRepository,
-    ProcessCancellation, TerminalLaunchState, TerminalMouseButton, WorktreeManagerEntry,
-    WorktreeManagerMode, WorktreeManagerState, agent_screen, github,
+use crate::app::{
+    ActiveView, AgentPaneStatus, GitHubDiffSource, GitHubDiffState, GitHubPanelState,
+    GitHubPanelTab, Message, Muxtrix, PaneRepository, TerminalLaunchState, WorktreeManagerEntry,
+    WorktreeManagerMode, WorktreeManagerState, github_diff_line_starts, github_diff_wrap_columns,
 };
+use crate::commands::CommandAction;
 use crate::effect::{Effect, ScrollTarget};
+use crate::process::ProcessCancellation;
 use crate::settings::{FleetScope, FleetView};
+use crate::{agent_screen, agents_roster, commands, github};
 
 const REPORT_ENV: &str = "MUXTRIX_E2E_REPORT";
 const SCREENSHOT_ENV: &str = "MUXTRIX_E2E_SCREENSHOT_RGBA";
@@ -837,7 +839,7 @@ impl Scenario {
             drop(app.open_settings());
             let installed = next_patch_version(env!("CARGO_PKG_VERSION"));
             app.installed_versions =
-                super::InstalledVersionsState::Ready(super::InstalledVersions {
+                crate::app::InstalledVersionsState::Ready(crate::app::InstalledVersions {
                     muxtrix: Ok(installed.clone()),
                     muxtrixctl: Ok(installed),
                 });
@@ -864,7 +866,7 @@ impl Scenario {
         } else if self.capturing("worktree-agent-setup") {
             app.default_agent_prompt = true;
             app.pending_default_agent_command = Some(CommandAction::NewWorktreeWithAgent(
-                super::commands::WorktreeKind::Pane(SplitAxis::Horizontal),
+                commands::WorktreeKind::Pane(SplitAxis::Horizontal),
             ));
         } else if self.capturing("worktree-agent-palette") {
             app.settings.default_agent = Some(Agent::Codex);
@@ -999,13 +1001,13 @@ impl Scenario {
                 } else {
                     None
                 };
-                let wrap_columns = super::github_diff_wrap_columns(
+                let wrap_columns = github_diff_wrap_columns(
                     app.window_size.width,
                     app.settings.terminal_cell_width(),
                 );
                 let line_starts = document.as_ref().map_or_else(
                     || vec![0],
-                    |document| super::github_diff_line_starts(document, wrap_columns),
+                    |document| github_diff_line_starts(document, wrap_columns),
                 );
                 app.github_diff = Some(GitHubDiffState {
                     source: GitHubDiffSource::PullRequest(391),
@@ -1275,7 +1277,7 @@ impl Scenario {
             app.worktree_manager = Some(manager);
             if self.capturing("worktree-manager") {
                 app.active_view = ActiveView::Settings;
-                app.settings_page = super::SettingsPage::Worktrees;
+                app.settings_page = crate::app::SettingsPage::Worktrees;
             } else if let Some(manager) = app.worktree_manager.as_mut() {
                 // The restart dialog has no keyboard step of its own
                 // here; keep its previous framing.
@@ -1318,9 +1320,9 @@ impl Scenario {
             app.active_view = ActiveView::ThemeGallery;
         } else if self.capturing("session-picker") {
             // Synthetic startup picker; exists only for the frame.
-            app.session_picker = Some(super::SessionPickerState {
+            app.session_picker = Some(crate::app::SessionPickerState {
                 entries: vec![
-                    super::SessionPickerEntry {
+                    crate::app::SessionPickerEntry {
                         record: muxtrix_sessions::SessionRecord {
                             id: uuid::Uuid::new_v4(),
                             name: "muxtrix".into(),
@@ -1337,7 +1339,7 @@ impl Scenario {
                         alive: true,
                         pane_count: 3,
                     },
-                    super::SessionPickerEntry {
+                    crate::app::SessionPickerEntry {
                         record: muxtrix_sessions::SessionRecord {
                             id: uuid::Uuid::new_v4(),
                             name: "experiments".into(),
@@ -1360,7 +1362,7 @@ impl Scenario {
                 startup: true,
             });
         } else if self.capturing("worktree-dialog") {
-            let _ = app.run_command(super::CommandAction::RestartPaneInWorktree);
+            let _ = app.run_command(CommandAction::RestartPaneInWorktree);
             app.worktree_name_draft = "worktree-2".into();
             if let Some(prompt) = app.worktree_prompt.as_mut() {
                 prompt.repo_root = Some("/home/user/dev/muxtrix".into());
@@ -1379,7 +1381,7 @@ impl Scenario {
             let targets = app.rail_targets();
             app.rail_nav = targets
                 .iter()
-                .filter(|target| matches!(target, super::RailTarget::FleetPane(..)))
+                .filter(|target| matches!(target, crate::app::RailTarget::FleetPane(..)))
                 .nth(1)
                 .copied();
             // The collapsed rail draws the same cursor with none of the room,
@@ -1387,9 +1389,9 @@ impl Scenario {
             app.sidebar_collapsed = self.capturing("rail-nav-collapsed");
         } else if self.capturing("stacked-layout") {
             app.split_terminal(SplitAxis::Vertical)?;
-            app.cycle_pane_layout(super::LayoutCycle::Next)?;
-            app.cycle_pane_layout(super::LayoutCycle::Next)?;
-            app.cycle_pane_layout(super::LayoutCycle::Next)?;
+            app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
+            app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
+            app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
         } else if self.capturing("needs-input") {
             // Stage a waiting agent so the whole-pane amber treatment
             // is capturable; this state exists only for the frame.
@@ -1440,7 +1442,7 @@ impl Scenario {
             // state a healthy fleet spends most of its time in and the
             // quietest colour the roll-up can paint, so the capture
             // fails visibly if the roster pip ever stops reading.
-            app.agents_roster = Some(super::agents_roster::AgentsRoster {
+            app.agents_roster = Some(agents_roster::AgentsRoster {
                 working: 0,
                 blocked: 0,
                 failed: 0,
@@ -1661,7 +1663,7 @@ impl Scenario {
                 pane.attention.unread_count = 3;
                 pane.attention.message = Some("Needs approval to run cargo test".into());
             }
-            app.notifications.push(super::AgentNotification {
+            app.notifications.push(crate::app::AgentNotification {
                 pane_id: second,
                 unread: true,
             });
@@ -1678,11 +1680,11 @@ impl Scenario {
                 },
             );
         } else if self.capturing("global-alert") {
-            app.global_alerts.push(super::GlobalAlert {
+            app.global_alerts.push(crate::app::GlobalAlert {
                 title: "codex · release-audit".into(),
                 body: "Sandbox denied a write outside the workspace".into(),
             });
-            app.global_alerts.push(super::GlobalAlert {
+            app.global_alerts.push(crate::app::GlobalAlert {
                 title: "claude · feature-ui".into(),
                 body: "Waiting on approval to run cargo test".into(),
             });
@@ -1695,17 +1697,17 @@ impl Scenario {
             app.workspace_create_visible = true;
             app.workspace_name_draft = "release-audit".into();
         } else if self.capturing("rename-workspace") {
-            app.rename_prompt = Some(super::RenameTarget::Workspace(
+            app.rename_prompt = Some(crate::app::RenameTarget::Workspace(
                 app.session.active_workspace_id,
             ));
             app.rename_draft = "Release audit".into();
         } else if self.capturing("rename-tab") {
             let workspace_id = app.session.active_workspace_id;
             let tab_id = app.active_workspace()?.active_tab_id;
-            app.rename_prompt = Some(super::RenameTarget::Tab(workspace_id, tab_id));
+            app.rename_prompt = Some(crate::app::RenameTarget::Tab(workspace_id, tab_id));
             app.rename_draft = "review".into();
         } else if self.capturing("rename-pane") {
-            app.rename_prompt = Some(super::RenameTarget::Pane(self.initial_pane));
+            app.rename_prompt = Some(crate::app::RenameTarget::Pane(self.initial_pane));
             app.rename_draft = "build watcher".into();
         } else if self.capturing("many-tabs") {
             for _ in 0..6 {
@@ -1730,13 +1732,13 @@ impl Scenario {
             app.palette.selected = 0;
         } else if self.capturing("settings-worktrees-loading") {
             app.active_view = ActiveView::Settings;
-            app.settings_page = super::SettingsPage::Worktrees;
+            app.settings_page = crate::app::SettingsPage::Worktrees;
             let mut manager = WorktreeManagerState::loading(WorktreeManagerMode::Manage, 1);
             manager.repo_root = Some("/home/user/dev/muxtrix".into());
             app.worktree_manager = Some(manager);
         } else if self.capturing("worktree-manager-error") {
             app.active_view = ActiveView::Settings;
-            app.settings_page = super::SettingsPage::Worktrees;
+            app.settings_page = crate::app::SettingsPage::Worktrees;
             let mut manager = WorktreeManagerState::loading(WorktreeManagerMode::Manage, 1);
             manager.repo_root = Some("/home/user/dev/muxtrix".into());
             manager.entries = vec![WorktreeManagerEntry {
@@ -1754,13 +1756,13 @@ impl Scenario {
             app.worktree_manager = Some(manager);
         } else if self.capturing("worktree-manager-no-repo") {
             app.active_view = ActiveView::Settings;
-            app.settings_page = super::SettingsPage::Worktrees;
+            app.settings_page = crate::app::SettingsPage::Worktrees;
             let mut manager = WorktreeManagerState::loading(WorktreeManagerMode::Manage, 1);
             manager.failure = Some("The focused pane is not inside a Git repository".into());
             manager.loading = false;
             app.worktree_manager = Some(manager);
         } else if self.capturing("session-picker-error") {
-            app.session_picker = Some(super::SessionPickerState {
+            app.session_picker = Some(crate::app::SessionPickerState {
                 entries: Vec::new(),
                 selected: 0,
                 error: Some("Could not read the session registry: permission denied".into()),
@@ -1851,15 +1853,15 @@ impl Scenario {
             app.github_panel = Some(panel);
         } else if self.capturing("layout-vertical") {
             app.split_terminal(SplitAxis::Vertical)?;
-            app.cycle_pane_layout(super::LayoutCycle::Next)?;
+            app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
         } else if self.capturing("layout-horizontal") {
             app.split_terminal(SplitAxis::Vertical)?;
-            app.cycle_pane_layout(super::LayoutCycle::Next)?;
-            app.cycle_pane_layout(super::LayoutCycle::Next)?;
+            app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
+            app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
         } else if self.capturing("layout-half-stacked") {
             app.split_terminal(SplitAxis::Vertical)?;
             for _ in 0..4 {
-                app.cycle_pane_layout(super::LayoutCycle::Next)?;
+                app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
             }
         } else if self.capturing("four-panes") {
             app.split_terminal(SplitAxis::Vertical)?;
@@ -2415,9 +2417,9 @@ fn pane_grid_mismatch(app: &Muxtrix) -> Option<String> {
         let Some(viewport) = runtime.viewport else {
             return Some(format!("pane {pane_id:?} was never measured by layout"));
         };
-        let expected = super::pty_size_for_pane(viewport, &app.settings);
+        let expected = crate::app::pty_size_for_pane(viewport, &app.settings);
         let snapshot = runtime.snapshot.as_ref()?;
-        if super::snapshot_matches_grid(snapshot, expected) {
+        if crate::app::snapshot_matches_grid(snapshot, expected) {
             return None;
         }
         Some(format!(

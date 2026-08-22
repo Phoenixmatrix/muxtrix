@@ -8,7 +8,7 @@ use iced::widget::column;
 
 use crate::views::prelude::*;
 
-use crate::{
+use crate::app::{
     add_tab_button_style, app_tooltip, centered_button_content, ellipsize, pane_icon_button,
     ruled_surface, signal_dot,
 };

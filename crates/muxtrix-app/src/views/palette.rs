@@ -7,9 +7,10 @@ use iced::widget::column;
 
 use crate::views::prelude::*;
 
-use crate::{
-    PALETTE_INPUT_ID, PALETTE_SCROLL_ID, agent_display_name, commands, palette_button_style,
-    selection_bar,
+use crate::commands;
+
+use crate::app::{
+    PALETTE_INPUT_ID, PALETTE_SCROLL_ID, agent_display_name, palette_button_style, selection_bar,
 };
 use iced::Font;
 

@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use muxtrix_domain::{PaneId, PaneTree, SplitAxis, SplitRatio, WorkspaceTab};
 
-use crate::{NavDirection, PaneLayout, PaneRect};
+use crate::app::{NavDirection, PaneLayout, PaneRect};
 
 pub(crate) fn pane_ids_in_layout(tree: &PaneTree) -> Vec<PaneId> {
     tree.pane_ids()

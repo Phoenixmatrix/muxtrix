@@ -7,7 +7,7 @@ use iced::widget::column;
 
 use crate::views::prelude::*;
 
-use crate::{
+use crate::app::{
     SETTINGS_PAGE_PADDING_X, SettingsButtonKind, WORKTREE_LANE_SPACING, WORKTREE_PAGE_MAX_WIDTH,
     WORKTREE_ROW_PADDING_X, WorktreeLanes, WorktreeManagerEntry, app_tooltip,
     centered_button_content, centered_button_label, ellipsize, ellipsize_start, ruled_surface,

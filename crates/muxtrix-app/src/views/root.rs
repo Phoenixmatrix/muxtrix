@@ -6,7 +6,7 @@
 
 use crate::views::prelude::*;
 
-use crate::{ActiveView, WorktreeManagerMode};
+use crate::app::{ActiveView, WorktreeManagerMode};
 
 impl Muxtrix {
     pub(crate) fn view(&self) -> Element<'_, Message> {
