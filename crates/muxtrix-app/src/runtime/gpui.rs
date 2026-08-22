@@ -8,12 +8,14 @@
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext, Bounds, ClipboardItem, Context, IntoElement, ParentElement, Render, Styled,
+    App, AppContext, Bounds, ClipboardItem, Context, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, ParentElement, Render, Styled,
     Window, WindowBounds, WindowOptions, div, px, size,
 };
 
 use crate::app::{Message, Muxtrix};
 use crate::effect::Effect;
+use crate::input::KeyEvent;
 use crate::terminal::element::TerminalElement;
 use crate::theme::DesignTokens;
 
@@ -57,12 +59,19 @@ pub(crate) fn run() -> iced::Result {
 /// effects — what `iced::application` does for the other runtime.
 pub(crate) struct Root {
     app: Muxtrix,
+    /// The window's keyboard focus. Held by the root rather than by any
+    /// surface: Muxtrix routes every key through one handler and decides there
+    /// whether it belongs to a shortcut, a dialog or the terminal, and that
+    /// decision has to keep working before the inputs of Phase 4 exist.
+    focus: FocusHandle,
 }
 
 impl Root {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (app, effects) = Muxtrix::boot();
-        let mut root = Self { app };
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        let mut root = Self { app, focus };
         root.spawn_timers(cx);
         root.spawn_terminal_wakeups(cx);
         root.observe_window(window, cx);
@@ -184,6 +193,39 @@ impl Root {
         .detach();
     }
 
+    /// Every key the window receives, in the app's own vocabulary.
+    ///
+    /// The rule the iced runtime enforced through `app_event` carries over:
+    /// the terminal receives everything the app does not explicitly claim, so
+    /// there is no keymap here to consult first.
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let input = crate::input::from_keystroke(&event.keystroke);
+        self.dispatch(Message::Keyboard(KeyEvent::Pressed(input)), window, cx);
+    }
+
+    fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let modifiers = crate::input::modifiers_from_gpui(event.keystroke.modifiers);
+        self.dispatch(
+            Message::Keyboard(KeyEvent::Released { modifiers }),
+            window,
+            cx,
+        );
+    }
+
+    fn on_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = crate::input::modifiers_from_gpui(event.modifiers);
+        self.dispatch(
+            Message::Keyboard(KeyEvent::ModifiersChanged(modifiers)),
+            window,
+            cx,
+        );
+    }
+
     fn observe_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.observe_window_activation(window, |root, window, cx| {
             let focused = window.is_window_active();
@@ -227,7 +269,7 @@ where
 }
 
 impl Render for Root {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = DesignTokens::for_appearance(self.app.settings.appearance);
         let theme = self.app.settings.terminal_theme.preset();
 
@@ -250,6 +292,11 @@ impl Render for Root {
         });
 
         div()
+            .track_focus(&self.focus)
+            .key_context("Muxtrix")
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .size_full()
             .flex()
             .flex_col()
@@ -269,5 +316,11 @@ pub(crate) fn color(value: iced::Color) -> gpui::Rgba {
         g: value.g,
         b: value.b,
         a: value.a,
+    }
+}
+
+impl Focusable for Root {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
     }
 }

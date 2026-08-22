@@ -2086,7 +2086,7 @@ impl Muxtrix {
             );
         }
         #[cfg(feature = "e2e")]
-        let subscriptions = if self.e2e.is_some() {
+        let subscriptions = if self.has_e2e_scenario() {
             let mut with_e2e = subscriptions;
             with_e2e.push(
                 iced::time::every(std::time::Duration::from_millis(50)).map(|_| Message::E2eTick),
@@ -2616,11 +2616,7 @@ impl Muxtrix {
                     .as_ref()
                     .is_some_and(|picker| picker.startup);
                 self.session_picker = None;
-                let pane_id = self
-                    .active_workspace()
-                    .ok()
-                    .and_then(|workspace| workspace.active_tab())
-                    .map(|tab| tab.focused_pane_id);
+                let pane_id = self.focused_pane_id();
                 if startup && let Some(pane_id) = pane_id {
                     return self.start_new_session_host(pane_id);
                 }
@@ -2689,12 +2685,7 @@ impl Muxtrix {
                 return Vec::new();
             }
             Message::RefreshWorktreeManager => {
-                let Some(pane_id) = self
-                    .active_workspace()
-                    .ok()
-                    .and_then(Workspace::active_tab)
-                    .map(|tab| tab.focused_pane_id)
-                else {
+                let Some(pane_id) = self.focused_pane_id() else {
                     return Vec::new();
                 };
                 return self.open_worktree_list(WorktreeManagerMode::Manage, pane_id);
@@ -3312,12 +3303,7 @@ impl Muxtrix {
             }
             Message::OpenSettingsPage(SettingsPage::Worktrees) => {
                 self.settings_page = SettingsPage::Worktrees;
-                let Some(pane_id) = self
-                    .active_workspace()
-                    .ok()
-                    .and_then(Workspace::active_tab)
-                    .map(|tab| tab.focused_pane_id)
-                else {
+                let Some(pane_id) = self.focused_pane_id() else {
                     return Vec::new();
                 };
                 return self.open_worktree_list(WorktreeManagerMode::Manage, pane_id);

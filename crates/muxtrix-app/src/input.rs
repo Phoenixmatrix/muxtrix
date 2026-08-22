@@ -301,7 +301,7 @@ pub(crate) fn from_keystroke(keystroke: &gpui::Keystroke) -> KeyInput {
 }
 
 #[cfg(feature = "gpui")]
-fn modifiers_from_gpui(modifiers: gpui::Modifiers) -> Modifiers {
+pub(crate) fn modifiers_from_gpui(modifiers: gpui::Modifiers) -> Modifiers {
     let mut result = Modifiers::empty();
     if modifiers.shift {
         result = result | Modifiers::SHIFT;
