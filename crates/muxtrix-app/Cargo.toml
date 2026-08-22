@@ -10,10 +10,17 @@ repository.workspace = true
 
 [features]
 e2e = []
+# The GPUI runtime, off by default while the port is in progress. Both runtimes
+# compile; `runtime/mod.rs` picks one, and the application core underneath is
+# the same either way.
+gpui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component"]
 
 [dependencies]
 async-channel.workspace = true
 bytes.workspace = true
+gpui = { workspace = true, optional = true }
+gpui_platform = { workspace = true, optional = true }
+gpui-component = { workspace = true, optional = true }
 iced.workspace = true
 fontdb.workspace = true
 libghostty-vt.workspace = true

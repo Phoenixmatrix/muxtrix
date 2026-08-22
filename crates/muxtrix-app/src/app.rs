@@ -2071,14 +2071,7 @@ impl Muxtrix {
             iced::time::every(std::time::Duration::from_millis(500)).map(|_| Message::BlinkCursor),
             iced::event::listen_with(app_event),
         ];
-        let animate_github_loading = self.window_focused
-            && self
-                .github_panel
-                .as_ref()
-                .is_some_and(GitHubPanelState::active_loading);
-        #[cfg(feature = "e2e")]
-        let animate_github_loading = animate_github_loading && self.e2e.is_none();
-        if animate_github_loading {
+        if self.github_loading_animating() {
             subscriptions.push(
                 iced::time::every(std::time::Duration::from_millis(90))
                     .map(|_| Message::AnimateGitHubLoading),
@@ -2101,6 +2094,27 @@ impl Muxtrix {
             subscriptions
         };
         Subscription::batch(subscriptions)
+    }
+
+    /// Whether the GitHub panel's loading animation should be stepping.
+    ///
+    /// Gated on window focus so an unattended window is not repainting for an
+    /// animation nobody can see.
+    pub(crate) fn github_loading_animating(&self) -> bool {
+        let animating = self.window_focused
+            && self
+                .github_panel
+                .as_ref()
+                .is_some_and(GitHubPanelState::active_loading);
+        #[cfg(feature = "e2e")]
+        let animating = animating && self.e2e.is_none();
+        animating
+    }
+
+    /// Whether an e2e scenario is driving this run.
+    #[cfg(feature = "e2e")]
+    pub(crate) fn has_e2e_scenario(&self) -> bool {
+        self.e2e.is_some()
     }
 
     pub(crate) fn update(&mut self, message: Message) -> Vec<Effect> {

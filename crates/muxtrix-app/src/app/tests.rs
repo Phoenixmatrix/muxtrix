@@ -2032,14 +2032,14 @@ fn embedded_window_icon_has_the_expected_rgba_shape() {
         include_bytes!("../../assets/muxtrix-icon.rgba").len(),
         256 * 256 * 4
     );
-    assert!(crate::muxtrix_window_icon().is_some());
+    assert!(crate::runtime::iced::muxtrix_window_icon().is_some());
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_application_id_matches_the_desktop_file() {
     assert_eq!(
-        crate::muxtrix_window_settings()
+        crate::runtime::iced::muxtrix_window_settings()
             .platform_specific
             .application_id,
         "muxtrix"
