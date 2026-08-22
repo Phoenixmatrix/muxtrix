@@ -12148,6 +12148,14 @@ impl Muxtrix {
                     ("Merged", IconKind::PullRequestMerged, tokens.github_merged)
                 }
             };
+            let marker_height = 30.0;
+            // The details column is vertically centered inside the 52 px row.
+            // Reserve its context line and 3 px gap below the marker, then
+            // compensate for the terminal face's higher visual baseline so
+            // the icon and number sit with the status pip and pane name.
+            let marker_top =
+                ((52.0 - marker_height - self.settings.ui_pixels(9.0) - 3.0) / 2.0 + 4.0).max(0.0);
+            let marker_bottom = 52.0 - marker_height - marker_top;
             let marker = app_tooltip(
                 button(
                     row![
@@ -12161,7 +12169,7 @@ impl Muxtrix {
                     .align_y(Alignment::Center),
                 )
                 .on_press(Message::OpenGitHubPullRequest(pull_request.url.clone()))
-                .height(30)
+                .height(marker_height)
                 .padding([0, 3])
                 .style(move |_, status| quiet_button_style(tokens, false, status)),
                 format!(
@@ -12177,9 +12185,9 @@ impl Muxtrix {
                 .color(state_color)
                 .wrapping(iced::widget::text::Wrapping::None);
             let marker_layer = container(marker).height(52).padding(Padding {
-                top: 5.0,
+                top: marker_top,
                 right: 2.0,
-                bottom: 17.0,
+                bottom: marker_bottom,
                 left: 2.0,
             });
             let state_layer = container(state)
