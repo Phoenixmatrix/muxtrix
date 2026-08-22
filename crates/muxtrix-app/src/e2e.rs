@@ -1154,7 +1154,7 @@ impl Scenario {
                     activity: Some("Needs approval".into()),
                     session_id: None,
                     cwd: Some("/home/user/dev/muxtrix".into()),
-                    git_branch: Some("main".into()),
+                    git_branch: Some("github-support".into()),
                 },
             );
             app.agent_statuses.insert(

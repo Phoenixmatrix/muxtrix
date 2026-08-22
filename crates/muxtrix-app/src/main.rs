@@ -972,6 +972,29 @@ struct PaneRepository {
     checked_at: std::time::Instant,
 }
 
+fn pane_repository_pull_request_is_relevant(
+    repository: &PaneRepository,
+    directory: &std::path::Path,
+    reported_branch: Option<&str>,
+) -> bool {
+    let directory_matches = repository.directory == directory
+        || repository
+            .root
+            .as_deref()
+            .is_some_and(|root| directory.starts_with(root));
+    directory_matches
+        && reported_branch.is_none_or(|reported_branch| {
+            repository.reported_branch.as_deref() == Some(reported_branch)
+        })
+}
+
+fn current_pull_request_after_refresh(
+    cached: Option<github::CurrentPullRequest>,
+    refresh: Result<Option<github::CurrentPullRequest>, String>,
+) -> Option<github::CurrentPullRequest> {
+    refresh.unwrap_or(cached)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FleetRepositoryGroup {
     name: String,
@@ -5928,7 +5951,12 @@ impl Muxtrix {
     }
 
     fn queue_github_pull_request_refresh(&mut self, pane_id: PaneId) {
-        self.pane_repositories.remove(&pane_id);
+        if let Some(repository) = self.pane_repositories.get_mut(&pane_id) {
+            // Keep truthful cached metadata on screen while the replacement
+            // probe runs. Removing the row here made the PR marker blink after
+            // every completed agent turn.
+            repository.checked_at = std::time::Instant::now() - PANE_REPOSITORY_INTERVAL;
+        }
         self.pending_repository_directories.remove(&pane_id);
         if self.control_pane_id(None).ok() != Some(pane_id) {
             return;
@@ -7592,6 +7620,27 @@ impl Muxtrix {
                 self.pending_repository_directories.remove(&pane_id);
                 continue;
             };
+            let reported_branch = self
+                .agent_statuses
+                .get(&pane_id)
+                .and_then(|status| status.git_branch.as_deref());
+            if self
+                .pane_repositories
+                .get(&pane_id)
+                .is_some_and(|repository| {
+                    !pane_repository_pull_request_is_relevant(
+                        repository,
+                        &directory,
+                        reported_branch,
+                    )
+                })
+                && let Some(repository) = self.pane_repositories.get_mut(&pane_id)
+            {
+                // Branch and worktree changes make the old PR false
+                // immediately. Repository grouping may stay until the
+                // replacement probe lands, but its stale action may not.
+                repository.pull_request = None;
+            }
             let cached = self
                 .pane_repositories
                 .get(&pane_id)
@@ -7652,6 +7701,10 @@ impl Muxtrix {
                 .agent_statuses
                 .get(&pane_id)
                 .and_then(|status| status.git_branch.clone());
+            let cached_pull_request = self
+                .pane_repositories
+                .get(&pane_id)
+                .and_then(|repository| repository.pull_request.clone());
             let cancellation = self.pane_repository_cancellation.clone();
             let wsl_distribution = wsl_distribution.clone();
             let github_host = github_host.clone();
@@ -7672,12 +7725,17 @@ impl Muxtrix {
                             &cancellation,
                         )
                     });
-                    let pull_request = repository.as_ref().and_then(|repository| {
-                        authenticated
-                            .then(|| github::current_pull_request(repository, &cancellation))
-                            .and_then(Result::ok)
-                            .flatten()
-                    });
+                    let pull_request = if authenticated {
+                        match repository.as_ref() {
+                            Some(repository) => current_pull_request_after_refresh(
+                                cached_pull_request,
+                                github::current_pull_request(repository, &cancellation),
+                            ),
+                            None => cached_pull_request,
+                        }
+                    } else {
+                        None
+                    };
                     vec![(
                         pane_id,
                         PaneRepository {
@@ -21274,6 +21332,11 @@ mod tests {
         let directory = app
             .pane_working_directory(pane_id)
             .expect("active pane should have a working directory");
+        let current = github::CurrentPullRequest {
+            number: 173,
+            url: "https://github.com/example/muxtrix/pull/173".into(),
+            state: github::CurrentPullRequestState::Open,
+        };
         app.pane_repositories.insert(
             pane_id,
             PaneRepository {
@@ -21284,7 +21347,7 @@ mod tests {
                 branch: Some("main".into()),
                 reported_branch: None,
                 head_oid: Some("old-head".into()),
-                pull_request: None,
+                pull_request: Some(current.clone()),
                 checked_at: std::time::Instant::now() - PANE_REPOSITORY_INTERVAL,
             },
         );
@@ -21296,6 +21359,42 @@ mod tests {
             Some(&directory)
         );
         assert_eq!(app.pane_repository_generation, 1);
+        assert_eq!(
+            app.pane_repositories
+                .get(&pane_id)
+                .and_then(|repository| repository.pull_request.as_ref()),
+            Some(&current),
+            "the last confirmed PR stays visible while its refresh is pending"
+        );
+    }
+
+    #[test]
+    fn failed_pr_refresh_keeps_the_last_confirmed_indicator() {
+        let current = github::CurrentPullRequest {
+            number: 173,
+            url: "https://github.com/example/muxtrix/pull/173".into(),
+            state: github::CurrentPullRequestState::Open,
+        };
+
+        assert_eq!(
+            current_pull_request_after_refresh(
+                Some(current.clone()),
+                Err("temporary GitHub failure".into()),
+            ),
+            Some(current)
+        );
+        assert_eq!(
+            current_pull_request_after_refresh(
+                Some(github::CurrentPullRequest {
+                    number: 173,
+                    url: "https://github.com/example/muxtrix/pull/173".into(),
+                    state: github::CurrentPullRequestState::Open,
+                }),
+                Ok(None),
+            ),
+            None,
+            "a successful no-PR answer clears the indicator"
+        );
     }
 
     /// A probe that cannot confirm the branch the hook reported — an
@@ -21373,7 +21472,11 @@ mod tests {
                 branch: Some("main".into()),
                 reported_branch: Some("main".into()),
                 head_oid: Some("old-head".into()),
-                pull_request: None,
+                pull_request: Some(github::CurrentPullRequest {
+                    number: 173,
+                    url: "https://github.com/example/muxtrix/pull/173".into(),
+                    state: github::CurrentPullRequestState::Open,
+                }),
                 checked_at: std::time::Instant::now(),
             },
         );
@@ -21385,10 +21488,16 @@ mod tests {
             Some(&directory)
         );
         assert_eq!(app.pane_repository_generation, 1);
+        assert!(
+            app.pane_repositories
+                .get(&pane_id)
+                .is_none_or(|repository| repository.pull_request.is_none()),
+            "the prior branch's PR must disappear before the new probe lands"
+        );
     }
 
     #[test]
-    fn completed_turn_invalidates_repository_metadata_for_a_background_pane() {
+    fn completed_turn_refresh_keeps_confirmed_pr_when_branch_report_is_missing() {
         let mut app = Muxtrix::new();
         let original = active_pane_id(&app);
         app.split_terminal(SplitAxis::Horizontal)
@@ -21396,6 +21505,11 @@ mod tests {
         let directory = app
             .pane_working_directory(original)
             .expect("original pane should have a working directory");
+        let current = github::CurrentPullRequest {
+            number: 173,
+            url: "https://github.com/example/muxtrix/pull/173".into(),
+            state: github::CurrentPullRequestState::Open,
+        };
         app.pane_repositories.insert(
             original,
             PaneRepository {
@@ -21404,16 +21518,77 @@ mod tests {
                 name: Some("muxtrix".into()),
                 worktree_name: None,
                 branch: Some("feature".into()),
-                reported_branch: None,
+                reported_branch: Some("feature".into()),
                 head_oid: Some("old-head".into()),
-                pull_request: None,
+                pull_request: Some(current.clone()),
                 checked_at: std::time::Instant::now(),
             },
         );
 
         app.queue_github_pull_request_refresh(original);
+        drop(app.refresh_pane_repositories());
 
-        assert!(!app.pane_repositories.contains_key(&original));
+        let cached = app
+            .pane_repositories
+            .get(&original)
+            .expect("completed turn should preserve cached repository metadata");
+        assert_eq!(cached.pull_request.as_ref(), Some(&current));
+        assert!(
+            cached.checked_at.elapsed() >= PANE_REPOSITORY_INTERVAL,
+            "completed turn should still make the repository due for refresh"
+        );
+    }
+
+    #[test]
+    fn changing_worktrees_clears_the_stale_pr_before_the_probe_lands() {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        let directory = app
+            .pane_working_directory(pane_id)
+            .expect("active pane should have a working directory");
+        let other_worktree = directory.with_file_name("mk-173-other-worktree");
+        app.pane_repositories.insert(
+            pane_id,
+            PaneRepository {
+                directory: directory.clone(),
+                root: Some(directory),
+                name: Some("muxtrix".into()),
+                worktree_name: None,
+                branch: Some("main".into()),
+                reported_branch: Some("main".into()),
+                head_oid: Some("old-head".into()),
+                pull_request: Some(github::CurrentPullRequest {
+                    number: 172,
+                    url: "https://github.com/example/muxtrix/pull/172".into(),
+                    state: github::CurrentPullRequestState::Open,
+                }),
+                checked_at: std::time::Instant::now(),
+            },
+        );
+        app.agent_statuses.insert(
+            pane_id,
+            AgentPaneStatus {
+                agent: "claude".into(),
+                display_name: None,
+                state: AgentState::Running,
+                activity: None,
+                session_id: None,
+                cwd: Some(other_worktree.display().to_string()),
+                git_branch: Some("main".into()),
+            },
+        );
+
+        drop(app.refresh_pane_repositories());
+
+        assert!(
+            app.pane_repositories
+                .get(&pane_id)
+                .is_none_or(|repository| repository.pull_request.is_none())
+        );
+        assert_eq!(
+            app.pending_repository_directories.get(&pane_id),
+            Some(&other_worktree)
+        );
     }
 
     #[test]
