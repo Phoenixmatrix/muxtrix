@@ -3,6 +3,8 @@ members = [
     "crates/muxtrix-app",
     "crates/muxtrix-control",
     "crates/muxtrix-domain",
+    # Phase 1 spike only; removed with the crate at the end of Phase 2.
+    "crates/muxtrix-gpui-spike",
     "crates/muxtrix-platform",
     "crates/muxtrix-sessions",
     "crates/muxtrix-terminal",
@@ -19,6 +21,19 @@ repository = "https://github.com/Phoenixmatrix/muxtrix"
 [workspace.dependencies]
 async-channel = "2.5.0"
 iced = { version = "0.14.0", features = ["advanced", "canvas", "image", "tokio", "wgpu", "svg"] }
+# GPUI predates its Linux wgpu renderer on crates.io, and Muxtrix needs the GL
+# fallback for WSLg, so these come from git rather than a release.
+#
+# Deliberately no `rev` on the zed dependencies. `gpui-component` declares them
+# with none either, and cargo treats two git specs as the same source only when
+# their revision spec matches — pinning here while it does not produces *two*
+# gpui crates in one graph, which fails to compile. A dependency's own
+# Cargo.lock does not carry over to a dependent workspace, so the pin has to
+# live in ours: the exact revisions are recorded in Cargo.lock, and
+# `cargo update -p gpui` is how they move.
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "5a5e2abc837b6d927e2b38e2097d2fbf39ebee77" }
 fontdb = "0.23.0"
 base64 = "0.22.1"
 bytes = "1.10.1"

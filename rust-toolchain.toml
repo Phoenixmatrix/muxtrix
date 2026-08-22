@@ -1,5 +1,7 @@
 [toolchain]
-channel = "stable"
+# Pinned rather than "stable" because GPUI is a git dependency: zed builds on
+# 1.97.1, and a toolchain older than theirs fails on language features they
+# already use. Bump this in step with the pinned zed revision.
+channel = "1.97.1"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
-

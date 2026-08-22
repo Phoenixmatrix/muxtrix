@@ -82,3 +82,69 @@ GPU requirements satisfied.
 `vulkaninfo` is not an authoritative WSLg acceleration check on this system: it
 reports `llvmpipe` because the working hardware path is Mesa D3D12 through
 OpenGL/EGL. Use the Muxtrix probe instead.
+
+## GPUI (port in progress)
+
+`docs/GPUI_PORT_PLAN.md` replaces Iced with GPUI. Phase 1 is a spike —
+`crates/muxtrix-gpui-spike` — that puts the two risky things on screen (the
+stock `gpui-component` widgets and a 200x60 monospace grid shaped one line per
+row) and reports the adapter and frame cost. What it has established so far:
+
+### Dependency resolution
+
+`gpui-component` declares its zed dependencies **without a revision**:
+
+```toml
+gpui = { version = "0.2.2", git = "https://github.com/zed-industries/zed", features = ["profiler"] }
+```
+
+Cargo treats two git dependencies as the same source only when their revision
+specs match, and a dependency's own `Cargo.lock` is not honoured by a dependent
+workspace. Pinning `rev` on our side while `gpui-component` does not therefore
+puts **two different `gpui` crates in one graph**, and the build fails with
+type mismatches between them (`expected gpui::app::App, found App`).
+
+So the zed dependencies are declared without a `rev`, and the exact revisions
+are pinned in this repo's committed `Cargo.lock`. `cargo update -p gpui` is how
+they move. This supersedes the plan's assumption that pinning `gpui-component`
+to a revision whose lockfile names a zed revision is enough — it is not.
+
+### Toolchain
+
+`rust-toolchain.toml` is pinned to 1.97.1, matching zed's. `stable` resolved to
+1.96.0 locally, which is older than zed's and not guaranteed to build it.
+
+### Linux build dependencies
+
+GPUI links `xkbcommon-x11`, which Iced did not. Beyond the existing set, a
+Linux build now needs:
+
+```bash
+sudo apt-get install -y libxkbcommon-x11-dev libgl1-mesa-dev
+```
+
+Without the first, everything compiles and only the final link fails with
+`unable to find library -lxkbcommon-x11`. These have to be added to the CI
+image as well.
+
+### Platform matrix
+
+Filled in as each leg is run. "Adapter" is what GPUI logs as
+`Selected GPU adapter`.
+
+| Platform | Backend | Adapter | Result |
+|---|---|---|---|
+| Linux, build + link | — | — | compiles; link needs the packages above |
+| Linux X11 (native) | | | not yet run |
+| Linux Wayland (native) | | | not yet run |
+| WSLg, NVIDIA | | | not yet run |
+| WSLg, no NVIDIA | | | not yet run |
+| Xvfb + llvmpipe (CI path) | | | not yet run |
+| Windows 11 | DirectX | | not yet run |
+| macOS | Metal | | not yet run |
+
+The open risk is unchanged and is what the remaining rows exist to settle: on
+WSLg, GPUI scores adapters by device type and then backend (Vulkan over GL),
+and there is no environment variable that forces GL. That is the opposite of
+what `gpu.rs` does today, and Mesa's `dzn` Vulkan driver under WSLg is the
+reason it does it.

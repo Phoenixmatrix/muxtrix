@@ -103,6 +103,21 @@ See `docs/GPU.md` for WSLg backend selection and overrides. `vulkaninfo` alone
 is not authoritative because the accelerated WSLg route is typically Mesa D3D12
 through OpenGL/EGL, not Vulkan.
 
+## Linux build dependencies
+
+Beyond a Rust toolchain, a Linux build needs the X, GL, Vulkan and Wayland
+development headers. The GPUI port adds `libxkbcommon-x11-dev`, without which
+everything compiles and only the final link fails:
+
+```bash
+sudo apt-get install -y \
+  libfontconfig-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev \
+  libwayland-dev libvulkan-dev libgl1-mesa-dev libzstd-dev
+```
+
+`mesa-vulkan-drivers` and `xvfb` are additionally required to run the headless
+e2e test and the capture gallery.
+
 ## Dependency policy
 
 - Prefer stable Rust and crates with Linux, Windows, and macOS support.
