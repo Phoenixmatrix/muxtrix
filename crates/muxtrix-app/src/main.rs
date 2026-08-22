@@ -7094,9 +7094,9 @@ impl Muxtrix {
                     (row + 1).min(runtime.size.rows.max(1)),
                 )
             });
-        // Selection remains emulator-owned. If this wheel is answered by a
-        // repainting application, the terminal session preserves the selected
-        // text and re-anchors it after the new frame arrives.
+        // Selection remains emulator-owned and anchored to cells, so a
+        // repainting application simply paints new content under the
+        // highlight — the behavior every terminal emulator offers.
         runtime.wheel(lines, cell)
     }
 
