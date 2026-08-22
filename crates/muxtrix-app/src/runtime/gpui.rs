@@ -288,6 +288,7 @@ impl Render for Root {
         let tokens = DesignTokens::for_appearance(self.app.settings.appearance);
         let sidebar = self.view_sidebar(cx);
         let palette = self.command_palette(cx);
+        let dialog = self.dialog(cx);
         let toast = self.toast();
         let status_bar = self.status_bar();
         let workspace = self.view_workspace(window, cx);
@@ -337,6 +338,7 @@ impl Render for Root {
             )
             .children(status_bar)
             .children(menu)
+            .children(dialog)
             .children(palette)
             .children(toast)
     }
