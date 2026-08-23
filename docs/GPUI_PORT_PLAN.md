@@ -89,7 +89,7 @@ Pure-logic modules in `muxtrix-app` with **zero** Iced references, reused as-is:
   `BlinkCursor`; `event::listen_with(app_event L18809)` → `Keyboard`,
   `PointerMoved`, `EndPointerInteraction`, `ScrollHoveredTerminal`,
   `WindowOpened/Resized/FocusChanged`; 90 ms `AnimateGitHubLoading` (gated);
-  1 ms one-shot `RefreshGitHubPullRequestsAfterAgentTurn`; 50 ms `E2eTick`.
+  1 ms gated `RefreshGitHubPullRequestsAfterAgentTurn` poll; 50 ms `E2eTick`.
 - `update()` L2131 → ~L8170. This is the business logic and stays.
 - `view()` L8179 and view methods L8350–L14600 (see §1.3).
 - Terminal grid renderer `styled_terminal` L18874–19103 and the run model
@@ -404,9 +404,10 @@ Performance target: one `shape_line` per row per frame with GPUI's shape cache
 - Timers: `cx.spawn(async move |this, cx| loop { cx.background_executor()
   .timer(d).await; this.update(cx, |m, cx| m.dispatch(Message::BlinkCursor,
   cx))?; })` for the 500 ms blink, the 90 ms GitHub loader (gated by the same
-  conditions as today), the 50 ms e2e tick; the 1 ms deferral becomes a plain
-  `cx.spawn` one-shot. Terminal wakeups: the `async_channel::Receiver<()>` is
-  awaited in a spawned loop → `PollTerminal`.
+  conditions as today), and the 50 ms e2e tick. Agent-turn pull-request
+  refreshes are consumed in the same `PollTerminal` pass that receives the
+  control event, so there is no idle deferral timer. Terminal wakeups: the
+  `async_channel::Receiver<()>` is awaited in a spawned loop → `PollTerminal`.
 - Daemon/control/agent background work: every `Task::perform(async fn)` and
   `Task::run(stream)` in `update` becomes `Effect::Spawn`/`SpawnStream`
   executed with `cx.background_spawn` and posted back through

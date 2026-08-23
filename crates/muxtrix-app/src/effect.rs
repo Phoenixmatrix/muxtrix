@@ -14,6 +14,8 @@ use crate::app::Message;
 pub(crate) enum Effect {
     /// Run blocking work off the UI thread; its return value becomes a message.
     Perform(Box<dyn FnOnce() -> Message + Send + 'static>),
+    /// Ask the native platform to open an HTTP(S) URL immediately.
+    OpenUrl(String),
     Focus(FocusTarget),
     /// Scroll to a fraction of the scrollable's length, 0.0 top to 1.0 end.
     ScrollToRatio(ScrollTarget, f32),

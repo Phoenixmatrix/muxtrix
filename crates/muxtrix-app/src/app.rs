@@ -1416,7 +1416,6 @@ pub(crate) enum Message {
     CopyTerminalSelection(PaneId),
     PastePane(PaneId),
     ClipboardPasted(PaneId, Option<String>),
-    TerminalLinkOpened(String, Result<(), String>),
     ScrollTerminal(PaneId, ScrollDelta),
     WindowOpened(Size),
     WindowResized(Size),
@@ -1467,7 +1466,6 @@ pub(crate) enum Message {
     GitHubAuthFinished(u64, Result<github::AuthStatus, String>),
     CloseGitHubPanel,
     RefreshGitHubPanel,
-    RefreshGitHubPullRequestsAfterAgentTurn,
     GitHubFocusedPaneLoaded(
         PaneId,
         u64,
@@ -2365,7 +2363,12 @@ impl Muxtrix {
                 } else {
                     Vec::new()
                 };
-                return effect::batch([metadata, github]);
+                let pull_requests = if self.github_pull_requests_refresh_pending {
+                    self.refresh_github_pull_requests_after_agent_turn()
+                } else {
+                    Vec::new()
+                };
+                return effect::batch([metadata, github, pull_requests]);
             }
             Message::AgentsRosterLoaded(result) => {
                 self.agents_roster_pending = false;
@@ -2628,13 +2631,6 @@ impl Muxtrix {
                         self.status = format!("Paste failed: {error}");
                     }
                 }
-                return Vec::new();
-            }
-            Message::TerminalLinkOpened(uri, result) => {
-                self.status = match result {
-                    Ok(()) => format!("Opened {uri}"),
-                    Err(error) => format!("Could not open {uri}: {error}"),
-                };
                 return Vec::new();
             }
             Message::ScrollTerminal(pane_id, delta) => {
@@ -3035,20 +3031,6 @@ impl Muxtrix {
                 return Vec::new();
             }
             Message::RefreshGitHubPanel => return self.refresh_github_panel(),
-            Message::RefreshGitHubPullRequestsAfterAgentTurn => {
-                self.github_pull_requests_refresh_pending = false;
-                let selected_pull_request_visible =
-                    self.github_panel.as_ref().is_some_and(|panel| {
-                        panel.active_tab == GitHubPanelTab::PullRequests
-                            && panel.selected_pull_request_number.is_some()
-                    });
-                let pull_requests = self.refresh_github_pull_requests();
-                return if selected_pull_request_visible {
-                    effect::batch([pull_requests, self.refresh_selected_github_pull_request()])
-                } else {
-                    pull_requests
-                };
-            }
             Message::GitHubFocusedPaneLoaded(pane_id, generation, purpose, result) => {
                 if generation != self.github_context_generation {
                     return Vec::new();
@@ -3399,11 +3381,8 @@ impl Muxtrix {
                 return Vec::new();
             }
             Message::OpenGitHubPullRequest(url) => {
-                let target = url.clone();
-                return vec![Effect::Perform(Box::new(move || {
-                    let result = open_web_url(&target).map_err(|error| error.to_string());
-                    Message::TerminalLinkOpened(url, result)
-                }))];
+                self.status = format!("Opening {url}");
+                return vec![Effect::OpenUrl(url)];
             }
             Message::ToggleGitHubPullRequestDraft => {
                 return self.toggle_github_pull_request_draft();
@@ -6241,6 +6220,20 @@ impl Muxtrix {
         }
     }
 
+    fn refresh_github_pull_requests_after_agent_turn(&mut self) -> Vec<Effect> {
+        self.github_pull_requests_refresh_pending = false;
+        let selected_pull_request_visible = self.github_panel.as_ref().is_some_and(|panel| {
+            panel.active_tab == GitHubPanelTab::PullRequests
+                && panel.selected_pull_request_number.is_some()
+        });
+        let pull_requests = self.refresh_github_pull_requests();
+        if selected_pull_request_visible {
+            effect::batch([pull_requests, self.refresh_selected_github_pull_request()])
+        } else {
+            pull_requests
+        }
+    }
+
     pub(crate) fn refresh_github_panel(&mut self) -> Vec<Effect> {
         let Some(panel) = self.github_panel.as_ref() else {
             return Vec::new();
@@ -7445,12 +7438,8 @@ impl Muxtrix {
                 if terminal_link_modifiers(self.keyboard_modifiers)
                     && let Some(link) = self.hovered_terminal_link(pane_id)
                 {
-                    let uri = link.uri;
-                    let target = uri.clone();
-                    return vec![Effect::Perform(Box::new(move || {
-                        let result = open_web_url(&target).map_err(|error| error.to_string());
-                        Message::TerminalLinkOpened(uri, result)
-                    }))];
+                    self.status = format!("Opening {}", link.uri);
+                    return vec![Effect::OpenUrl(link.uri)];
                 }
                 let cell = self.terminal_grid_cell_at(pane_id, position);
                 if let Some(runtime) = self.terminals.get_mut(&pane_id)
@@ -11325,36 +11314,6 @@ pub(crate) fn is_valid_web_url(candidate: &str) -> bool {
         && candidate
             .bytes()
             .all(|byte| !byte.is_ascii_control() && !byte.is_ascii_whitespace())
-}
-
-pub(crate) fn open_web_url(uri: &str) -> std::io::Result<()> {
-    if valid_web_url(uri).is_none() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "only http and https URLs can be opened",
-        ));
-    }
-
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = console_command("rundll32.exe");
-        command.args(["url.dll,FileProtocolHandler", uri]);
-        command
-    };
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = console_command("open");
-        command.arg(uri);
-        command
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = {
-        let mut command = console_command("xdg-open");
-        command.arg(uri);
-        command
-    };
-
-    command.spawn().map(|_| ())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

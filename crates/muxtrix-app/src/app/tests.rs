@@ -997,7 +997,7 @@ fn completed_agent_turn_queues_visible_pull_request_refresh() {
     assert!(panel.pull_requests_loading);
     assert!(app.github_pull_requests_refresh_pending);
 
-    drop(app.update(Message::RefreshGitHubPullRequestsAfterAgentTurn));
+    drop(app.update(Message::PollTerminal));
     assert!(!app.github_pull_requests_refresh_pending);
     assert_eq!(
         app.github_panel
@@ -1050,7 +1050,7 @@ fn completed_agent_turn_refreshes_the_selected_pull_request_and_list() {
     assert!(panel.selected_pull_request_loading);
     assert!(app.github_pull_requests_refresh_pending);
 
-    drop(app.update(Message::RefreshGitHubPullRequestsAfterAgentTurn));
+    drop(app.update(Message::PollTerminal));
     let panel = app.github_panel.as_ref().expect("panel should remain open");
     assert!(!app.github_pull_requests_refresh_pending);
     assert_eq!(panel.pull_request_generation, 1);
@@ -3027,6 +3027,44 @@ fn web_urls_are_dotted_by_default_and_solid_when_clickable() {
             .sum::<usize>(),
         link.end_column - link.start_column
     );
+    actor.shutdown().expect("terminal actor should stop");
+}
+
+#[test]
+fn terminal_link_click_requests_native_open_immediately() {
+    let actor = TerminalActor::spawn(TerminalOptions {
+        cols: 64,
+        rows: 2,
+        max_scrollback: 10,
+    })
+    .expect("terminal actor should start");
+    actor
+        .feed(b"See https://example.com/docs".to_vec())
+        .expect("terminal should accept a URL");
+
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    app.terminals
+        .get_mut(&pane_id)
+        .expect("the initial pane should have a runtime")
+        .snapshot = Some(actor.snapshot().expect("snapshot should render"));
+    app.hovered_terminal = Some(pane_id);
+    app.keyboard_modifiers = Modifiers::CTRL | Modifiers::SHIFT;
+    app.terminal_pointer_positions.insert(
+        pane_id,
+        Point::new(
+            TERMINAL_PADDING / 2.0 + app.settings.terminal_cell_width() * 10.0,
+            TERMINAL_PADDING / 2.0,
+        ),
+    );
+
+    let effects = app.begin_terminal_mouse(pane_id, TerminalMouseButton::Left);
+
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::OpenUrl(url)] if url == "https://example.com/docs"
+    ));
+    assert_eq!(app.status, "Opening https://example.com/docs");
     actor.shutdown().expect("terminal actor should stop");
 }
 

@@ -789,6 +789,12 @@ impl Scenario {
                     self.settle_ticks = 1;
                     return Ok(TickAction::Wait);
                 }
+                if self.capturing("terminal-links")
+                    && !pane_contains(app, self.initial_pane, TERMINAL_URL_MARKER)
+                {
+                    self.settle_ticks = 1;
+                    return Ok(TickAction::Wait);
+                }
                 if self.capturing("terminal-image")
                     && app.terminals.get(&self.initial_pane).is_none_or(|runtime| {
                         runtime
@@ -961,6 +967,19 @@ impl Scenario {
                 .ok_or_else(|| "glyph capture pane lost its live session".to_owned())?
                 .input(
                     "printf '\\033[2J\\033[HClaude prompt rule\\nDesktop  Documents  Downloads  Pictures\\n────────────────────────────────────────\\nWeekly limit\\n████████████████░░░░ 80%%\\n\\033[38;2;255;0;255m╭──────────────────────────────╮\\n│ Codex · model · directory    │\\n╰──────────────────────────────╯\\033[0m\\n\\033[38;2;0;255;255m┏━━━━━━━━━━━━━━━━━━┓\\n┃ Heavy box        ┃\\n┗━━━━━━━━━━━━━━━━━━┛\\033[0m\\n\\033[38;2;0;255;0m╔══════╗ ┄┅┆┇┈┉┊┋ ╱╲╳\\n╚══════╝ ═║╬\\033[0m\\n'\r"
+                        .as_bytes()
+                        .to_vec(),
+                )
+                .map_err(|error| error.to_string())?;
+        } else if self.capturing("terminal-links") {
+            app.focus_pane(self.initial_pane)?;
+            app.maximized_pane = Some(self.initial_pane);
+            app.terminals
+                .get(&self.initial_pane)
+                .and_then(|runtime| runtime.session.as_ref())
+                .ok_or_else(|| "link capture pane lost its live session".to_owned())?
+                .input(
+                    "printf '\\033[2J\\033[HDetected link\\nhttps://example.com/docs\\n\\nApplication underline\\n\\033[4mstatus text\\033[24m\\n'\r"
                         .as_bytes()
                         .to_vec(),
                 )
