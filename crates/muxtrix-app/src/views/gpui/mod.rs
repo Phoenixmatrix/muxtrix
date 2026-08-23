@@ -10,6 +10,7 @@ pub(crate) mod inputs;
 pub(crate) mod overlays;
 pub(crate) mod panes;
 pub(crate) mod settings;
+pub(crate) mod settings_widgets;
 pub(crate) mod sidebar;
 pub(crate) mod workspace;
 

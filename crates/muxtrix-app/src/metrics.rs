@@ -160,6 +160,7 @@ pub(crate) fn system_monospace_family() -> Option<&'static str> {
 /// given no family at all, falls back to a face of its own choosing, and the
 /// two runtimes then set the same copy at visibly different widths. Naming
 /// the family keeps the chrome's type identical across both.
+#[cfg(feature = "gpui")]
 pub(crate) fn system_sans_family() -> Option<&'static str> {
     let database = database()?;
     let query = Query {

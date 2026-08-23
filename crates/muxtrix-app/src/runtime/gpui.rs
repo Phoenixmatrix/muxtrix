@@ -72,11 +72,15 @@ pub(crate) fn run() -> iced::Result {
 pub(crate) struct Root {
     pub(crate) app: Muxtrix,
     pub(crate) inputs: crate::views::gpui::inputs::Inputs,
+    /// The settings page's pickers, sliders and fields.
+    pub(crate) settings_widgets: crate::views::gpui::settings_widgets::SettingsWidgets,
     /// A focus request waiting for a frame to apply it against.
     pending_focus: Option<crate::effect::FocusTarget>,
     /// The title the window already carries, so an unchanged one costs
     /// nothing.
     title: String,
+    /// The appearance `gpui-component`'s theme was last synced to.
+    component_theme: Option<crate::settings::Appearance>,
     /// Inline terminal images, decoded once and kept while the emulator still
     /// references them. Keyed by the emulator's own generation, so an image
     /// that is redrawn unchanged is not decoded again.
@@ -216,11 +220,15 @@ impl Root {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let inputs = crate::views::gpui::inputs::Inputs::new(window, cx);
+        let settings_widgets =
+            crate::views::gpui::settings_widgets::SettingsWidgets::new(window, cx);
         let mut root = Self {
             app,
             inputs,
+            settings_widgets,
             pending_focus: None,
             title: String::new(),
+            component_theme: None,
             images: std::collections::BTreeMap::new(),
             scrolls: Scrolls::default(),
             pending_scrolls: Vec::new(),
@@ -266,6 +274,7 @@ impl Root {
             .is_none_or(|before| before != (self.app.grid_revision(), self.app.chrome_revision()));
         self.run_effects(effects, window, cx);
         self.sync_inputs(window, cx);
+        self.sync_settings_widgets(window, cx);
         // Setting the title is a round trip to the X server. The title
         // changes when a pane's does; a keystroke is not that, and paying for
         // one per key is enough to fall behind a fast typist.
@@ -531,6 +540,7 @@ where
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drain_terminals(cx);
+        self.sync_component_theme(window, cx);
         // Both of these read what the last frame laid out, so they belong at
         // the start of the next one.
         self.apply_pending_scrolls();
@@ -641,6 +651,92 @@ impl Focusable for Root {
 ///
 /// [`DesignTokens`] stays the single source of truth for chrome colour under
 /// both runtimes; only the conversion differs.
+impl Root {
+    /// Keep `gpui-component`'s own theme on the app's design tokens.
+    ///
+    /// The stock widgets — pickers, switches, sliders, text fields — read the
+    /// library's global theme, not the tokens the rest of the chrome is drawn
+    /// from. Left alone they render in the library's light default, white on
+    /// a dark page. Mapping the tokens over it, whenever the appearance the
+    /// page is drawn in changes, is what makes a `Select` sit on a settings
+    /// row as if it were drawn there by hand.
+    fn sync_component_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_component::{Theme, ThemeMode};
+        let appearance = self.app.settings_draft.appearance;
+        if self.component_theme == Some(appearance) {
+            return;
+        }
+        self.component_theme = Some(appearance);
+        let tokens = DesignTokens::for_appearance(appearance);
+        let mode = match appearance {
+            crate::settings::Appearance::Light => ThemeMode::Light,
+            crate::settings::Appearance::System | crate::settings::Appearance::Dark => {
+                ThemeMode::Dark
+            }
+        };
+        Theme::change(mode, None, cx);
+        let hsla = |value: iced::Color| -> gpui::Hsla { color(value).into() };
+        let faded = |value: iced::Color, alpha: f32| -> gpui::Hsla {
+            let mut faded = color(value);
+            faded.a = alpha;
+            faded.into()
+        };
+        let theme = Theme::global_mut(cx);
+        theme.font_family = ui_family(&self.app.settings);
+        theme.font_size = px(self.app.settings.ui_pixels(11.0));
+        theme.mono_font_family = crate::views::gpui::terminal_family(&self.app.settings);
+        theme.radius = px(5.);
+        theme.radius_lg = px(7.);
+        theme.shadow = false;
+        let colors = &mut theme.colors;
+        colors.background = hsla(tokens.app);
+        colors.foreground = hsla(tokens.text);
+        colors.border = hsla(tokens.line_strong);
+        colors.input = hsla(tokens.line_strong);
+        colors.ring = faded(tokens.accent, 0.6);
+        colors.caret = hsla(tokens.text);
+        colors.selection = faded(tokens.accent, 0.35);
+        colors.muted = hsla(tokens.panel_raised);
+        colors.muted_foreground = hsla(tokens.muted);
+        colors.accent = hsla(tokens.panel_raised);
+        colors.accent_foreground = hsla(tokens.text);
+        colors.primary = hsla(tokens.accent);
+        colors.primary_hover = faded(tokens.accent, 0.86);
+        colors.primary_active = faded(tokens.accent, 0.8);
+        colors.primary_foreground = hsla(tokens.app);
+        colors.secondary = hsla(tokens.panel);
+        colors.secondary_hover = hsla(tokens.panel_raised);
+        colors.secondary_active = hsla(tokens.panel_raised);
+        colors.secondary_foreground = hsla(tokens.text);
+        colors.popover = hsla(tokens.overlay);
+        colors.popover_foreground = hsla(tokens.text);
+        colors.list = hsla(tokens.overlay);
+        colors.list_hover = hsla(tokens.panel_raised);
+        colors.list_active = faded(tokens.accent, 0.18);
+        colors.list_active_border = hsla(tokens.accent);
+        colors.list_even = hsla(tokens.overlay);
+        colors.list_head = hsla(tokens.overlay);
+        colors.slider_bar = hsla(tokens.accent);
+        colors.slider_thumb = hsla(tokens.accent);
+        colors.switch = hsla(tokens.line_strong);
+        colors.switch_thumb = hsla(tokens.text);
+        colors.scrollbar = hsla(iced::Color::TRANSPARENT);
+        colors.scrollbar_thumb = faded(tokens.text, 0.25);
+        colors.scrollbar_thumb_hover = faded(tokens.text, 0.4);
+        colors.danger = hsla(tokens.danger);
+        colors.danger_foreground = hsla(tokens.app);
+        colors.success = hsla(tokens.success);
+        colors.success_foreground = hsla(tokens.app);
+        colors.warning = hsla(tokens.warning);
+        colors.warning_foreground = hsla(tokens.app);
+        colors.link = hsla(tokens.accent);
+        colors.link_hover = hsla(tokens.accent);
+        colors.link_active = hsla(tokens.accent);
+        colors.overlay = hsla(tokens.scrim);
+        window.refresh();
+    }
+}
+
 /// The chrome's face: the configured UI font, or the platform's sans-serif.
 pub(crate) fn ui_family(settings: &crate::settings::AppSettings) -> gpui::SharedString {
     settings
