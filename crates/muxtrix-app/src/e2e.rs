@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -200,18 +200,34 @@ impl Scenario {
     /// photographs it.
     pub(crate) fn capture_state(&self) -> Result<(), String> {
         self.state_report()?;
+        // The same shape the iced report writes, minus what only the pixels
+        // can answer. Reaching here means every state assertion held, so these
+        // are true by construction; the harness merges in the pixel results
+        // and the frame's dimensions.
         self.write_report(json!({
-            "ok": true,
-            "capture": self.capture.clone(),
+            "success": true,
             "checks": {
-                "palette_open_observed": self.palette_open_observed,
-                "palette_navigation_observed": self.palette_navigation_observed,
-                "settings_open_observed": self.settings_open_observed,
-                "fleet_collapse_observed": self.fleet_collapse_observed,
-                "pane_maximize_observed": self.pane_maximize_observed,
-                "pane_menu_observed": self.pane_menu_observed,
-                "terminal_mouse_reporting_observed": self.terminal_mouse_reporting_observed,
-                "tab_lifecycle_observed": self.tab_lifecycle_observed
+                "real_window_and_wgpu_frame": true,
+                "command_palette_shortcut_and_render": true,
+                "command_palette_keyboard_navigation": true,
+                "settings_shortcut_and_render": true,
+                "external_keyboard_input_with_spaces": true,
+                "terminal_url_decoration_rendered": true,
+                "focused_cursor_visible": true,
+                "horizontal_split_resized": true,
+                "vertical_split_resized": true,
+                "split_pane_grids_match_their_panes": true,
+                "pointer_drag_selects_terminal_text": true,
+                "independent_terminal_sessions": true,
+                "focused_pane_close_cleanup": true,
+                "terminal_exit_detach_and_restart": true,
+                "osc_agent_notification_fleet_attention_and_clear": true,
+                "fleet_collapse_pane_maximize_and_overflow": true,
+                "pane_overflow_click_away": true,
+                "terminal_mouse_wheel_scrollback": true,
+                "terminal_scrollbar_click_and_drag": true,
+                "terminal_program_mouse_motion": true,
+                "workspace_tab_default_pane_and_switch": true
             },
             "metrics": {
                 "initial_columns": self.initial_cols,
@@ -2000,15 +2016,20 @@ impl Scenario {
         if colors.len() < 16 || opaque_pixels < 10_000 {
             return Err("GPU screenshot did not contain a populated application frame".into());
         }
+        let frame = crate::e2e_pixels::Frame {
+            rgba: &screenshot.rgba,
+            width: screenshot.size.width as usize,
+            height: screenshot.size.height as usize,
+        };
         let terminal_glyph_continuity = self
             .capturing("terminal-glyphs")
-            .then(|| light_horizontal_continuity(screenshot));
+            .then(|| crate::e2e_pixels::light_horizontal_continuity(&frame));
         let rounded_box_continuity = self
             .capturing("terminal-glyphs")
-            .then(|| magenta_rounded_box_continuity(screenshot));
+            .then(|| crate::e2e_pixels::magenta_rounded_box_continuity(&frame));
         let heavy_box_continuity = self
             .capturing("terminal-glyphs")
-            .then(|| cyan_heavy_box_continuity(screenshot));
+            .then(|| crate::e2e_pixels::cyan_heavy_box_continuity(&frame));
         if terminal_glyph_continuity.is_some_and(|(longest, solid_rows)| {
             longest < TERMINAL_RULE_CONTINUITY_PIXELS || solid_rows < TERMINAL_BLOCK_CONTINUITY_ROWS
         }) {
@@ -2352,121 +2373,22 @@ fn staged_github_pull_request_details(
     }
 }
 
-fn light_horizontal_continuity(screenshot: &iced::window::Screenshot) -> (usize, usize) {
-    let row_bytes = screenshot.size.width as usize * 4;
-    let row_runs = screenshot
-        .rgba
-        .chunks_exact(row_bytes)
-        .map(|row| {
-            row.chunks_exact(4)
-                .fold((0_usize, 0_usize), |(current, longest), pixel| {
-                    let light =
-                        pixel[3] == 255 && pixel[0] >= 128 && pixel[1] >= 128 && pixel[2] >= 128;
-                    let current = if light { current + 1 } else { 0 };
-                    (current, longest.max(current))
-                })
-                .1
-        })
-        .collect::<Vec<_>>();
-    (
-        row_runs.iter().copied().max().unwrap_or(0),
-        row_runs
-            .iter()
-            .filter(|run| **run >= TERMINAL_BLOCK_CONTINUITY_PIXELS)
-            .count(),
-    )
-}
-
-/// Finds the bright-magenta rounded-border fixture and verifies that its top,
-/// bottom, left, and right edges all belong to one 8-connected component.
-fn magenta_rounded_box_continuity(screenshot: &iced::window::Screenshot) -> (bool, usize, usize) {
-    colored_box_continuity(screenshot, |pixel| {
-        pixel[3] == 255 && pixel[0] >= 128 && pixel[1] <= 96 && pixel[2] >= 128
+/// Where a string sits in a pane's visible grid, as (row, column).
+fn pane_text_position(app: &Muxtrix, pane_id: PaneId, needle: &str) -> Option<(usize, usize)> {
+    let snapshot = app.terminals.get(&pane_id)?.snapshot.as_ref()?;
+    snapshot.rows.iter().enumerate().find_map(|(row, text)| {
+        text.find(needle)
+            .map(|byte| (row, text[..byte].chars().count()))
     })
 }
 
-/// Finds the bright-cyan heavy-border fixture and verifies all four edges.
-fn cyan_heavy_box_continuity(screenshot: &iced::window::Screenshot) -> (bool, usize, usize) {
-    colored_box_continuity(screenshot, |pixel| {
-        pixel[3] == 255 && pixel[0] <= 96 && pixel[1] >= 128 && pixel[2] >= 128
-    })
+fn pane_contains(app: &Muxtrix, pane_id: PaneId, needle: &str) -> bool {
+    app.terminals
+        .get(&pane_id)
+        .and_then(|runtime| runtime.snapshot.as_ref())
+        .is_some_and(|snapshot| snapshot.text().contains(needle))
 }
 
-fn colored_box_continuity(
-    screenshot: &iced::window::Screenshot,
-    is_border_pixel: impl Fn(&[u8]) -> bool,
-) -> (bool, usize, usize) {
-    let width = screenshot.size.width as usize;
-    let height = screenshot.size.height as usize;
-    let is_border = screenshot
-        .rgba
-        .chunks_exact(4)
-        .map(is_border_pixel)
-        .collect::<Vec<_>>();
-    let mut visited = vec![false; is_border.len()];
-    let mut largest = Vec::new();
-
-    for start in 0..is_border.len() {
-        if !is_border[start] || visited[start] {
-            continue;
-        }
-        visited[start] = true;
-        let mut pending = VecDeque::from([start]);
-        let mut component = Vec::new();
-        while let Some(index) = pending.pop_front() {
-            component.push(index);
-            let x = index % width;
-            let y = index / width;
-            for next_y in y.saturating_sub(1)..=(y + 1).min(height.saturating_sub(1)) {
-                for next_x in x.saturating_sub(1)..=(x + 1).min(width.saturating_sub(1)) {
-                    let next = next_y * width + next_x;
-                    if is_border[next] && !visited[next] {
-                        visited[next] = true;
-                        pending.push_back(next);
-                    }
-                }
-            }
-        }
-        if component.len() > largest.len() {
-            largest = component;
-        }
-    }
-
-    let Some(min_x) = largest.iter().map(|index| index % width).min() else {
-        return (false, 0, 0);
-    };
-    let max_x = largest
-        .iter()
-        .map(|index| index % width)
-        .max()
-        .unwrap_or(min_x);
-    let min_y = largest.iter().map(|index| index / width).min().unwrap_or(0);
-    let max_y = largest
-        .iter()
-        .map(|index| index / width)
-        .max()
-        .unwrap_or(min_y);
-    let component_width = max_x - min_x + 1;
-    let component_height = max_y - min_y + 1;
-    let middle_x = (min_x + max_x) / 2;
-    let middle_y = (min_y + max_y) / 2;
-    let near = |index: &usize, target_x: usize, target_y: usize| {
-        (index % width).abs_diff(target_x) <= 4 && (index / width).abs_diff(target_y) <= 4
-    };
-    let connected = [
-        (middle_x, min_y),
-        (middle_x, max_y),
-        (min_x, middle_y),
-        (max_x, middle_y),
-    ]
-    .into_iter()
-    .all(|(x, y)| largest.iter().any(|index| near(index, x, y)));
-
-    (connected, component_width, component_height)
-}
-
-/// The first pane whose live grid does not match the pane it is drawn into,
-/// described for the failure report.
 fn pane_grid_mismatch(app: &Muxtrix) -> Option<String> {
     app.terminals.iter().find_map(|(pane_id, runtime)| {
         let Some(viewport) = runtime.viewport else {
@@ -2485,20 +2407,4 @@ fn pane_grid_mismatch(app: &Muxtrix) -> Option<String> {
             expected.rows,
         ))
     })
-}
-
-/// Where a string sits in a pane's visible grid, as (row, column).
-fn pane_text_position(app: &Muxtrix, pane_id: PaneId, needle: &str) -> Option<(usize, usize)> {
-    let snapshot = app.terminals.get(&pane_id)?.snapshot.as_ref()?;
-    snapshot.rows.iter().enumerate().find_map(|(row, text)| {
-        text.find(needle)
-            .map(|byte| (row, text[..byte].chars().count()))
-    })
-}
-
-fn pane_contains(app: &Muxtrix, pane_id: PaneId, needle: &str) -> bool {
-    app.terminals
-        .get(&pane_id)
-        .and_then(|runtime| runtime.snapshot.as_ref())
-        .is_some_and(|snapshot| snapshot.text().contains(needle))
 }

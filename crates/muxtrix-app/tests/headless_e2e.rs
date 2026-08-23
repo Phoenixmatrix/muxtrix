@@ -8,11 +8,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ConfigureWindowAux, ConnectionExt as _, InputFocus,
-    KEY_PRESS_EVENT, KEY_RELEASE_EVENT, MOTION_NOTIFY_EVENT, MapState,
+    BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ConfigureWindowAux, ConnectionExt as _, ImageFormat,
+    InputFocus, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, MOTION_NOTIFY_EVENT, MapState,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
+
+// The pixel checks are shared with the application: which process holds the
+// frame depends on the renderer, but what counts as a joined border does not.
+#[path = "../src/e2e_pixels.rs"]
+mod e2e_pixels;
 
 struct ProcessGuard(Option<Child>);
 
@@ -335,6 +340,34 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     connection.flush()?;
     eprintln!("injected terminal command with spaces");
 
+    let mut captured: Option<CapturedFrame> = None;
+    // GPUI cannot render its window to an image outside its test platform, so
+    // when it is the runtime the frame is grabbed from the X server here. The
+    // app says when the scenario has settled, and waits to be told to quit so
+    // the frame is still on screen when it is taken.
+    if capture_is_external() {
+        let ready = Instant::now() + Duration::from_secs(20);
+        loop {
+            let status = control_request(&control_path, r#"{"method":"e2e_status"}"#)?;
+            if status["capture_ready"] == true {
+                break;
+            }
+            if Instant::now() >= ready {
+                let _ = control_request(&control_path, r#"{"method":"quit"}"#);
+                return Err("Muxtrix never reached its capture point".into());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let frame = grab_window(&connection, window)?;
+        std::fs::write(&screenshot_path, &frame.rgba)?;
+        eprintln!(
+            "captured a {}x{} frame from the X server",
+            frame.width, frame.height
+        );
+        let _ = control_request(&control_path, r#"{"method":"quit"}"#);
+        captured = Some(frame);
+    }
+
     let deadline = Instant::now() + Duration::from_secs(25);
     loop {
         if app.child_mut().try_wait()?.is_some() {
@@ -356,7 +389,12 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         .into());
     }
 
-    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
+    let mut report: serde_json::Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
+    // The application answered for its state; the pixels are answered here,
+    // because this is the process that holds them.
+    if let Some(frame) = &captured {
+        merge_pixel_findings(&mut report, frame);
+    }
     let _ = std::fs::remove_file(&report_path);
     let _ = std::fs::remove_file(&config_path);
     let _ = std::fs::remove_file(&control_path);
@@ -483,6 +521,91 @@ fn requested_viewport() -> Result<(u32, u32), Box<dyn std::error::Error>> {
         return Err("MUXTRIX_E2E_VIEWPORT is below the supported 720x480 minimum".into());
     }
     Ok((width, height))
+}
+
+/// Fold the pixel checks into a report whose state half the app already wrote.
+///
+/// Only the `terminal-glyphs` capture puts the drawing fixtures on screen; any
+/// other frame has nothing to measure, and the checks pass vacuously — the same
+/// rule the in-process path follows.
+fn merge_pixel_findings(report: &mut serde_json::Value, frame: &CapturedFrame) {
+    let pixels = e2e_pixels::Frame {
+        rgba: &frame.rgba,
+        width: frame.width,
+        height: frame.height,
+    };
+    let glyphs = std::env::var("MUXTRIX_E2E_CAPTURE").is_ok_and(|state| state == "terminal-glyphs");
+    let rule = glyphs.then(|| e2e_pixels::light_horizontal_continuity(&pixels));
+    let rounded = glyphs.then(|| e2e_pixels::magenta_rounded_box_continuity(&pixels));
+    let heavy = glyphs.then(|| e2e_pixels::cyan_heavy_box_continuity(&pixels));
+
+    let unique = frame
+        .rgba
+        .chunks_exact(4)
+        .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+
+    report["checks"]["terminal_drawing_glyphs_are_pixel_continuous"] =
+        serde_json::Value::Bool(rule.is_none_or(|(longest, rows)| longest >= 240 && rows >= 12));
+    report["checks"]["terminal_rounded_box_is_pixel_connected"] = serde_json::Value::Bool(
+        rounded.is_none_or(|(connected, width, height)| connected && width >= 90 && height >= 30),
+    );
+    report["checks"]["terminal_heavy_box_is_pixel_connected"] = serde_json::Value::Bool(
+        heavy.is_none_or(|(connected, width, height)| connected && width >= 90 && height >= 30),
+    );
+    report["metrics"]["screenshot_width"] = serde_json::json!(frame.width);
+    report["metrics"]["screenshot_height"] = serde_json::json!(frame.height);
+    report["metrics"]["screenshot_unique_colors_at_least"] = serde_json::json!(unique);
+}
+
+/// Whether the frame has to be captured from outside the application.
+///
+/// True exactly when the GPUI runtime is the one compiled in, which is the
+/// same feature the app was built with because the test and the binary share
+/// a feature set.
+const fn capture_is_external() -> bool {
+    cfg!(feature = "gpui")
+}
+
+/// One captured frame, as 8-bit RGBA rows.
+struct CapturedFrame {
+    rgba: Vec<u8>,
+    width: usize,
+    height: usize,
+}
+
+/// Read a window's pixels straight off the X server.
+fn grab_window(
+    connection: &RustConnection,
+    window: u32,
+) -> Result<CapturedFrame, Box<dyn std::error::Error>> {
+    let geometry = connection.get_geometry(window)?.reply()?;
+    let width = usize::from(geometry.width);
+    let height = usize::from(geometry.height);
+    let image = connection
+        .get_image(
+            ImageFormat::Z_PIXMAP,
+            window,
+            0,
+            0,
+            geometry.width,
+            geometry.height,
+            u32::MAX,
+        )?
+        .reply()?;
+    // The server hands back its own visual layout — 24-bit depth in 32-bit
+    // units here, blue first. The checks want straight RGBA.
+    let step = image.data.len() / (width * height).max(1);
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for pixel in image.data.chunks_exact(step) {
+        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+    }
+    Ok(CapturedFrame {
+        rgba,
+        width,
+        height,
+    })
 }
 
 fn control_request(

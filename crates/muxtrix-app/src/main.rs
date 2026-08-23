@@ -40,6 +40,9 @@ mod views;
 
 #[cfg(feature = "e2e")]
 mod e2e;
+#[cfg(feature = "e2e")]
+#[path = "e2e_pixels.rs"]
+mod e2e_pixels;
 
 use app::NO_TERMINAL_STARTUP;
 /*
