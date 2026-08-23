@@ -59,7 +59,7 @@ This document tracks the work required for the GPUI build to replace the Iced bu
   - Record before-and-after timings for the changed jobs.
   - Baseline run [32633064797](https://github.com/Phoenixmatrix/muxtrix/actions/runs/32633064797) serialized checks (3:22) before Linux (3:56), Windows (6:43), and macOS (3:29) builds, producing a 10:07 job critical path.
   - Optimized run [32646164531](https://github.com/Phoenixmatrix/muxtrix/actions/runs/32646164531) started all four jobs within two seconds: checks 4:22, Linux 3:33, Windows 5:45, and macOS 3:40. The critical path fell to 5:45, a 4:22 (43%) reduction.
-  - GPUI/Zed remains a Cargo git dependency; `Swatinem/rust-cache` caches Cargo registry, git, and target data without a second clone or cache convention.
+  - GPUI/Zed remains a Cargo git dependency; the existing Rust cache step retains Cargo registry, git, and target data without a second clone or cache convention.
 
 - [x] **Update third-party notices.** Reconcile `THIRD_PARTY_NOTICES.md` with every dependency introduced, removed, or changed by the GPUI build.
   - Include all required copyright and license text.
