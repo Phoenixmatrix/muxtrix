@@ -34,7 +34,11 @@ use crate::themes::TerminalThemePreset;
 use muxtrix_domain::PaneId;
 use muxtrix_terminal::GridSnapshot;
 
-/// The scrollbar's lane down the right edge, and the thumb inside it.
+/// The scrollbar's grab lane down the right edge, and the thumb inside it.
+///
+/// The lane is wider than the thumb on purpose: a 3 px target is not something
+/// a pointer can reasonably hit, and the iced pane reserved the same strip.
+const SCROLLBAR_LANE: f32 = 24.0;
 const SCROLLBAR_WIDTH: f32 = 12.0;
 const SCROLLBAR_INSET: f32 = 3.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 3.0;
@@ -52,6 +56,12 @@ pub(crate) struct TerminalElement {
     /// itself — the PTY is the thing that has to agree, and it lives in the
     /// application.
     reported: Size,
+    /// The grid the PTY currently has, when the runtime knows its viewport.
+    ///
+    /// `None` means the runtime has no viewport yet — a replacement terminal
+    /// in an unchanged layout — and must be told its size even though the grid
+    /// would come out the same.
+    reported_grid: Option<muxtrix_platform::PtySize>,
     pane_id: PaneId,
     /// How the element talks back. Elements are rebuilt every frame and have
     /// no `Context`, so the handle is what turns a click into a message.
@@ -119,6 +129,7 @@ impl TerminalElement {
             cursor_phase_visible: app.cursor_phase_visible,
             hovered_link: app.hovered_terminal_link(pane_id),
             reported: runtime.viewport.unwrap_or_default(),
+            reported_grid: runtime.viewport.map(|_| runtime.size),
             pane_id,
             root,
             link_modifiers: terminal_link_modifiers(app.keyboard_modifiers),
@@ -164,7 +175,19 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        // Absolutely positioned and pinned to its parent's box. A grid that
+        // took part in flex sizing would feed its own measurements back into
+        // the layout that produced them, and the PTY would oscillate: each
+        // resize changes the content, which changes the size, which resizes
+        // the PTY again.
         let style = Style {
+            position: gpui::Position::Absolute,
+            inset: gpui::Edges {
+                top: px(0.).into(),
+                right: px(0.).into(),
+                bottom: px(0.).into(),
+                left: px(0.).into(),
+            },
             size: size(relative(1.).into(), relative(1.).into()),
             ..Default::default()
         };
@@ -199,7 +222,15 @@ impl Element for TerminalElement {
             bounds.size.width.into(),
             bounds.size.height.into(),
         ))
-        .filter(|size| *size != self.reported);
+        .filter(|size| *size != self.reported)
+        // Resizing a PTY reflows its whole grid, so it is only worth doing
+        // when the grid actually changes. Dragging a window edge crosses many
+        // pixel widths per column; without this the reflow runs every frame of
+        // the drag and starves everything else on the main thread.
+        .filter(|size| {
+            self.reported_grid
+                .is_none_or(|grid| crate::app::pty_size_for_pane(*size, &self.settings) != grid)
+        });
         if let Some(size) = resized_to {
             // The PTY is what has to agree with the layout, and it lives in
             // the application. Reporting rather than resizing here is what
@@ -367,6 +398,22 @@ impl TerminalElement {
             window.set_cursor_style(CursorStyle::PointingHand, &prepared.hitbox);
         }
 
+        // The scrollbar's lane down the right edge. A press here grabs the
+        // thumb rather than starting a selection, so it is tested first.
+        let scrollbar_lane = Bounds {
+            origin: point(
+                bounds.origin.x + bounds.size.width - px(SCROLLBAR_LANE),
+                bounds.origin.y,
+            ),
+            size: size(px(SCROLLBAR_LANE), bounds.size.height),
+        };
+        let position_in_pane = move |window_point: gpui::Point<Pixels>| {
+            AppPoint::new(
+                f32::from(window_point.x - bounds.origin.x),
+                f32::from(window_point.y - bounds.origin.y),
+            )
+        };
+
         let position_in_grid = move |window_point: gpui::Point<Pixels>| {
             AppPoint::new(
                 f32::from(window_point.x - origin.x) + TERMINAL_PADDING / 2.0,
@@ -381,12 +428,20 @@ impl TerminalElement {
                     return;
                 }
                 let inside = bounds.contains(&event.position);
-                let point = position_in_grid(event.position);
+                let grid_point = position_in_grid(event.position);
+                let pane_point = position_in_pane(event.position);
                 root.update(cx, |root, cx| {
                     if inside {
                         root.dispatch_detached(Message::EnterTerminal(pane_id), cx);
                     }
-                    root.dispatch_detached(Message::TerminalPointerMoved(pane_id, point), cx);
+                    // A drag that began on the thumb keeps steering it even
+                    // once the pointer leaves the lane, which is what makes
+                    // dragging usable.
+                    root.dispatch_detached(
+                        Message::TerminalScrollbarMoved(pane_id, pane_point),
+                        cx,
+                    );
+                    root.dispatch_detached(Message::TerminalPointerMoved(pane_id, grid_point), cx);
                 });
             });
         }
@@ -395,6 +450,16 @@ impl TerminalElement {
             let root = root.clone();
             window.on_mouse_event(move |event: &MouseDownEvent, phase, _window, cx| {
                 if !phase.bubble() || !bounds.contains(&event.position) {
+                    return;
+                }
+                if scrollbar_lane.contains(&event.position) {
+                    let point = position_in_pane(event.position);
+                    root.update(cx, |root, cx| {
+                        // Position first: grabbing the thumb is defined
+                        // relative to where in the lane the press landed.
+                        root.dispatch_detached(Message::TerminalScrollbarMoved(pane_id, point), cx);
+                        root.dispatch_detached(Message::BeginTerminalScroll(pane_id), cx);
+                    });
                     return;
                 }
                 let Some(button) = terminal_button(event.button) else {
@@ -420,6 +485,7 @@ impl TerminalElement {
                 };
                 root.update(cx, |root, cx| {
                     root.dispatch_detached(Message::TerminalMouseReleased(pane_id, button), cx);
+                    root.dispatch_detached(Message::EndPointerInteraction, cx);
                 });
             });
         }

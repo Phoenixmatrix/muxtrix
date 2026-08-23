@@ -142,6 +142,12 @@ pub(super) struct Scenario {
     fleet_collapse_observed: bool,
     pane_maximize_observed: bool,
     pane_menu_observed: bool,
+    /// Latched once the shell has echoed the click-away marker.
+    ///
+    /// The marker is transient — the mouse-reporting probe that runs next
+    /// takes over the screen — and a state machine that polls for it must not
+    /// depend on landing a poll inside that window.
+    click_away_marker_seen: bool,
     pane_menu_click_open_observed: bool,
     pane_menu_click_away_observed: bool,
     terminal_scroll_observed: bool,
@@ -184,10 +190,14 @@ enum TickAction {
 impl Scenario {
     /// Assert everything about state and write the state half of the report.
     ///
-    /// The GPUI path: the frame itself is captured by the harness process, so
-    /// the pixel checks and their metrics are merged in there. Failing here
-    /// still fails the run, because a wrong state produces a wrong frame no
-    /// matter who photographs it.
+    /// Only reached under the GPUI runtime, where the frame is captured by the
+    /// harness rather than by the application.
+    #[cfg(feature = "gpui")]
+    ///
+    /// The frame itself is captured by the harness process, so the pixel
+    /// checks and their metrics are merged in there. Failing here still fails
+    /// the run, because a wrong state produces a wrong frame no matter who
+    /// photographs it.
     pub(crate) fn capture_state(&self) -> Result<(), String> {
         self.state_report()?;
         self.write_report(json!({
@@ -244,6 +254,7 @@ impl Scenario {
             fleet_collapse_observed: false,
             pane_maximize_observed: false,
             pane_menu_observed: false,
+            click_away_marker_seen: false,
             pane_menu_click_open_observed: false,
             pane_menu_click_away_observed: false,
             terminal_scroll_observed: false,
@@ -300,12 +311,12 @@ impl Scenario {
 
         match self.stage {
             Stage::PaneMenuClickAway => {
-                let marker_visible = app
+                self.click_away_marker_seen |= app
                     .terminals
                     .get(&self.initial_pane)
                     .and_then(|runtime| runtime.snapshot.as_ref())
                     .is_some_and(|snapshot| snapshot.text().contains(PANE_MENU_CLICK_AWAY_MARKER));
-                if !marker_visible {
+                if !self.click_away_marker_seen {
                     return Ok(TickAction::Wait);
                 }
                 if !self.pane_menu_click_open_observed {

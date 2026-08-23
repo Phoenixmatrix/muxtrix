@@ -175,7 +175,13 @@ impl Root {
         let runtime = app.terminals.get(&pane_id);
 
         let body = match TerminalElement::for_pane(app, pane_id, focused, cx.entity()) {
-            Some(terminal) => div().size_full().child(terminal).into_any_element(),
+            // The relative box the grid pins itself to.
+            Some(terminal) => div()
+                .relative()
+                .size_full()
+                .overflow_hidden()
+                .child(terminal)
+                .into_any_element(),
             // No grid yet: either the shell has not spoken or the launch
             // failed, and the preview text says which.
             None => div()

@@ -2119,6 +2119,41 @@ impl Muxtrix {
             .map(|tab| tab.focused_pane_id)
     }
 
+    /// A cheap fingerprint of everything the terminal grids show.
+    ///
+    /// Polling a terminal that produced no output must not repaint: under a
+    /// software renderer a full-window repaint costs more than the poll, and
+    /// doing one per poll is what makes timers slip under load.
+    #[cfg(feature = "gpui")]
+    pub(crate) fn grid_revision(&self) -> u64 {
+        self.terminals
+            .values()
+            .map(|runtime| runtime.snapshot_revision)
+            .fold(0u64, u64::wrapping_add)
+    }
+
+    /// Which text field should hold focus, given what is open.
+    ///
+    /// Focus is derived from state rather than remembered, so closing a
+    /// surface cannot leave its field holding keys the terminal needs.
+    #[cfg(feature = "gpui")]
+    pub(crate) fn focus_target(&self) -> Option<crate::effect::FocusTarget> {
+        use crate::effect::FocusTarget;
+        if self.palette.visible {
+            return Some(FocusTarget::CommandPalette);
+        }
+        if self.workspace_create_visible {
+            return Some(FocusTarget::WorkspaceCreate);
+        }
+        if self.rename_prompt.is_some() {
+            return Some(FocusTarget::Rename);
+        }
+        if self.worktree_prompt.is_some() {
+            return Some(FocusTarget::Worktree);
+        }
+        None
+    }
+
     /// Whether the GitHub panel's loading animation should be stepping.
     ///
     /// Gated on window focus so an unattended window is not repainting for an
@@ -7829,7 +7864,10 @@ impl Muxtrix {
     }
 
     /// Assert the scenario's state and write its half of the report.
-    #[cfg(feature = "e2e")]
+    ///
+    /// Only the GPUI runtime needs this: the iced one still photographs its
+    /// own window, so it writes the whole report in one go.
+    #[cfg(all(feature = "e2e", feature = "gpui"))]
     pub(crate) fn report_e2e_capture(&self) -> Result<(), String> {
         self.e2e
             .as_ref()

@@ -118,9 +118,16 @@ impl Root {
     /// Deliver a message from a context that has no `Window` — a timer or a
     /// channel. The window is reached through the entity's own handle.
     pub(crate) fn dispatch_detached(&mut self, message: Message, cx: &mut Context<Self>) {
+        // A poll that found nothing new should not repaint. Everything else
+        // might have changed something this cannot see, so it repaints.
+        let quiet_poll = matches!(message, Message::PollTerminal);
+        let before = quiet_poll.then(|| self.app.grid_revision());
         let effects = self.app.update(message);
+        let repaint = before.is_none_or(|before| before != self.app.grid_revision());
         self.run_detached_effects(effects, cx);
-        cx.notify();
+        if repaint {
+            cx.notify();
+        }
     }
 
     fn run_effects(&mut self, effects: Vec<Effect>, _window: &mut Window, cx: &mut Context<Self>) {
@@ -141,12 +148,30 @@ impl Root {
     fn run_effect(&mut self, effect: Effect, cx: &mut Context<Self>) {
         match effect {
             Effect::Perform(work) => {
-                cx.spawn(async move |this, cx| {
-                    // Off the UI thread: this work shells out to git and gh.
-                    let message = cx.background_executor().spawn(async move { work() }).await;
-                    let _ = this.update(cx, |root, cx| root.dispatch_detached(message, cx));
-                })
-                .detach();
+                // A real thread, not the background executor. This work shells
+                // out to git and gh and blocks for as long as they take; on the
+                // executor it occupies a pool thread, and the timers that share
+                // that pool — cursor blink, the e2e tick — stop firing until it
+                // returns.
+                let (sender, receiver) = async_channel::bounded(1);
+                std::thread::Builder::new()
+                    .name("muxtrix-effect".into())
+                    .spawn(move || {
+                        let _ = sender.send_blocking(work());
+                    })
+                    .map_or_else(
+                        |error| eprintln!("muxtrix: could not start background work: {error}"),
+                        |_| {
+                            cx.spawn(async move |this, cx| {
+                                if let Ok(message) = receiver.recv().await {
+                                    let _ = this.update(cx, |root, cx| {
+                                        root.dispatch_detached(message, cx);
+                                    });
+                                }
+                            })
+                            .detach();
+                        },
+                    );
             }
             Effect::ClipboardWrite(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -275,9 +300,9 @@ impl Root {
 /// The closure is asked each tick rather than once, so a message that should
 /// only fire under some condition (a loading animation, an e2e run) can stop
 /// producing without tearing the timer down.
-fn repeat<F>(cx: &mut Context<Root>, every: Duration, message: F)
+fn repeat<F>(cx: &mut Context<Root>, every: Duration, mut message: F)
 where
-    F: Fn(&Root) -> Option<Message> + 'static,
+    F: FnMut(&Root) -> Option<Message> + 'static,
 {
     cx.spawn(async move |this, cx| {
         loop {
@@ -299,12 +324,23 @@ where
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(target) = self.pending_focus.take() {
-            match self.inputs.get(target).cloned() {
-                Some(field) => field.update(cx, |state, cx| state.focus(window, cx)),
-                // The GitHub keyboard sink: taking focus off the search field
-                // is done by giving it back to the root.
-                None => self.focus.focus(window, cx),
+        // Focus follows what is open. An explicit request wins; otherwise the
+        // root takes it back, because a field that keeps focus after its
+        // surface closes swallows everything the terminal should receive.
+        let target = self
+            .pending_focus
+            .take()
+            .or_else(|| self.app.focus_target());
+        match target.and_then(|target| self.inputs.get(target).cloned()) {
+            Some(field) => {
+                if !field.read(cx).focus_handle(cx).is_focused(window) {
+                    field.update(cx, |state, cx| state.focus(window, cx));
+                }
+            }
+            None => {
+                if !self.focus.is_focused(window) {
+                    self.focus.focus(window, cx);
+                }
             }
         }
         let tokens = DesignTokens::for_appearance(self.app.settings.appearance);
