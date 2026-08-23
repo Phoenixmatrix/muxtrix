@@ -386,6 +386,10 @@ pub(crate) struct TerminalRuntime {
     pub(crate) preview: String,
     pub(crate) snapshot: Option<GridSnapshot>,
     pub(crate) snapshot_revision: u64,
+    /// Frames refused for not matching the expected grid, and the grid the
+    /// last such frame had: the e2e report's evidence when a pane goes stale.
+    #[cfg(feature = "e2e")]
+    pub(crate) e2e_dropped_frames: (u32, (usize, usize)),
     pub(crate) session: Option<LiveSession>,
     pub(crate) fallback_title: String,
     pub(crate) display_title: String,
@@ -10340,6 +10344,8 @@ impl TerminalRuntime {
             preview: preview.into(),
             snapshot: None,
             snapshot_revision: 0,
+            #[cfg(feature = "e2e")]
+            e2e_dropped_frames: (0, (0, 0)),
             session,
             fallback_title: fallback_title.into(),
             display_title: fallback_title.into(),
@@ -10488,6 +10494,14 @@ impl TerminalRuntime {
             match event {
                 Some(LiveSessionEvent::Frame(snapshot)) => {
                     if !snapshot_matches_grid(&snapshot, self.size) {
+                        #[cfg(feature = "e2e")]
+                        {
+                            self.e2e_dropped_frames.0 += 1;
+                            self.e2e_dropped_frames.1 = (
+                                snapshot.cells.len(),
+                                snapshot.cells.first().map_or(0, |row| row.len()),
+                            );
+                        }
                         continue;
                     }
                     let title = snapshot

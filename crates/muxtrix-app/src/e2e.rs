@@ -298,19 +298,26 @@ impl Scenario {
             pane_contains(app, self.initial_pane, MOUSE_REPORT_MARKER);
         {
             let (moves, reporting_moves, reporting_seen) = app.e2e_pointer_trace;
-            let initial = app
-                .terminals
-                .get(&self.initial_pane)
-                .and_then(|runtime| runtime.snapshot.as_ref())
-                .map(|snapshot| {
+            let initial = app.terminals.get(&self.initial_pane).map(|runtime| {
+                let (dropped, grid) = runtime.e2e_dropped_frames;
+                let Some(snapshot) = runtime.snapshot.as_ref() else {
+                    return format!("no snapshot, dropped={dropped} last={grid:?}");
+                };
                     let text = snapshot.text();
                     let probe: String = text
                         .lines()
                         .filter(|line| line.contains("mouse-report"))
                         .collect::<Vec<_>>()
                         .join(" | ");
-                    format!("reporting_now={} probe={probe:?}", snapshot.mouse_reporting)
-                });
+                format!(
+                    "reporting_now={} size={}x{} snapshot={}x{} dropped={dropped} last={grid:?} probe={probe:?}",
+                    snapshot.mouse_reporting,
+                    runtime.size.cols,
+                    runtime.size.rows,
+                    snapshot.cells.first().map_or(0, |row| row.len()),
+                    snapshot.cells.len(),
+                )
+            });
             let (polls, ticks) = app.e2e_clock_trace;
             let (window_moves, polls) = (polls / 1_000_000, polls % 1_000_000);
             self.pointer_trace = format!(
