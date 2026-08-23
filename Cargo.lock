@@ -2167,7 +2167,7 @@ checksum = "13d2233c9842d08cfe13f9eac96e207ca6a2ea10b80259ebe8ad0268be27d2af"
 
 [[package]]
 name = "muxtrix"
-version = "0.1.61"
+version = "0.1.62"
 dependencies = [
  "async-channel",
  "bytes",
@@ -2192,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-control"
-version = "0.1.61"
+version = "0.1.62"
 dependencies = [
  "interprocess",
  "serde",
@@ -2203,7 +2203,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-domain"
-version = "0.1.61"
+version = "0.1.62"
 dependencies = [
  "serde",
  "serde_json",
@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-platform"
-version = "0.1.61"
+version = "0.1.62"
 dependencies = [
  "muxtrix-domain",
  "portable-pty",
@@ -2222,7 +2222,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-sessions"
-version = "0.1.61"
+version = "0.1.62"
 dependencies = [
  "base64",
  "interprocess",
@@ -2234,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-terminal"
-version = "0.1.61"
+version = "0.1.62"
 dependencies = [
  "libghostty-vt",
  "muxtrix-platform",
