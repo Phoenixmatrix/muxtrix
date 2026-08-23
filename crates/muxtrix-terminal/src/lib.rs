@@ -77,9 +77,7 @@ impl graphics::DecodePng for PngDecoder {
                 }
             }
             png::ColorType::Grayscale => {
-                for (source, target) in
-                    source.iter().zip(rgba.as_chunks_mut::<4>().0.iter_mut())
-                {
+                for (source, target) in source.iter().zip(rgba.as_chunks_mut::<4>().0.iter_mut()) {
                     target.copy_from_slice(&[*source, *source, *source, u8::MAX]);
                 }
             }
