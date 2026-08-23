@@ -205,10 +205,11 @@ impl Element for TerminalElement {
     ) -> Self::PrepaintState {
         let font = crate::terminal::element::terminal_font(&self.settings);
         let font_size = px(self.settings.terminal_font_pixels());
+        // Shaping uses the advance of the face GPUI actually resolved, because
+        // that is what the glyphs will be drawn with; measuring it any other
+        // way spreads or crowds the row.
         let text_system = window.text_system();
         let font_id = text_system.resolve_font(&font);
-        // Measured through GPUI rather than from font metrics, so the grid and
-        // the shaper can never disagree about a column's width.
         let cell_width = text_system
             .advance(font_id, font_size, 'M')
             .map_or_else(|_| px(self.settings.terminal_cell_width()), |a| a.width);
@@ -621,10 +622,18 @@ fn prepare_row(
 /// the iced runtime needed does not carry over. An unset family means "the
 /// system monospace", which GPUI resolves itself from the generic name.
 pub(crate) fn terminal_font(settings: &AppSettings) -> gpui::Font {
-    let family = settings
-        .terminal_font
-        .family_name()
-        .map_or_else(|| "monospace".to_owned(), ToOwned::to_owned);
+    // Resolve the generic name through fontconfig rather than handing GPUI
+    // the word "monospace": GPUI can answer that with a proportional fallback,
+    // and a proportional face in a fixed grid spreads every row — an 'M' is
+    // far wider than a digit, and the cell is sized from one of them.
+    let family = settings.terminal_font.family_name().map_or_else(
+        || {
+            crate::metrics::system_monospace_family()
+                .unwrap_or("monospace")
+                .to_owned()
+        },
+        ToOwned::to_owned,
+    );
     gpui::Font {
         family: family.into(),
         features: gpui::FontFeatures::default(),
