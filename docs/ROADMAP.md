@@ -33,7 +33,7 @@ Linux, Windows, WSL2, and macOS.
 
 - Rust workspace, formatting, linting, unit tests, and cross-platform CI
 - Serializable workspaces, surfaces, tabs, and recursive split trees
-- Iced application shell with explicit wgpu renderer
+- GPUI application shell
 - Ghostty VT adapter with deterministic headless tests
 - Local PTY abstraction and lifecycle
 - Native Windows and Windows-to-WSL2 launch profiles

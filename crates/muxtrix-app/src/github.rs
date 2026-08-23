@@ -1382,7 +1382,7 @@ fn git(
     arguments: &[&str],
     cancellation: &ProcessCancellation,
 ) -> Result<Output, String> {
-    super::git_in_cancellable(directory, wsl_distribution, arguments, cancellation)
+    crate::app::git_in_cancellable(directory, wsl_distribution, arguments, cancellation)
         .map_err(|error| format!("Git could not start: {error}"))
 }
 

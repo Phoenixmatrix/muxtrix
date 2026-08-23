@@ -1,23 +1,23 @@
-use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use iced::Task;
+use muxtrix_control::{Agent, AgentState, ControlRequest, HookScope, HookStatus};
 use muxtrix_domain::{PaneId, SplitAxis, TabId};
+use muxtrix_terminal::TerminalMouseButton;
 use serde_json::json;
 
-use muxtrix_control::{AgentState, ControlRequest};
-
-use super::{
-    ActiveView, Agent, AgentPaneStatus, CommandAction, GitHubDiffSource, GitHubDiffState,
-    GitHubPanelState, GitHubPanelTab, HookScope, HookStatus, Message, Muxtrix, PaneRepository,
-    ProcessCancellation, TerminalLaunchState, TerminalMouseButton, WorktreeManagerEntry,
-    WorktreeManagerMode, WorktreeManagerState, agent_screen, github,
+use crate::app::{
+    ActiveView, AgentPaneStatus, GitHubDiffSource, GitHubDiffState, GitHubPanelState,
+    GitHubPanelTab, Message, Muxtrix, PaneRepository, TerminalLaunchState, WorktreeManagerEntry,
+    WorktreeManagerMode, WorktreeManagerState, github_diff_line_starts, github_diff_wrap_columns,
 };
+use crate::commands::CommandAction;
+use crate::effect::{Effect, ScrollTarget};
+use crate::process::ProcessCancellation;
 use crate::settings::{FleetScope, FleetView};
+use crate::{agent_screen, agents_roster, commands, github};
 
 const REPORT_ENV: &str = "MUXTRIX_E2E_REPORT";
-const SCREENSHOT_ENV: &str = "MUXTRIX_E2E_SCREENSHOT_RGBA";
 const EXTERNAL_MARKER: &str = "alpha beta";
 const TERMINAL_URL_MARKER: &str = "https://example.com/docs";
 const PANE_MENU_CLICK_AWAY_MARKER: &str = "pane-menu-click-away-ready";
@@ -27,26 +27,16 @@ const MOUSE_REPORT_MARKER: &str = "mouse-report-ok";
 // marker that wraps can never be found in a single row of the snapshot.
 const SECOND_MARKER: &str = "p2-mark";
 const THIRD_MARKER: &str = "p3-mark";
-const TERMINAL_RULE_CONTINUITY_PIXELS: usize = 300;
-const TERMINAL_BLOCK_CONTINUITY_PIXELS: usize = 120;
-const TERMINAL_BLOCK_CONTINUITY_ROWS: usize = 8;
-const TERMINAL_ROUNDED_BOX_WIDTH_PIXELS: usize = 200;
-const TERMINAL_ROUNDED_BOX_HEIGHT_PIXELS: usize = 30;
-const TERMINAL_HEAVY_BOX_WIDTH_PIXELS: usize = 120;
-const TERMINAL_HEAVY_BOX_HEIGHT_PIXELS: usize = 30;
-
 /// A bare Down press, shaped exactly as the window delivers one.
-fn arrow_down() -> iced::keyboard::Event {
-    let key = iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown);
-    iced::keyboard::Event::KeyPressed {
+fn arrow_down() -> crate::input::KeyEvent {
+    let key = crate::input::Key::Named(crate::input::Named::ArrowDown);
+    crate::input::KeyEvent::Pressed(crate::input::KeyInput {
         key: key.clone(),
         modified_key: key,
-        physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::ArrowDown),
-        location: iced::keyboard::Location::Standard,
-        modifiers: iced::keyboard::Modifiers::default(),
+        modifiers: crate::input::Modifiers::empty(),
         text: None,
         repeat: false,
-    }
+    })
 }
 
 /// Printed by the `terminal-palette` capture so a terminal theme is legible
@@ -143,11 +133,20 @@ pub(super) struct Scenario {
     fleet_collapse_observed: bool,
     pane_maximize_observed: bool,
     pane_menu_observed: bool,
+    /// Latched once the shell has echoed the click-away marker.
+    ///
+    /// The marker is transient — the mouse-reporting probe that runs next
+    /// takes over the screen — and a state machine that polls for it must not
+    /// depend on landing a poll inside that window.
+    click_away_marker_seen: bool,
     pane_menu_click_open_observed: bool,
     pane_menu_click_away_observed: bool,
     terminal_scroll_observed: bool,
     terminal_scrollbar_observed: bool,
     terminal_mouse_reporting_observed: bool,
+    /// Carried from the application on every observation, for the report.
+    pointer_trace: String,
+    reporting_panes_seen: String,
     tab_lifecycle_observed: bool,
     /// The `MUXTRIX_E2E_CAPTURE` state this run ends on, empty for the plain
     /// workspace frame. One name per staged surface; `capturing` is the only
@@ -179,10 +178,64 @@ enum TickAction {
     ScrollSettingsToGitHub,
     ScrollGitHubToEnd,
     ScrollGitHubPullRequestsToEnd,
+    SeedClipboard,
     Capture,
 }
 
 impl Scenario {
+    /// Assert everything about state and write the state half of the report.
+    ///
+    /// Only reached under the GPUI runtime, where the frame is captured by the
+    /// harness rather than by the application.
+    ///
+    /// The frame itself is captured by the harness process, so the pixel
+    /// checks and their metrics are merged in there. Failing here still fails
+    /// the run, because a wrong state produces a wrong frame no matter who
+    /// photographs it.
+    pub(crate) fn capture_state(&self) -> Result<(), String> {
+        self.state_report()?;
+        // The state half of the report, minus what only the pixels
+        // can answer. Reaching here means every state assertion held, so these
+        // are true by construction; the harness merges in the pixel results
+        // and the frame's dimensions.
+        self.write_report(json!({
+            "success": true,
+            "pointer_trace": self.pointer_trace,
+            "checks": {
+                "real_window_and_wgpu_frame": true,
+                "command_palette_shortcut_and_render": true,
+                "command_palette_keyboard_navigation": true,
+                "settings_shortcut_and_render": true,
+                "external_keyboard_input_with_spaces": true,
+                "terminal_url_decoration_rendered": true,
+                "focused_cursor_visible": true,
+                "horizontal_split_resized": true,
+                "vertical_split_resized": true,
+                "split_pane_grids_match_their_panes": true,
+                "pointer_drag_selects_terminal_text": true,
+                "independent_terminal_sessions": true,
+                "focused_pane_close_cleanup": true,
+                "terminal_exit_detach_and_restart": true,
+                "osc_agent_notification_fleet_attention_and_clear": true,
+                "fleet_collapse_pane_maximize_and_overflow": true,
+                "pane_overflow_click_away": true,
+                "terminal_mouse_wheel_scrollback": true,
+                "terminal_scrollbar_click_and_drag": true,
+                "terminal_program_mouse_motion": true,
+                "workspace_tab_default_pane_and_switch": true
+            },
+            "metrics": {
+                "initial_columns": self.initial_cols,
+                "initial_rows": self.initial_rows
+            }
+        }))
+    }
+
+    /// Whether this scenario has settled on the frame it wants captured.
+    pub(crate) fn capture_ready(&self) -> bool {
+        matches!(self.stage, Stage::Screenshot)
+    }
+
     pub(super) fn from_environment(initial_pane: PaneId) -> Option<Self> {
         let report_path = std::env::var_os(REPORT_ENV).map(PathBuf::from)?;
         Some(Self {
@@ -213,11 +266,14 @@ impl Scenario {
             fleet_collapse_observed: false,
             pane_maximize_observed: false,
             pane_menu_observed: false,
+            click_away_marker_seen: false,
             pane_menu_click_open_observed: false,
             pane_menu_click_away_observed: false,
             terminal_scroll_observed: false,
             terminal_scrollbar_observed: false,
             terminal_mouse_reporting_observed: false,
+            pointer_trace: String::new(),
+            reporting_panes_seen: String::new(),
             tab_lifecycle_observed: false,
             capture: std::env::var_os("MUXTRIX_E2E_CAPTURE")
                 .map_or_else(String::new, |value| value.to_string_lossy().into_owned()),
@@ -228,7 +284,13 @@ impl Scenario {
         self.capture == state
     }
 
-    fn tick(&mut self, app: &mut Muxtrix) -> Result<TickAction, String> {
+    /// Note anything transient the scenario has to have seen.
+    ///
+    /// Run on every frame as well as every tick: a surface that opens and
+    /// closes between two ticks — which a slow renderer can stretch well past
+    /// the tick interval — would otherwise be missed, and the run would fail
+    /// on a state that did happen.
+    fn observe(&mut self, app: &Muxtrix) {
         self.palette_open_observed |= app.palette.visible;
         self.palette_navigation_observed |= app.palette.visible && app.palette.selected > 0;
         self.settings_open_observed |= app.active_view == ActiveView::Settings;
@@ -239,7 +301,79 @@ impl Scenario {
         }
         self.terminal_mouse_reporting_observed |=
             pane_contains(app, self.initial_pane, MOUSE_REPORT_MARKER);
-        if self.started.elapsed() > Duration::from_secs(20) {
+        {
+            let (moves, reporting_moves, reporting_seen) = app.e2e_pointer_trace;
+            let initial = app.terminals.get(&self.initial_pane).map(|runtime| {
+                let (dropped, grid) = runtime.e2e_dropped_frames;
+                let Some(snapshot) = runtime.snapshot.as_ref() else {
+                    return format!("no snapshot, dropped={dropped} last={grid:?}");
+                };
+                    let text = snapshot.text();
+                    let probe: String = text
+                        .lines()
+                        .filter(|line| line.contains("mouse-report"))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                format!(
+                    "reporting_now={} size={}x{} snapshot={}x{} dropped={dropped} last={grid:?} probe={probe:?}",
+                    snapshot.mouse_reporting,
+                    runtime.size.cols,
+                    runtime.size.rows,
+                    snapshot.cells.first().map_or(0, |row| row.len()),
+                    snapshot.cells.len(),
+                )
+            });
+            let reporting_panes: Vec<PaneId> = app
+                .terminals
+                .iter()
+                .filter(|(_, runtime)| {
+                    runtime
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.mouse_reporting)
+                })
+                .map(|(pane_id, _)| *pane_id)
+                .collect();
+            if !reporting_panes.is_empty() {
+                self.reporting_panes_seen = format!("{reporting_panes:?}");
+            }
+            let (polls, ticks) = app.e2e_clock_trace;
+            let (window_moves, polls) = (polls / 1_000_000, polls % 1_000_000);
+            self.pointer_trace = format!(
+                "pointer motions={moves}, while reporting={reporting_moves}, \
+                 reporting ever seen={reporting_seen}, hovered={:?}, polls={polls}, \
+                 ticks={ticks}, window moves={window_moves}, paints={:?}, element listener={:?}, elapsed={:?}, view={:?}, \
+                 palette={}, menu={}, prompts={}{}{}{}{}{}, maximized={:?}, focused={:?}, \
+                 initial={:?}, panes ever reporting={}, initial pane: {initial:?}",
+                app.hovered_terminal,
+                app.e2e_paint_trace,
+                app.e2e_phase_trace,
+                self.started.elapsed(),
+                app.active_view,
+                app.palette.visible,
+                app.pane_menu.is_some(),
+                u8::from(app.workspace_create_visible),
+                u8::from(app.rename_prompt.is_some()),
+                u8::from(app.worktree_prompt.is_some()),
+                u8::from(app.session_picker.is_some()),
+                u8::from(app.close_workspace_prompt.is_some()),
+                u8::from(app.default_agent_prompt),
+                app.maximized_pane,
+                app.focused_pane_id(),
+                self.initial_pane,
+                self.reporting_panes_seen,
+            );
+        }
+    }
+
+    fn tick(&mut self, app: &mut Muxtrix) -> Result<TickAction, String> {
+        self.observe(app);
+        // Generous on purpose: the harness drives real input through a real X
+        // server at whatever pace a software renderer allows, and a two-core
+        // CI runner spends most of this budget before the scenario's own
+        // stages begin. The deadline exists to turn a hang into a report, not
+        // to hold the run to a pace.
+        if self.started.elapsed() > Duration::from_secs(60) {
             let terminal = self.third_pane.and_then(|pane_id| {
                 app.terminals.get(&pane_id).map(|runtime| {
                     format!(
@@ -269,16 +403,24 @@ impl Scenario {
 
         match self.stage {
             Stage::PaneMenuClickAway => {
-                let marker_visible = app
+                self.click_away_marker_seen |= app
                     .terminals
                     .get(&self.initial_pane)
                     .and_then(|runtime| runtime.snapshot.as_ref())
                     .is_some_and(|snapshot| snapshot.text().contains(PANE_MENU_CLICK_AWAY_MARKER));
-                if !marker_visible {
+                if !self.click_away_marker_seen {
                     return Ok(TickAction::Wait);
                 }
                 if !self.pane_menu_click_open_observed {
                     app.pane_menu = Some(self.initial_pane);
+                    // Recorded here rather than waiting for a later tick to
+                    // notice: the outside click can land before the next one,
+                    // and a step that only trusts what it has seen open would
+                    // then open the menu again — over a click that has already
+                    // been spent, leaving it open for the rest of the run with
+                    // every later pointer event going to the menu's backdrop
+                    // instead of the terminal underneath.
+                    self.pane_menu_click_open_observed = true;
                     return Ok(TickAction::Wait);
                 }
                 if app.pane_menu.is_some() {
@@ -350,7 +492,7 @@ impl Scenario {
                     let cell_width = app.settings.terminal_cell_width();
                     let cell_height = app.settings.terminal_cell_height();
                     let point = |column: usize, row: usize| {
-                        iced::Point::new(
+                        crate::geom::Point::new(
                             8.0 + cell_width * (column as f32 + 0.5),
                             8.0 + cell_height * (row as f32 + 0.5),
                         )
@@ -366,7 +508,7 @@ impl Scenario {
                         second,
                         TerminalMouseButton::Left,
                     ));
-                    if copy_task.units() == 0 {
+                    if copy_task.is_empty() {
                         return Err(
                             "releasing a genuine text selection did not schedule a clipboard copy"
                                 .into(),
@@ -649,9 +791,10 @@ impl Scenario {
                 }
                 if self.capturing("terminal-image")
                     && app.terminals.get(&self.initial_pane).is_none_or(|runtime| {
-                        runtime.snapshot.as_ref().is_none_or(|snapshot| {
-                            snapshot.images.is_empty() || runtime.image_handles.is_empty()
-                        })
+                        runtime
+                            .snapshot
+                            .as_ref()
+                            .is_none_or(|snapshot| snapshot.images.is_empty())
                     })
                 {
                     self.settle_ticks = 1;
@@ -679,10 +822,14 @@ impl Scenario {
                     return Ok(TickAction::ScrollSettingsToEnd);
                 }
                 if (self.capturing("settings-github-enterprise")
-                    || self.capturing("settings-github-invalid"))
+                    || self.capturing("settings-github-invalid")
+                    || self.capturing("settings-github-typing"))
                     && self.settle_ticks == 2
                 {
                     return Ok(TickAction::ScrollSettingsToGitHub);
+                }
+                if self.capturing("settings-github-typing") && self.settle_ticks == 3 {
+                    return Ok(TickAction::SeedClipboard);
                 }
                 if self.capturing("github-pull-requests-scrolled") && self.settle_ticks == 2 {
                     return Ok(TickAction::ScrollGitHubPullRequestsToEnd);
@@ -841,7 +988,10 @@ impl Scenario {
                     .into_bytes(),
                 )
                 .map_err(|error| error.to_string())?;
-        } else if self.capturing("settings") || self.capturing("settings-scrollback") {
+        } else if self.capturing("settings")
+            || self.capturing("settings-scrollback")
+            || self.capturing("settings-github-typing")
+        {
             drop(app.open_settings());
         } else if self.capturing("settings-github-enterprise") {
             drop(app.open_settings());
@@ -853,7 +1003,7 @@ impl Scenario {
             drop(app.open_settings());
             let installed = next_patch_version(env!("CARGO_PKG_VERSION"));
             app.installed_versions =
-                super::InstalledVersionsState::Ready(super::InstalledVersions {
+                crate::app::InstalledVersionsState::Ready(crate::app::InstalledVersions {
                     muxtrix: Ok(installed.clone()),
                     muxtrixctl: Ok(installed),
                 });
@@ -880,7 +1030,7 @@ impl Scenario {
         } else if self.capturing("worktree-agent-setup") {
             app.default_agent_prompt = true;
             app.pending_default_agent_command = Some(CommandAction::NewWorktreeWithAgent(
-                super::commands::WorktreeKind::Pane(SplitAxis::Horizontal),
+                commands::WorktreeKind::Pane(SplitAxis::Horizontal),
             ));
         } else if self.capturing("worktree-agent-palette") {
             app.settings.default_agent = Some(Agent::Codex);
@@ -959,10 +1109,11 @@ impl Scenario {
             {
                 panel.active_tab = GitHubPanelTab::PullRequests;
                 if self.capturing("github-pull-request-search") {
-                    panel.pull_request_query = "mouse".into();
-                    // Reproduce filtering from a deep virtualized scroll. The
-                    // final matching row must remain visible, never a blank
-                    // viewport while the widget catches up to the new offset.
+                    // The harness clicks this real field and types "mouse"
+                    // before capture. Starting empty makes that frame prove
+                    // the input accepted keyboard events rather than merely
+                    // rendering a pre-seeded model value.
+                    panel.pull_request_query.clear();
                     panel.pull_request_scroll_offset = 9_999.0;
                 }
                 if self.capturing("github-merged-pr")
@@ -1015,13 +1166,13 @@ impl Scenario {
                 } else {
                     None
                 };
-                let wrap_columns = super::github_diff_wrap_columns(
+                let wrap_columns = github_diff_wrap_columns(
                     app.window_size.width,
                     app.settings.terminal_cell_width(),
                 );
                 let line_starts = document.as_ref().map_or_else(
                     || vec![0],
-                    |document| super::github_diff_line_starts(document, wrap_columns),
+                    |document| github_diff_line_starts(document, wrap_columns),
                 );
                 app.github_diff = Some(GitHubDiffState {
                     source: GitHubDiffSource::PullRequest(391),
@@ -1291,7 +1442,7 @@ impl Scenario {
             app.worktree_manager = Some(manager);
             if self.capturing("worktree-manager") {
                 app.active_view = ActiveView::Settings;
-                app.settings_page = super::SettingsPage::Worktrees;
+                app.settings_page = crate::app::SettingsPage::Worktrees;
             } else if let Some(manager) = app.worktree_manager.as_mut() {
                 // The restart dialog has no keyboard step of its own
                 // here; keep its previous framing.
@@ -1334,9 +1485,9 @@ impl Scenario {
             app.active_view = ActiveView::ThemeGallery;
         } else if self.capturing("session-picker") {
             // Synthetic startup picker; exists only for the frame.
-            app.session_picker = Some(super::SessionPickerState {
+            app.session_picker = Some(crate::app::SessionPickerState {
                 entries: vec![
-                    super::SessionPickerEntry {
+                    crate::app::SessionPickerEntry {
                         record: muxtrix_sessions::SessionRecord {
                             id: uuid::Uuid::new_v4(),
                             name: "muxtrix".into(),
@@ -1353,7 +1504,7 @@ impl Scenario {
                         alive: true,
                         pane_count: 3,
                     },
-                    super::SessionPickerEntry {
+                    crate::app::SessionPickerEntry {
                         record: muxtrix_sessions::SessionRecord {
                             id: uuid::Uuid::new_v4(),
                             name: "experiments".into(),
@@ -1376,7 +1527,7 @@ impl Scenario {
                 startup: true,
             });
         } else if self.capturing("worktree-dialog") {
-            let _ = app.run_command(super::CommandAction::RestartPaneInWorktree);
+            let _ = app.run_command(CommandAction::RestartPaneInWorktree);
             app.worktree_name_draft = "worktree-2".into();
             if let Some(prompt) = app.worktree_prompt.as_mut() {
                 prompt.repo_root = Some("/home/user/dev/muxtrix".into());
@@ -1395,7 +1546,7 @@ impl Scenario {
             let targets = app.rail_targets();
             app.rail_nav = targets
                 .iter()
-                .filter(|target| matches!(target, super::RailTarget::FleetPane(..)))
+                .filter(|target| matches!(target, crate::app::RailTarget::FleetPane(..)))
                 .nth(1)
                 .copied();
             // The collapsed rail draws the same cursor with none of the room,
@@ -1403,9 +1554,9 @@ impl Scenario {
             app.sidebar_collapsed = self.capturing("rail-nav-collapsed");
         } else if self.capturing("stacked-layout") {
             app.split_terminal(SplitAxis::Vertical)?;
-            app.cycle_pane_layout(super::LayoutCycle::Next)?;
-            app.cycle_pane_layout(super::LayoutCycle::Next)?;
-            app.cycle_pane_layout(super::LayoutCycle::Next)?;
+            app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
+            app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
+            app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
         } else if self.capturing("needs-input") {
             // Stage a waiting agent so the whole-pane amber treatment
             // is capturable; this state exists only for the frame.
@@ -1456,7 +1607,7 @@ impl Scenario {
             // state a healthy fleet spends most of its time in and the
             // quietest colour the roll-up can paint, so the capture
             // fails visibly if the roster pip ever stops reading.
-            app.agents_roster = Some(super::agents_roster::AgentsRoster {
+            app.agents_roster = Some(agents_roster::AgentsRoster {
                 working: 0,
                 blocked: 0,
                 failed: 0,
@@ -1677,7 +1828,7 @@ impl Scenario {
                 pane.attention.unread_count = 3;
                 pane.attention.message = Some("Needs approval to run cargo test".into());
             }
-            app.notifications.push(super::AgentNotification {
+            app.notifications.push(crate::app::AgentNotification {
                 pane_id: second,
                 unread: true,
             });
@@ -1694,11 +1845,11 @@ impl Scenario {
                 },
             );
         } else if self.capturing("global-alert") {
-            app.global_alerts.push(super::GlobalAlert {
+            app.global_alerts.push(crate::app::GlobalAlert {
                 title: "codex · release-audit".into(),
                 body: "Sandbox denied a write outside the workspace".into(),
             });
-            app.global_alerts.push(super::GlobalAlert {
+            app.global_alerts.push(crate::app::GlobalAlert {
                 title: "claude · feature-ui".into(),
                 body: "Waiting on approval to run cargo test".into(),
             });
@@ -1707,21 +1858,21 @@ impl Scenario {
             app.maximized_pane = Some(self.second_pane()?);
         } else if self.capturing("prefix-armed") {
             app.prefix_armed = true;
-        } else if self.capturing("workspace-create") {
+        } else if self.capturing("workspace-create") || self.capturing("workspace-create-buttons") {
             app.workspace_create_visible = true;
             app.workspace_name_draft = "release-audit".into();
         } else if self.capturing("rename-workspace") {
-            app.rename_prompt = Some(super::RenameTarget::Workspace(
+            app.rename_prompt = Some(crate::app::RenameTarget::Workspace(
                 app.session.active_workspace_id,
             ));
             app.rename_draft = "Release audit".into();
         } else if self.capturing("rename-tab") {
             let workspace_id = app.session.active_workspace_id;
             let tab_id = app.active_workspace()?.active_tab_id;
-            app.rename_prompt = Some(super::RenameTarget::Tab(workspace_id, tab_id));
+            app.rename_prompt = Some(crate::app::RenameTarget::Tab(workspace_id, tab_id));
             app.rename_draft = "review".into();
         } else if self.capturing("rename-pane") {
-            app.rename_prompt = Some(super::RenameTarget::Pane(self.initial_pane));
+            app.rename_prompt = Some(crate::app::RenameTarget::Pane(self.initial_pane));
             app.rename_draft = "build watcher".into();
         } else if self.capturing("many-tabs") {
             for _ in 0..6 {
@@ -1746,13 +1897,13 @@ impl Scenario {
             app.palette.selected = 0;
         } else if self.capturing("settings-worktrees-loading") {
             app.active_view = ActiveView::Settings;
-            app.settings_page = super::SettingsPage::Worktrees;
+            app.settings_page = crate::app::SettingsPage::Worktrees;
             let mut manager = WorktreeManagerState::loading(WorktreeManagerMode::Manage, 1);
             manager.repo_root = Some("/home/user/dev/muxtrix".into());
             app.worktree_manager = Some(manager);
         } else if self.capturing("worktree-manager-error") {
             app.active_view = ActiveView::Settings;
-            app.settings_page = super::SettingsPage::Worktrees;
+            app.settings_page = crate::app::SettingsPage::Worktrees;
             let mut manager = WorktreeManagerState::loading(WorktreeManagerMode::Manage, 1);
             manager.repo_root = Some("/home/user/dev/muxtrix".into());
             manager.entries = vec![WorktreeManagerEntry {
@@ -1770,13 +1921,13 @@ impl Scenario {
             app.worktree_manager = Some(manager);
         } else if self.capturing("worktree-manager-no-repo") {
             app.active_view = ActiveView::Settings;
-            app.settings_page = super::SettingsPage::Worktrees;
+            app.settings_page = crate::app::SettingsPage::Worktrees;
             let mut manager = WorktreeManagerState::loading(WorktreeManagerMode::Manage, 1);
             manager.failure = Some("The focused pane is not inside a Git repository".into());
             manager.loading = false;
             app.worktree_manager = Some(manager);
         } else if self.capturing("session-picker-error") {
-            app.session_picker = Some(super::SessionPickerState {
+            app.session_picker = Some(crate::app::SessionPickerState {
                 entries: Vec::new(),
                 selected: 0,
                 error: Some("Could not read the session registry: permission denied".into()),
@@ -1867,15 +2018,15 @@ impl Scenario {
             app.github_panel = Some(panel);
         } else if self.capturing("layout-vertical") {
             app.split_terminal(SplitAxis::Vertical)?;
-            app.cycle_pane_layout(super::LayoutCycle::Next)?;
+            app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
         } else if self.capturing("layout-horizontal") {
             app.split_terminal(SplitAxis::Vertical)?;
-            app.cycle_pane_layout(super::LayoutCycle::Next)?;
-            app.cycle_pane_layout(super::LayoutCycle::Next)?;
+            app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
+            app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
         } else if self.capturing("layout-half-stacked") {
             app.split_terminal(SplitAxis::Vertical)?;
             for _ in 0..4 {
-                app.cycle_pane_layout(super::LayoutCycle::Next)?;
+                app.cycle_pane_layout(crate::app::LayoutCycle::Next)?;
             }
         } else if self.capturing("four-panes") {
             app.split_terminal(SplitAxis::Vertical)?;
@@ -1905,7 +2056,13 @@ impl Scenario {
             .ok_or_else(|| "third pane was not recorded".into())
     }
 
-    fn success_report(&self, screenshot: &iced::window::Screenshot) -> Result<(), String> {
+    /// Everything the scenario asserts about application state.
+    ///
+    /// Separate from the pixel checks because the two now run in different
+    /// places: GPUI cannot render a window to an image outside its test
+    /// platform, so the frame is captured by the harness process while these
+    /// assertions stay with the state that produced them.
+    fn state_report(&self) -> Result<(), String> {
         if !self.palette_open_observed {
             return Err("Ctrl+P did not open the command palette".into());
         }
@@ -1941,127 +2098,15 @@ impl Scenario {
             return Err("terminal scrollbar interaction was not observed".into());
         }
         if !self.terminal_mouse_reporting_observed {
-            return Err("a mouse-reporting program did not receive pointer motion".into());
+            return Err(format!(
+                "a mouse-reporting program did not receive pointer motion ({})",
+                self.pointer_trace
+            ));
         }
         if !self.tab_lifecycle_observed {
             return Err("workspace tab creation was not observed".into());
         }
-        let expected_bytes = screenshot.size.width as usize * screenshot.size.height as usize * 4;
-        if screenshot.rgba.len() != expected_bytes {
-            return Err("GPU screenshot byte length did not match its dimensions".into());
-        }
-        let mut colors = HashSet::new();
-        let mut opaque_pixels = 0_usize;
-        for pixel in screenshot.rgba.chunks_exact(4) {
-            colors.insert([pixel[0], pixel[1], pixel[2]]);
-            opaque_pixels += usize::from(pixel[3] == 255);
-            if colors.len() > 64 && opaque_pixels > 10_000 {
-                break;
-            }
-        }
-        if colors.len() < 16 || opaque_pixels < 10_000 {
-            return Err("GPU screenshot did not contain a populated application frame".into());
-        }
-        let terminal_glyph_continuity = self
-            .capturing("terminal-glyphs")
-            .then(|| light_horizontal_continuity(screenshot));
-        let rounded_box_continuity = self
-            .capturing("terminal-glyphs")
-            .then(|| magenta_rounded_box_continuity(screenshot));
-        let heavy_box_continuity = self
-            .capturing("terminal-glyphs")
-            .then(|| cyan_heavy_box_continuity(screenshot));
-        if terminal_glyph_continuity.is_some_and(|(longest, solid_rows)| {
-            longest < TERMINAL_RULE_CONTINUITY_PIXELS || solid_rows < TERMINAL_BLOCK_CONTINUITY_ROWS
-        }) {
-            return Err(format!(
-                "terminal drawing glyphs did not produce a {TERMINAL_RULE_CONTINUITY_PIXELS}-pixel rule and at least {TERMINAL_BLOCK_CONTINUITY_ROWS} rows of a {TERMINAL_BLOCK_CONTINUITY_PIXELS}-pixel block"
-            ));
-        }
-        if rounded_box_continuity.is_some_and(|(connected, width, height)| {
-            !connected
-                || width < TERMINAL_ROUNDED_BOX_WIDTH_PIXELS
-                || height < TERMINAL_ROUNDED_BOX_HEIGHT_PIXELS
-        }) {
-            return Err(format!(
-                "rounded terminal border was not one connected component spanning at least {TERMINAL_ROUNDED_BOX_WIDTH_PIXELS}x{TERMINAL_ROUNDED_BOX_HEIGHT_PIXELS} pixels"
-            ));
-        }
-        if heavy_box_continuity.is_some_and(|(connected, width, height)| {
-            !connected
-                || width < TERMINAL_HEAVY_BOX_WIDTH_PIXELS
-                || height < TERMINAL_HEAVY_BOX_HEIGHT_PIXELS
-        }) {
-            return Err(format!(
-                "heavy terminal border was not one connected component spanning at least {TERMINAL_HEAVY_BOX_WIDTH_PIXELS}x{TERMINAL_HEAVY_BOX_HEIGHT_PIXELS} pixels"
-            ));
-        }
-        if let Some(path) = std::env::var_os(SCREENSHOT_ENV) {
-            std::fs::write(path, &screenshot.rgba).map_err(|error| error.to_string())?;
-        }
-
-        self.write_report(json!({
-            "success": true,
-            "checks": {
-                "real_window_and_wgpu_frame": true,
-                "command_palette_shortcut_and_render": true,
-                "command_palette_keyboard_navigation": true,
-                "settings_shortcut_and_render": true,
-                "external_keyboard_input_with_spaces": true,
-                "terminal_url_decoration_rendered": true,
-                "focused_cursor_visible": true,
-                "horizontal_split_resized": true,
-                "vertical_split_resized": true,
-                "split_pane_grids_match_their_panes": true,
-                "pointer_drag_selects_terminal_text": true,
-                "independent_terminal_sessions": true,
-                "focused_pane_close_cleanup": true,
-                "terminal_exit_detach_and_restart": true,
-                "osc_agent_notification_fleet_attention_and_clear": true,
-                "fleet_collapse_pane_maximize_and_overflow": true,
-                "pane_overflow_click_away": true,
-                "terminal_mouse_wheel_scrollback": true,
-                "terminal_scrollbar_click_and_drag": true,
-                "terminal_program_mouse_motion": true,
-                "workspace_tab_default_pane_and_switch": true,
-                "terminal_drawing_glyphs_are_pixel_continuous": terminal_glyph_continuity
-                    .is_none_or(|(longest, solid_rows)| {
-                        longest >= TERMINAL_RULE_CONTINUITY_PIXELS
-                            && solid_rows >= TERMINAL_BLOCK_CONTINUITY_ROWS
-                    }),
-                "terminal_rounded_box_is_pixel_connected": rounded_box_continuity
-                    .is_none_or(|(connected, width, height)| {
-                        connected
-                            && width >= TERMINAL_ROUNDED_BOX_WIDTH_PIXELS
-                            && height >= TERMINAL_ROUNDED_BOX_HEIGHT_PIXELS
-                    }),
-                "terminal_heavy_box_is_pixel_connected": heavy_box_continuity
-                    .is_none_or(|(connected, width, height)| {
-                        connected
-                            && width >= TERMINAL_HEAVY_BOX_WIDTH_PIXELS
-                            && height >= TERMINAL_HEAVY_BOX_HEIGHT_PIXELS
-                    })
-            },
-            "metrics": {
-                "screenshot_width": screenshot.size.width,
-                "screenshot_height": screenshot.size.height,
-                "screenshot_unique_colors_at_least": colors.len(),
-                "initial_columns": self.initial_cols,
-                "initial_rows": self.initial_rows,
-                "terminal_drawing_longest_continuous_run": terminal_glyph_continuity
-                    .map(|(longest, _)| longest),
-                "terminal_block_continuous_rows": terminal_glyph_continuity
-                    .map(|(_, solid_rows)| solid_rows),
-                "terminal_rounded_box_width": rounded_box_continuity
-                    .map(|(_, width, _)| width),
-                "terminal_rounded_box_height": rounded_box_continuity
-                    .map(|(_, _, height)| height),
-                "terminal_heavy_box_width": heavy_box_continuity
-                    .map(|(_, width, _)| width),
-                "terminal_heavy_box_height": heavy_box_continuity
-                    .map(|(_, _, height)| height)
-            }
-        }))
+        Ok(())
     }
 
     fn failure_report(&self, error: &str) {
@@ -2097,76 +2142,48 @@ fn next_patch_version(version: &str) -> String {
 }
 
 impl Muxtrix {
-    pub(super) fn drive_e2e(&mut self) -> Task<Message> {
+    /// Let the scenario see the state after any message, not only on its
+    /// own clock.
+    pub(crate) fn observe_e2e(&mut self) {
+        if let Some(mut scenario) = self.e2e.take() {
+            scenario.observe(self);
+            self.e2e = Some(scenario);
+        }
+    }
+
+    pub(super) fn drive_e2e(&mut self) -> Vec<Effect> {
         let Some(mut scenario) = self.e2e.take() else {
-            return Task::none();
+            return Vec::new();
         };
-        match scenario.tick(self) {
-            Ok(TickAction::Wait) => {
-                self.e2e = Some(scenario);
-                Task::none()
-            }
+        let action = scenario.tick(self);
+        if let Err(error) = &action {
+            scenario.failure_report(error);
+            return vec![Effect::Exit];
+        }
+        self.e2e = Some(scenario);
+        match action {
+            Ok(TickAction::Wait) => Vec::new(),
             Ok(TickAction::ScrollSettingsToEnd) => {
-                self.e2e = Some(scenario);
-                iced::widget::operation::snap_to_end(iced::widget::Id::new(
-                    super::SETTINGS_SCROLL_ID,
-                ))
+                vec![Effect::ScrollToEnd(ScrollTarget::Settings)]
             }
             Ok(TickAction::ScrollSettingsToTerminal) => {
-                self.e2e = Some(scenario);
-                iced::widget::operation::snap_to(
-                    iced::widget::Id::new(super::SETTINGS_SCROLL_ID),
-                    iced::widget::operation::RelativeOffset { x: 0.0, y: 0.45 },
-                )
+                vec![Effect::ScrollToRatio(ScrollTarget::Settings, 0.45)]
             }
             Ok(TickAction::ScrollSettingsToGitHub) => {
-                self.e2e = Some(scenario);
-                iced::widget::operation::snap_to(
-                    iced::widget::Id::new(super::SETTINGS_SCROLL_ID),
-                    iced::widget::operation::RelativeOffset { x: 0.0, y: 0.65 },
-                )
+                vec![Effect::ScrollToRatio(ScrollTarget::Settings, 0.65)]
+            }
+            Ok(TickAction::SeedClipboard) => {
+                vec![Effect::ClipboardWrite("github.pasted.example".into())]
             }
             Ok(TickAction::ScrollGitHubToEnd) => {
-                self.e2e = Some(scenario);
-                iced::widget::operation::snap_to_end(iced::widget::Id::new(
-                    super::GITHUB_FILE_SCROLL_ID,
-                ))
+                vec![Effect::ScrollToEnd(ScrollTarget::GitHubFiles)]
             }
             Ok(TickAction::ScrollGitHubPullRequestsToEnd) => {
-                self.e2e = Some(scenario);
-                iced::widget::operation::snap_to_end(iced::widget::Id::new(
-                    super::GITHUB_PULL_REQUEST_SCROLL_ID,
-                ))
+                vec![Effect::ScrollToEnd(ScrollTarget::GitHubPullRequests)]
             }
-            Ok(TickAction::Capture) => {
-                self.e2e = Some(scenario);
-                iced::window::latest().then(|window| match window {
-                    Some(window) => iced::window::screenshot(window).map(Message::E2eScreenshot),
-                    None => Task::done(Message::E2eWindowMissing),
-                })
-            }
-            Err(error) => {
-                scenario.failure_report(&error);
-                iced::exit()
-            }
+            Ok(TickAction::Capture) => vec![Effect::Capture],
+            Err(_) => unreachable!("the error case returned above"),
         }
-    }
-
-    pub(super) fn finish_e2e(&mut self, screenshot: iced::window::Screenshot) -> Task<Message> {
-        let Some(scenario) = self.e2e.take() else {
-            return iced::exit();
-        };
-        if let Err(error) = scenario.success_report(&screenshot) {
-            scenario.failure_report(&error);
-        }
-        iced::exit()
-    }
-
-    pub(super) fn fail_e2e(&mut self, error: &str) -> Task<Message> {
-        if let Some(scenario) = self.e2e.take() {
-            scenario.failure_report(error);
-        }
-        iced::exit()
     }
 }
 
@@ -2337,141 +2354,6 @@ fn staged_github_pull_request_details(
     }
 }
 
-fn light_horizontal_continuity(screenshot: &iced::window::Screenshot) -> (usize, usize) {
-    let row_bytes = screenshot.size.width as usize * 4;
-    let row_runs = screenshot
-        .rgba
-        .chunks_exact(row_bytes)
-        .map(|row| {
-            row.chunks_exact(4)
-                .fold((0_usize, 0_usize), |(current, longest), pixel| {
-                    let light =
-                        pixel[3] == 255 && pixel[0] >= 128 && pixel[1] >= 128 && pixel[2] >= 128;
-                    let current = if light { current + 1 } else { 0 };
-                    (current, longest.max(current))
-                })
-                .1
-        })
-        .collect::<Vec<_>>();
-    (
-        row_runs.iter().copied().max().unwrap_or(0),
-        row_runs
-            .iter()
-            .filter(|run| **run >= TERMINAL_BLOCK_CONTINUITY_PIXELS)
-            .count(),
-    )
-}
-
-/// Finds the bright-magenta rounded-border fixture and verifies that its top,
-/// bottom, left, and right edges all belong to one 8-connected component.
-fn magenta_rounded_box_continuity(screenshot: &iced::window::Screenshot) -> (bool, usize, usize) {
-    colored_box_continuity(screenshot, |pixel| {
-        pixel[3] == 255 && pixel[0] >= 128 && pixel[1] <= 96 && pixel[2] >= 128
-    })
-}
-
-/// Finds the bright-cyan heavy-border fixture and verifies all four edges.
-fn cyan_heavy_box_continuity(screenshot: &iced::window::Screenshot) -> (bool, usize, usize) {
-    colored_box_continuity(screenshot, |pixel| {
-        pixel[3] == 255 && pixel[0] <= 96 && pixel[1] >= 128 && pixel[2] >= 128
-    })
-}
-
-fn colored_box_continuity(
-    screenshot: &iced::window::Screenshot,
-    is_border_pixel: impl Fn(&[u8]) -> bool,
-) -> (bool, usize, usize) {
-    let width = screenshot.size.width as usize;
-    let height = screenshot.size.height as usize;
-    let is_border = screenshot
-        .rgba
-        .chunks_exact(4)
-        .map(is_border_pixel)
-        .collect::<Vec<_>>();
-    let mut visited = vec![false; is_border.len()];
-    let mut largest = Vec::new();
-
-    for start in 0..is_border.len() {
-        if !is_border[start] || visited[start] {
-            continue;
-        }
-        visited[start] = true;
-        let mut pending = VecDeque::from([start]);
-        let mut component = Vec::new();
-        while let Some(index) = pending.pop_front() {
-            component.push(index);
-            let x = index % width;
-            let y = index / width;
-            for next_y in y.saturating_sub(1)..=(y + 1).min(height.saturating_sub(1)) {
-                for next_x in x.saturating_sub(1)..=(x + 1).min(width.saturating_sub(1)) {
-                    let next = next_y * width + next_x;
-                    if is_border[next] && !visited[next] {
-                        visited[next] = true;
-                        pending.push_back(next);
-                    }
-                }
-            }
-        }
-        if component.len() > largest.len() {
-            largest = component;
-        }
-    }
-
-    let Some(min_x) = largest.iter().map(|index| index % width).min() else {
-        return (false, 0, 0);
-    };
-    let max_x = largest
-        .iter()
-        .map(|index| index % width)
-        .max()
-        .unwrap_or(min_x);
-    let min_y = largest.iter().map(|index| index / width).min().unwrap_or(0);
-    let max_y = largest
-        .iter()
-        .map(|index| index / width)
-        .max()
-        .unwrap_or(min_y);
-    let component_width = max_x - min_x + 1;
-    let component_height = max_y - min_y + 1;
-    let middle_x = (min_x + max_x) / 2;
-    let middle_y = (min_y + max_y) / 2;
-    let near = |index: &usize, target_x: usize, target_y: usize| {
-        (index % width).abs_diff(target_x) <= 4 && (index / width).abs_diff(target_y) <= 4
-    };
-    let connected = [
-        (middle_x, min_y),
-        (middle_x, max_y),
-        (min_x, middle_y),
-        (max_x, middle_y),
-    ]
-    .into_iter()
-    .all(|(x, y)| largest.iter().any(|index| near(index, x, y)));
-
-    (connected, component_width, component_height)
-}
-
-/// The first pane whose live grid does not match the pane it is drawn into,
-/// described for the failure report.
-fn pane_grid_mismatch(app: &Muxtrix) -> Option<String> {
-    app.terminals.iter().find_map(|(pane_id, runtime)| {
-        let Some(viewport) = runtime.viewport else {
-            return Some(format!("pane {pane_id:?} was never measured by layout"));
-        };
-        let expected = super::pty_size_for_pane(viewport, &app.settings);
-        let snapshot = runtime.snapshot.as_ref()?;
-        if super::snapshot_matches_grid(snapshot, expected) {
-            return None;
-        }
-        Some(format!(
-            "pane {pane_id:?} renders a {}x{} grid inside a pane sized for {}x{}",
-            snapshot.cells.first().map_or(0, |row| row.len()),
-            snapshot.cells.len(),
-            expected.cols,
-            expected.rows,
-        ))
-    })
-}
-
 /// Where a string sits in a pane's visible grid, as (row, column).
 fn pane_text_position(app: &Muxtrix, pane_id: PaneId, needle: &str) -> Option<(usize, usize)> {
     let snapshot = app.terminals.get(&pane_id)?.snapshot.as_ref()?;
@@ -2486,4 +2368,24 @@ fn pane_contains(app: &Muxtrix, pane_id: PaneId, needle: &str) -> bool {
         .get(&pane_id)
         .and_then(|runtime| runtime.snapshot.as_ref())
         .is_some_and(|snapshot| snapshot.text().contains(needle))
+}
+
+fn pane_grid_mismatch(app: &Muxtrix) -> Option<String> {
+    app.terminals.iter().find_map(|(pane_id, runtime)| {
+        let Some(viewport) = runtime.viewport else {
+            return Some(format!("pane {pane_id:?} was never measured by layout"));
+        };
+        let expected = crate::app::pty_size_for_pane(viewport, &app.settings);
+        let snapshot = runtime.snapshot.as_ref()?;
+        if crate::app::snapshot_matches_grid(snapshot, expected) {
+            return None;
+        }
+        Some(format!(
+            "pane {pane_id:?} renders a {}x{} grid inside a pane sized for {}x{}",
+            snapshot.cells.first().map_or(0, |row| row.len()),
+            snapshot.cells.len(),
+            expected.cols,
+            expected.rows,
+        ))
+    })
 }

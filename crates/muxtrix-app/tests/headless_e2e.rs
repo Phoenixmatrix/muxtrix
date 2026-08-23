@@ -8,11 +8,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ConfigureWindowAux, ConnectionExt as _, InputFocus,
-    KEY_PRESS_EVENT, KEY_RELEASE_EVENT, MOTION_NOTIFY_EVENT, MapState,
+    AutoRepeatMode, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ChangeKeyboardControlAux,
+    ConfigureWindowAux, ConnectionExt as _, ImageFormat, InputFocus, KEY_PRESS_EVENT,
+    KEY_RELEASE_EVENT, MOTION_NOTIFY_EVENT, MapState,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
+
+// The pixel checks are shared with the application: which process holds the
+// frame depends on the renderer, but what counts as a joined border does not.
+#[path = "../src/e2e_pixels.rs"]
+mod e2e_pixels;
 
 struct ProcessGuard(Option<Child>);
 
@@ -97,6 +103,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         std::env::temp_dir().join(format!("muxtrix-e2e-home-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&home_path)?;
     let requested_screenshot = std::env::var_os("MUXTRIX_E2E_SCREENSHOT_RGBA");
+    let capture = std::env::var("MUXTRIX_E2E_CAPTURE").unwrap_or_default();
     let screenshot_path = requested_screenshot.clone().map_or_else(
         || {
             std::env::temp_dir().join(format!(
@@ -133,17 +140,19 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         .spawn()
         .map(|child| ProcessGuard(Some(child)))?;
 
+    // No key repeat. A key is pressed and released by XTEST back to back, but
+    // the app reads them when it next gets to its event queue; if that is
+    // later than the server's repeat delay, the server has already started
+    // repeating the key. A repeated Enter after the one that launched the
+    // mouse probe reaches the probe's raw stdin ahead of any mouse report and
+    // is taken for the answer.
+    connection
+        .change_keyboard_control(
+            &ChangeKeyboardControlAux::new().auto_repeat_mode(AutoRepeatMode::OFF),
+        )?
+        .check()?;
     let window = wait_for_app_window(&connection, root, Duration::from_secs(8))?;
     let final_viewport = requested_viewport()?;
-    let window_origin = connection
-        .translate_coordinates(window, root, 0, 0)?
-        .reply()?;
-    let terminal_x = window_origin.dst_x.saturating_add(
-        i16::try_from(final_viewport.0 / 2).map_err(|_| "viewport width exceeds X11 range")?,
-    );
-    let terminal_y = window_origin.dst_y.saturating_add(
-        i16::try_from(final_viewport.1 / 2).map_err(|_| "viewport height exceeds X11 range")?,
-    );
     eprintln!("Muxtrix window mapped as X11 window {window}");
     let control_response = control_request(&control_path, r#"{"method":"ping"}"#)?;
     assert_eq!(control_response["ok"], true);
@@ -153,6 +162,18 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     let control_response = control_request(&control_path, r#"{"method":"ping"}"#)?;
     assert_eq!(control_response["ok"], true);
     eprintln!("survived repeated real-window resizes with control service responsive");
+    // Read after the resizes, not before. A toolkit that centres its window
+    // on the screen moves it when it grows, and a screen sized to hold a wide
+    // viewport starts with the window well inside it. Pointer input is in root
+    // coordinates, so an origin read at map time would aim every click a few
+    // hundred pixels left of where the window now is.
+    let window_origin = pin_window(&connection, root, window)?;
+    let terminal_x = window_origin.dst_x.saturating_add(
+        i16::try_from(final_viewport.0 / 2).map_err(|_| "viewport width exceeds X11 range")?,
+    );
+    let terminal_y = window_origin.dst_y.saturating_add(
+        i16::try_from(final_viewport.1 / 2).map_err(|_| "viewport height exceeds X11 range")?,
+    );
     connection
         .set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME)?
         .check()?;
@@ -184,6 +205,12 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     connection.flush()?;
     thread::sleep(Duration::from_millis(200));
     eprintln!("opened the pane menu and dismissed it with an outside click");
+    // The probe has to run in the pane the pointer will sweep. The app's own
+    // scenario splits panes on its clock and focuses each new one, so focus
+    // is put back on the initial pane right before the probe is typed.
+    click_at(&connection, root, terminal_x, terminal_y)?;
+    connection.flush()?;
+    thread::sleep(Duration::from_millis(150));
     type_text(
         &connection,
         mouse_probe_path
@@ -192,28 +219,113 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     )?;
     tap_keysym(&connection, 0xff0d)?;
     connection.flush()?;
-    thread::sleep(Duration::from_millis(300));
-    connection
-        .xtest_fake_input(
-            MOTION_NOTIFY_EVENT,
-            0,
-            0,
-            root,
-            terminal_x.saturating_add(32),
-            terminal_y,
-            0,
-        )?
-        .check()?;
+    // The probe only listens once the shell has read the line and the
+    // interpreter has started, and how long that takes has nothing to do with
+    // what is being tested. It touches a file as soon as it has mouse
+    // reporting on, so wait for that rather than guessing at the cost of a
+    // process start.
+    let ready_marker = std::path::PathBuf::from(format!("{}.ready", mouse_probe_path.display()));
+    let waiting_since = std::time::Instant::now();
+    while !ready_marker.exists() {
+        if waiting_since.elapsed() > Duration::from_secs(10) {
+            return Err("the mouse probe never enabled mouse reporting".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(50));
+    // Every step lands somewhere new. A client that is busy drawing makes the
+    // server compress the motion it missed into one event at the final
+    // position, so a pointer that returns to where it started compresses to no
+    // movement at all and nothing is delivered. Sweeping in one direction
+    // means whatever survives compression is still a move onto a fresh cell,
+    // which is what the program under test has asked to hear about.
+    //
+    // The sweep keeps going for as long as the probe is listening — it drops
+    // its marker when it has heard a report or given up — rather than for a
+    // fixed count, because how long the app takes to learn that reporting is
+    // on is the renderer's business, and a slow one needs more nudges.
+    // The toolkit may have moved the window since it was pinned — a late
+    // configure of its own lands whenever the event loop gets to it — and a
+    // pointer event is in root coordinates. Put it back before aiming.
+    let moved = pin_window(&connection, root, window)?;
+    if (moved.dst_x, moved.dst_y) != (window_origin.dst_x, window_origin.dst_y) {
+        return Err(format!(
+            "the window moved to ({}, {}) after being pinned at ({}, {})",
+            moved.dst_x, moved.dst_y, window_origin.dst_x, window_origin.dst_y
+        )
+        .into());
+    }
+    let mut step: i16 = 0;
+    while ready_marker.exists() && step < 64 {
+        step += 1;
+        connection
+            .xtest_fake_input(
+                MOTION_NOTIFY_EVENT,
+                0,
+                0,
+                root,
+                terminal_x.saturating_add((step % 24) * 8),
+                terminal_y.saturating_add(step / 24 * 8),
+                0,
+            )?
+            .check()?;
+        connection.flush()?;
+        thread::sleep(Duration::from_millis(120));
+    }
+    eprintln!("delivered pointer motion to a mouse-reporting terminal program ({step} nudges)");
+    let result_marker = std::path::PathBuf::from(format!("{}.result", mouse_probe_path.display()));
+    let result_deadline = Instant::now() + Duration::from_secs(10);
+    while !result_marker.exists() && Instant::now() < result_deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!(
+        "mouse probe result: {}",
+        std::fs::read_to_string(&result_marker)
+            .unwrap_or_else(|_| "none written".into())
+            .trim()
+    );
+    let _ = std::fs::remove_file(&result_marker);
     connection.flush()?;
-    thread::sleep(Duration::from_millis(350));
-    eprintln!("delivered pointer motion to a mouse-reporting terminal program");
-    connection
-        .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, terminal_x, terminal_y, 0)?
-        .check()?;
-    type_text(&connection, "seq 1 120")?;
+    // The probe reads whatever reaches the pty first and judges that. Pointer
+    // and keyboard arrive over separate X streams with no ordering promised
+    // between them, so typing here lets the keystrokes overtake the motion and
+    // be mistaken for its report. The probe drops its marker when it is done,
+    // so wait for that and leave the pty to it until then.
+    let probe_finished_by = std::time::Instant::now();
+    while ready_marker.exists() {
+        if probe_finished_by.elapsed() > Duration::from_secs(10) {
+            return Err("the mouse probe never finished listening".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    // The drag that follows needs scrollback to exist, so the lines have to
+    // have been printed — not merely typed — before it starts. The shell
+    // touches a file once `seq` has run; waiting for that is how long it
+    // actually took, which at a large viewport under a software renderer is
+    // not a number worth guessing at.
+    let scrollback_marker = mouse_probe_path.with_file_name(format!(
+        "{}.scrollback",
+        mouse_probe_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("non-UTF-8 mouse probe path")?
+    ));
+    type_text(
+        &connection,
+        &format!("seq 1 120; touch {}", scrollback_marker.display()),
+    )?;
     tap_keysym(&connection, 0xff0d)?;
     connection.flush()?;
-    thread::sleep(Duration::from_millis(350));
+    let scrollback_since = std::time::Instant::now();
+    while !scrollback_marker.exists() {
+        if scrollback_since.elapsed() > Duration::from_secs(10) {
+            return Err("the scrollback seeding command never finished".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    // The emulator has the bytes once the shell is back at its prompt, but
+    // the app reads them on its own clock; give it a frame or two.
+    thread::sleep(Duration::from_millis(150));
     // The content area carries 8px padding and each pane card a 1px border,
     // so the right pane's scrollbar hit area ends ~9px inside the window edge.
     let scrollbar_x = window_origin.dst_x.saturating_add(
@@ -335,7 +447,89 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     connection.flush()?;
     eprintln!("injected terminal command with spaces");
 
-    let deadline = Instant::now() + Duration::from_secs(25);
+    // GPUI cannot render its window to an image outside its test platform, so
+    // the frame is grabbed from the X server here. The app says when the
+    // scenario has settled, and waits to be told to quit so the frame is
+    // still on screen when it is taken.
+    let captured = {
+        let ready = Instant::now() + Duration::from_secs(60);
+        loop {
+            // The app closes its socket when it gives up, so a lost
+            // connection means it has already written why.
+            let Ok(status) = control_request(&control_path, r#"{"method":"e2e_status"}"#) else {
+                return Err(format!(
+                    "Muxtrix exited before its capture point; report: {}",
+                    std::fs::read_to_string(&report_path).unwrap_or_default()
+                )
+                .into());
+            };
+            if status["capture_ready"] == true {
+                break;
+            }
+            if Instant::now() >= ready {
+                let _ = control_request(&control_path, r#"{"method":"quit"}"#);
+                return Err(format!(
+                    "Muxtrix never reached its capture point; report: {}",
+                    std::fs::read_to_string(&report_path).unwrap_or_default()
+                )
+                .into());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if capture == "github-pull-request-search" {
+            let origin = pin_window(&connection, root, window)?;
+            let search_x = origin
+                .dst_x
+                .saturating_add(i16::try_from(final_viewport.0.saturating_sub(186))?);
+            let search_y = origin.dst_y.saturating_add(135);
+            click_at(&connection, root, search_x, search_y)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(750));
+            type_text(&connection, "mouse")?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("clicked and typed in the pull request filter");
+        }
+        if capture == "settings-github-typing" {
+            let origin = pin_window(&connection, root, window)?;
+            let input_x = origin
+                .dst_x
+                .saturating_add(i16::try_from(final_viewport.0.saturating_sub(385))?);
+            let input_y = origin.dst_y.saturating_add(542);
+            click_at(&connection, root, input_x, input_y)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(750));
+            chord(&connection, 0xffe3, 'a' as u32)?;
+            type_text(&connection, "github.typed.example")?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("clicked, selected, and typed in the GitHub host field");
+            chord(&connection, 0xffe3, 'a' as u32)?;
+            chord(&connection, 0xffe3, 'v' as u32)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("selected the host and pasted from the GPUI clipboard");
+        }
+        if capture == "workspace-create-buttons" {
+            tap_keysym(&connection, 0xff54)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(500));
+            tap_keysym(&connection, 0xff51)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("moved from the naming input to the dialog button row");
+        }
+        let frame = grab_window(&connection, window)?;
+        std::fs::write(&screenshot_path, &frame.rgba)?;
+        eprintln!(
+            "captured a {}x{} frame from the X server",
+            frame.width, frame.height
+        );
+        let _ = control_request(&control_path, r#"{"method":"quit"}"#);
+        frame
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if app.child_mut().try_wait()?.is_some() {
             break;
@@ -356,10 +550,19 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         .into());
     }
 
-    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
-    let _ = std::fs::remove_file(&report_path);
+    let mut report: serde_json::Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
+    // The application answered for its state; the pixels are answered here,
+    // because this is the process that holds them.
+    merge_pixel_findings(&mut report, &captured);
+    if std::env::var_os("MUXTRIX_E2E_KEEP_REPORT").is_none() {
+        let _ = std::fs::remove_file(&report_path);
+    } else {
+        eprintln!("report kept at {}", report_path.display());
+    }
     let _ = std::fs::remove_file(&config_path);
     let _ = std::fs::remove_file(&control_path);
+    let _ = std::fs::remove_file(format!("{}.ready", mouse_probe_path.display()));
+    let _ = std::fs::remove_file(&scrollback_marker);
     let _ = std::fs::remove_file(&mouse_probe_path);
     let _ = std::fs::remove_dir_all(&home_path);
     if requested_screenshot.is_none() {
@@ -414,27 +617,61 @@ import sys
 import termios
 import tty
 
+import time
+
 fd = sys.stdin.fileno()
 original = termios.tcgetattr(fd)
 data = b""
+started = time.monotonic()
+waited = None
 try:
     tty.setraw(fd)
     sys.stdout.write("\x1b[?1003h\x1b[?1006h")
     sys.stdout.flush()
-    if select.select([fd], [], [], 3)[0]:
+    open(sys.argv[0] + ".ready", "w").close()
+    if select.select([fd], [], [], 8)[0]:
         data = os.read(fd, 64)
+    waited = time.monotonic() - started
+    # What the probe saw, for the harness log: the app's own report cannot
+    # say what reached the pty.
+    with open(sys.argv[0] + ".result", "w") as result:
+        result.write("waited=%r data=%r\n" % (waited, data))
 finally:
     sys.stdout.write("\x1b[?1003l\x1b[?1006l\r\n")
     sys.stdout.flush()
     termios.tcsetattr(fd, termios.TCSADRAIN, original)
+    try:
+        os.remove(sys.argv[0] + ".ready")
+    except OSError:
+        pass
 
-print("mouse-report-ok" if data.startswith(b"\x1b[<35;") else "mouse-report-fail")
+print("mouse-report-ok" if data.startswith(b"\x1b[<35;") else "mouse-report-fail " + repr(data))
 "#,
     )?;
     let mut permissions = std::fs::metadata(path)?.permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(path, permissions)?;
     Ok(())
+}
+
+/// Put the window at the screen's corner and report where it actually is.
+///
+/// A toolkit that centres its window re-issues that placement on its own
+/// schedule, so pinning once is not enough: this is asked again before any
+/// phase that aims pointer events in root coordinates.
+fn pin_window(
+    connection: &RustConnection,
+    root: u32,
+    window: u32,
+) -> Result<x11rb::protocol::xproto::TranslateCoordinatesReply, Box<dyn std::error::Error>> {
+    connection
+        .configure_window(window, &ConfigureWindowAux::new().x(0).y(0))?
+        .check()?;
+    connection.flush()?;
+    thread::sleep(Duration::from_millis(120));
+    Ok(connection
+        .translate_coordinates(window, root, 0, 0)?
+        .reply()?)
 }
 
 fn stress_resize_window(
@@ -452,10 +689,19 @@ fn stress_resize_window(
     ];
     viewports.push(final_viewport);
     for (width, height) in viewports {
+        // Pinned to the screen's corner as well as sized. A toolkit that
+        // centres the window where it first maps leaves it there when it
+        // grows, and the private screen is only as large as the final
+        // viewport — so a window that grew in place would hang off the
+        // screen's right and bottom edges, where no pointer event can reach.
         connection
             .configure_window(
                 window,
-                &ConfigureWindowAux::new().width(width).height(height),
+                &ConfigureWindowAux::new()
+                    .x(0)
+                    .y(0)
+                    .width(width)
+                    .height(height),
             )?
             .check()?;
         connection.flush()?;
@@ -483,6 +729,82 @@ fn requested_viewport() -> Result<(u32, u32), Box<dyn std::error::Error>> {
         return Err("MUXTRIX_E2E_VIEWPORT is below the supported 720x480 minimum".into());
     }
     Ok((width, height))
+}
+
+/// Fold the pixel checks into a report whose state half the app already wrote.
+///
+/// Only the `terminal-glyphs` capture puts the drawing fixtures on screen; any
+/// other frame has nothing to measure, and the checks pass vacuously — the same
+/// rule the in-process path follows.
+fn merge_pixel_findings(report: &mut serde_json::Value, frame: &CapturedFrame) {
+    let pixels = e2e_pixels::Frame {
+        rgba: &frame.rgba,
+        width: frame.width,
+        height: frame.height,
+    };
+    let glyphs = std::env::var("MUXTRIX_E2E_CAPTURE").is_ok_and(|state| state == "terminal-glyphs");
+    let rule = glyphs.then(|| e2e_pixels::light_horizontal_continuity(&pixels));
+    let rounded = glyphs.then(|| e2e_pixels::magenta_rounded_box_continuity(&pixels));
+    let heavy = glyphs.then(|| e2e_pixels::cyan_heavy_box_continuity(&pixels));
+
+    let unique = frame
+        .rgba
+        .chunks_exact(4)
+        .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+
+    report["checks"]["terminal_drawing_glyphs_are_pixel_continuous"] =
+        serde_json::Value::Bool(rule.is_none_or(|(longest, rows)| longest >= 240 && rows >= 12));
+    report["checks"]["terminal_rounded_box_is_pixel_connected"] = serde_json::Value::Bool(
+        rounded.is_none_or(|(connected, width, height)| connected && width >= 90 && height >= 30),
+    );
+    report["checks"]["terminal_heavy_box_is_pixel_connected"] = serde_json::Value::Bool(
+        heavy.is_none_or(|(connected, width, height)| connected && width >= 90 && height >= 30),
+    );
+    report["metrics"]["screenshot_width"] = serde_json::json!(frame.width);
+    report["metrics"]["screenshot_height"] = serde_json::json!(frame.height);
+    report["metrics"]["screenshot_unique_colors_at_least"] = serde_json::json!(unique);
+}
+
+/// One captured frame, as 8-bit RGBA rows.
+struct CapturedFrame {
+    rgba: Vec<u8>,
+    width: usize,
+    height: usize,
+}
+
+/// Read a window's pixels straight off the X server.
+fn grab_window(
+    connection: &RustConnection,
+    window: u32,
+) -> Result<CapturedFrame, Box<dyn std::error::Error>> {
+    let geometry = connection.get_geometry(window)?.reply()?;
+    let width = usize::from(geometry.width);
+    let height = usize::from(geometry.height);
+    let image = connection
+        .get_image(
+            ImageFormat::Z_PIXMAP,
+            window,
+            0,
+            0,
+            geometry.width,
+            geometry.height,
+            u32::MAX,
+        )?
+        .reply()?;
+    // The server hands back its own visual layout — 24-bit depth in 32-bit
+    // units here, blue first. The checks want straight RGBA.
+    let step = image.data.len() / (width * height).max(1);
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for pixel in image.data.chunks_exact(step) {
+        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+    }
+    Ok(CapturedFrame {
+        rgba,
+        width,
+        height,
+    })
 }
 
 fn control_request(

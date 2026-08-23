@@ -1,86 +1,31 @@
-use std::collections::BTreeMap;
+//! Where an inline image lands on the grid.
+//!
+//! Ghostty reports placements in integer pixels on its own idea of the cell;
+//! the renderer's cells are fractional, so the placement is scaled onto the
+//! render grid and the source crop is expressed as the full image's rectangle
+//! behind a clip. Renderers draw from [`PlacementGeometry`].
 
-use iced::advanced::image::{FilterMethod, Handle, Image};
-use iced::mouse;
-use iced::widget::canvas::{self, Geometry};
-use iced::{Element, Length, Rectangle, Renderer, Theme};
-use muxtrix_terminal::{GridSnapshot, ImageLayer, ImageSourceRect};
+use muxtrix_terminal::ImageSourceRect;
 
-use crate::Message;
-
-pub(crate) fn layer(
-    snapshot: &GridSnapshot,
-    handles: &BTreeMap<u64, Handle>,
-    image_layer: ImageLayer,
-    cell_width: f32,
-    cell_height: f32,
-) -> Element<'static, Message> {
-    let placements = snapshot
-        .images
-        .iter()
-        .filter(|placement| placement.layer == image_layer)
-        .filter_map(|placement| {
-            let handle = handles.get(&placement.image.generation)?.clone();
-            let destination = scaled_destination(
-                (placement.column, placement.row),
-                (placement.width, placement.height),
-                (placement.x_offset, placement.y_offset),
-                (cell_width, cell_height),
-            );
-            let geometry = placement_geometry(
-                destination,
-                placement.source,
-                placement.image.width,
-                placement.image.height,
-            )?;
-            Some(DrawPlacement { handle, geometry })
-        })
-        .collect();
-    let width = snapshot
-        .cells
-        .iter()
-        .map(|row| {
-            row.iter()
-                .map(|cell| usize::from(cell.columns))
-                .sum::<usize>()
-        })
-        .max()
-        .unwrap_or_default() as f32
-        * cell_width;
-    let height = snapshot.cells.len() as f32 * cell_height;
-
-    canvas::Canvas::new(TerminalImageCanvas { placements })
-        .width(Length::Fixed(width))
-        .height(Length::Fixed(height))
-        .into()
-}
-
-#[derive(Debug, Clone)]
-struct TerminalImageCanvas {
-    placements: Vec<DrawPlacement>,
-}
-
-#[derive(Debug, Clone)]
-struct DrawPlacement {
-    handle: Handle,
-    geometry: PlacementGeometry,
-}
+use crate::geom::Rect;
+#[cfg(test)]
+use crate::geom::{Point, Size};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct PlacementGeometry {
-    destination: Rectangle,
-    full_image: Rectangle,
+pub(crate) struct PlacementGeometry {
+    pub(crate) destination: Rect,
+    pub(crate) full_image: Rect,
 }
 
-fn scaled_destination(
+pub(crate) fn scaled_destination(
     grid: (i32, i32),
     pixels: (u32, u32),
     offsets: (u32, u32),
     cell: (f32, f32),
-) -> Rectangle {
+) -> Rect {
     let cell_scale_x = cell.0 / cell.0.round().max(1.0);
     let cell_scale_y = cell.1 / cell.1.round().max(1.0);
-    Rectangle {
+    Rect {
         x: grid.0 as f32 * cell.0 + offsets.0 as f32 * cell_scale_x,
         y: grid.1 as f32 * cell.1 + offsets.1 as f32 * cell_scale_y,
         width: pixels.0 as f32 * cell_scale_x,
@@ -88,8 +33,8 @@ fn scaled_destination(
     }
 }
 
-fn placement_geometry(
-    destination: Rectangle,
+pub(crate) fn placement_geometry(
+    destination: Rect,
     source: ImageSourceRect,
     image_width: u32,
     image_height: u32,
@@ -107,37 +52,13 @@ fn placement_geometry(
     let scale_y = destination.height / source.height as f32;
     Some(PlacementGeometry {
         destination,
-        full_image: Rectangle {
+        full_image: Rect {
             x: destination.x - source.x as f32 * scale_x,
             y: destination.y - source.y as f32 * scale_y,
             width: image_width as f32 * scale_x,
             height: image_height as f32 * scale_y,
         },
     })
-}
-
-impl canvas::Program<Message> for TerminalImageCanvas {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &Self::State,
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        for placement in &self.placements {
-            frame.with_clip(placement.geometry.destination, |frame| {
-                frame.draw_image(
-                    placement.geometry.full_image,
-                    Image::new(placement.handle.clone()).filter_method(FilterMethod::Linear),
-                );
-            });
-        }
-        vec![frame.into_geometry()]
-    }
 }
 
 #[cfg(test)]
@@ -147,7 +68,7 @@ mod tests {
     #[test]
     fn a_source_crop_scales_the_full_texture_behind_its_destination_clip() {
         let geometry = placement_geometry(
-            Rectangle {
+            Rect {
                 x: 20.0,
                 y: 30.0,
                 width: 80.0,
@@ -164,15 +85,9 @@ mod tests {
         )
         .expect("placement geometry");
 
-        assert_eq!(
-            geometry.destination.position(),
-            iced::Point::new(20.0, 30.0)
-        );
-        assert_eq!(
-            geometry.full_image.position(),
-            iced::Point::new(-20.0, 10.0)
-        );
-        assert_eq!(geometry.full_image.size(), iced::Size::new(160.0, 80.0));
+        assert_eq!(geometry.destination.position(), Point::new(20.0, 30.0));
+        assert_eq!(geometry.full_image.position(), Point::new(-20.0, 10.0));
+        assert_eq!(geometry.full_image.size(), Size::new(160.0, 80.0));
     }
 
     #[test]

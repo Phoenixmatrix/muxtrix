@@ -37,8 +37,8 @@ cargo test -p muxtrix --features e2e --test headless_e2e -- --test-threads=1
 ```
 
 This requires `Xvfb` and `xvfb-run`. The test creates a private virtual display,
-forces winit to X11 and wgpu to Mesa Vulkan/llvmpipe, injects input through the
-XTest extension, captures an Iced GPU screenshot, and exits automatically. It
+forces X11 and wgpu to Mesa Vulkan/llvmpipe, injects input through the XTest
+extension, photographs the window from the X server, and exits automatically. It
 does not connect to WSLg and cannot place a window on the host desktop. See
 `docs/TESTING.md` for its assertions and architecture.
 
@@ -68,11 +68,12 @@ The macOS binaries are ad-hoc signed and checked as arm64 before packaging, but
 are not Developer ID signed or notarized. Verify every download against the
 published `SHA256SUMS`.
 
-Linux release binaries are built through `cargo-zigbuild` against glibc 2.34
-even when the release host is newer. Keep the version suffix on
-`x86_64-unknown-linux-gnu.2.34` and pass the unsuffixed Rust target to
-`cargo-deb`; otherwise a release made on a newer Ubuntu can silently require
-that host's newer libc.
+Linux release binaries are built on Ubuntu 22.04, which sets their glibc floor
+at 2.35. GPUI links the host's `libxkbcommon` dynamically, so the release
+cannot be pinned to an older glibc with `cargo-zigbuild` the way it once was —
+a library from a newer host cannot be linked into a binary that promises an
+older libc. Keep the release job on the oldest supported Ubuntu; moving it to
+a newer image silently raises the floor for every user.
 
 See `docs/RELEASING.md` for the repository secrets, package repository
 permissions, and tag procedure.
@@ -102,6 +103,21 @@ cargo run --bin muxtrix-gpu-probe -- \
 See `docs/GPU.md` for WSLg backend selection and overrides. `vulkaninfo` alone
 is not authoritative because the accelerated WSLg route is typically Mesa D3D12
 through OpenGL/EGL, not Vulkan.
+
+## Linux build dependencies
+
+Beyond a Rust toolchain, a Linux build needs the X, GL, Vulkan and Wayland
+development headers. The GPUI port adds `libxkbcommon-x11-dev`, without which
+everything compiles and only the final link fails:
+
+```bash
+sudo apt-get install -y \
+  libfontconfig-dev libfreetype-dev libxkbcommon-dev libxkbcommon-x11-dev \
+  libwayland-dev libvulkan-dev libgl1-mesa-dev libzstd-dev
+```
+
+`mesa-vulkan-drivers` and `xvfb` are additionally required to run the headless
+e2e test and the capture gallery.
 
 ## Dependency policy
 

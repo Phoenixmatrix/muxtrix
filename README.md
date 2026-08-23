@@ -2,7 +2,7 @@
 
 Muxtrix is a GPU-accelerated, cross-platform terminal workspace for running and
 supervising many concurrent development sessions. It is written primarily in
-Rust with [Iced](https://iced.rs/) for the application UI and Ghostty's VT
+Rust with [GPUI](https://www.gpui.rs/) for the application UI and Ghostty's VT
 engine for terminal emulation.
 
 > **Status: early, and vibe coded.** Muxtrix is pre-1.0 and was built almost

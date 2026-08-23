@@ -22,7 +22,7 @@ jobs:
   checks:
     name: Checks and headless E2E
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Check out source
@@ -56,6 +56,8 @@ jobs:
             echo "apt-get update stalled (attempt ${attempt}/3); retrying"
           done
           sudo apt-get install --yes --no-install-recommends \
+            libfontconfig-dev \
+            libfreetype-dev \
             libgl1-mesa-dev \
             libvulkan-dev \
             libwayland-dev \
@@ -67,6 +69,7 @@ jobs:
             libxinerama-dev \
             libxrandr-dev \
             mesa-vulkan-drivers \
+            libzstd-dev \
             pkg-config \
             xauth \
             xvfb
@@ -85,15 +88,18 @@ jobs:
 
   build:
     name: Build ${{ matrix.name }}
-    needs: checks
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Ubuntu 22.04 rather than a zig-pinned glibc: GPUI links the host's
+          # libxkbcommon dynamically, and a library from a newer host cannot be
+          # linked into a binary that promises an older glibc. Building on the
+          # oldest supported release sets the floor (glibc 2.35) the honest way.
           - name: Linux x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
             artifact: muxtrix-linux-x86_64
           - name: Windows x86_64
             runner: windows-2025
@@ -136,6 +142,8 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             desktop-file-utils \
             file \
+            libfontconfig-dev \
+            libfreetype-dev \
             libgl1-mesa-dev \
             libvulkan-dev \
             libwayland-dev \
@@ -146,15 +154,15 @@ jobs:
             libxi-dev \
             libxinerama-dev \
             libxrandr-dev \
+            libzstd-dev \
             pkg-config
           cargo install cargo-deb --locked
-          cargo install cargo-zigbuild --locked
 
       - name: Build portable Linux release binaries
         if: runner.os == 'Linux'
         run: |
-          cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.34 -p muxtrix --bin muxtrix
-          cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.34 -p muxtrix-control --bin muxtrixctl
+          cargo build --release --locked --target x86_64-unknown-linux-gnu -p muxtrix --bin muxtrix
+          cargo build --release --locked --target x86_64-unknown-linux-gnu -p muxtrix-control --bin muxtrixctl
 
       - name: Build native Windows release binaries
         if: runner.os == 'Windows'
@@ -293,7 +301,7 @@ jobs:
   publish_continuous:
     name: Publish continuous release
     if: github.ref == 'refs/heads/main'
-    needs: build
+    needs: [checks, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -358,6 +366,7 @@ jobs:
     name: Publish versioned GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
+      - checks
       - build
       - validate_homebrew
     runs-on: ubuntu-24.04

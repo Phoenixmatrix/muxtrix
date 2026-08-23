@@ -10,15 +10,37 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.62"
+version = "0.1.63"
 edition = "2024"
 license = "MIT"
 publish = false
 repository = "https://github.com/Phoenixmatrix/muxtrix"
 
 [workspace.dependencies]
+# Only for the headless adapter probe (`gpu.rs`, `doctor`, `muxtrix-gpu-probe`);
+# the window is drawn by GPUI, which carries its own copy at the same version.
+wgpu = { version = "29.0.4", default-features = false, features = ["wgsl", "vulkan", "gles", "dx12", "metal"] }
+pollster = "0.4"
 async-channel = "2.5.0"
-iced = { version = "0.14.0", features = ["advanced", "canvas", "image", "tokio", "wgpu", "svg"] }
+# GPUI predates its Linux wgpu renderer on crates.io, and Muxtrix needs the GL
+# fallback for WSLg, so these come from git rather than a release.
+#
+# Deliberately no `rev` on the zed dependencies. `gpui-component` declares them
+# with none either, and cargo treats two git specs as the same source only when
+# their revision spec matches — pinning here while it does not produces *two*
+# gpui crates in one graph, which fails to compile. A dependency's own
+# Cargo.lock does not carry over to a dependent workspace, so the pin has to
+# live in ours: the exact revisions are recorded in Cargo.lock, and
+# `cargo update -p gpui` is how they move.
+# `windows-manifest` is a gpui default. It shells out to a resource compiler
+# with a path relative to gpui's own source directory, which native `rc.exe`
+# resolves and `llvm-rc` (what cargo-xwin uses to cross-build from Linux) does
+# not. It is off here so a Windows binary can be produced from this machine;
+# a native Windows CI build should turn it back on, because the manifest is
+# what makes the app DPI-aware.
+gpui = { git = "https://github.com/zed-industries/zed", default-features = false, features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "5a5e2abc837b6d927e2b38e2097d2fbf39ebee77" }
 fontdb = "0.23.0"
 base64 = "0.22.1"
 bytes = "1.10.1"

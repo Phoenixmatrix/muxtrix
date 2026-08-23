@@ -1,9 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
 
-use iced::{Font, font};
 use muxtrix_control::Agent;
 use serde::{Deserialize, Serialize};
 
@@ -154,28 +152,7 @@ impl FontWeight {
         Self::Black,
     ];
 
-    pub(crate) const fn iced(self) -> font::Weight {
-        match self {
-            Self::Thin => font::Weight::Thin,
-            Self::ExtraLight => font::Weight::ExtraLight,
-            Self::Light => font::Weight::Light,
-            Self::Normal => font::Weight::Normal,
-            Self::Medium => font::Weight::Medium,
-            Self::Semibold => font::Weight::Semibold,
-            Self::Bold => font::Weight::Bold,
-            Self::ExtraBold => font::Weight::ExtraBold,
-            Self::Black => font::Weight::Black,
-        }
-    }
-
-    pub(crate) const fn bold_variant(self) -> font::Weight {
-        match self {
-            Self::Thin | Self::ExtraLight | Self::Light | Self::Normal => font::Weight::Bold,
-            Self::Medium | Self::Semibold => font::Weight::ExtraBold,
-            Self::Bold | Self::ExtraBold | Self::Black => font::Weight::Black,
-        }
-    }
-
+    /// The CSS numeric weight this step names.
     pub(crate) const fn numeric(self) -> u16 {
         match self {
             Self::Thin => 100,
@@ -190,7 +167,15 @@ impl FontWeight {
         }
     }
 
-    const fn from_numeric(weight: u16) -> Self {
+    pub(crate) const fn bold_variant(self) -> Self {
+        match self {
+            Self::Thin | Self::ExtraLight | Self::Light | Self::Normal => Self::Bold,
+            Self::Medium | Self::Semibold => Self::ExtraBold,
+            Self::Bold | Self::ExtraBold | Self::Black => Self::Black,
+        }
+    }
+
+    pub(crate) const fn from_numeric(weight: u16) -> Self {
         match weight {
             0..=149 => Self::Thin,
             150..=249 => Self::ExtraLight,
@@ -236,13 +221,6 @@ pub(crate) enum UiFont {
 impl UiFont {
     pub(crate) fn named(family: impl Into<String>) -> Self {
         Self::Named(family.into())
-    }
-
-    pub(crate) fn iced(&self) -> Font {
-        match self {
-            Self::SystemSans => Font::DEFAULT,
-            Self::Named(family) => Font::with_name(intern_font_family(family)),
-        }
     }
 
     pub(crate) fn family_name(&self) -> Option<&str> {
@@ -386,17 +364,6 @@ impl InstalledFontCatalog {
             .unwrap_or_default()
     }
 
-    /// The installed weight closest to `desired` for `font`'s family.
-    ///
-    /// Shaping a run at a weight its family does not install does not fall back
-    /// to that family's nearest face — it falls back to a *different family*
-    /// that does have the weight. The run then changes typeface, and glyphs
-    /// like `…` move off the baseline mid-rail. Snapping first keeps every
-    /// emphasis level inside one family.
-    pub(crate) fn nearest_ui_weight(&self, font: &UiFont, desired: FontWeight) -> FontWeight {
-        nearest_weight(&self.ui_weights(font), desired)
-    }
-
     pub(crate) fn terminal_fonts(&self) -> Vec<TerminalFont> {
         self.terminal_fonts.clone()
     }
@@ -417,79 +384,12 @@ impl TerminalFont {
         Self::Named(family.into())
     }
 
-    pub(crate) fn iced(&self) -> Font {
-        self.iced_with_system_family(metrics::system_monospace_family())
-    }
-
-    fn iced_with_system_family(&self, system_family: Option<&str>) -> Font {
-        match self {
-            Self::SystemMonospace => system_family.map_or(Font::MONOSPACE, |family| {
-                Font::with_name(intern_font_family(family))
-            }),
-            Self::Named(family) => Font::with_name(intern_font_family(family)),
-        }
-    }
-
     pub(crate) fn family_name(&self) -> Option<&str> {
         match self {
             Self::SystemMonospace => None,
             Self::Named(family) => Some(family),
         }
     }
-}
-
-/// Nearest Iced weight for a face's numeric weight.
-pub(crate) const fn weight_from_numeric(weight: u16) -> font::Weight {
-    match weight {
-        0..=149 => font::Weight::Thin,
-        150..=249 => font::Weight::ExtraLight,
-        250..=349 => font::Weight::Light,
-        350..=449 => font::Weight::Normal,
-        450..=549 => font::Weight::Medium,
-        550..=649 => font::Weight::Semibold,
-        650..=749 => font::Weight::Bold,
-        750..=849 => font::Weight::ExtraBold,
-        _ => font::Weight::Black,
-    }
-}
-
-/// Numeric weight for a resolved Iced weight, used when measuring a face.
-pub(crate) const fn weight_numeric(weight: font::Weight) -> u16 {
-    match weight {
-        font::Weight::Thin => 100,
-        font::Weight::ExtraLight => 200,
-        font::Weight::Light => 300,
-        font::Weight::Normal => 400,
-        font::Weight::Medium => 500,
-        font::Weight::Semibold => 600,
-        font::Weight::Bold => 700,
-        font::Weight::ExtraBold => 800,
-        font::Weight::Black => 900,
-    }
-}
-
-/// The entry of `installed` closest to `desired`, or `desired` when nothing is
-/// known about the family.
-///
-/// Ties round *down*. A family with only two faces has to collapse one step of
-/// the emphasis ladder either way; rounding down collapses Medium into Regular,
-/// which two adjacent levels already distinguish by size and colour. Rounding
-/// up would instead collapse Medium into Semibold — the weight that marks the
-/// focused row — and focus is the signal that has nothing else to fall back on.
-fn nearest_weight(installed: &[FontWeight], desired: FontWeight) -> FontWeight {
-    if installed.is_empty() || installed.contains(&desired) {
-        return desired;
-    }
-    installed
-        .iter()
-        .copied()
-        .min_by_key(|weight| {
-            (
-                weight.numeric().abs_diff(desired.numeric()),
-                u16::from(weight.numeric() > desired.numeric()),
-            )
-        })
-        .unwrap_or(desired)
 }
 
 fn font_weight_choices(weights: impl IntoIterator<Item = u16>) -> Vec<FontWeight> {
@@ -554,28 +454,6 @@ fn terminal_font_choices<'a>(families: impl IntoIterator<Item = &'a str>) -> Vec
     std::iter::once(TerminalFont::SystemMonospace)
         .chain(installed.into_values().map(TerminalFont::named))
         .collect()
-}
-
-pub(crate) fn intern_font_family(family: &str) -> &'static str {
-    static FAMILIES: OnceLock<RwLock<HashMap<String, &'static str>>> = OnceLock::new();
-    let families = FAMILIES.get_or_init(|| RwLock::new(HashMap::new()));
-    if let Some(interned) = families
-        .read()
-        .expect("font family cache should be readable")
-        .get(family)
-    {
-        return interned;
-    }
-
-    let mut families = families
-        .write()
-        .expect("font family cache should be writable");
-    if let Some(interned) = families.get(family) {
-        return interned;
-    }
-    let interned = Box::leak(family.to_owned().into_boxed_str());
-    families.insert(family.to_owned(), interned);
-    interned
 }
 
 /// Canonical GitHub CLI hostname. The CLI owns API-path discovery for GitHub
@@ -743,14 +621,6 @@ impl AppSettings {
         (self.terminal_font_size * POINTS_TO_PIXELS * 100.0).round() / 100.0
     }
 
-    pub(crate) fn ui_font(&self) -> Font {
-        font_with_style(
-            self.ui_font.iced(),
-            self.ui_font_weight.iced(),
-            font::Style::Normal,
-        )
-    }
-
     /// Characters that occupy the space `base_characters` occupy at the
     /// reference type size.
     ///
@@ -844,50 +714,10 @@ fn save_to(path: &Path, settings: &AppSettings) -> Result<(), String> {
     std::fs::rename(&temporary, path).map_err(|error| error.to_string())
 }
 
-pub(crate) fn font_with_style(base: Font, weight: font::Weight, style: font::Style) -> Font {
-    Font {
-        weight,
-        style,
-        ..base
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn emphasis_weights_snap_into_the_family_the_user_actually_has() {
-        // FreeSans, the sans this project's Linux CI resolves to, ships exactly
-        // these two. Medium sits halfway between them.
-        let two_face = [FontWeight::Normal, FontWeight::Semibold];
-        assert_eq!(
-            nearest_weight(&two_face, FontWeight::Medium),
-            FontWeight::Normal,
-            "a tie must not collapse Medium onto the weight that marks focus"
-        );
-        assert_eq!(
-            nearest_weight(&two_face, FontWeight::Semibold),
-            FontWeight::Semibold
-        );
-        assert_eq!(
-            nearest_weight(&two_face, FontWeight::Bold),
-            FontWeight::Semibold,
-            "a heavier request than the family ships snaps to its heaviest face"
-        );
-        assert_eq!(
-            nearest_weight(&two_face, FontWeight::Thin),
-            FontWeight::Normal
-        );
-
-        // A family with the requested face is left alone, and an unknown family
-        // keeps the caller's intent rather than snapping to nothing.
-        assert_eq!(
-            nearest_weight(&FontWeight::ALL, FontWeight::Medium),
-            FontWeight::Medium
-        );
-        assert_eq!(nearest_weight(&[], FontWeight::Medium), FontWeight::Medium);
-    }
     #[test]
     fn github_host_accepts_enterprise_hostname_and_web_url() {
         assert_eq!(
@@ -1015,26 +845,6 @@ mod tests {
     }
 
     #[test]
-    fn interface_font_applies_the_selected_family_and_weight() {
-        let settings = AppSettings {
-            ui_font: UiFont::named("Inter"),
-            ui_font_weight: FontWeight::Semibold,
-            ..AppSettings::default()
-        };
-
-        assert_eq!(settings.ui_font().family, font::Family::Name("Inter"));
-        assert_eq!(settings.ui_font().weight, font::Weight::Semibold);
-    }
-
-    #[test]
-    fn system_monospace_shapes_with_the_resolved_platform_family() {
-        let font =
-            TerminalFont::SystemMonospace.iced_with_system_family(Some("Resolved System Mono"));
-
-        assert_eq!(font.family, font::Family::Name("Resolved System Mono"));
-    }
-
-    #[test]
     fn old_or_partial_settings_receive_defaults() {
         let restored: AppSettings = serde_json::from_str(r#"{"terminal_font_size":18.0}"#)
             .expect("partial settings should deserialize");
@@ -1092,20 +902,20 @@ mod tests {
     #[test]
     fn font_settings_use_point_sizing_for_consistent_cross_platform_metrics() {
         let settings = AppSettings::default();
-        // No face database is published in unit tests, so cell width follows the
-        // assumed ratio. See `cell_width_tracks_the_measured_advance_ratio`.
-        assert_eq!(
-            settings.terminal_advance_ratio(),
-            metrics::FALLBACK_ADVANCE_RATIO
-        );
+        // Cell width follows whichever face is published process-wide: the
+        // assumed ratio when no test has booted the application yet, or the
+        // measured one once `Muxtrix::boot` in another test has installed the
+        // real database. Either way it is what the font size scales by.
+        let ratio = settings.terminal_advance_ratio();
+        let cell_width = (settings.terminal_font_pixels() * ratio * 100.0).round() / 100.0;
         if cfg!(target_os = "macos") {
             assert_eq!(settings.terminal_font_pixels(), 14.0);
-            assert_eq!(settings.terminal_cell_width(), 8.4);
+            assert_eq!(settings.terminal_cell_width(), cell_width);
             assert_eq!(settings.terminal_cell_height(), 16.1);
             assert_eq!(settings.ui_pixels(12.0), 13.71);
         } else {
             assert_eq!(settings.terminal_font_pixels(), 18.67);
-            assert_eq!(settings.terminal_cell_width(), 11.2);
+            assert_eq!(settings.terminal_cell_width(), cell_width);
             assert_eq!(settings.terminal_cell_height(), 21.47);
             assert_eq!(settings.ui_pixels(12.0), 18.29);
         }

@@ -2,9 +2,11 @@
 
 ## Decision summary
 
-Muxtrix uses Iced's default wgpu renderer for the application chrome and a
-custom terminal widget. Terminal cells are drawn through the same GPU-backed
-renderer rather than embedded as a second native window.
+Muxtrix uses GPUI, Zed's UI framework, for the application chrome and a
+custom terminal element. GPUI renders through wgpu on Linux and through the
+native Metal and DirectX backends on macOS and Windows; terminal cells are
+drawn through the same GPU-backed renderer rather than embedded as a second
+native window.
 
 Muxtrix uses the safe Rust `libghostty-vt` crate instead of the broader
 `libghostty` API. The VT crate is the appropriate boundary today because it is
@@ -12,7 +14,7 @@ available on Linux, Windows, and macOS and owns terminal parsing, screen state,
 scrollback, input encoding, selection, and render-state extraction. Muxtrix
 continues to own PTYs, fonts, glyph shaping/atlases, GPU drawing, panes, and
 application lifecycle. This boundary can be revisited when full libghostty has
-a stable cross-platform rendering API suitable for Iced composition.
+a stable cross-platform rendering API suitable for GPUI composition.
 
 The published `libghostty-vt-sys` 0.2.1 source is vendored with the narrow
 upstream MSVC static-archive link correction. Keeping the released source pin
@@ -20,14 +22,14 @@ avoids coupling that Windows fix to unrelated Ghostty and Zig upgrades; the
 path patch should be removed when a compatible fixed release is available.
 
 The current vertical slice projects Ghostty snapshots as fixed-height rows of
-fixed-column Iced text runs rendered by wgpu. Snapshots retain foreground and
+fixed-column shaped text runs rendered by GPUI. Snapshots retain foreground and
 background colors, font/decorative attributes, cursor state, and each cell's
 terminal width. Ghostty's dirty-row state lets snapshots share unchanged row
-text and cell buffers. The Iced bridge combines adjacent ASCII cells with
+text and cell buffers. The run model combines adjacent ASCII cells with
 identical style, isolates Unicode fallback glyphs whose natural metrics may
 vary, and assigns wide glyphs their two terminal columns. As in Ghostty's
 sprite-font resolver, U+2500..=U+257F bypasses configured-font lookup and maps
-to semantic cell geometry; this lives in the Iced bridge because
+to semantic cell geometry; this lives in the run model because
 `libghostty-vt` does not include Ghostty's font renderer. A pane-sized clipped
 container draws the default background while runs draw non-default cell
 backgrounds, selections, and the cursor. Standard VT window-title metadata
@@ -40,12 +42,12 @@ Kitty graphics stay on the same boundary. `libghostty-vt` parses commands,
 limits each terminal's decoded image storage to 64 MiB, decodes PNG payloads on
 the terminal actor thread, and resolves placement geometry, source rectangles,
 viewport positions, and z-layers. Snapshots share decoded RGBA buffers by
-Ghostty generation stamp; the app retains one Iced image handle per visible
+Ghostty generation stamp; the runtime retains one GPUI render image per visible
 generation instead of copying or uploading pixels on every repaint. Separate
 canvas passes place images below cell backgrounds, below glyphs, or above
 glyphs, matching Ghostty's renderer order; a renderer-owned overlay pass keeps
 selection and cursor backgrounds visible over below-text images. Placement
-extents scale from Ghostty's integer cell metrics to Iced's fractional grid,
+extents scale from Ghostty's integer cell metrics to the renderer's fractional grid,
 and the pane clip contains off-screen geometry.
 
 Terminal themes are applied on the Ghostty owner thread as default foreground,
@@ -59,38 +61,39 @@ contract.
 The Ghostty handles are intentionally thread-confined. Each pane's terminal
 actor owns its VT state and receives PTY output/input messages over channels.
 Runtime handles are keyed by `PaneId`, so split, focus, event delivery, and
-close stay isolated. Iced size sensors resize the corresponding PTY and VT grid whenever a
+close stay isolated. The terminal element reports its bounds and resizes the corresponding PTY and VT grid whenever a
 pane's terminal body changes dimensions. Pixel-only drag events are coalesced:
 the actor receives a resize only when terminal rows or columns change, while
-the latest viewport is still retained. When the grid changes, Iced keeps the
+the latest viewport is still retained. When the grid changes, the element keeps the
 last valid snapshot visible and clipped to the current pane while rejecting
 queued frames whose rows or columns do not match the requested grid. Resize and
 input commands remain ordered on the terminal actor, so input cannot render at
 stale pre-resize coordinates. Terminal actors coalesce consecutive PTY
 chunks before snapshotting and keep a single latest-frame slot while preserving
-notifications and exit/error events. A bounded wake channel drives Iced only
-when terminal or control work arrives; the cursor blink is the only periodic UI
-tick. Snapshots or render batches cross into the Iced update/render loop; raw
-Ghostty handles do not.
+notifications and exit/error events. A bounded wake channel wakes the runtime
+when terminal or control work arrives, and every frame drains the terminals
+before drawing, so a frame never paints a grid older than the bytes it has.
+Snapshots cross into the application's update loop; raw Ghostty handles do
+not.
 
 Pane trees contain leaves, recursive splits, and stacks. A stack keeps its live
-pane IDs in visual order while Iced expands only the focused pane and projects
+pane IDs in visual order while the view expands only the focused pane and projects
 the others as title-height sheets; no PTY ownership moves. Recursive split
-nodes are addressed by workspace, tab, and tree path. A size sensor records
-each node's extent, and global pointer movement updates only the active node's
+nodes are addressed by workspace, tab, and tree path. Each split records its
+own painted extent, and global pointer movement updates only the active node's
 bounded `SplitRatio`. Keyboard growth snapshots the focused pane's tree before
 adjusting a split or folding blocked siblings into a stack, which makes
 decrease an exact undo chain. Terminal mouse-wheel deltas remain pane-scoped and
 are applied on the Ghostty owner thread through `scroll_viewport`. Snapshot
 metadata carries Ghostty's exact scrollbar total, visible length, and offset;
-Iced draws a hover-only thumb as an overlay so its appearance never changes PTY
+the element draws a hover-only thumb as an overlay so its appearance never changes PTY
 columns. Selection is pane-local UI state mapped from pointer coordinates to
 the visible cell grid and projected into the fixed-column style runs.
 
 ## Component boundaries
 
 ```text
-Iced application + wgpu compositor
+GPUI application + compositor
   |-- workspace/sidebar model
   |-- recursive split tree
   |-- terminal canvas -> glyph atlas + cell decorations
@@ -112,13 +115,13 @@ process host
 The implemented actor uses one blocking PTY reader thread and one owning
 session thread. Only byte buffers cross from the reader. The session thread
 feeds Ghostty, writes any terminal-generated replies to the PTY, creates render
-snapshots, and publishes those snapshots to the Iced loop. This preserves
+snapshots, and publishes those snapshots to the application loop. This preserves
 ordering and keeps every Ghostty handle on the thread that created it.
 
 ## GPU strategy
 
-Iced uses wgpu, which maps to Vulkan/OpenGL on Linux, Direct3D 12 on Windows,
-and Metal on macOS. WSLg exposes the host GPU through `/dev/dxg`. Muxtrix
+GPUI renders through wgpu on Linux, which maps to Vulkan or OpenGL, and through
+Direct3D on Windows and Metal on macOS. WSLg exposes the host GPU through `/dev/dxg`. Muxtrix
 defaults WSL to wgpu GL plus Mesa Gallium D3D12; when the NVIDIA WSL driver is
 present it also prefers the NVIDIA adapter. These defaults are process-local
 and only fill missing environment variables, so users can override every
@@ -130,7 +133,7 @@ is required. See `docs/GPU.md` for the exact bootstrap and headless probe.
 Terminal rendering will batch cells by texture atlas and decoration style. The
 CPU performs VT parsing and glyph shaping; glyph rasterization is cached in GPU
 textures and wgpu draws backgrounds, glyphs, selections, cursors, and pane
-effects. This keeps terminal rendering inside Iced's compositor and avoids
+effects. This keeps terminal rendering inside GPUI's compositor and avoids
 cross-window synchronization.
 
 ## Process backends
@@ -163,7 +166,7 @@ caches the resulting hook context per selected distribution.
 
 ## Persistence and programmability
 
-The serializable domain model is independent of Iced widgets. A workspace owns
+The serializable domain model is independent of the UI framework. A workspace owns
 one or more ordered tabs; each tab owns a split tree whose leaves are panes, and
 each pane owns terminal, browser, or document surfaces. Runtime handles remain
 keyed by globally unique pane identity and are never serialized. Schema v2

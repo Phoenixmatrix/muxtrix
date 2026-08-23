@@ -53,6 +53,14 @@ pub enum ControlRequest {
         pane_id: Option<String>,
     },
     ListPanes,
+    /// Whether the e2e scenario has reached its capture point.
+    ///
+    /// GPUI can only render a window to an image on its test platform, so a
+    /// headless capture is taken from outside the process. The harness polls
+    /// this, grabs the frame itself, and then asks the app to quit.
+    E2eStatus,
+    /// End the process. Only the e2e harness sends this.
+    Quit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +98,10 @@ pub struct ControlResponse {
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub panes: Vec<PaneSummary>,
+    /// Set only in reply to [`ControlRequest::E2eStatus`]: the scenario has
+    /// settled on the frame it wants captured.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capture_ready: bool,
 }
 
 impl ControlResponse {
@@ -100,6 +112,7 @@ impl ControlResponse {
             message: Some(message.into()),
             text: None,
             panes: Vec::new(),
+            capture_ready: false,
         }
     }
 
@@ -110,6 +123,19 @@ impl ControlResponse {
             message: Some(message.into()),
             text: None,
             panes: Vec::new(),
+            capture_ready: false,
+        }
+    }
+
+    /// The reply to [`ControlRequest::E2eStatus`].
+    #[must_use]
+    pub fn e2e_status(capture_ready: bool) -> Self {
+        Self {
+            ok: true,
+            message: None,
+            text: None,
+            panes: Vec::new(),
+            capture_ready,
         }
     }
 }

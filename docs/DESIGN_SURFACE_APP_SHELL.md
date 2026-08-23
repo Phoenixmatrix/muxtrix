@@ -7,7 +7,7 @@ related_targets: ["crates/muxtrix-app/src/settings.rs","crates/muxtrix-app/src/c
 
 # Muxtrix native workspace
 
-- Scope: the native Iced application shell in `crates/muxtrix-app/src/main.rs`,
+- Scope: the native GPUI application shell in `crates/muxtrix-app/src/views/gpui`,
   including workspace/fleet navigation, command palette, settings, terminal
   pane chrome, and the focused-pane GitHub review panel.
 - Mode: Operate.
@@ -66,21 +66,21 @@ truthful local/GitHub data.
 
 | Visible ingredient | Commitment | Medium |
 | --- | --- | --- |
-| Native top command bar | Muxtrix, command access, Settings | Semantic Iced widgets |
-| Workspace inventory | Ruled workspace rows above Fleet with rolled state, counts, real context, inline rename, and nested draggable tabs | Semantic Iced widgets and domain/runtime state |
-| Workspace tab strip | Scrollable ordered tabs with signal, name, pane count, close, drag/drop, and one-pane add action | Semantic Iced widgets and domain/runtime state |
-| Fleet projection | Persisted This/All workspace scope beside Tabs/Agents/Repos; All inserts workspace bands in session order, Tabs preserves nested tab bands, Agents filters within each workspace, and Repos groups within each workspace with a `No Repo` fallback | Semantic Iced widgets, cached Git metadata, and domain/runtime state |
-| Conditional global Attention | Ruled rows only for non-pane messages; omitted when empty | Semantic Iced widgets and state |
-| Collapsible fleet rail | Rich 3-4 line task rows with title, identity/state, latest activity, context | Semantic Iced widgets and domain/runtime state |
-| Collapse control | Subtle double chevrons at lower-right; compact rail retains state signals | Semantic Iced button |
-| Pane tab | Compact left tab with title or agent state and close action | Semantic Iced widgets |
+| Native top command bar | Muxtrix, command access, Settings | Semantic GPUI elements |
+| Workspace inventory | Ruled workspace rows above Fleet with rolled state, counts, real context, inline rename, and nested draggable tabs | Semantic GPUI elements and domain/runtime state |
+| Workspace tab strip | Scrollable ordered tabs with signal, name, pane count, close, drag/drop, and one-pane add action | Semantic GPUI elements and domain/runtime state |
+| Fleet projection | Persisted This/All workspace scope beside Tabs/Agents/Repos; All inserts workspace bands in session order, Tabs preserves nested tab bands, Agents filters within each workspace, and Repos groups within each workspace with a `No Repo` fallback | Semantic GPUI elements, cached Git metadata, and domain/runtime state |
+| Conditional global Attention | Ruled rows only for non-pane messages; omitted when empty | Semantic GPUI elements and state |
+| Collapsible fleet rail | Rich 3-4 line task rows with title, identity/state, latest activity, context | Semantic GPUI elements and domain/runtime state |
+| Collapse control | Subtle double chevrons at lower-right; compact rail retains state signals | Semantic GPUI element |
+| Pane tab | Compact left tab with title or agent state and close action | Semantic GPUI elements |
 | Pane controls | Split right, split down, maximize/restore, overflow | Code-native controls with accessible labels |
-| Terminal field | Existing Ghostty snapshot projection remains dominant and readable | Existing GPU-backed Iced rich text |
+| Terminal field | Existing Ghostty snapshot projection remains dominant and readable | The GPUI terminal element |
 | Focus and attention | Blue focus perimeter; amber waiting state on pane and fleet row | Semantic color tokens and borders |
-| Settings | Full-window Preferences/Worktrees navigation, grouped native preferences, configured-agent default selection, and asynchronous ruled worktree inventory | Semantic Iced form and list controls |
-| Optional status bar | Hidden by default; enabled from Settings | Semantic Iced widgets |
-| Command palette | Search field and ruled command rows in the same system | Semantic Iced overlay |
-| GitHub review panel | 372 px ruled dock on wide windows, opaque overlay on compact windows, auth/readiness/checks/virtualized files/guarded merge | Semantic Iced widgets plus Git and GitHub CLI state |
+| Settings | Full-window Preferences/Worktrees navigation, grouped native preferences, configured-agent default selection, and asynchronous ruled worktree inventory | Semantic GPUI form and list controls |
+| Optional status bar | Hidden by default; enabled from Settings | Semantic GPUI elements |
+| Command palette | Search field and ruled command rows in the same system | Semantic GPUI overlay |
+| GitHub review panel | 372 px ruled dock on wide windows, opaque overlay on compact windows, auth/readiness/checks/virtualized files/guarded merge | Semantic GPUI elements plus Git and GitHub CLI state |
 | Raster media | None; the approved comp is a north star, not a shipped bitmap | Accepted omission |
 
 ## Non-literal comp details
@@ -89,7 +89,7 @@ The comp's demonstration repository names, terminal output, branches, agent
 summaries, and global hook message are synthetic layout content. Production UI
 must derive those fields from real Muxtrix state, omit unavailable metadata,
 and never invent activity. Pane-control glyphs may be translated to the closest
-consistent code-native icon treatment supported by Iced.
+consistent code-native icon treatment as SVG assets.
 
 ## Unresolved implementation decisions
 

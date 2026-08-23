@@ -51,7 +51,8 @@ not yet published.
 
 ## Capabilities and Constraints
 
-- Muxtrix is written primarily in Rust using Iced and its wgpu renderer.
+- Muxtrix is written primarily in Rust using GPUI, Zed's UI framework, with
+  its wgpu renderer on Linux and the native Metal and DirectX backends elsewhere.
 - Terminal state uses `libghostty-vt`; Muxtrix owns PTYs, panes, process
   backends, terminal drawing, application state, and lifecycle.
 - Application chrome and terminal content share a GPU-accelerated compositor.
@@ -88,13 +89,13 @@ not yet published.
 ## Evidence on Hand
 
 - The implemented Rust workspace and current application surface live under
-  `crates/`, with the Iced application in `crates/muxtrix-app`.
+  `crates/`, with the GPUI application in `crates/muxtrix-app`.
 - `docs/ARCHITECTURE.md` records the GPU, terminal, process-host, persistence,
   and control-service boundaries.
 - `docs/AGENT_INTEGRATIONS.md` documents reversible Codex and Claude Code
   lifecycle integration.
 - `docs/TESTING.md` documents deterministic integration coverage and the
-  private-display Iced/wgpu E2E harness.
+  private-display GPUI E2E harness.
 - The repository contains no testimonials, customer claims, benchmarks,
   pricing, or market evidence; future product work must not fabricate them.
 

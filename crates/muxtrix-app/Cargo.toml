@@ -14,7 +14,18 @@ e2e = []
 [dependencies]
 async-channel.workspace = true
 bytes.workspace = true
-iced.workspace = true
+# GPUI's AssetSource trait is defined in terms of anyhow::Result, so serving
+# icons to it means speaking that dialect at the boundary.
+anyhow = "1.0"
+# GPUI takes decoded frames as `image` buffers in a `SmallVec`, so building one
+# means speaking both at the boundary. Versions follow gpui's own.
+image = { version = "0.25", default-features = false }
+smallvec = "1"
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
 fontdb.workspace = true
 libghostty-vt.workspace = true
 muxtrix-domain = { path = "../muxtrix-domain" }

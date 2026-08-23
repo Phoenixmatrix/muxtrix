@@ -44,11 +44,46 @@ upstream static archive is linked on Windows.
 The vendored binding's original license is also retained at
 `vendor/libghostty-vt-sys/LICENSE`.
 
+### GPUI
+
+Muxtrix's application chrome and terminal element are built on GPUI, the UI
+framework of the Zed editor, consumed as a library dependency and compiled
+into the Muxtrix binary. Its Linux renderer uses wgpu.
+
+- Project: Zed (GPUI)
+- Source: <https://github.com/zed-industries/zed>
+- Reference revision: `fd82517a115d97a07835b52f0512b22b38e38ccf`
+- Copyright: Zed Industries, Inc.
+- License: Apache License 2.0 (text below)
+
+### Zed font-kit
+
+GPUI uses Zed's maintained fork of `font-kit` for cross-platform font loading;
+it is compiled into the Muxtrix binary.
+
+- Project: Zed font-kit fork
+- Source: <https://github.com/zed-industries/font-kit>
+- Reference revision: `94b0f28166665e8fd2f53ff6d268a14955c82269`
+- Copyright: Patrick Walton and font-kit contributors
+- License: MIT OR Apache-2.0; Muxtrix redistributes it under the MIT terms
+  reproduced below
+
+### gpui-component
+
+The settings page's pickers, sliders, switches and every text field are
+gpui-component widgets, consumed as a library dependency.
+
+- Project: gpui-component
+- Source: <https://github.com/longbridge/gpui-component>
+- Reference revision: `5a5e2abc837b6d927e2b38e2097d2fbf39ebee77`
+- Copyright: Longbridge and gpui-component contributors
+- License: Apache License 2.0 (text below)
+
 ### Herdr
 
 Portions of Muxtrix's agent screen-state detection and its workspace, tab,
 pane, and fleet information architecture were adapted from Herdr. The adapted
-implementation has been modified for Muxtrix's native Iced application and
+implementation has been modified for Muxtrix's native GPUI application and
 its screen-authoritative agent-state model. The relevant source file carries
 a modification and origin notice.
 
