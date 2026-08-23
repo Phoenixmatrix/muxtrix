@@ -370,6 +370,10 @@ pub(crate) struct Muxtrix {
     /// pane was reporting, and whether reporting was ever on at all.
     #[cfg(feature = "e2e")]
     pub(crate) e2e_pointer_trace: (u32, u32, bool),
+    /// How many terminal polls and scenario ticks have run, so a report can
+    /// say whether the runtime was starved.
+    #[cfg(feature = "e2e")]
+    pub(crate) e2e_clock_trace: (u32, u32),
 }
 
 pub(crate) struct TerminalRuntime {
@@ -1968,6 +1972,8 @@ impl Muxtrix {
             e2e,
             #[cfg(feature = "e2e")]
             e2e_pointer_trace: (0, 0, false),
+            #[cfg(feature = "e2e")]
+            e2e_clock_trace: (0, 0),
         };
         let _ = app.publish_control_panes();
         app
@@ -2162,6 +2168,10 @@ impl Muxtrix {
                 return Vec::new();
             }
             Message::PollTerminal => {
+                #[cfg(feature = "e2e")]
+                {
+                    self.e2e_clock_trace.0 += 1;
+                }
                 self.poll_terminal();
                 self.poll_control();
                 if self.quit_requested {
@@ -3540,7 +3550,10 @@ impl Muxtrix {
                 return effect::batch([version_task, scroll_task]);
             }
             #[cfg(feature = "e2e")]
-            Message::E2eTick => return self.drive_e2e(),
+            Message::E2eTick => {
+                self.e2e_clock_trace.1 += 1;
+                return self.drive_e2e();
+            }
         };
 
         self.status = match result {
