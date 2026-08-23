@@ -95,8 +95,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Ubuntu 22.04 rather than a zig-pinned glibc: GPUI links the host's
+          # libxkbcommon dynamically, and a library from a newer host cannot be
+          # linked into a binary that promises an older glibc. Building on the
+          # oldest supported release sets the floor (glibc 2.35) the honest way.
           - name: Linux x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
             artifact: muxtrix-linux-x86_64
           - name: Windows x86_64
             runner: windows-2025
@@ -154,13 +158,12 @@ jobs:
             libzstd-dev \
             pkg-config
           cargo install cargo-deb --locked
-          cargo install cargo-zigbuild --locked
 
       - name: Build portable Linux release binaries
         if: runner.os == 'Linux'
         run: |
-          cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.34 -p muxtrix --bin muxtrix
-          cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.34 -p muxtrix-control --bin muxtrixctl
+          cargo build --release --locked --target x86_64-unknown-linux-gnu -p muxtrix --bin muxtrix
+          cargo build --release --locked --target x86_64-unknown-linux-gnu -p muxtrix-control --bin muxtrixctl
 
       - name: Build native Windows release binaries
         if: runner.os == 'Windows'

@@ -68,11 +68,12 @@ The macOS binaries are ad-hoc signed and checked as arm64 before packaging, but
 are not Developer ID signed or notarized. Verify every download against the
 published `SHA256SUMS`.
 
-Linux release binaries are built through `cargo-zigbuild` against glibc 2.34
-even when the release host is newer. Keep the version suffix on
-`x86_64-unknown-linux-gnu.2.34` and pass the unsuffixed Rust target to
-`cargo-deb`; otherwise a release made on a newer Ubuntu can silently require
-that host's newer libc.
+Linux release binaries are built on Ubuntu 22.04, which sets their glibc floor
+at 2.35. GPUI links the host's `libxkbcommon` dynamically, so the release
+cannot be pinned to an older glibc with `cargo-zigbuild` the way it once was —
+a library from a newer host cannot be linked into a binary that promises an
+older libc. Keep the release job on the oldest supported Ubuntu; moving it to
+a newer image silently raises the floor for every user.
 
 See `docs/RELEASING.md` for the repository secrets, package repository
 permissions, and tag procedure.
