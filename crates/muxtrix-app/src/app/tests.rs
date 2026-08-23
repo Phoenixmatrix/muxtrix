@@ -3225,6 +3225,75 @@ fn rename_prompt_keystrokes_never_reach_the_terminal() {
 }
 
 #[test]
+fn naming_dialogs_submit_with_enter_and_cancel_from_the_button_row() {
+    let mut app = Muxtrix::new();
+    let original_workspaces = app.session.workspaces.len();
+    let _ = app.open_workspace_create();
+    app.workspace_name_draft = "Keyboard workspace".into();
+
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+
+    assert_eq!(app.session.workspaces.len(), original_workspaces + 1);
+    assert!(!app.workspace_create_visible);
+
+    let _ = app.open_workspace_create();
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowDown), Modifiers::empty()));
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowLeft), Modifiers::empty()));
+    assert_eq!(app.dialog_button, Some(DialogButton::Cancel));
+
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+
+    assert_eq!(app.session.workspaces.len(), original_workspaces + 1);
+    assert!(!app.workspace_create_visible);
+}
+
+#[test]
+fn new_tab_action_opens_rename_with_the_default_name() {
+    let mut app = Muxtrix::new();
+    let workspace_id = app.session.active_workspace_id;
+
+    let effects = app.update(Message::NewTab);
+
+    let tab = app
+        .active_workspace()
+        .expect("workspace")
+        .active_tab()
+        .expect("tab");
+    assert_eq!(tab.name, "Tab 2");
+    assert_eq!(
+        app.rename_prompt,
+        Some(RenameTarget::Tab(workspace_id, tab.id))
+    );
+    assert_eq!(app.rename_draft, "Tab 2");
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Focus(FocusTarget::Rename)]
+    ));
+}
+
+#[test]
+fn rename_input_arrows_keep_editing_until_the_button_row_is_entered() {
+    let mut app = Muxtrix::new();
+    let workspace_id = app.session.active_workspace_id;
+    let _ = app.run_command(CommandAction::RenameWorkspace);
+    app.rename_draft = "Edited workspace".into();
+
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowLeft), Modifiers::empty()));
+    assert_eq!(app.dialog_button, None);
+    assert_eq!(
+        app.rename_prompt,
+        Some(RenameTarget::Workspace(workspace_id))
+    );
+
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+    assert_eq!(
+        app.active_workspace().expect("workspace").name,
+        "Edited workspace"
+    );
+    assert_eq!(app.rename_prompt, None);
+}
+
+#[test]
 fn palette_rename_updates_workspaces_tabs_and_panes() {
     let mut app = Muxtrix::new();
     let workspace_id = app.session.active_workspace_id;

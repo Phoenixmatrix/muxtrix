@@ -21,7 +21,7 @@ use crate::layout::pane_ids_in_layout;
 use crate::runtime::gpui::{Root, color};
 use crate::settings::{FleetScope, FleetView};
 use crate::theme::DesignTokens;
-use crate::views::gpui::{icon_button, pane_key, rail_marker, terminal_family};
+use crate::views::{icon_button, pane_key, rail_marker, terminal_family};
 
 impl Root {
     pub(crate) fn view_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -310,7 +310,7 @@ impl Root {
             hover.a = 0.05;
             let mut segment = div()
                 .id(SharedString::from(format!("fleet-{view}")))
-                .h(px(24.))
+                .h(px(26.))
                 .px(px(6.))
                 .flex()
                 .items_center()

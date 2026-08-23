@@ -10,18 +10,17 @@ use gpui::{
 };
 
 use crate::app::{
-    Message, RenameTarget, SettingsButtonKind, WorktreeManagerMode, WorktreeManagerState,
-    agent_display_name, ellipsize, worktree_display_name,
+    DialogButton, Message, RenameTarget, SettingsButtonKind, WorktreeManagerMode,
+    WorktreeManagerState, agent_display_name, ellipsize, worktree_display_name,
 };
 use crate::runtime::gpui::{Root, color};
 use crate::theme::DesignTokens;
-use crate::views::gpui::terminal_family;
+use crate::views::terminal_family;
 
 impl Root {
-    /// The dialog that is up, with the message that dismisses it.
+    /// The active dialog and the message that dismisses it.
     ///
-    /// One place decides, in the same order the iced shell used, so two
-    /// dialogs can never be open at once.
+    /// One place decides precedence so two dialogs can never be open at once.
     pub(crate) fn dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let app = self.app();
         let tokens = DesignTokens::for_appearance(app.settings.appearance);
@@ -375,6 +374,19 @@ impl Root {
         } else {
             tokens.text
         };
+        let button = if primary {
+            DialogButton::Confirm
+        } else {
+            DialogButton::Cancel
+        };
+        let selected = self.app().dialog_button == Some(button);
+        let border = if selected && primary {
+            tokens.text
+        } else if selected {
+            tokens.accent
+        } else {
+            tokens.line
+        };
         div()
             .id(gpui::ElementId::from(gpui::SharedString::from(
                 label.to_owned(),
@@ -384,6 +396,8 @@ impl Root {
             .flex()
             .items_center()
             .rounded(px(6.))
+            .border_1()
+            .border_color(color(border))
             .cursor_pointer()
             .bg(color(background))
             .text_size(px(self.app().settings.ui_pixels(11.0)))
@@ -514,22 +528,50 @@ impl Root {
                                 .text_color(color(tokens.faint))
                                 .child("Enter restarts · Esc goes back"),
                         )
-                        .child(self.settings_action_button(
-                            "worktree-restart-cancel",
-                            "Cancel",
-                            Message::CancelWorktreeManagerRestart,
-                            SettingsButtonKind::Secondary,
-                            tokens,
-                            cx,
-                        ))
-                        .child(self.settings_action_button(
-                            "worktree-restart-confirm",
-                            if restart_agent.is_some() { "Restart and launch" } else { "Restart pane" },
-                            Message::ConfirmWorktreeManagerRestart,
-                            SettingsButtonKind::Danger,
-                            tokens,
-                            cx,
-                        )),
+                        .child(
+                            div()
+                                .rounded(px(7.))
+                                .border_1()
+                                .border_color(color(
+                                    if app.dialog_button == Some(DialogButton::Cancel) {
+                                        tokens.accent
+                                    } else {
+                                        tokens.line
+                                    },
+                                ))
+                                .child(self.settings_action_button(
+                                    "worktree-restart-cancel",
+                                    "Cancel",
+                                    Message::CancelWorktreeManagerRestart,
+                                    SettingsButtonKind::Secondary,
+                                    tokens,
+                                    cx,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .rounded(px(7.))
+                                .border_1()
+                                .border_color(color(
+                                    if app.dialog_button == Some(DialogButton::Confirm) {
+                                        tokens.text
+                                    } else {
+                                        tokens.line
+                                    },
+                                ))
+                                .child(self.settings_action_button(
+                                    "worktree-restart-confirm",
+                                    if restart_agent.is_some() {
+                                        "Restart and launch"
+                                    } else {
+                                        "Restart pane"
+                                    },
+                                    Message::ConfirmWorktreeManagerRestart,
+                                    SettingsButtonKind::Danger,
+                                    tokens,
+                                    cx,
+                                )),
+                        ),
                 )
                 .into_any_element();
         }

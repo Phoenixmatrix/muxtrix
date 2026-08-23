@@ -31,8 +31,8 @@ use crate::commands::CommandAction;
 use crate::runtime::gpui::{Root, color};
 use crate::settings::FleetScope;
 use crate::theme::DesignTokens;
-use crate::views::gpui::settings_widgets::Picker;
-use crate::views::gpui::terminal_family;
+use crate::views::settings_widgets::Picker;
+use crate::views::terminal_family;
 
 impl Root {
     pub(crate) fn view_settings(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -268,8 +268,8 @@ impl Root {
                 .w(px(width))
                 .child(
                     Select::new(&state.state)
-                        .small()
-                        .menu_max_h(px(FONT_FAMILY_MENU_MAX_HEIGHT)),
+                        .menu_max_h(px(FONT_FAMILY_MENU_MAX_HEIGHT))
+                        .cursor_pointer(),
                 )
                 .into_any_element()
         };

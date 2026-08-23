@@ -3,10 +3,9 @@
 //! Docks at 372 px on wide windows and floats over the workspace on narrow
 //! ones; both share this body. Everything it shows comes from
 //! [`crate::app::GitHubPanelState`] — nothing here talks to the network.
-//!
-//! The layout is the iced panel's: a 54 px identity header, the Local / Pull
-//! requests well, then the tab's body. Lists scroll through handles the root
-//! owns and reports back, so the application's own offsets stay the record.
+//! A 54 px identity header and the Local / Pull requests well lead into the
+//! active tab. Lists scroll through handles the root owns and reports back, so
+//! application offsets remain the source of truth.
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -24,7 +23,7 @@ use crate::app::{
 use crate::github;
 use crate::runtime::gpui::{Root, color};
 use crate::theme::DesignTokens;
-use crate::views::gpui::{icon_button, terminal_family};
+use crate::views::{icon_button, terminal_family};
 
 impl Root {
     /// The panel, when one is open.

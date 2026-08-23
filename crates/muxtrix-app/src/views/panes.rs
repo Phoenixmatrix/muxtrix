@@ -21,7 +21,7 @@ use crate::runtime::gpui::{Root, color};
 use crate::terminal::element::TerminalElement;
 use crate::terminal::runs::rgb;
 use crate::theme::DesignTokens;
-use crate::views::gpui::{icon_button, pane_key, terminal_family};
+use crate::views::{icon_button, pane_key, terminal_family};
 
 impl Root {
     /// One level of the split tree.
@@ -257,7 +257,7 @@ impl Root {
             glow.a = 0.14;
             (edge, Some((glow, 5.0, 16.0)))
         } else {
-            (color(tokens.line), None)
+            (color(tokens.line_strong), None)
         };
         let mut card = div()
             .flex()
@@ -313,9 +313,8 @@ impl Root {
         .into_any_element()
     }
 
-    /// The card's header: rounded top corners carry the card radius, and the
-    /// whole band shares one fill so it can never render two-toned. Geometry
-    /// follows the iced header to the pixel: a 34 px band over a 1 px rule.
+    /// The card header: rounded top corners carry the card radius and one fill
+    /// spans the whole 34 px band above its one-pixel rule.
     fn pane_header(
         &self,
         workspace: &Workspace,
@@ -577,7 +576,7 @@ fn split_id(key: &SplitKey) -> u64 {
 /// The pane menu: the actions that do not fit in the header's five buttons.
 ///
 /// Anchored under the overflow button and dismissed by any press outside it,
-/// which is the behaviour the iced `Popover` had and the e2e suite asserts.
+/// which the E2E suite asserts.
 impl Root {
     pub(crate) fn pane_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let app = self.app();

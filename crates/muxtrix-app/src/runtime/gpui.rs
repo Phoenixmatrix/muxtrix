@@ -1,9 +1,7 @@
-//! The GPUI runtime: window, event loop, timers, and the effect runner.
+//! The GPUI window and event-loop adapter.
 //!
-//! Sibling of [`super::iced`]. The application core is identical under both —
-//! `update` returns [`Effect`] values and this module decides what they mean
-//! to GPUI — so the framework swap is contained in this file plus the elements
-//! it draws with.
+//! The application core remains framework-agnostic: `update` returns
+//! [`Effect`] values and this module executes them against GPUI.
 
 use std::time::Duration;
 
@@ -68,12 +66,12 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// The window's root view.
 ///
 /// Owns the single [`Muxtrix`] value and turns messages into state changes and
-/// effects — what `iced::application` does for the other runtime.
+/// runtime effects.
 pub(crate) struct Root {
     pub(crate) app: Muxtrix,
-    pub(crate) inputs: crate::views::gpui::inputs::Inputs,
+    pub(crate) inputs: crate::views::inputs::Inputs,
     /// The settings page's pickers, sliders and fields.
-    pub(crate) settings_widgets: crate::views::gpui::settings_widgets::SettingsWidgets,
+    pub(crate) settings_widgets: crate::views::settings_widgets::SettingsWidgets,
     /// A focus request waiting for a frame to apply it against.
     pending_focus: Option<crate::effect::FocusTarget>,
     /// The title the window already carries, so an unchanged one costs
@@ -81,8 +79,8 @@ pub(crate) struct Root {
     title: String,
     /// The appearance `gpui-component`'s theme was last synced to.
     component_theme: Option<crate::settings::Appearance>,
-    /// Where each pane card was painted last frame, so a menu can be placed
-    /// against its own pane the way the iced popover was.
+    /// Where each pane card was painted last frame, so its menu can be placed
+    /// against the card.
     pub(crate) pane_bounds: std::rc::Rc<
         std::cell::RefCell<std::collections::HashMap<muxtrix_domain::PaneId, Bounds<gpui::Pixels>>>,
     >,
@@ -225,9 +223,8 @@ impl Root {
         let (app, effects) = Muxtrix::boot();
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        let inputs = crate::views::gpui::inputs::Inputs::new(window, cx);
-        let settings_widgets =
-            crate::views::gpui::settings_widgets::SettingsWidgets::new(window, cx);
+        let inputs = crate::views::inputs::Inputs::new(window, cx);
+        let settings_widgets = crate::views::settings_widgets::SettingsWidgets::new(window, cx);
         let mut root = Self {
             app,
             inputs,
@@ -245,9 +242,8 @@ impl Root {
         root.spawn_terminal_wakeups(cx);
         root.observe_window(window, cx);
         root.run_effects(effects, window, cx);
-        // The startup terminal is launched by `WindowOpened`, which iced
-        // delivered as a window event. There is a window by the time this
-        // runs, so say so directly.
+        // The startup terminal is launched by `WindowOpened`. There is a
+        // window by the time this runs, so report its real bounds directly.
         let bounds = window.bounds();
         let size = crate::geom::Size::new(bounds.size.width.into(), bounds.size.height.into());
         root.dispatch(Message::WindowOpened(size), window, cx);
@@ -432,12 +428,10 @@ impl Root {
             Effect::Exit => cx.quit(),
         }
     }
-
-    /// The periodic messages the iced runtime got from `subscription`.
+    /// Starts independent loops for periodic application work.
     ///
-    /// Each is its own loop rather than one tick with counters, so the gating
-    /// conditions stay where they are readable and a paused animation costs
-    /// nothing but a sleeping task.
+    /// Separate loops keep each cadence and its gating conditions local, so a
+    /// paused animation costs no unrelated polling work.
     fn spawn_timers(&mut self, cx: &mut Context<Self>) {
         repeat(cx, POLL_INTERVAL, |root| {
             (!root.app.terminals.is_empty()).then_some(Message::PollTerminal)
@@ -460,7 +454,7 @@ impl Root {
     }
 
     /// The terminal actors signal readable output on a channel; each signal is
-    /// one poll. This replaces the iced `Subscription::run_with` stream.
+    /// one poll.
     fn spawn_terminal_wakeups(&mut self, cx: &mut Context<Self>) {
         let receiver = self.app.event_receiver.clone();
         cx.spawn(async move |this, cx| {
@@ -479,10 +473,8 @@ impl Root {
     }
 
     /// Every key the window receives, in the app's own vocabulary.
-    ///
-    /// The rule the iced runtime enforced through `app_event` carries over:
-    /// the terminal receives everything the app does not explicitly claim, so
-    /// there is no keymap here to consult first.
+    /// The terminal receives every key the application does not explicitly
+    /// claim; this adapter does not maintain a second keymap.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let input = crate::input::from_keystroke(&event.keystroke);
         self.dispatch(Message::Keyboard(KeyEvent::Pressed(input)), window, cx);
@@ -568,21 +560,41 @@ impl Render for Root {
             .pending_focus
             .take()
             .or_else(|| self.app.focus_target());
-        match target.and_then(|target| self.inputs.get(target).cloned()) {
-            Some(field) => {
-                if !field.read(cx).focus_handle(cx).is_focused(window) {
-                    field.update(cx, |state, cx| state.focus(window, cx));
+        match target {
+            Some(target) => match self.inputs.get(target).cloned() {
+                Some(field) => {
+                    if !field.read(cx).focus_handle(cx).is_focused(window) {
+                        let select_all = matches!(
+                            target,
+                            crate::effect::FocusTarget::WorkspaceCreate
+                                | crate::effect::FocusTarget::Rename
+                        );
+                        field.update(cx, |state, cx| {
+                            state.focus(window, cx);
+                            if select_all {
+                                state.select_all(window, cx);
+                            }
+                        });
+                    }
                 }
-            }
+                None => {
+                    if !self.focus.is_focused(window) {
+                        self.focus.focus(window, cx);
+                    }
+                }
+            },
             None => {
-                if !self.focus.is_focused(window) {
+                let settings_control_focused = self.app.active_view
+                    == crate::app::ActiveView::Settings
+                    && self.focus.contains_focused(window, cx);
+                if !settings_control_focused && !self.focus.is_focused(window) {
                     self.focus.focus(window, cx);
                 }
             }
         }
         let tokens = DesignTokens::for_appearance(self.app.settings.appearance);
-        // Settings and the theme gallery replace the whole shell, as they do
-        // under iced: they are screens, not panels.
+        // Settings and the theme gallery replace the whole shell rather than
+        // behaving as panels.
         let screen = match self.app.active_view {
             crate::app::ActiveView::Settings | crate::app::ActiveView::ThemeGallery => {
                 Some(self.view_settings(cx))
@@ -613,13 +625,11 @@ impl Render for Root {
         let toast = self.toast();
         let status_bar = self.status_bar();
         let workspace = self.view_workspace(window, cx);
-        // The menu floats above the shell and any press outside it dismisses
-        // and is consumed — the behaviour the iced `Popover` had, and what
-        // `pane_menu_click_away_observed` asserts.
+        // The menu floats above the shell. A press outside dismisses it and is
+        // consumed, as `pane_menu_click_away_observed` asserts.
         let menu = self.pane_menu(cx).map(|menu| {
-            // Under the pane's own overflow button, as the iced popover put
-            // it: six pixels in from the card's right edge and 38 down from
-            // its top, kept inside the window.
+            // Keep the menu six pixels in from the card's right edge and 38
+            // pixels below its top, constrained to the window.
             let anchor = self
                 .app
                 .pane_menu
@@ -676,10 +686,8 @@ impl Render for Root {
             .flex()
             .flex_col()
             .bg(color(tokens.app))
-            .text_color(color(tokens.text))
-            // The same face iced's `Font::DEFAULT` resolves to. Left unnamed,
-            // GPUI picks a fallback of its own, and the chrome's type came out
-            // a fifth narrower than the iced build's at the same size.
+            // Name the resolved system face explicitly; an unnamed GPUI
+            // fallback has different metrics and changes chrome width.
             .font_family(ui_family(&self.app.settings))
             .font_weight(gpui::FontWeight(f32::from(
                 self.app.settings.ui_font_weight.numeric(),
@@ -751,7 +759,7 @@ impl Root {
         let theme = Theme::global_mut(cx);
         theme.font_family = ui_family(&self.app.settings);
         theme.font_size = px(self.app.settings.ui_pixels(11.0));
-        theme.mono_font_family = crate::views::gpui::terminal_family(&self.app.settings);
+        theme.mono_font_family = crate::views::terminal_family(&self.app.settings);
         theme.radius = px(5.);
         theme.radius_lg = px(7.);
         theme.shadow = false;
@@ -829,12 +837,10 @@ pub(crate) fn color(value: crate::theme::Color) -> gpui::Rgba {
     }
 }
 
-/// Where the pane menu hangs from.
+/// Fallback anchor when a pane card has not been painted yet.
 ///
-/// The iced popover anchored to the overflow button, 6 px in and 38 px below
-/// its top. GPUI elements do not report their painted bounds back to the view
-/// that built them, so this places the menu against the window's top-right
-/// instead, which is where that button sits in every layout the header has.
+/// GPUI elements report their painted bounds after rendering, so the first
+/// frame uses the window's top-right where the header action lives.
 fn root_menu_anchor(window: &Window) -> Point<gpui::Pixels> {
     let bounds = window.bounds();
     point(bounds.size.width - px(6.), px(38.))

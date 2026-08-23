@@ -1,11 +1,9 @@
 //! The stateful controls on the settings page, owned by the root.
 //!
-//! `gpui-component`'s pickers, sliders and text fields each carry an entity of
+//! `gpui-component` pickers, sliders and text fields each carry an entity of
 //! their own, so they cannot be made in `render`: they live here, are built
 //! once with the window, and are kept in step with the settings draft in both
-//! directions — a control reports its change as the same message the iced
-//! control sent, and a draft changed by anything else (Cancel, a restored
-//! session) is pushed back into the control.
+//! directions.
 //!
 //! Every picker is a list of display strings. The application's own enums
 //! are mapped to and from those by position, which keeps one state type for

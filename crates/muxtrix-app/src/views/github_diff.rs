@@ -19,7 +19,7 @@ use crate::app::{
 use crate::github;
 use crate::runtime::gpui::{Root, color};
 use crate::theme::DesignTokens;
-use crate::views::gpui::terminal_family;
+use crate::views::terminal_family;
 
 impl Root {
     /// The diff screen, when one is open.

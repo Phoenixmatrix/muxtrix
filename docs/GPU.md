@@ -85,10 +85,10 @@ OpenGL/EGL. Use the Muxtrix probe instead.
 
 ## GPUI
 
-`docs/GPUI_PORT_PLAN.md` records the port from Iced to GPUI. Its Phase 1 spike
-— `crates/muxtrix-gpui-spike` — put the two risky things on screen (the stock
-`gpui-component` widgets and a 200x60 monospace grid shaped one line per row)
-and reported the adapter and frame cost. What it established:
+`docs/GPUI_PORT_PLAN.md` records the port from Iced to GPUI. The retired
+Phase 1 spike put the two risky things on screen — the stock `gpui-component`
+widgets and a 200x60 monospace grid shaped one line per row — and reported the
+adapter and frame cost before its throwaway crate was removed. It established:
 
 ### Dependency resolution
 
@@ -128,7 +128,7 @@ image as well.
 
 ### Platform matrix
 
-Measured with `crates/muxtrix-gpui-spike`: a 200x60 monospace grid, one
+Measured with the now-removed Phase 1 spike: a 200x60 monospace grid, one
 `shape_line` per row per frame, beside the stock `gpui-component` widgets.
 "Adapter" is what GPUI logs as `Selected GPU adapter`. "Shape" is the cost of
 shaping all 60 rows for one frame; the plan's budget is under 1 ms.

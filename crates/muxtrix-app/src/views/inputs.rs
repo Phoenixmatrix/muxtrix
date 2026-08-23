@@ -2,10 +2,9 @@
 //!
 //! Editing needs real inputs: a field that only displays a draft cannot show a
 //! caret, a selection, or respond to Home. These are `gpui-component`
-//! `InputState`s owned by the root, kept in step with the application's own
-//! drafts in both directions — the field reports edits as the same messages
-//! the iced inputs sent, and a draft changed by anything else (a command, a
-//! restored session) is pushed back into the field.
+//! [`InputState`]s owned by the root, kept in step with application drafts in
+//! both directions: edits emit the same application messages as every other
+//! interaction, while commands and restored sessions can update the fields.
 
 use gpui::{AppContext, Context, Entity, Window};
 use gpui_component::input::{InputEvent, InputState};

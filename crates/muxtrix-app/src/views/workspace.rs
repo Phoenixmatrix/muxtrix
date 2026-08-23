@@ -11,9 +11,9 @@ use gpui::{
 use crate::app::{IconKind, Message, ellipsize};
 use crate::runtime::gpui::{Root, color};
 use crate::theme::DesignTokens;
-use crate::views::gpui::{icon_button, icon_path, tab_key};
+use crate::views::{icon_button, icon_path, tab_key};
 
-/// The app bar's height, matching the iced build.
+/// The application bar's fixed height.
 const APP_BAR_HEIGHT: f32 = 43.0;
 
 impl Root {
@@ -91,9 +91,9 @@ impl Root {
             });
             let signal = app.tab_signal_kind(tab).color(tokens);
             let name = ellipsize(&tab.name, app.settings.ui_char_budget(20));
-            // The chip carries fill, border and radius; the label and the
-            // close are transparent children so the whole chip reads as one
-            // control — as the iced strip draws it.
+            // The chip carries fill, border and radius; its label and close
+            // action remain transparent children so the chip reads as one
+            // control.
             let (fill, edge) = if selected {
                 (0.08, tokens.line_strong)
             } else {
@@ -142,10 +142,8 @@ impl Root {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |root, _: &MouseDownEvent, window, cx| {
-                                    // The same message the iced strip sends: a
-                                    // click is a zero-distance drag, and
-                                    // dragging a tab is also how it is
-                                    // reordered.
+                                    // A click is a zero-distance drag; movement
+                                    // turns the same gesture into reordering.
                                     root.dispatch(
                                         Message::BeginTabDrag(workspace_id, tab_id, index),
                                         window,
@@ -251,7 +249,7 @@ impl Root {
                     .bg(keycap_fill)
                     .border_1()
                     .border_color(color(tokens.line_strong))
-                    .font_family(crate::views::gpui::terminal_family(&app.settings))
+                    .font_family(crate::views::terminal_family(&app.settings))
                     .text_size(px(app.settings.ui_pixels(7.5)))
                     .line_height(px(app.settings.ui_pixels(7.5) * 1.3))
                     .text_color(color(tokens.muted))

@@ -56,6 +56,18 @@ into the Muxtrix binary. Its Linux renderer uses wgpu.
 - Copyright: Zed Industries, Inc.
 - License: Apache License 2.0 (text below)
 
+### Zed font-kit
+
+GPUI uses Zed's maintained fork of `font-kit` for cross-platform font loading;
+it is compiled into the Muxtrix binary.
+
+- Project: Zed font-kit fork
+- Source: <https://github.com/zed-industries/font-kit>
+- Reference revision: `94b0f28166665e8fd2f53ff6d268a14955c82269`
+- Copyright: Patrick Walton and font-kit contributors
+- License: MIT OR Apache-2.0; Muxtrix redistributes it under the MIT terms
+  reproduced below
+
 ### gpui-component
 
 The settings page's pickers, sliders, switches and every text field are

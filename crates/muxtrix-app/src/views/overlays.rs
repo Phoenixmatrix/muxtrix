@@ -14,9 +14,9 @@ use crate::app::{Message, agent_display_name};
 use crate::commands;
 use crate::runtime::gpui::{Root, color};
 use crate::theme::DesignTokens;
-use crate::views::gpui::terminal_family;
+use crate::views::terminal_family;
 
-/// How long a toast stays up. Matches the iced shell.
+/// How long a toast stays visible.
 const TOAST_LIFETIME: std::time::Duration = std::time::Duration::from_secs(4);
 
 impl Root {

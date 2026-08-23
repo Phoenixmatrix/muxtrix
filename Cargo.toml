@@ -3,8 +3,6 @@ members = [
     "crates/muxtrix-app",
     "crates/muxtrix-control",
     "crates/muxtrix-domain",
-    # Phase 1 spike only; removed with the crate at the end of Phase 2.
-    "crates/muxtrix-gpui-spike",
     "crates/muxtrix-platform",
     "crates/muxtrix-sessions",
     "crates/muxtrix-terminal",

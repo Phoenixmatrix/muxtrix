@@ -3,8 +3,8 @@
 //! `update` is otherwise a pure function of state and message, and keeping it
 //! that way is what makes it testable without standing up a window: a test
 //! asserts on the [`Effect`]s a message produced rather than on something that
-//! only a running UI framework can inspect. The runtime — currently the iced
-//! one in `main.rs` — is the only place that knows how to carry them out.
+//! only a running UI framework can inspect. The runtime is the only place that
+//! knows how to carry them out.
 
 use std::sync::Arc;
 

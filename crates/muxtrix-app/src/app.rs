@@ -263,6 +263,12 @@ pub(crate) struct Muxtrix {
     pub(crate) rail_nav: Option<RailTarget>,
     pub(crate) workspace_create_visible: bool,
     pub(crate) close_workspace_prompt: Option<WorkspaceId>,
+    /// Keyboard cursor for the two actions at the bottom of a dialog.
+    ///
+    /// `None` leaves focus in the dialog's editable or list content. Down
+    /// enters the button row without stealing Left/Right from text editing;
+    /// once there, horizontal arrows choose an action and Up returns.
+    pub(crate) dialog_button: Option<DialogButton>,
     pub(crate) tab_drag: Option<TabDrag>,
     pub(crate) notifications: Vec<AgentNotification>,
     pub(crate) global_alerts: Vec<GlobalAlert>,
@@ -796,6 +802,12 @@ pub(crate) enum RenameTarget {
     Workspace(WorkspaceId),
     Tab(WorkspaceId, TabId),
     Pane(PaneId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DialogButton {
+    Cancel,
+    Confirm,
 }
 
 #[derive(Debug, Clone)]
@@ -1916,6 +1928,7 @@ impl Muxtrix {
             rail_nav: None,
             workspace_create_visible: false,
             close_workspace_prompt: None,
+            dialog_button: None,
             tab_drag: None,
             notifications: Vec::new(),
             global_alerts,
@@ -2532,6 +2545,7 @@ impl Muxtrix {
             Message::CreateWorkspace => self.create_workspace(),
             Message::CancelWorkspaceCreate => {
                 self.workspace_create_visible = false;
+                self.dialog_button = None;
                 return Vec::new();
             }
             Message::SwitchWorkspace(workspace_id) => self.switch_workspace(workspace_id),
@@ -2547,11 +2561,13 @@ impl Muxtrix {
                 let result = self.apply_rename();
                 if result.is_ok() {
                     self.rename_prompt = None;
+                    self.dialog_button = None;
                 }
                 result
             }
             Message::CancelRename => {
                 self.rename_prompt = None;
+                self.dialog_button = None;
                 return Vec::new();
             }
             Message::WorktreeNameChanged(name) => {
@@ -2561,6 +2577,7 @@ impl Muxtrix {
             Message::ConfirmWorktree => return self.confirm_worktree(),
             Message::CancelWorktree => {
                 self.worktree_prompt = None;
+                self.dialog_button = None;
                 return Vec::new();
             }
             Message::WorktreeCreated(target, result) => {
@@ -2614,10 +2631,11 @@ impl Muxtrix {
                 }
                 return Vec::new();
             }
-            Message::NewTab => self.new_tab(),
+            Message::NewTab => return self.new_tab_and_open_rename(),
             Message::CloseTab(workspace_id, tab_id) => self.close_tab(workspace_id, tab_id),
             Message::ConfirmCloseWorkspace(workspace_id) => {
                 self.close_workspace_prompt = None;
+                self.dialog_button = None;
                 self.close_workspace_by_id(workspace_id)
             }
             Message::CloseSessionPicker => {
@@ -2626,6 +2644,7 @@ impl Muxtrix {
                     .as_ref()
                     .is_some_and(|picker| picker.startup);
                 self.session_picker = None;
+                self.dialog_button = None;
                 let pane_id = self.focused_pane_id();
                 if startup && let Some(pane_id) = pane_id {
                     return self.start_new_session_host(pane_id);
@@ -2716,6 +2735,7 @@ impl Muxtrix {
                 {
                     manager.restart_target = Some(index);
                     manager.error = None;
+                    self.dialog_button = Some(DialogButton::Confirm);
                 }
                 return Vec::new();
             }
@@ -2751,6 +2771,7 @@ impl Muxtrix {
             }
             Message::CancelCloseWorkspace => {
                 self.close_workspace_prompt = None;
+                self.dialog_button = None;
                 return Vec::new();
             }
             Message::BeginTabDrag(workspace_id, tab_id, index) => {
@@ -3580,10 +3601,12 @@ impl Muxtrix {
             Message::CloseDefaultAgentPrompt => {
                 self.default_agent_prompt = false;
                 self.pending_default_agent_command = None;
+                self.dialog_button = None;
                 return Vec::new();
             }
             Message::OpenDefaultAgentSettings => {
                 self.default_agent_prompt = false;
+                self.dialog_button = None;
                 let version_task = self.open_settings();
                 let scroll_task = vec![Effect::ScrollToRatio(ScrollTarget::Settings, 1.0)];
                 return effect::batch([version_task, scroll_task]);
@@ -3821,6 +3844,7 @@ impl Muxtrix {
     pub(crate) fn open_workspace_create(&mut self) -> Vec<Effect> {
         self.workspace_name_draft = format!("Workspace {}", self.session.workspaces.len() + 1);
         self.workspace_create_visible = true;
+        self.dialog_button = None;
         self.rename_prompt = None;
         self.close_command_palette();
         vec![Effect::Focus(FocusTarget::WorkspaceCreate)]
@@ -3854,6 +3878,7 @@ impl Muxtrix {
         self.workspace_name_draft = workspace_name;
         self.rename_prompt = None;
         self.workspace_create_visible = false;
+        self.dialog_button = None;
         self.active_view = ActiveView::Workspace;
         self.maximized_pane = None;
         self.pane_menu = None;
@@ -3918,6 +3943,7 @@ impl Muxtrix {
     ) -> Vec<Effect> {
         self.rename_prompt = Some(target);
         self.rename_draft = current_name;
+        self.dialog_button = None;
         self.active_view = ActiveView::Workspace;
         vec![Effect::Focus(FocusTarget::Rename)]
     }
@@ -4082,6 +4108,7 @@ impl Muxtrix {
         } else {
             String::new()
         };
+        self.dialog_button = None;
         self.worktree_prompt = Some(WorktreePrompt {
             target,
             repo_root,
@@ -4468,6 +4495,7 @@ impl Muxtrix {
                 }
             })
             .collect();
+        self.dialog_button = None;
         self.session_picker = Some(SessionPickerState {
             entries,
             selected: 0,
@@ -4719,6 +4747,25 @@ impl Muxtrix {
         }
     }
 
+    fn new_tab_and_open_rename(&mut self) -> Vec<Effect> {
+        if let Err(error) = self.new_tab() {
+            self.status = error;
+            return Vec::new();
+        }
+        let workspace_id = self.session.active_workspace_id;
+        let Some((tab_id, name)) = self
+            .active_workspace()
+            .ok()
+            .and_then(Workspace::active_tab)
+            .map(|tab| (tab.id, tab.name.clone()))
+        else {
+            self.status = "Created a tab, but its name is unavailable".into();
+            return Vec::new();
+        };
+        self.status = "Created a new tab".into();
+        self.open_rename_prompt(RenameTarget::Tab(workspace_id, tab_id), name)
+    }
+
     pub(crate) fn new_tab(&mut self) -> Result<(), String> {
         let profile = self.regular_terminal_profile()?;
         let tab_name = format!("Tab {}", self.active_workspace()?.tabs.len() + 1);
@@ -4832,6 +4879,7 @@ impl Muxtrix {
         if pane_count == 1 {
             if tab_count == 1 {
                 self.close_workspace_prompt = Some(workspace_id);
+                self.dialog_button = Some(DialogButton::Confirm);
                 return Ok(());
             }
             return self.close_tab(workspace_id, tab_id);
@@ -4861,6 +4909,7 @@ impl Muxtrix {
             .ok_or_else(|| "workspace is missing".to_owned())?;
         if workspace.tabs.len() == 1 {
             self.close_workspace_prompt = Some(workspace_id);
+            self.dialog_button = Some(DialogButton::Confirm);
             return Ok(());
         }
         let removed = workspace
@@ -5024,6 +5073,23 @@ impl Muxtrix {
         // preserving daemon Kill-before-Spawn ordering without joining a PTY
         // owner thread on the UI path.
         self.request_terminal_launch(profile, pane_id, fallback_title)
+    }
+
+    fn select_dialog_button(&mut self, key: Key<&str>) -> bool {
+        let selection = match key {
+            Key::Named(Named::ArrowLeft) => DialogButton::Cancel,
+            Key::Named(Named::ArrowRight | Named::ArrowDown) => DialogButton::Confirm,
+            _ => return false,
+        };
+        self.dialog_button = Some(selection);
+        true
+    }
+
+    fn dialog_action(&self, cancel: Message, confirm: Message) -> Message {
+        match self.dialog_button.unwrap_or(DialogButton::Confirm) {
+            DialogButton::Cancel => cancel,
+            DialogButton::Confirm => confirm,
+        }
     }
 
     pub(crate) fn handle_keyboard(&mut self, event: KeyEvent) -> Vec<Effect> {
@@ -5238,11 +5304,7 @@ impl Muxtrix {
                 return self.update(Message::ToggleMaximize(pane_id));
             }
             if character_key_is(modified_key.as_ref(), "t") {
-                self.status = match self.new_tab() {
-                    Ok(()) => "Created a new tab".into(),
-                    Err(error) => error,
-                };
-                return Vec::new();
+                return self.new_tab_and_open_rename();
             }
         }
         if self.palette.visible {
@@ -5316,50 +5378,102 @@ impl Muxtrix {
         }
 
         if self.workspace_create_visible {
-            if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
-                self.workspace_create_visible = false;
-            }
-            return Vec::new();
-        }
-
-        if let Some(workspace_id) = self.close_workspace_prompt {
             match modified_key.as_ref() {
-                Key::Named(Named::Escape) => self.close_workspace_prompt = None,
+                Key::Named(Named::Escape) => {
+                    return self.update(Message::CancelWorkspaceCreate);
+                }
                 Key::Named(Named::Enter) => {
-                    // Enter confirms when closing is possible; the dialog for
-                    // the last workspace only offers dismissal.
-                    self.close_workspace_prompt = None;
-                    if self.session.workspaces.len() > 1
-                        && let Err(error) = self.close_workspace_by_id(workspace_id)
-                    {
-                        self.status = error;
-                    }
+                    let action = self
+                        .dialog_action(Message::CancelWorkspaceCreate, Message::CreateWorkspace);
+                    return self.update(action);
+                }
+                Key::Named(Named::ArrowUp) if self.dialog_button.is_some() => {
+                    self.dialog_button = None;
+                }
+                key if self.dialog_button.is_some()
+                    || matches!(key, Key::Named(Named::ArrowDown)) =>
+                {
+                    self.select_dialog_button(key);
                 }
                 _ => {}
             }
             return Vec::new();
         }
 
+        if let Some(workspace_id) = self.close_workspace_prompt {
+            match modified_key.as_ref() {
+                Key::Named(Named::Escape) => {
+                    return self.update(Message::CancelCloseWorkspace);
+                }
+                Key::Named(Named::Enter) => {
+                    let action = self.dialog_action(
+                        Message::CancelCloseWorkspace,
+                        Message::ConfirmCloseWorkspace(workspace_id),
+                    );
+                    return self.update(action);
+                }
+                key => {
+                    self.select_dialog_button(key);
+                }
+            }
+            return Vec::new();
+        }
+
         if self.rename_prompt.is_some() {
-            if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
-                self.rename_prompt = None;
+            match modified_key.as_ref() {
+                Key::Named(Named::Escape) => return self.update(Message::CancelRename),
+                Key::Named(Named::Enter) => {
+                    let action = self.dialog_action(Message::CancelRename, Message::ConfirmRename);
+                    return self.update(action);
+                }
+                Key::Named(Named::ArrowUp) if self.dialog_button.is_some() => {
+                    self.dialog_button = None;
+                }
+                key if self.dialog_button.is_some()
+                    || matches!(key, Key::Named(Named::ArrowDown)) =>
+                {
+                    self.select_dialog_button(key);
+                }
+                _ => {}
             }
             return Vec::new();
         }
 
         if self.default_agent_prompt {
-            if matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
-                self.default_agent_prompt = false;
-                self.pending_default_agent_command = None;
+            match modified_key.as_ref() {
+                Key::Named(Named::Escape) => {
+                    return self.update(Message::CloseDefaultAgentPrompt);
+                }
+                Key::Named(Named::Enter) => {
+                    let action = self.dialog_action(
+                        Message::CloseDefaultAgentPrompt,
+                        Message::OpenDefaultAgentSettings,
+                    );
+                    return self.update(action);
+                }
+                key => {
+                    self.select_dialog_button(key);
+                }
             }
             return Vec::new();
         }
 
-        if let Some(picker) = &mut self.session_picker {
-            let entry_count = picker.entries.len();
-            let selected = picker.selected;
+        if self.session_picker.is_some() {
+            let (entry_count, selected) = self
+                .session_picker
+                .as_ref()
+                .map(|picker| (picker.entries.len(), picker.selected))
+                .unwrap_or_default();
             match modified_key.as_ref() {
-                Key::Named(Named::Escape) => self.session_picker = None,
+                Key::Named(Named::Escape) => {
+                    self.session_picker = None;
+                    self.dialog_button = None;
+                }
+                Key::Named(Named::Enter) if self.dialog_button.is_some() => {
+                    let action = self
+                        .dialog_action(Message::SessionPickerKillAll, Message::CloseSessionPicker);
+                    return self.update(action);
+                }
                 Key::Named(Named::Enter) if entry_count > 0 => {
                     // A dead row cannot resume; Enter does the one thing it
                     // can — clean it up — instead of printing a refusal.
@@ -5376,10 +5490,19 @@ impl Muxtrix {
                 }
                 Key::Named(Named::Enter) => self.session_picker = None,
                 Key::Named(Named::ArrowUp) if entry_count > 0 => {
-                    picker.selected = selected.saturating_sub(1);
+                    self.dialog_button = None;
+                    if let Some(picker) = self.session_picker.as_mut() {
+                        picker.selected = selected.saturating_sub(1);
+                    }
                 }
                 Key::Named(Named::ArrowDown) if entry_count > 0 => {
-                    picker.selected = (selected + 1).min(entry_count - 1);
+                    self.dialog_button = None;
+                    if let Some(picker) = self.session_picker.as_mut() {
+                        picker.selected = (selected + 1).min(entry_count - 1);
+                    }
+                }
+                Key::Named(Named::ArrowLeft | Named::ArrowRight) => {
+                    self.select_dialog_button(modified_key.as_ref());
                 }
                 Key::Named(Named::Delete | Named::Backspace) if entry_count > 0 => {
                     self.kill_picked_session(selected);
@@ -5401,8 +5524,24 @@ impl Muxtrix {
             let entry_count = manager.entries.len();
             if manager.restart_target.is_some() {
                 match modified_key.as_ref() {
-                    Key::Named(Named::Escape) => manager.restart_target = None,
-                    Key::Named(Named::Enter) => self.confirm_worktree_restart(),
+                    Key::Named(Named::Escape) => {
+                        manager.restart_target = None;
+                        self.dialog_button = None;
+                    }
+                    Key::Named(Named::Enter) => {
+                        if self.dialog_button == Some(DialogButton::Cancel) {
+                            manager.restart_target = None;
+                            self.dialog_button = None;
+                        } else {
+                            self.confirm_worktree_restart();
+                        }
+                    }
+                    Key::Named(Named::ArrowLeft) => {
+                        self.dialog_button = Some(DialogButton::Cancel);
+                    }
+                    Key::Named(Named::ArrowRight) => {
+                        self.dialog_button = Some(DialogButton::Confirm);
+                    }
                     _ => {}
                 }
                 return Vec::new();
@@ -5427,6 +5566,7 @@ impl Muxtrix {
                         ) =>
                 {
                     manager.restart_target = Some(manager.selected);
+                    self.dialog_button = Some(DialogButton::Confirm);
                 }
                 // Manage renders only as the settings page, never as a
                 // dismissible dialog. Enter there has nothing to confirm, and
@@ -5455,13 +5595,27 @@ impl Muxtrix {
         if let Some(prompt) = &self.worktree_prompt {
             // Enter drives the primary action so the dialog is fully keyboard
             // operable: confirm when creation is possible, dismiss the
-            // not-a-repo notice otherwise. A double fire from the input's
-            // on_submit is absorbed by the busy guard in confirm_worktree.
+            // not-a-repo notice otherwise.
             let can_confirm = prompt.repo_root.is_some();
             match modified_key.as_ref() {
-                Key::Named(Named::Escape) => self.worktree_prompt = None,
-                Key::Named(Named::Enter) if can_confirm => return self.confirm_worktree(),
-                Key::Named(Named::Enter) => self.worktree_prompt = None,
+                Key::Named(Named::Escape) => return self.update(Message::CancelWorktree),
+                Key::Named(Named::Enter) => {
+                    if self.dialog_button == Some(DialogButton::Cancel) {
+                        return self.update(Message::CancelWorktree);
+                    }
+                    if can_confirm {
+                        return self.confirm_worktree();
+                    }
+                    return self.update(Message::CancelWorktree);
+                }
+                Key::Named(Named::ArrowUp) if self.dialog_button.is_some() => {
+                    self.dialog_button = None;
+                }
+                key if self.dialog_button.is_some()
+                    || matches!(key, Key::Named(Named::ArrowDown)) =>
+                {
+                    self.select_dialog_button(key);
+                }
                 _ => {}
             }
             return Vec::new();
@@ -6595,6 +6749,7 @@ impl Muxtrix {
             self.active_view = ActiveView::Workspace;
             self.default_agent_prompt = true;
             self.pending_default_agent_command = Some(action);
+            self.dialog_button = Some(DialogButton::Confirm);
             self.status =
                 "Choose a configured default agent before opening a worktree with an agent".into();
         }
@@ -6748,6 +6903,7 @@ impl Muxtrix {
         }
         self.pending_default_agent_command = Some(action);
         self.default_agent_prompt = true;
+        self.dialog_button = Some(DialogButton::Confirm);
         self.status = "Choose a configured default agent to continue the worktree command".into();
         Vec::new()
     }

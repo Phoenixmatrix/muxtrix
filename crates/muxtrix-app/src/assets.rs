@@ -1,9 +1,8 @@
 //! Icons, served to GPUI from the binary.
 //!
-//! The same SVG files the iced runtime embeds with `include_bytes!` are
-//! reachable here by path, because GPUI resolves `svg().path(..)` through an
-//! [`AssetSource`] rather than taking bytes directly. Nothing is read from
-//! disk: an installed Muxtrix has no icon directory beside it.
+//! SVG files are reachable by path because GPUI resolves `svg().path(..)`
+//! through an [`AssetSource`] rather than taking bytes directly. Nothing is
+//! read from disk: an installed Muxtrix has no icon directory beside it.
 
 use std::borrow::Cow;
 
