@@ -64,6 +64,10 @@ pub(crate) struct Root {
     pub(crate) inputs: crate::views::gpui::inputs::Inputs,
     /// A focus request waiting for a frame to apply it against.
     pending_focus: Option<crate::effect::FocusTarget>,
+    /// Inline terminal images, decoded once and kept while the emulator still
+    /// references them. Keyed by the emulator's own generation, so an image
+    /// that is redrawn unchanged is not decoded again.
+    images: std::collections::BTreeMap<u64, std::sync::Arc<gpui::RenderImage>>,
     /// The window's keyboard focus. Held by the root rather than by any
     /// surface: Muxtrix routes every key through one handler and decides there
     /// whether it belongs to a shortcut, a dialog or the terminal, and that
@@ -72,6 +76,48 @@ pub(crate) struct Root {
 }
 
 impl Root {
+    /// The images the terminals currently reference, decoded for GPUI.
+    pub(crate) fn images(
+        &self,
+    ) -> &std::collections::BTreeMap<u64, std::sync::Arc<gpui::RenderImage>> {
+        &self.images
+    }
+
+    /// Decode any new inline image and forget the ones no terminal shows.
+    ///
+    /// Keyed by the emulator's generation, which changes only when the image
+    /// itself does, so a placement that merely moved costs nothing.
+    fn sync_images(&mut self) {
+        let mut live = std::collections::BTreeSet::new();
+        for runtime in self.app.terminals.values() {
+            let Some(snapshot) = runtime.snapshot.as_ref() else {
+                continue;
+            };
+            for placement in &snapshot.images {
+                let generation = placement.image.generation;
+                live.insert(generation);
+                self.images.entry(generation).or_insert_with(|| {
+                    // GPUI wants BGRA; the emulator hands out RGBA.
+                    let mut pixels = placement.image.rgba.as_ref().to_vec();
+                    for pixel in pixels.chunks_exact_mut(4) {
+                        pixel.swap(0, 2);
+                    }
+                    let frame: Option<image::RgbaImage> = image::ImageBuffer::from_raw(
+                        placement.image.width,
+                        placement.image.height,
+                        pixels,
+                    );
+                    let frames = frame.map_or_else(smallvec::SmallVec::new, |buffer| {
+                        smallvec::smallvec![image::Frame::new(buffer)]
+                    });
+                    std::sync::Arc::new(gpui::RenderImage::new(frames))
+                });
+            }
+        }
+        self.images
+            .retain(|generation, _| live.contains(generation));
+    }
+
     /// The application state the views read.
     pub(crate) fn app(&self) -> &Muxtrix {
         &self.app
@@ -86,6 +132,7 @@ impl Root {
             app,
             inputs,
             pending_focus: None,
+            images: std::collections::BTreeMap::new(),
             focus,
         };
         root.spawn_timers(cx);
@@ -126,6 +173,7 @@ impl Root {
         let repaint = before.is_none_or(|before| before != self.app.grid_revision());
         self.run_detached_effects(effects, cx);
         if repaint {
+            self.sync_images();
             cx.notify();
         }
     }

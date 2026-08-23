@@ -67,12 +67,12 @@ struct DrawPlacement {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct PlacementGeometry {
-    destination: Rectangle,
-    full_image: Rectangle,
+pub(crate) struct PlacementGeometry {
+    pub(crate) destination: Rectangle,
+    pub(crate) full_image: Rectangle,
 }
 
-fn scaled_destination(
+pub(crate) fn scaled_destination(
     grid: (i32, i32),
     pixels: (u32, u32),
     offsets: (u32, u32),
@@ -88,7 +88,7 @@ fn scaled_destination(
     }
 }
 
-fn placement_geometry(
+pub(crate) fn placement_geometry(
     destination: Rectangle,
     source: ImageSourceRect,
     image_width: u32,

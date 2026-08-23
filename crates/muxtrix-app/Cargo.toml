@@ -13,7 +13,14 @@ e2e = []
 # The GPUI runtime, off by default while the port is in progress. Both runtimes
 # compile; `runtime/mod.rs` picks one, and the application core underneath is
 # the same either way.
-gpui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component", "dep:anyhow"]
+gpui = [
+    "dep:gpui",
+    "dep:gpui_platform",
+    "dep:gpui-component",
+    "dep:anyhow",
+    "dep:image",
+    "dep:smallvec",
+]
 
 [dependencies]
 async-channel.workspace = true
@@ -21,6 +28,10 @@ bytes.workspace = true
 # GPUI's AssetSource trait is defined in terms of anyhow::Result, so serving
 # icons to it means speaking that dialect at the boundary.
 anyhow = { version = "1.0", optional = true }
+# GPUI takes decoded frames as `image` buffers in a `SmallVec`, so building one
+# means speaking both at the boundary. Versions follow gpui's own.
+image = { version = "0.25", optional = true, default-features = false }
+smallvec = { version = "1", optional = true }
 gpui = { workspace = true, optional = true }
 gpui_platform = { workspace = true, optional = true }
 gpui-component = { workspace = true, optional = true }

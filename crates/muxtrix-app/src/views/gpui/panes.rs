@@ -174,7 +174,13 @@ impl Root {
             && tab.focused_pane_id == pane_id;
         let runtime = app.terminals.get(&pane_id);
 
-        let body = match TerminalElement::for_pane(app, pane_id, focused, cx.entity()) {
+        let body = match TerminalElement::for_pane(
+            app,
+            pane_id,
+            focused,
+            cx.entity(),
+            self.images().clone(),
+        ) {
             // The relative box the grid pins itself to.
             Some(terminal) => div()
                 .relative()

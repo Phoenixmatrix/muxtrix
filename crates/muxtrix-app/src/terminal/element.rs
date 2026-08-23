@@ -16,7 +16,7 @@ use gpui::{
     MouseUpEvent, Pixels, ScrollWheelEvent, ShapedLine, Style, TextRun, Window, fill, point, px,
     relative, size,
 };
-use muxtrix_terminal::TerminalMouseButton;
+use muxtrix_terminal::{ImageLayer, TerminalMouseButton};
 
 use crate::app::{
     Message, TERMINAL_PADDING, TerminalLink, terminal_link_modifiers, terminal_scrollbar_geometry,
@@ -71,6 +71,8 @@ pub(crate) struct TerminalElement {
     link_modifiers: bool,
     /// The scrollback position, when there is scrollback to show.
     scrollbar: Option<muxtrix_terminal::ScrollbarSnapshot>,
+    /// Inline images, already decoded, keyed the way the emulator keys them.
+    images: std::collections::BTreeMap<u64, std::sync::Arc<gpui::RenderImage>>,
 }
 
 /// What `prepaint` worked out and `paint` consumes.
@@ -119,6 +121,7 @@ impl TerminalElement {
         pane_id: PaneId,
         focused: bool,
         root: Entity<Root>,
+        images: std::collections::BTreeMap<u64, std::sync::Arc<gpui::RenderImage>>,
     ) -> Option<Self> {
         let runtime = app.terminals.get(&pane_id)?;
         Some(Self {
@@ -138,6 +141,7 @@ impl TerminalElement {
                 .as_ref()
                 .map(|snapshot| snapshot.scrollbar)
                 .filter(|scrollbar| scrollbar.is_scrollable()),
+            images,
         })
     }
 
@@ -283,6 +287,7 @@ impl Element for TerminalElement {
         // Clipped to the pane: a grid whose last row half-fits should be cut,
         // not spill over the pane's chrome.
         window.paint_layer(bounds, |window| {
+            self.paint_images(origin, prepared, ImageLayer::BelowBackground, window);
             // Backgrounds first, as one quad per run, then all the text. Two
             // passes rather than interleaving so the shaped lines paint in one
             // uninterrupted sequence.
@@ -300,6 +305,7 @@ impl Element for TerminalElement {
                     ));
                 }
             }
+            self.paint_images(origin, prepared, ImageLayer::BelowText, window);
             for (index, row) in prepared.lines.iter().enumerate() {
                 let top = origin.y + prepared.line_height * index;
                 for run in &row.geometry {
@@ -340,6 +346,7 @@ impl Element for TerminalElement {
                     cx,
                 );
             }
+            self.paint_images(origin, prepared, ImageLayer::AboveText, window);
         });
 
         self.paint_scrollbar(bounds, window);
@@ -348,6 +355,60 @@ impl Element for TerminalElement {
 }
 
 impl TerminalElement {
+    /// Inline images on one of the three planes the emulator places them on.
+    ///
+    /// A placement can be a crop of a larger image, so the whole image is
+    /// painted into the rectangle it would occupy and clipped to the part the
+    /// placement actually asked for — the same source-crop-by-clip the iced
+    /// canvas did.
+    fn paint_images(
+        &self,
+        origin: gpui::Point<Pixels>,
+        prepared: &PreparedGrid,
+        layer: ImageLayer,
+        window: &mut Window,
+    ) {
+        for placement in self
+            .snapshot
+            .images
+            .iter()
+            .filter(|placement| placement.layer == layer)
+        {
+            let Some(image) = self.images.get(&placement.image.generation) else {
+                continue;
+            };
+            let cell = (
+                f32::from(prepared.cell_width),
+                f32::from(prepared.line_height),
+            );
+            let destination = crate::terminal_image::scaled_destination(
+                (placement.column, placement.row),
+                (placement.width, placement.height),
+                (placement.x_offset, placement.y_offset),
+                cell,
+            );
+            let Some(geometry) = crate::terminal_image::placement_geometry(
+                destination,
+                placement.source,
+                placement.image.width,
+                placement.image.height,
+            ) else {
+                continue;
+            };
+            let clip = to_bounds(origin, geometry.destination);
+            window.with_content_mask(Some(gpui::ContentMask { bounds: clip }), |window| {
+                let _ = window.paint_image(
+                    to_bounds(origin, geometry.full_image),
+                    clip,
+                    gpui::Corners::default(),
+                    std::sync::Arc::clone(image),
+                    0,
+                    false,
+                );
+            });
+        }
+    }
+
     /// The scrollback indicator down the right edge.
     ///
     /// Drawn only when there is scrollback, matching the iced pane: a track
@@ -642,5 +703,13 @@ pub(crate) fn terminal_font(settings: &AppSettings) -> gpui::Font {
         ))),
         style: gpui::FontStyle::Normal,
         fallbacks: None,
+    }
+}
+
+/// A grid-local rectangle in window coordinates.
+fn to_bounds(origin: gpui::Point<Pixels>, rect: iced::Rectangle) -> Bounds<Pixels> {
+    Bounds {
+        origin: point(origin.x + px(rect.x), origin.y + px(rect.y)),
+        size: size(px(rect.width), px(rect.height)),
     }
 }
