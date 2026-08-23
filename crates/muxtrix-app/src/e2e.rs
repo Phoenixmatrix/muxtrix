@@ -318,9 +318,10 @@ impl Scenario {
             self.pointer_trace = format!(
                 "pointer motions={moves}, while reporting={reporting_moves}, \
                  reporting ever seen={reporting_seen}, hovered={:?}, polls={polls}, \
-                 ticks={ticks}, window moves={window_moves}, elapsed={:?}, view={:?}, \
+                 ticks={ticks}, window moves={window_moves}, paints={:?}, elapsed={:?}, view={:?}, \
                  palette={}, menu={}, prompts={}{}{}{}{}{}, maximized={:?}, initial pane: {initial:?}",
                 app.hovered_terminal,
+                app.e2e_paint_trace,
                 self.started.elapsed(),
                 app.active_view,
                 app.palette.visible,

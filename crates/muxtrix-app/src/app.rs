@@ -374,6 +374,9 @@ pub(crate) struct Muxtrix {
     /// say whether the runtime was starved.
     #[cfg(feature = "e2e")]
     pub(crate) e2e_clock_trace: (u32, u32),
+    /// Terminal element paints, and those that registered pointer handlers.
+    #[cfg(feature = "e2e")]
+    pub(crate) e2e_paint_trace: (u32, u32),
 }
 
 pub(crate) struct TerminalRuntime {
@@ -1974,6 +1977,8 @@ impl Muxtrix {
             e2e_pointer_trace: (0, 0, false),
             #[cfg(feature = "e2e")]
             e2e_clock_trace: (0, 0),
+            #[cfg(feature = "e2e")]
+            e2e_paint_trace: (0, 0),
         };
         let _ = app.publish_control_panes();
         app

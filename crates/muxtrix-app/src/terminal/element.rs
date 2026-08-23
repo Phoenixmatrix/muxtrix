@@ -364,6 +364,16 @@ impl Element for TerminalElement {
         });
 
         self.paint_scrollbar(bounds, window);
+        #[cfg(feature = "e2e")]
+        {
+            let obscured = self.obscured;
+            self.root.update(cx, |root, _| {
+                root.app.e2e_paint_trace.0 += 1;
+                if !obscured {
+                    root.app.e2e_paint_trace.1 += 1;
+                }
+            });
+        }
         self.paint_mouse(bounds, origin, prepared, window);
     }
 }
