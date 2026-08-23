@@ -2282,6 +2282,10 @@ impl Muxtrix {
                 return Vec::new();
             }
             Message::PointerMoved(position) => {
+                #[cfg(feature = "e2e")]
+                {
+                    self.e2e_clock_trace.0 += 1_000_000;
+                }
                 self.cursor_position = position;
                 if let Err(error) = self.update_split_drag(position) {
                     self.status = error;

@@ -314,10 +314,11 @@ impl Scenario {
                     format!("reporting_now={} tail={tail:?}", snapshot.mouse_reporting)
                 });
             let (polls, ticks) = app.e2e_clock_trace;
+            let (window_moves, polls) = (polls / 1_000_000, polls % 1_000_000);
             self.pointer_trace = format!(
                 "pointer motions={moves}, while reporting={reporting_moves}, \
                  reporting ever seen={reporting_seen}, hovered={:?}, polls={polls}, \
-                 ticks={ticks}, elapsed={:?}, initial pane: {initial:?}",
+                 ticks={ticks}, window moves={window_moves}, elapsed={:?}, initial pane: {initial:?}",
                 app.hovered_terminal,
                 self.started.elapsed()
             );
