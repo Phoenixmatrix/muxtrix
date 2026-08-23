@@ -204,6 +204,12 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     connection.flush()?;
     thread::sleep(Duration::from_millis(200));
     eprintln!("opened the pane menu and dismissed it with an outside click");
+    // The probe has to run in the pane the pointer will sweep. The app's own
+    // scenario splits panes on its clock and focuses each new one, so focus
+    // is put back on the initial pane right before the probe is typed.
+    click_at(&connection, root, terminal_x, terminal_y)?;
+    connection.flush()?;
+    thread::sleep(Duration::from_millis(150));
     type_text(
         &connection,
         mouse_probe_path

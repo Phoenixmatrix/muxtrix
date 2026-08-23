@@ -145,6 +145,7 @@ pub(super) struct Scenario {
     terminal_mouse_reporting_observed: bool,
     /// Carried from the application on every observation, for the report.
     pointer_trace: String,
+    reporting_panes_seen: String,
     tab_lifecycle_observed: bool,
     /// The `MUXTRIX_E2E_CAPTURE` state this run ends on, empty for the plain
     /// workspace frame. One name per staged surface; `capturing` is the only
@@ -269,6 +270,7 @@ impl Scenario {
             terminal_scrollbar_observed: false,
             terminal_mouse_reporting_observed: false,
             pointer_trace: String::new(),
+            reporting_panes_seen: String::new(),
             tab_lifecycle_observed: false,
             capture: std::env::var_os("MUXTRIX_E2E_CAPTURE")
                 .map_or_else(String::new, |value| value.to_string_lossy().into_owned()),
@@ -318,13 +320,28 @@ impl Scenario {
                     snapshot.cells.len(),
                 )
             });
+            let reporting_panes: Vec<PaneId> = app
+                .terminals
+                .iter()
+                .filter(|(_, runtime)| {
+                    runtime
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.mouse_reporting)
+                })
+                .map(|(pane_id, _)| *pane_id)
+                .collect();
+            if !reporting_panes.is_empty() {
+                self.reporting_panes_seen = format!("{reporting_panes:?}");
+            }
             let (polls, ticks) = app.e2e_clock_trace;
             let (window_moves, polls) = (polls / 1_000_000, polls % 1_000_000);
             self.pointer_trace = format!(
                 "pointer motions={moves}, while reporting={reporting_moves}, \
                  reporting ever seen={reporting_seen}, hovered={:?}, polls={polls}, \
                  ticks={ticks}, window moves={window_moves}, paints={:?}, element listener={:?}, elapsed={:?}, view={:?}, \
-                 palette={}, menu={}, prompts={}{}{}{}{}{}, maximized={:?}, initial pane: {initial:?}",
+                 palette={}, menu={}, prompts={}{}{}{}{}{}, maximized={:?}, focused={:?}, \
+                 initial={:?}, panes ever reporting={}, initial pane: {initial:?}",
                 app.hovered_terminal,
                 app.e2e_paint_trace,
                 app.e2e_phase_trace,
@@ -339,6 +356,9 @@ impl Scenario {
                 u8::from(app.close_workspace_prompt.is_some()),
                 u8::from(app.default_agent_prompt),
                 app.maximized_pane,
+                app.focused_pane_id(),
+                self.initial_pane,
+                self.reporting_panes_seen,
             );
         }
     }
