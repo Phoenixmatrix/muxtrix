@@ -217,6 +217,7 @@ impl Root {
         let maximized = app.maximized_pane == Some(pane_id);
         let single_pane = tab.panes.len() == 1;
         let signal = app.pane_signal_kind(pane_id, false).color(tokens);
+        let compact = crate::app::pane_header_is_compact(app.window_size.width, tab.panes.len());
 
         let mut controls = div().flex().flex_row().items_center().gap(px(2.));
         if !single_pane || !maximized {
@@ -296,6 +297,20 @@ impl Root {
                             .text_color(color(if focused { tokens.text } else { tokens.muted }))
                             .truncate()
                             .child(title),
+                    )
+                    // What is actually running, when there is room to say so.
+                    .children(
+                        app.pane_program(pane_id)
+                            .filter(|_| !compact)
+                            .map(|program| {
+                                div()
+                                    .px(px(5.))
+                                    .rounded(px(4.))
+                                    .bg(color(tokens.panel_raised))
+                                    .text_size(px(app.settings.ui_pixels(8.0)))
+                                    .text_color(color(tokens.faint))
+                                    .child(program)
+                            }),
                     ),
             )
             .child(controls)

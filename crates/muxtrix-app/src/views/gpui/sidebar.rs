@@ -6,14 +6,16 @@
 
 use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Styled, div, px,
+    ParentElement, SharedString, Styled, div, px, svg,
 };
 use muxtrix_domain::{PaneId, Workspace, WorkspaceId};
 
 use crate::app::{
     COLLAPSED_SIDEBAR_WIDTH, IconKind, Message, RailTarget, SIDEBAR_WIDTH, ellipsize,
 };
+use crate::github;
 use crate::runtime::gpui::{Root, color};
+use crate::settings::{FleetScope, FleetView};
 use crate::theme::DesignTokens;
 use crate::views::gpui::{icon_button, pane_key};
 
@@ -75,17 +77,7 @@ impl Root {
             .child(div().h(px(10.)))
             .child(div().h(px(1.)).w_full().bg(color(tokens.line)))
             .child(div().h(px(4.)))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h(px(28.))
-                    .px(px(8.))
-                    .text_size(px(app.settings.ui_pixels(9.0)))
-                    .text_color(color(tokens.faint))
-                    .child("FLEET"),
-            );
+            .child(self.fleet_header(tokens, cx));
 
         // One entry order feeds the rows and the keyboard handler, so the
         // visible order and the direct-navigation targets cannot disagree.
@@ -93,7 +85,131 @@ impl Root {
         for (workspace_id, pane_id) in app.fleet_entries() {
             fleet = fleet.child(self.fleet_row(workspace_id, pane_id, tokens, cx));
         }
-        rail.child(fleet).into_any_element()
+        rail.child(fleet)
+            .child(self.github_chip(tokens, cx))
+            .into_any_element()
+    }
+
+    /// The fleet's segmented view control, and the scope toggle beside it.
+    fn fleet_header(&self, tokens: DesignTokens, cx: &mut Context<Self>) -> AnyElement {
+        let app = self.app();
+        let current = app.effective_fleet_view();
+        let mut views = div().flex().flex_row().gap(px(2.));
+        for (label, view) in [
+            ("Tabs", FleetView::Tabs),
+            ("Agents", FleetView::Agents),
+            ("Repos", FleetView::Repos),
+        ] {
+            let selected = view == current;
+            views = views.child(
+                div()
+                    .id(SharedString::from(format!("fleet-{label}")))
+                    .h(px(20.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .bg(color(if selected {
+                        tokens.panel_raised
+                    } else {
+                        tokens.rail
+                    }))
+                    .text_size(px(app.settings.ui_pixels(9.0)))
+                    .text_color(color(if selected { tokens.text } else { tokens.faint }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                            root.dispatch(Message::SetFleetView(view), window, cx);
+                        }),
+                    )
+                    .child(label),
+            );
+        }
+        let all_workspaces = app.settings.fleet_scope == FleetScope::AllWorkspaces;
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(30.))
+            .px(px(8.))
+            .child(views)
+            .child(
+                div()
+                    .id("fleet-scope")
+                    .h(px(20.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_size(px(app.settings.ui_pixels(9.0)))
+                    .text_color(color(if all_workspaces {
+                        tokens.accent
+                    } else {
+                        tokens.faint
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                            root.dispatch(
+                                Message::SettingsShowAllWorkspaces(!all_workspaces),
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
+                    .child("All"),
+            )
+            .into_any_element()
+    }
+
+    /// The GitHub connection chip that closes the rail.
+    fn github_chip(&self, tokens: DesignTokens, cx: &mut Context<Self>) -> AnyElement {
+        let app = self.app();
+        let (label, hue) = match &app.github_auth {
+            github::AuthStatus::Checking => ("Checking GitHub…".to_owned(), tokens.faint),
+            github::AuthStatus::Authenticated { login } => (login.clone(), tokens.success),
+            github::AuthStatus::NeedsAuthentication => ("Connect GitHub".to_owned(), tokens.muted),
+            github::AuthStatus::Unavailable { .. } => {
+                ("GitHub unavailable".to_owned(), tokens.faint)
+            }
+        };
+        div()
+            .id("github-chip")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(7.))
+            .h(px(34.))
+            .px(px(10.))
+            .cursor_pointer()
+            .bg(color(tokens.rail))
+            .border_t(px(1.))
+            .border_color(color(tokens.line))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|root, _: &MouseDownEvent, window, cx| {
+                    root.dispatch(Message::GitHubStatusPressed, window, cx);
+                }),
+            )
+            .child(
+                svg()
+                    .path(crate::assets::icon_path(IconKind::GitHub))
+                    .size(px(14.))
+                    .text_color(color(tokens.muted)),
+            )
+            .child(
+                div()
+                    .flex_grow(1.0)
+                    .text_size(px(app.settings.ui_pixels(9.0)))
+                    .text_color(color(tokens.muted))
+                    .truncate()
+                    .child(label),
+            )
+            .child(div().size(px(7.)).rounded_full().bg(color(hue)))
+            .into_any_element()
     }
 
     /// One workspace: name, state, and how much is in it.
