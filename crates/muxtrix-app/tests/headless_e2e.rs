@@ -222,15 +222,22 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     // movement at all and nothing is delivered. Sweeping in one direction
     // means whatever survives compression is still a move onto a fresh cell,
     // which is what the program under test has asked to hear about.
-    for step in 1..=12 {
+    //
+    // The sweep keeps going for as long as the probe is listening — it drops
+    // its marker when it has heard a report or given up — rather than for a
+    // fixed count, because how long the app takes to learn that reporting is
+    // on is the renderer's business, and a slow one needs more nudges.
+    let mut step: i16 = 0;
+    while ready_marker.exists() && step < 64 {
+        step += 1;
         connection
             .xtest_fake_input(
                 MOTION_NOTIFY_EVENT,
                 0,
                 0,
                 root,
-                terminal_x.saturating_add(step * 8),
-                terminal_y,
+                terminal_x.saturating_add((step % 24) * 8),
+                terminal_y.saturating_add(step / 24 * 8),
                 0,
             )?
             .check()?;
@@ -535,7 +542,7 @@ try:
     sys.stdout.write("\x1b[?1003h\x1b[?1006h")
     sys.stdout.flush()
     open(sys.argv[0] + ".ready", "w").close()
-    if select.select([fd], [], [], 6)[0]:
+    if select.select([fd], [], [], 8)[0]:
         data = os.read(fd, 64)
 finally:
     sys.stdout.write("\x1b[?1003l\x1b[?1006l\r\n")
