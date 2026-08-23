@@ -139,6 +139,8 @@ jobs:
           sudo apt-get install --yes --no-install-recommends \
             desktop-file-utils \
             file \
+            libfontconfig-dev \
+            libfreetype-dev \
             libgl1-mesa-dev \
             libvulkan-dev \
             libwayland-dev \
@@ -149,6 +151,7 @@ jobs:
             libxi-dev \
             libxinerama-dev \
             libxrandr-dev \
+            libzstd-dev \
             pkg-config
           cargo install cargo-deb --locked
           cargo install cargo-zigbuild --locked
