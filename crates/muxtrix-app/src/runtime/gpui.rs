@@ -522,7 +522,13 @@ impl Root {
                         },
                     );
             }
-            Effect::OpenUrl(url) => cx.open_url(&url),
+            Effect::OpenUrl(url) => {
+                if let Some(url) = platform_web_url(&url) {
+                    cx.open_url(url);
+                } else {
+                    eprintln!("muxtrix: refused to open a non-HTTP(S) URL");
+                }
+            }
             Effect::ClipboardWrite(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
@@ -1051,9 +1057,13 @@ fn queue_pending_scroll(
     }
 }
 
+fn platform_web_url(uri: &str) -> Option<&str> {
+    crate::app::is_valid_web_url(uri).then_some(uri)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ScrollTo, queue_pending_scroll};
+    use super::{ScrollTo, platform_web_url, queue_pending_scroll};
     use crate::effect::ScrollTarget;
 
     #[test]
@@ -1074,5 +1084,26 @@ mod tests {
             (ScrollTarget::CommandPalette, ScrollTo::Offset(99_999.0))
         );
         assert_eq!(pending[1], (ScrollTarget::Settings, ScrollTo::Ratio(0.75)));
+    }
+
+    #[test]
+    fn platform_url_boundary_rejects_non_web_schemes() {
+        assert_eq!(
+            platform_web_url("https://example.com/docs"),
+            Some("https://example.com/docs")
+        );
+        assert_eq!(
+            platform_web_url("http://localhost:3000"),
+            Some("http://localhost:3000")
+        );
+        for uri in [
+            "file:///etc/passwd",
+            "mailto:person@example.com",
+            "javascript:alert(1)",
+            "muxtrix://settings",
+            "https://",
+        ] {
+            assert_eq!(platform_web_url(uri), None, "{uri} must be rejected");
+        }
     }
 }

@@ -3069,6 +3069,21 @@ fn terminal_link_click_requests_native_open_immediately() {
 }
 
 #[test]
+fn non_http_open_request_is_rejected_before_native_dispatch() {
+    let mut app = Muxtrix::new();
+
+    let effects = app.update(Message::OpenGitHubPullRequest(
+        "file:///tmp/untrusted".to_owned(),
+    ));
+
+    assert!(effects.is_empty());
+    assert_eq!(
+        app.status,
+        "Could not open link: only HTTP and HTTPS URLs are allowed"
+    );
+}
+
+#[test]
 fn inferred_urls_override_application_underlines_until_clickable() {
     let actor = TerminalActor::spawn(TerminalOptions {
         cols: 64,

@@ -3381,8 +3381,7 @@ impl Muxtrix {
                 return Vec::new();
             }
             Message::OpenGitHubPullRequest(url) => {
-                self.status = format!("Opening {url}");
-                return vec![Effect::OpenUrl(url)];
+                return self.request_open_web_url(url);
             }
             Message::ToggleGitHubPullRequestDraft => {
                 return self.toggle_github_pull_request_draft();
@@ -7438,8 +7437,7 @@ impl Muxtrix {
                 if terminal_link_modifiers(self.keyboard_modifiers)
                     && let Some(link) = self.hovered_terminal_link(pane_id)
                 {
-                    self.status = format!("Opening {}", link.uri);
-                    return vec![Effect::OpenUrl(link.uri)];
+                    return self.request_open_web_url(link.uri);
                 }
                 let cell = self.terminal_grid_cell_at(pane_id, position);
                 if let Some(runtime) = self.terminals.get_mut(&pane_id)
@@ -9307,6 +9305,16 @@ impl Muxtrix {
         let position = self.terminal_pointer_positions.get(&pane_id).copied()?;
         let cell = terminal_cell_at(position, &self.settings, snapshot.scrollbar.offset);
         terminal_link_at(snapshot, cell)
+    }
+
+    fn request_open_web_url(&mut self, uri: String) -> Vec<Effect> {
+        if is_valid_web_url(&uri) {
+            self.status = format!("Opening {uri}");
+            vec![Effect::OpenUrl(uri)]
+        } else {
+            self.status = "Could not open link: only HTTP and HTTPS URLs are allowed".into();
+            Vec::new()
+        }
     }
 
     pub(crate) fn sidebar_is_compact(&self) -> bool {
