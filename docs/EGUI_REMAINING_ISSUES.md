@@ -69,3 +69,13 @@ This document tracks the remaining work before the egui build replaces the Iced 
   - Merge the complete egui build and its required CI/release configuration into `main`.
   - Verify branch protection, release, packaging, and installation paths against the new default.
   - Confirm the tagged Iced build remains retrievable and buildable from its documented instructions.
+
+- [ ] **Publish a tagged egui release through all three release channels.** Once
+  the egui build is fully merged into `main`, cut a tagged release and confirm
+  that the new build is published everywhere.
+  - Create the annotated version tag from the final release commit on `main`
+    using the documented release process.
+  - Confirm the GitHub release contains the expected Linux, Windows, and macOS
+    egui build artifacts and checksums.
+  - Confirm Scoop, Homebrew, and the apt repository all publish and install the
+    same tagged egui version.
