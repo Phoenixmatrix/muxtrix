@@ -11,7 +11,7 @@ use gpui::{
     ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px,
 };
 
-use crate::app::{IconKind, Message, settings_have_changes};
+use crate::app::{IconKind, Message, SettingsButtonKind, settings_have_changes};
 use crate::runtime::gpui::{Root, color};
 use crate::settings::{Appearance, FleetView, FontWeight, TerminalFont, UiFont};
 use crate::theme::DesignTokens;
@@ -20,7 +20,9 @@ use crate::views::gpui::icon_button;
 impl Root {
     pub(crate) fn view_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let app = self.app();
-        let tokens = DesignTokens::for_appearance(app.settings.appearance);
+        // The draft's appearance, not the saved one: flipping Light/Dark on
+        // the page previews it on the page, as the iced screen does.
+        let tokens = DesignTokens::for_appearance(app.settings_draft.appearance);
         if app.active_view == crate::app::ActiveView::ThemeGallery {
             return self.theme_gallery(tokens, cx);
         }
@@ -190,67 +192,135 @@ impl Root {
             .into_any_element()
     }
 
-    /// Every terminal palette, two per row, each showing its own colours.
-    ///
-    /// The swatch is the preview: a palette is its colours, and a sample of
-    /// them says more than the name does.
+    /// Full-screen theme browser: every preset rendered as the same live
+    /// terminal preview the settings page shows for the current theme —
+    /// sample output, selection, cursor, and the full ANSI strip — two per
+    /// row, clickable, Esc or Back to return.
     fn theme_gallery(&self, tokens: DesignTokens, cx: &mut Context<Self>) -> AnyElement {
         let app = self.app();
-        let chosen = app.settings_draft.terminal_theme;
-        let mut grid = div().flex().flex_row().flex_wrap().gap(px(10.)).p(px(20.));
-        for id in crate::themes::TerminalThemeId::ALL {
+        let draft = &app.settings_draft;
+        let chosen = draft.terminal_theme;
+        let count_nudge = (draft.ui_pixels(18.0) - draft.ui_pixels(9.5)) * 0.6;
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(16.))
+            .child(self.settings_action_button(
+                "gallery-back",
+                "← Settings",
+                Message::CloseThemeGallery,
+                SettingsButtonKind::Secondary,
+                tokens,
+                cx,
+            ))
+            .child(
+                div()
+                    .text_size(px(draft.ui_pixels(18.0)))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(color(tokens.text))
+                    .child("Theme gallery"),
+            )
+            .child(div().flex_grow(1.0))
+            .child(
+                div()
+                    .pt(px(count_nudge))
+                    .text_size(px(draft.ui_pixels(9.5)))
+                    .text_color(color(tokens.faint))
+                    .child(format!(
+                        "Current: {} · {} themes",
+                        chosen.preset().name,
+                        crate::themes::TerminalThemeId::ALL.len()
+                    )),
+            );
+
+        // One column keeps the preview truthful when cards would squeeze
+        // below the width the sample line and ANSI strip need.
+        let columns: usize = if app.window_size.width < 980.0 { 1 } else { 2 };
+        let mut grid = div().flex().flex_col().gap(px(12.));
+        let mut cards: Vec<AnyElement> = Vec::new();
+        let flush = |grid: gpui::Div, cards: &mut Vec<AnyElement>| -> gpui::Div {
+            if cards.is_empty() {
+                return grid;
+            }
+            while cards.len() < columns {
+                cards.push(div().flex_1().into_any_element());
+            }
+            grid.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(12.))
+                    .children(std::mem::take(cards)),
+            )
+        };
+        let mut current_group: Option<bool> = None;
+        // Dark first, then light: grouped so the mode chip on every card
+        // becomes redundant and a named theme is findable by section.
+        let ordered = crate::themes::TerminalThemeId::ALL
+            .into_iter()
+            .filter(|id| !id.preset().is_light)
+            .chain(
+                crate::themes::TerminalThemeId::ALL
+                    .into_iter()
+                    .filter(|id| id.preset().is_light),
+            );
+        for id in ordered {
             let preset = id.preset();
-            let selected = id == chosen;
-            let mut swatches = div().flex().flex_row().gap(px(3.));
-            for hue in [
-                preset.ansi[1],
-                preset.ansi[2],
-                preset.ansi[3],
-                preset.ansi[4],
-                preset.ansi[5],
-                preset.ansi[6],
-            ] {
-                swatches = swatches.child(
+            if current_group != Some(preset.is_light) {
+                grid = flush(grid, &mut cards);
+                current_group = Some(preset.is_light);
+                grid = grid.child(
                     div()
-                        .size(px(12.))
-                        .rounded(px(2.))
-                        .bg(color(crate::terminal::runs::rgb(hue))),
+                        .pt(px(8.))
+                        .pl(px(3.))
+                        .text_size(px(draft.ui_pixels(8.5)))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(color(tokens.faint))
+                        .child(if preset.is_light { "LIGHT" } else { "DARK" }),
                 );
             }
-            grid = grid.child(
+            let selected = id == chosen;
+            cards.push(
                 div()
                     .id(SharedString::from(preset.name))
-                    .w(px(320.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .p(px(12.))
-                    .rounded(px(8.))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .p(px(3.))
+                    .rounded(px(12.))
+                    .border_2()
+                    .border_color(color(if selected {
+                        tokens.accent
+                    } else {
+                        iced::Color::TRANSPARENT
+                    }))
+                    .when(!selected, |card| {
+                        card.hover(move |style| style.border_color(color(tokens.line_strong)))
+                    })
                     .cursor_pointer()
-                    .bg(color(crate::terminal::runs::rgb(preset.background)))
-                    .border_1()
-                    .border_color(color(if selected { tokens.accent } else { tokens.line }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |root, _: &MouseDownEvent, window, cx| {
                             root.dispatch(Message::GalleryThemeChosen(id), window, cx);
                         }),
                     )
-                    .child(
-                        div()
-                            .text_size(px(app.settings.ui_pixels(11.0)))
-                            .text_color(color(crate::terminal::runs::rgb(preset.foreground)))
-                            .child(preset.name),
-                    )
-                    .child(swatches),
+                    .child(theme_preview_card(preset, draft, false))
+                    .into_any_element(),
             );
+            if cards.len() == columns {
+                grid = flush(grid, &mut cards);
+            }
         }
+        grid = flush(grid, &mut cards);
+
         div()
             .flex()
             .flex_col()
+            .gap(px(18.))
             .size_full()
+            .p(px(28.))
             .bg(color(tokens.app))
-            .child(self.screen_bar("Terminal palettes", Message::CloseThemeGallery, tokens, cx))
+            .child(header)
             .child(
                 div()
                     .id("gallery-scroll")
@@ -258,8 +328,81 @@ impl Root {
                     .min_h(px(0.))
                     .overflow_y_scroll()
                     .track_scroll(&self.scrolls.settings)
-                    .child(grid),
+                    .child(grid.pt(px(4.)).pr(px(14.)).pb(px(24.))),
             )
+            .into_any_element()
+    }
+
+    /// A settings-page action: the same three kinds the iced page draws.
+    fn settings_action_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        message: Message,
+        kind: SettingsButtonKind,
+        tokens: DesignTokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let app = self.app();
+        let (fill, hover, text, edge, hover_edge) = match kind {
+            SettingsButtonKind::Primary => {
+                let mut hover = color(tokens.accent);
+                hover.a = 0.86;
+                (
+                    color(tokens.accent),
+                    hover,
+                    tokens.app,
+                    tokens.accent,
+                    tokens.accent,
+                )
+            }
+            SettingsButtonKind::Secondary => (
+                color(tokens.panel),
+                color(tokens.panel_raised),
+                tokens.text,
+                tokens.line_strong,
+                tokens.line_strong,
+            ),
+            SettingsButtonKind::Danger => {
+                let mut fill = color(tokens.danger);
+                fill.a = 0.05;
+                let mut hover = color(tokens.danger);
+                hover.a = 0.12;
+                // tokens.line rendered these borders invisible.
+                let mut edge = tokens.danger;
+                edge.a = 0.45;
+                (fill, hover, tokens.danger, edge, tokens.danger)
+            }
+            SettingsButtonKind::Quiet => (
+                color(iced::Color::TRANSPARENT),
+                color(tokens.panel_raised),
+                tokens.muted,
+                iced::Color::TRANSPARENT,
+                tokens.line_strong,
+            ),
+        };
+        div()
+            .id(id)
+            .h(px(30.))
+            .px(px(11.))
+            .flex()
+            .items_center()
+            .rounded(px(5.))
+            .cursor_pointer()
+            .bg(fill)
+            .border_1()
+            .border_color(color(edge))
+            .text_size(px(app.settings_draft.ui_pixels(9.0)))
+            .text_color(color(text))
+            .whitespace_nowrap()
+            .hover(move |style| style.bg(hover).border_color(color(hover_edge)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                    root.dispatch(message.clone(), window, cx);
+                }),
+            )
+            .child(label)
             .into_any_element()
     }
 
@@ -687,4 +830,136 @@ impl Root {
             .into_any_element();
         self.row(label, control, tokens)
     }
+}
+
+/// The live terminal preview for a theme: sample output, a selection, the
+/// cursor, and the full ANSI strip, on the theme's own background. Built from
+/// the same colours the real grid uses, so what the card shows is what the
+/// terminal will render.
+pub(crate) fn theme_preview_card(
+    preset: crate::themes::TerminalThemePreset,
+    settings: &crate::settings::AppSettings,
+    caption: bool,
+) -> AnyElement {
+    use crate::terminal::runs::rgb;
+    let tokens = DesignTokens::for_appearance(settings.appearance);
+    let font = crate::terminal::element::terminal_font(settings);
+    let preview_size = settings.terminal_font_pixels().clamp(13.0, 18.0);
+    let mode = if preset.is_light { "Light" } else { "Dark" };
+
+    // The sample line, as one styled run per coloured span.
+    let spans: [(&str, muxtrix_terminal::Rgb, Option<muxtrix_terminal::Rgb>); 10] = [
+        ("❯ ", preset.ansi[10], None),
+        ("cargo test ", preset.foreground, None),
+        ("--workspace\n", preset.ansi[12], None),
+        ("   Compiling ", preset.ansi[3], None),
+        ("muxtrix\n", preset.foreground, None),
+        ("   Finished ", preset.ansi[2], None),
+        ("95 tests passed  ", preset.foreground, None),
+        (
+            " selected ",
+            preset.selection_foreground,
+            Some(preset.selection_background),
+        ),
+        ("  ", preset.foreground, None),
+        (" C ", preset.cursor_text, Some(preset.cursor)),
+    ];
+    let mut text = String::new();
+    let mut runs = Vec::with_capacity(spans.len());
+    for (piece, foreground, background) in spans {
+        text.push_str(piece);
+        runs.push(gpui::TextRun {
+            len: piece.len(),
+            font: font.clone(),
+            color: color(rgb(foreground)).into(),
+            background_color: background.map(|hue| color(rgb(hue)).into()),
+            underline: None,
+            strikethrough: None,
+        });
+    }
+    let sample = div()
+        .text_size(px(preview_size))
+        .line_height(px(preview_size * 1.35))
+        .child(gpui::StyledText::new(text).with_runs(runs));
+
+    let strip = |colors: &[muxtrix_terminal::Rgb]| {
+        let mut row = div().flex().flex_row().gap(px(5.));
+        for hue in colors {
+            // The iced strip asks for a 24 px cap on a fill-width swatch and
+            // gets the fill: the cap never applies. The rendered width is
+            // what the gallery is compared against, so match that.
+            row = row.child(
+                div()
+                    .flex_1()
+                    .h(px(12.))
+                    .rounded(px(2.))
+                    .bg(color(rgb(*hue))),
+            );
+        }
+        row
+    };
+
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .w_full()
+        .py(px(14.))
+        .px(px(16.))
+        .rounded(px(6.))
+        .bg(color(rgb(preset.background)))
+        .border_1()
+        .border_color(color(tokens.line_strong))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_grow(1.0)
+                        .min_w(px(0.))
+                        .text_size(px(settings.ui_pixels(11.0)))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(color(rgb(preset.foreground)))
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(preset.name),
+                )
+                .when(caption, |head| {
+                    // In the gallery, section headings already say the mode;
+                    // repeating a pill on every card is noise.
+                    head.child(
+                        div()
+                            .py(px(2.))
+                            .px(px(7.))
+                            .rounded(px(4.))
+                            .bg(color(rgb(preset.foreground)))
+                            .text_size(px(settings.ui_pixels(8.0)))
+                            .text_color(color(rgb(preset.background)))
+                            .child(mode),
+                    )
+                }),
+        )
+        .child(sample)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(5.))
+                .child(strip(&preset.ansi[..8]))
+                .child(strip(&preset.ansi[8..])),
+        );
+    if caption {
+        card = card.child(
+            div()
+                .text_size(px(settings.ui_pixels(8.0)))
+                .text_color(color(rgb(preset.ansi[8])))
+                .child(
+                    "Theme colors set defaults · direct RGB and application OSC colors stay intact",
+                ),
+        );
+    }
+    card.into_any_element()
 }
