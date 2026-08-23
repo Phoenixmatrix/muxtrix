@@ -365,6 +365,11 @@ pub(crate) struct Muxtrix {
     pub(crate) integration_refreshing: bool,
     #[cfg(feature = "e2e")]
     pub(crate) e2e: Option<e2e::Scenario>,
+    /// What the pointer path saw, for the e2e report when a mouse-reporting
+    /// program hears nothing: how many motions arrived, how many while the
+    /// pane was reporting, and whether reporting was ever on at all.
+    #[cfg(feature = "e2e")]
+    pub(crate) e2e_pointer_trace: (u32, u32, bool),
 }
 
 pub(crate) struct TerminalRuntime {
@@ -1961,6 +1966,8 @@ impl Muxtrix {
             integration_refreshing: false,
             #[cfg(feature = "e2e")]
             e2e,
+            #[cfg(feature = "e2e")]
+            e2e_pointer_trace: (0, 0, false),
         };
         let _ = app.publish_control_panes();
         app
@@ -2302,6 +2309,19 @@ impl Muxtrix {
                 return Vec::new();
             }
             Message::TerminalPointerMoved(pane_id, position) => {
+                #[cfg(feature = "e2e")]
+                {
+                    let reporting = self
+                        .terminals
+                        .get(&pane_id)
+                        .and_then(|runtime| runtime.snapshot.as_ref())
+                        .is_some_and(|snapshot| snapshot.mouse_reporting);
+                    self.e2e_pointer_trace.0 += 1;
+                    if reporting {
+                        self.e2e_pointer_trace.1 += 1;
+                    }
+                    self.e2e_pointer_trace.2 |= reporting;
+                }
                 self.terminal_pointer_positions.insert(pane_id, position);
                 if let Some(mut drag) = self
                     .terminal_selection_drag

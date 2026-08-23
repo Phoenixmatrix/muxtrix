@@ -143,6 +143,8 @@ pub(super) struct Scenario {
     terminal_scroll_observed: bool,
     terminal_scrollbar_observed: bool,
     terminal_mouse_reporting_observed: bool,
+    /// Carried from the application on every observation, for the report.
+    pointer_trace: String,
     tab_lifecycle_observed: bool,
     /// The `MUXTRIX_E2E_CAPTURE` state this run ends on, empty for the plain
     /// workspace frame. One name per staged surface; `capturing` is the only
@@ -265,6 +267,7 @@ impl Scenario {
             terminal_scroll_observed: false,
             terminal_scrollbar_observed: false,
             terminal_mouse_reporting_observed: false,
+            pointer_trace: String::new(),
             tab_lifecycle_observed: false,
             capture: std::env::var_os("MUXTRIX_E2E_CAPTURE")
                 .map_or_else(String::new, |value| value.to_string_lossy().into_owned()),
@@ -292,6 +295,30 @@ impl Scenario {
         }
         self.terminal_mouse_reporting_observed |=
             pane_contains(app, self.initial_pane, MOUSE_REPORT_MARKER);
+        if !self.terminal_mouse_reporting_observed {
+            let (moves, reporting_moves, reporting_seen) = app.e2e_pointer_trace;
+            let initial = app
+                .terminals
+                .get(&self.initial_pane)
+                .and_then(|runtime| runtime.snapshot.as_ref())
+                .map(|snapshot| {
+                    let text = snapshot.text();
+                    let tail: String = text
+                        .chars()
+                        .rev()
+                        .take(160)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    format!("reporting_now={} tail={tail:?}", snapshot.mouse_reporting)
+                });
+            self.pointer_trace = format!(
+                "pointer motions={moves}, while reporting={reporting_moves}, \
+                 reporting ever seen={reporting_seen}, hovered={:?}, initial pane: {initial:?}",
+                app.hovered_terminal
+            );
+        }
     }
 
     fn tick(&mut self, app: &mut Muxtrix) -> Result<TickAction, String> {
@@ -2003,7 +2030,10 @@ impl Scenario {
             return Err("terminal scrollbar interaction was not observed".into());
         }
         if !self.terminal_mouse_reporting_observed {
-            return Err("a mouse-reporting program did not receive pointer motion".into());
+            return Err(format!(
+                "a mouse-reporting program did not receive pointer motion ({})",
+                self.pointer_trace
+            ));
         }
         if !self.tab_lifecycle_observed {
             return Err("workspace tab creation was not observed".into());
