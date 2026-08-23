@@ -8,8 +8,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ConfigureWindowAux, ConnectionExt as _, ImageFormat,
-    InputFocus, KEY_PRESS_EVENT, KEY_RELEASE_EVENT, MOTION_NOTIFY_EVENT, MapState,
+    AutoRepeatMode, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ChangeKeyboardControlAux,
+    ConfigureWindowAux, ConnectionExt as _, ImageFormat, InputFocus, KEY_PRESS_EVENT,
+    KEY_RELEASE_EVENT, MOTION_NOTIFY_EVENT, MapState,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
@@ -138,6 +139,17 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         .spawn()
         .map(|child| ProcessGuard(Some(child)))?;
 
+    // No key repeat. A key is pressed and released by XTEST back to back, but
+    // the app reads them when it next gets to its event queue; if that is
+    // later than the server's repeat delay, the server has already started
+    // repeating the key. A repeated Enter after the one that launched the
+    // mouse probe reaches the probe's raw stdin ahead of any mouse report and
+    // is taken for the answer.
+    connection
+        .change_keyboard_control(
+            &ChangeKeyboardControlAux::new().auto_repeat_mode(AutoRepeatMode::OFF),
+        )?
+        .check()?;
     let window = wait_for_app_window(&connection, root, Duration::from_secs(8))?;
     let final_viewport = requested_viewport()?;
     eprintln!("Muxtrix window mapped as X11 window {window}");
