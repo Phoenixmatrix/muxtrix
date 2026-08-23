@@ -6,6 +6,7 @@
 
 pub(crate) mod dialogs;
 pub(crate) mod github;
+pub(crate) mod github_diff;
 pub(crate) mod inputs;
 pub(crate) mod overlays;
 pub(crate) mod panes;

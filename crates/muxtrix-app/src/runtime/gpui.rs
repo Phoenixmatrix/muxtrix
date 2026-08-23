@@ -575,7 +575,24 @@ impl Render for Root {
             crate::app::ActiveView::Settings | crate::app::ActiveView::ThemeGallery => {
                 Some(self.view_settings(cx))
             }
-            _ => None,
+            // The diff keeps the GitHub panel docked beside it and drops the
+            // sidebar: the file list is what you navigate from here.
+            crate::app::ActiveView::GitHubDiff => Some(
+                div()
+                    .flex()
+                    .flex_row()
+                    .size_full()
+                    .child(
+                        div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .child(self.github_diff_view(tokens, cx)),
+                    )
+                    .children(self.github_panel(cx))
+                    .into_any_element(),
+            ),
+            crate::app::ActiveView::Workspace => None,
         };
         let sidebar = self.view_sidebar(cx);
         let github = self.github_panel(cx);
