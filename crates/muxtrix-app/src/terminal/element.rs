@@ -73,6 +73,13 @@ pub(crate) struct TerminalElement {
     scrollbar: Option<muxtrix_terminal::ScrollbarSnapshot>,
     /// Inline images, already decoded, keyed the way the emulator keys them.
     images: std::collections::BTreeMap<u64, std::sync::Arc<gpui::RenderImage>>,
+    /// Whether something is open above the grid — a menu, a dialog, the
+    /// palette. These handlers are registered on the window rather than on the
+    /// element, so nothing else can swallow a press for them; without this a
+    /// click that dismisses a menu also starts a selection in the terminal
+    /// underneath, and the drag it leaves behind captures the pointer motion
+    /// a mouse-reporting program should have received.
+    obscured: bool,
 }
 
 /// What `prepaint` worked out and `paint` consumes.
@@ -142,6 +149,14 @@ impl TerminalElement {
                 .map(|snapshot| snapshot.scrollbar)
                 .filter(|scrollbar| scrollbar.is_scrollable()),
             images,
+            obscured: app.pane_menu.is_some()
+                || app.palette.visible
+                || app.workspace_create_visible
+                || app.rename_prompt.is_some()
+                || app.worktree_prompt.is_some()
+                || app.session_picker.is_some()
+                || app.close_workspace_prompt.is_some()
+                || app.default_agent_prompt,
         })
     }
 
@@ -449,6 +464,9 @@ impl TerminalElement {
         prepared: &PreparedGrid,
         window: &mut Window,
     ) {
+        if self.obscured {
+            return;
+        }
         let pane_id = self.pane_id;
         let root = self.root.clone();
         let cell_width = prepared.cell_width;

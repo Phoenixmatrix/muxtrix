@@ -68,6 +68,15 @@ pub(crate) struct Root {
     /// references them. Keyed by the emulator's own generation, so an image
     /// that is redrawn unchanged is not decoded again.
     images: std::collections::BTreeMap<u64, std::sync::Arc<gpui::RenderImage>>,
+    /// One handle per scrollable surface, so an effect that names a surface by
+    /// role has something to move.
+    pub(crate) scrolls: Scrolls,
+    /// Scroll requests waiting for their surface to have an extent.
+    ///
+    /// An effect can arrive before the surface it names has ever been laid
+    /// out — opening a panel and scrolling it are one gesture — and a handle
+    /// with no content yet reports nowhere to go. Held until it does.
+    pending_scrolls: Vec<(crate::effect::ScrollTarget, ScrollTo)>,
     /// The window's keyboard focus. Held by the root rather than by any
     /// surface: Muxtrix routes every key through one handler and decides there
     /// whether it belongs to a shortcut, a dialog or the terminal, and that
@@ -76,6 +85,72 @@ pub(crate) struct Root {
 }
 
 impl Root {
+    /// Move any surface whose scroll request can now be honoured.
+    ///
+    /// A request survives until its surface has somewhere to go, because the
+    /// alternative is silently dropping it on the frame the surface appeared.
+    fn apply_pending_scrolls(&mut self) {
+        self.pending_scrolls.retain(|(target, request)| {
+            let handle = self.scrolls.get(*target);
+            let travel = handle.max_offset().y.max(px(0.));
+            if travel <= px(0.) {
+                // Nothing to scroll yet. Either the surface has not been laid
+                // out or it genuinely fits, and one more frame tells them apart.
+                return true;
+            }
+            let offset = match request {
+                ScrollTo::Ratio(ratio) => travel * ratio.clamp(0.0, 1.0),
+                ScrollTo::Offset(offset) => px(*offset).min(travel),
+                ScrollTo::End => travel,
+            };
+            handle.set_offset(point(px(0.), -offset));
+            false
+        });
+    }
+
+    /// Tell the application where its scrollable surfaces have got to.
+    ///
+    /// GPUI scroll handles hold a position but announce nothing, and the
+    /// GitHub panel's virtual lists need the offset to decide which rows to
+    /// build. Reported only on a real change, so this settles rather than
+    /// feeding itself.
+    fn report_scrolls(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.app.github_panel.as_ref() else {
+            return;
+        };
+        let files = -f32::from(self.scrolls.github_files.offset().y);
+        let requests = -f32::from(self.scrolls.github_pull_requests.offset().y);
+        // A chosen pull request's file list and the working tree's share one
+        // handle and one message, but land in different fields — compare
+        // against whichever the message will actually write, or this reports
+        // the same move on every frame forever.
+        let recorded = if panel.selected_pull_request_number.is_some() {
+            panel.selected_pull_request_file_scroll_offset
+        } else {
+            panel.file_scroll_offset
+        };
+        let file_moved = (files - recorded).abs() > 0.5;
+        let request_moved = (requests - panel.pull_request_scroll_offset).abs() > 0.5;
+        // Deferred rather than dispatched here: this runs inside a render,
+        // and updating state mid-frame means rendering against a value the
+        // frame did not start with.
+        let mut moves = Vec::new();
+        if file_moved {
+            moves.push(Message::GitHubFileScrolled(files.max(0.0)));
+        }
+        if request_moved {
+            moves.push(Message::GitHubPullRequestScrolled(requests.max(0.0)));
+        }
+        if !moves.is_empty() {
+            cx.spawn(async move |this, cx| {
+                for message in moves {
+                    let _ = this.update(cx, |root, cx| root.dispatch_detached(message, cx));
+                }
+            })
+            .detach();
+        }
+    }
+
     /// The images the terminals currently reference, decoded for GPUI.
     pub(crate) fn images(
         &self,
@@ -133,6 +208,8 @@ impl Root {
             inputs,
             pending_focus: None,
             images: std::collections::BTreeMap::new(),
+            scrolls: Scrolls::default(),
+            pending_scrolls: Vec::new(),
             focus,
         };
         root.spawn_timers(cx);
@@ -235,9 +312,20 @@ impl Root {
             // can produce them. Recorded here and applied on the next frame,
             // which is soon enough for a caret to appear.
             Effect::Focus(target) => self.pending_focus = Some(target),
-            Effect::ScrollToRatio(..) | Effect::ScrollToOffset(..) => {}
+            // Held rather than applied: an effect can name a surface that has
+            // not been laid out yet — opening a panel and scrolling it are one
+            // gesture — and a handle with no content reports nowhere to go.
+            Effect::ScrollToRatio(target, ratio) => {
+                self.pending_scrolls.push((target, ScrollTo::Ratio(ratio)));
+            }
+            Effect::ScrollToOffset(target, offset) => {
+                self.pending_scrolls
+                    .push((target, ScrollTo::Offset(offset)));
+            }
             #[cfg(feature = "e2e")]
-            Effect::ScrollToEnd(_) => {}
+            Effect::ScrollToEnd(target) => {
+                self.pending_scrolls.push((target, ScrollTo::End));
+            }
             #[cfg(feature = "e2e")]
             Effect::Capture => {
                 // The frame is grabbed from outside this process; all that
@@ -372,6 +460,10 @@ where
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Both of these read what the last frame laid out, so they belong at
+        // the start of the next one.
+        self.apply_pending_scrolls();
+        self.report_scrolls(cx);
         // Focus follows what is open. An explicit request wins; otherwise the
         // root takes it back, because a field that keeps focus after its
         // surface closes swallows everything the terminal should receive.
@@ -489,4 +581,32 @@ pub(crate) fn color(value: iced::Color) -> gpui::Rgba {
 fn root_menu_anchor(window: &Window) -> Point<gpui::Pixels> {
     let bounds = window.bounds();
     point(bounds.size.width - px(6.), px(38.))
+}
+
+/// Every scrollable surface in the shell, addressed the way effects name them.
+#[derive(Default)]
+pub(crate) struct Scrolls {
+    pub(crate) settings: gpui::ScrollHandle,
+    pub(crate) palette: gpui::ScrollHandle,
+    pub(crate) github_files: gpui::ScrollHandle,
+    pub(crate) github_pull_requests: gpui::ScrollHandle,
+}
+
+impl Scrolls {
+    fn get(&self, target: crate::effect::ScrollTarget) -> &gpui::ScrollHandle {
+        use crate::effect::ScrollTarget;
+        match target {
+            ScrollTarget::Settings => &self.settings,
+            ScrollTarget::CommandPalette => &self.palette,
+            ScrollTarget::GitHubFiles => &self.github_files,
+            ScrollTarget::GitHubPullRequests => &self.github_pull_requests,
+        }
+    }
+}
+
+/// Where a scroll request wants its surface to end up.
+enum ScrollTo {
+    Ratio(f32),
+    Offset(f32),
+    End,
 }

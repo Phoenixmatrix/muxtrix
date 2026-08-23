@@ -6,7 +6,7 @@
 
 use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Styled, div, px,
+    ParentElement, StatefulInteractiveElement, Styled, div, px,
 };
 
 use crate::app::Message;
@@ -27,7 +27,7 @@ impl Root {
         let tokens = DesignTokens::for_appearance(app.settings.appearance);
         let commands = commands::filtered(&app.palette.query);
 
-        let mut list = div().flex().flex_col().gap(px(1.)).max_h(px(420.));
+        let mut rows = div().flex().flex_col().gap(px(1.));
         for (index, command) in commands.iter().enumerate() {
             let enabled = app.command_enabled(command.action);
             let selected = index == app.palette.selected;
@@ -87,7 +87,7 @@ impl Root {
                         }),
                     );
             }
-            list = list.child(row);
+            rows = rows.child(row);
         }
 
         Some(
@@ -127,7 +127,14 @@ impl Root {
                                 .bg(color(tokens.panel))
                                 .child(gpui_component::input::Input::new(&self.inputs.palette)),
                         )
-                        .child(list),
+                        .child(
+                            div()
+                                .id("palette-list")
+                                .max_h(px(420.))
+                                .overflow_y_scroll()
+                                .track_scroll(&self.scrolls.palette)
+                                .child(rows),
+                        ),
                 )
                 .into_any_element(),
         )

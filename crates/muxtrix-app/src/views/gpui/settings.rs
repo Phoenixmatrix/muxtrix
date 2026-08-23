@@ -182,7 +182,9 @@ impl Root {
                 div()
                     .id("settings-scroll")
                     .flex_grow(1.0)
+                    .min_h(px(0.))
                     .overflow_y_scroll()
+                    .track_scroll(&self.scrolls.settings)
                     .child(body),
             )
             .into_any_element()
@@ -253,7 +255,9 @@ impl Root {
                 div()
                     .id("gallery-scroll")
                     .flex_grow(1.0)
+                    .min_h(px(0.))
                     .overflow_y_scroll()
+                    .track_scroll(&self.scrolls.settings)
                     .child(grid),
             )
             .into_any_element()
@@ -370,7 +374,9 @@ impl Root {
                 div()
                     .id("worktrees-scroll")
                     .flex_grow(1.0)
+                    .min_h(px(0.))
                     .overflow_y_scroll()
+                    .track_scroll(&self.scrolls.settings)
                     .child(rows),
             )
             .into_any_element()

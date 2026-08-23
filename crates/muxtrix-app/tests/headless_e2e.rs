@@ -348,13 +348,25 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     if capture_is_external() {
         let ready = Instant::now() + Duration::from_secs(20);
         loop {
-            let status = control_request(&control_path, r#"{"method":"e2e_status"}"#)?;
+            // The app closes its socket when it gives up, so a lost
+            // connection means it has already written why.
+            let Ok(status) = control_request(&control_path, r#"{"method":"e2e_status"}"#) else {
+                return Err(format!(
+                    "Muxtrix exited before its capture point; report: {}",
+                    std::fs::read_to_string(&report_path).unwrap_or_default()
+                )
+                .into());
+            };
             if status["capture_ready"] == true {
                 break;
             }
             if Instant::now() >= ready {
                 let _ = control_request(&control_path, r#"{"method":"quit"}"#);
-                return Err("Muxtrix never reached its capture point".into());
+                return Err(format!(
+                    "Muxtrix never reached its capture point; report: {}",
+                    std::fs::read_to_string(&report_path).unwrap_or_default()
+                )
+                .into());
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -395,7 +407,11 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     if let Some(frame) = &captured {
         merge_pixel_findings(&mut report, frame);
     }
-    let _ = std::fs::remove_file(&report_path);
+    if std::env::var_os("MUXTRIX_E2E_KEEP_REPORT").is_none() {
+        let _ = std::fs::remove_file(&report_path);
+    } else {
+        eprintln!("report kept at {}", report_path.display());
+    }
     let _ = std::fs::remove_file(&config_path);
     let _ = std::fs::remove_file(&control_path);
     let _ = std::fs::remove_file(&mouse_probe_path);
