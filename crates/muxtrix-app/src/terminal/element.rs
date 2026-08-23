@@ -12,9 +12,8 @@
 
 use gpui::{
     App, Bounds, CursorStyle, Element, ElementId, Entity, GlobalElementId, Hsla,
-    InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, ScrollWheelEvent, ShapedLine, Style, TextRun, Window, fill, point, px,
-    relative, size,
+    InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseUpEvent, Pixels,
+    ScrollWheelEvent, ShapedLine, Style, TextRun, Window, fill, point, px, relative, size,
 };
 use muxtrix_terminal::{ImageLayer, TerminalMouseButton};
 
@@ -374,7 +373,7 @@ impl Element for TerminalElement {
                 }
             });
         }
-        self.paint_mouse(bounds, origin, prepared, window);
+        self.paint_mouse(bounds, origin, prepared, window, cx);
     }
 }
 
@@ -472,14 +471,19 @@ impl TerminalElement {
         origin: gpui::Point<Pixels>,
         prepared: &PreparedGrid,
         window: &mut Window,
+        cx: &mut App,
     ) {
-        if self.obscured {
-            return;
-        }
         let pane_id = self.pane_id;
         let root = self.root.clone();
-        let cell_width = prepared.cell_width;
-        let line_height = prepared.line_height;
+        if self.obscured {
+            root.update(cx, |root, _| {
+                root.terminal_regions.remove(&pane_id);
+            });
+            return;
+        }
+        root.update(cx, |root, _| {
+            root.terminal_regions.insert(pane_id, (bounds, origin));
+        });
 
         // A hovered link only becomes clickable while the modifiers are held,
         // and the cursor is what says so.
@@ -509,44 +513,6 @@ impl TerminalElement {
                 f32::from(window_point.y - origin.y) + TERMINAL_PADDING / 2.0,
             )
         };
-
-        {
-            let root = root.clone();
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
-                #[cfg(feature = "e2e")]
-                root.update(cx, |root, _| {
-                    root.app.e2e_phase_trace.0 += 1;
-                    if phase.bubble() {
-                        root.app.e2e_phase_trace.1 += 1;
-                    }
-                });
-                if !phase.bubble() {
-                    return;
-                }
-                let inside = bounds.contains(&event.position);
-                let grid_point = position_in_grid(event.position);
-                let pane_point = position_in_pane(event.position);
-                root.update(cx, |root, cx| {
-                    // Whether this motion belongs to the program or to a
-                    // selection depends on a mode the PTY may have set since
-                    // the last frame, so read what is pending before deciding.
-                    root.drain_terminals(cx);
-                    if inside {
-                        root.dispatch_detached(Message::EnterTerminal(pane_id), cx);
-                    } else if root.app.hovered_terminal == Some(pane_id) {
-                        root.dispatch_detached(Message::LeaveTerminal(pane_id), cx);
-                    }
-                    // A drag that began on the thumb keeps steering it even
-                    // once the pointer leaves the lane, which is what makes
-                    // dragging usable.
-                    root.dispatch_detached(
-                        Message::TerminalScrollbarMoved(pane_id, pane_point),
-                        cx,
-                    );
-                    root.dispatch_detached(Message::TerminalPointerMoved(pane_id, grid_point), cx);
-                });
-            });
-        }
 
         {
             let root = root.clone();
@@ -606,7 +572,6 @@ impl TerminalElement {
                     y: pixels.y.into(),
                 },
             };
-            let _ = (cell_width, line_height);
             root.update(cx, |root, cx| {
                 root.dispatch_detached(Message::ScrollTerminal(pane_id, delta), cx);
             });

@@ -233,17 +233,17 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         thread::sleep(Duration::from_millis(20));
     }
     thread::sleep(Duration::from_millis(50));
-    // Sweep the whole usable window rather than a narrow strip around its
-    // midpoint. The workspace origin changes with sidebar width and compact
-    // layout, and a midpoint that lands on chrome never reaches the terminal
-    // hitbox. Motion outside the grid is harmless; the reporting program only
-    // receives the samples that actually cross its terminal.
+    // Every step lands somewhere new. A client that is busy drawing makes the
+    // server compress the motion it missed into one event at the final
+    // position, so a pointer that returns to where it started compresses to no
+    // movement at all and nothing is delivered. Sweeping in one direction
+    // means whatever survives compression is still a move onto a fresh cell,
+    // which is what the program under test has asked to hear about.
     //
     // The sweep keeps going for as long as the probe is listening — it drops
     // its marker when it has heard a report or given up — rather than for a
-    // fixed duration, because how long the app takes to learn that reporting
-    // is on is the renderer's business.
-    //
+    // fixed count, because how long the app takes to learn that reporting is
+    // on is the renderer's business, and a slow one needs more nudges.
     // The toolkit may have moved the window since it was pinned — a late
     // configure of its own lands whenever the event loop gets to it — and a
     // pointer event is in root coordinates. Put it back before aiming.
@@ -255,28 +255,17 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         )
         .into());
     }
-    const SAMPLES_PER_AXIS: u32 = 8;
-    let horizontal_span = final_viewport.0.saturating_sub(96);
-    let vertical_span = final_viewport.1.saturating_sub(160);
-    let mut step = 0_u32;
-    while ready_marker.exists() && step < SAMPLES_PER_AXIS * SAMPLES_PER_AXIS {
-        let column = step % SAMPLES_PER_AXIS;
-        let row = step / SAMPLES_PER_AXIS;
+    let mut step: i16 = 0;
+    while ready_marker.exists() && step < 64 {
         step += 1;
-        let x = 48 + horizontal_span * column / (SAMPLES_PER_AXIS - 1);
-        let y = 80 + vertical_span * row / (SAMPLES_PER_AXIS - 1);
         connection
             .xtest_fake_input(
                 MOTION_NOTIFY_EVENT,
                 0,
                 0,
                 root,
-                moved
-                    .dst_x
-                    .saturating_add(i16::try_from(x).map_err(|_| "pointer x exceeds X11 range")?),
-                moved
-                    .dst_y
-                    .saturating_add(i16::try_from(y).map_err(|_| "pointer y exceeds X11 range")?),
+                terminal_x.saturating_add((step % 24) * 8),
+                terminal_y.saturating_add(step / 24 * 8),
                 0,
             )?
             .check()?;

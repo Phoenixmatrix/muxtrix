@@ -12,7 +12,7 @@ use gpui::{
     size,
 };
 
-use crate::app::{Message, Muxtrix};
+use crate::app::{Message, Muxtrix, TERMINAL_PADDING};
 use crate::effect::Effect;
 use crate::input::{Key, KeyEvent, Named};
 use crate::theme::DesignTokens;
@@ -83,6 +83,16 @@ pub(crate) struct Root {
     /// against the card.
     pub(crate) pane_bounds: std::rc::Rc<
         std::cell::RefCell<std::collections::HashMap<muxtrix_domain::PaneId, Bounds<gpui::Pixels>>>,
+    >,
+    /// Terminal body and grid origins from the last painted frame.
+    ///
+    /// Pointer motion is routed from the root listener through these regions.
+    /// GPUI window listeners registered by a child can be skipped when an
+    /// intervening overlay owns propagation, while the root listener remains
+    /// the stable owner of window-wide motion.
+    pub(crate) terminal_regions: std::collections::HashMap<
+        muxtrix_domain::PaneId,
+        (Bounds<gpui::Pixels>, Point<gpui::Pixels>),
     >,
     /// Inline terminal images, decoded once and kept while the emulator still
     /// references them. Keyed by the emulator's own generation, so an image
@@ -233,6 +243,7 @@ impl Root {
             title: String::new(),
             component_theme: None,
             pane_bounds: std::rc::Rc::default(),
+            terminal_regions: std::collections::HashMap::new(),
             images: std::collections::BTreeMap::new(),
             scrolls: Scrolls::default(),
             pending_scrolls: Vec::new(),
@@ -295,6 +306,119 @@ impl Root {
         if repaint {
             cx.notify();
         }
+    }
+
+    fn terminal_pane_visible(&self, pane_id: muxtrix_domain::PaneId) -> bool {
+        if self.app.active_view != crate::app::ActiveView::Workspace {
+            return false;
+        }
+        let Ok(workspace) = self.app.active_workspace() else {
+            return false;
+        };
+        let Some(tab) = workspace.active_tab() else {
+            return false;
+        };
+        if self
+            .app
+            .maximized_pane
+            .is_some_and(|maximized| maximized != pane_id)
+        {
+            return false;
+        }
+        tab.panes.contains_key(&pane_id) && self.app.terminals.contains_key(&pane_id)
+    }
+
+    /// Route one window-level motion event into the terminal beneath it.
+    ///
+    /// A terminal selection, scrollbar drag, or reporting capture keeps
+    /// receiving motion after the pointer leaves its bounds.
+    fn dispatch_pointer_move(
+        &mut self,
+        position: Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch(
+            Message::PointerMoved(crate::geom::Point::new(
+                f32::from(position.x),
+                f32::from(position.y),
+            )),
+            window,
+            cx,
+        );
+
+        let hit = self
+            .terminal_regions
+            .iter()
+            .find(|(pane_id, (bounds, _))| {
+                self.terminal_pane_visible(**pane_id) && bounds.contains(&position)
+            })
+            .map(|(pane_id, region)| (*pane_id, *region));
+        let hit_pane = hit.map(|(pane_id, _)| pane_id);
+        if self.app.hovered_terminal != hit_pane {
+            if let Some(previous) = self.app.hovered_terminal {
+                self.dispatch_detached(Message::LeaveTerminal(previous), cx);
+            }
+            if let Some(pane_id) = hit_pane {
+                self.dispatch_detached(Message::EnterTerminal(pane_id), cx);
+            }
+        }
+
+        if let Some((pane_id, region)) = hit {
+            self.dispatch_terminal_pointer_move(pane_id, region, position, cx);
+        }
+        let captured = self
+            .app
+            .terminal_selection_drag
+            .map(|drag| drag.pane_id)
+            .or_else(|| self.app.terminal_scroll_drag.map(|drag| drag.pane_id))
+            .or_else(|| {
+                self.app
+                    .terminal_mouse_capture
+                    .map(|capture| capture.pane_id)
+            });
+        if let Some(pane_id) = captured
+            .filter(|pane_id| Some(*pane_id) != hit_pane && self.terminal_pane_visible(*pane_id))
+            && let Some(region) = self.terminal_regions.get(&pane_id).copied()
+        {
+            self.dispatch_terminal_pointer_move(pane_id, region, position, cx);
+        }
+    }
+
+    fn dispatch_terminal_pointer_move(
+        &mut self,
+        pane_id: muxtrix_domain::PaneId,
+        (bounds, origin): (Bounds<gpui::Pixels>, Point<gpui::Pixels>),
+        position: Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(feature = "e2e")]
+        {
+            self.app.e2e_phase_trace.0 += 1;
+            if bounds.contains(&position) {
+                self.app.e2e_phase_trace.1 += 1;
+            }
+        }
+        self.dispatch_detached(
+            Message::TerminalScrollbarMoved(
+                pane_id,
+                crate::geom::Point::new(
+                    f32::from(position.x - bounds.origin.x),
+                    f32::from(position.y - bounds.origin.y),
+                ),
+            ),
+            cx,
+        );
+        self.dispatch_detached(
+            Message::TerminalPointerMoved(
+                pane_id,
+                crate::geom::Point::new(
+                    f32::from(position.x - origin.x) + TERMINAL_PADDING / 2.0,
+                    f32::from(position.y - origin.y) + TERMINAL_PADDING / 2.0,
+                ),
+            ),
+            cx,
+        );
     }
 
     /// Drain the terminals once per frame.
@@ -689,11 +813,7 @@ impl Render for Root {
             // release anywhere ends whatever was in progress.
             .on_mouse_move(
                 cx.listener(|root, event: &gpui::MouseMoveEvent, window, cx| {
-                    let position = crate::geom::Point::new(
-                        f32::from(event.position.x),
-                        f32::from(event.position.y),
-                    );
-                    root.dispatch(Message::PointerMoved(position), window, cx);
+                    root.dispatch_pointer_move(event.position, window, cx);
                 }),
             )
             .on_mouse_up(
