@@ -21,11 +21,7 @@ use crate::runtime::gpui::{Root, color};
 use crate::terminal::element::TerminalElement;
 use crate::terminal::runs::rgb;
 use crate::theme::DesignTokens;
-use crate::views::gpui::{icon_button, pane_key};
-
-/// The pane header's height, matching the iced build so layout comparisons
-/// against the capture gallery stay meaningful.
-const HEADER_HEIGHT: f32 = 31.0;
+use crate::views::gpui::{icon_button, pane_key, terminal_family};
 
 impl Root {
     /// One level of the split tree.
@@ -175,6 +171,10 @@ impl Root {
             && workspace.active_tab_id == tab.id
             && tab.focused_pane_id == pane_id;
         let runtime = app.terminals.get(&pane_id);
+        let needs_attention = tab
+            .panes
+            .get(&pane_id)
+            .is_some_and(|pane| app.pane_needs_attention(pane_id, pane.attention.unread_count));
 
         // The surface takes the terminal's own background, not the chrome's:
         // a program that sets one (OSC 11) is honoured, and otherwise the
@@ -210,17 +210,74 @@ impl Root {
                 .into_any_element(),
         };
 
-        div()
+        // Panes are rounded cards. A pane that needs a person carries a full
+        // amber border and glow — the whole card, not just an edge — with
+        // focus as the accent-blue equivalent beneath it in priority.
+        let awaiting_input = app
+            .agent_statuses
+            .get(&pane_id)
+            .is_some_and(|status| status.state == muxtrix_control::AgentState::Waiting)
+            || needs_attention;
+        let (edge, glow) = if awaiting_input {
+            let mut edge = color(tokens.warning);
+            edge.a = 0.75;
+            let mut glow = color(tokens.warning);
+            glow.a = 0.22;
+            (edge, Some((glow, 0.0, 18.0)))
+        } else if focused {
+            let mut edge = color(tokens.accent);
+            edge.a = 0.62;
+            let mut glow = color(tokens.accent);
+            glow.a = 0.14;
+            (edge, Some((glow, 5.0, 16.0)))
+        } else {
+            (color(tokens.line), None)
+        };
+        let mut card = div()
             .flex()
             .flex_col()
             .size_full()
+            .p(px(1.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(edge)
             .bg(color(tokens.panel))
-            .child(self.pane_header(workspace, tab, pane_id, focused, cx))
-            .child(div().flex_grow(1.0).overflow_hidden().child(body))
-            .into_any_element()
+            .overflow_hidden();
+        if let Some((glow, offset_y, blur)) = glow {
+            card = card.shadow(vec![gpui::BoxShadow {
+                color: glow.into(),
+                offset: gpui::point(px(0.), px(offset_y)),
+                blur_radius: px(blur),
+                spread_radius: px(0.),
+                inset: false,
+            }]);
+        }
+        card.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                root.dispatch(Message::Focus(pane_id), window, cx);
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                root.dispatch(Message::OpenPaneContextMenu(pane_id), window, cx);
+            }),
+        )
+        .child(self.pane_header(workspace, tab, pane_id, focused, cx))
+        .child(
+            div()
+                .flex_grow(1.0)
+                .overflow_hidden()
+                .rounded_b(px(9.))
+                .child(body),
+        )
+        .into_any_element()
     }
 
-    /// The 31 px chrome strip above a pane.
+    /// The card's header: rounded top corners carry the card radius, and the
+    /// whole band shares one fill so it can never render two-toned. Geometry
+    /// follows the iced header to the pixel: a 34 px band over a 1 px rule.
     fn pane_header(
         &self,
         workspace: &Workspace,
@@ -233,32 +290,64 @@ impl Root {
         let tokens = DesignTokens::for_appearance(app.settings.appearance);
         let title = app.pane_title(workspace, pane_id).to_owned();
         let maximized = app.maximized_pane == Some(pane_id);
-        let single_pane = tab.panes.len() == 1;
-        let signal = app.pane_signal_kind(pane_id, false).color(tokens);
+        let needs_attention = tab
+            .panes
+            .get(&pane_id)
+            .is_some_and(|pane| app.pane_needs_attention(pane_id, pane.attention.unread_count));
+        let signal_kind = app.pane_signal_kind(pane_id, needs_attention);
+        let signal = signal_kind.color(tokens);
+        let state = app.pane_state_label(pane_id);
         let compact = crate::app::pane_header_is_compact(app.window_size.width, tab.panes.len());
+        let runtime = app.terminals.get(&pane_id);
+        let process_exited = runtime.is_some_and(|runtime| {
+            matches!(
+                runtime.launch_state,
+                crate::app::TerminalLaunchState::Exited
+            )
+        });
+        let launch_failed = runtime.is_some_and(|runtime| {
+            matches!(
+                runtime.launch_state,
+                crate::app::TerminalLaunchState::Failed(_)
+            )
+        });
+        let launch_pending = runtime.is_some_and(|runtime| {
+            matches!(
+                runtime.launch_state,
+                crate::app::TerminalLaunchState::PreparingHost
+                    | crate::app::TerminalLaunchState::Starting { .. }
+            )
+        });
+        let launch_suppressed = runtime.is_some_and(|runtime| {
+            matches!(
+                runtime.launch_state,
+                crate::app::TerminalLaunchState::Suppressed
+            )
+        });
+        let ui_size = px(app.settings.ui_pixels(9.0));
 
         let mut controls = div().flex().flex_row().items_center().gap(px(2.));
-        if !single_pane || !maximized {
-            controls = controls
-                .child(self.header_button(
-                    ("split-right", pane_key(pane_id)),
-                    IconKind::SplitRight,
-                    Message::SplitFrom(pane_id, SplitAxis::Horizontal),
-                    false,
-                    tokens,
-                    cx,
-                ))
-                .child(self.header_button(
-                    ("split-down", pane_key(pane_id)),
-                    IconKind::SplitDown,
-                    Message::SplitFrom(pane_id, SplitAxis::Vertical),
-                    false,
-                    tokens,
-                    cx,
-                ));
-        }
-        controls = controls
-            .child(self.header_button(
+        if !compact {
+            if app.maximized_pane.is_none() {
+                controls = controls
+                    .child(self.header_button(
+                        ("split-right", pane_key(pane_id)),
+                        IconKind::SplitRight,
+                        Message::SplitFrom(pane_id, SplitAxis::Horizontal),
+                        false,
+                        tokens,
+                        cx,
+                    ))
+                    .child(self.header_button(
+                        ("split-down", pane_key(pane_id)),
+                        IconKind::SplitDown,
+                        Message::SplitFrom(pane_id, SplitAxis::Vertical),
+                        false,
+                        tokens,
+                        cx,
+                    ));
+            }
+            controls = controls.child(self.header_button(
                 ("maximize", pane_key(pane_id)),
                 if maximized {
                     IconKind::Restore
@@ -269,7 +358,43 @@ impl Root {
                 false,
                 tokens,
                 cx,
-            ))
+            ));
+        }
+        let quiet = |label: &'static str, message: Message| {
+            let mut hover = color(tokens.text);
+            hover.a = 0.07;
+            div()
+                .id((label, pane_key(pane_id)))
+                .h(px(24.))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .text_size(ui_size)
+                .text_color(color(tokens.text))
+                .hover(move |style| style.bg(hover))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                        root.dispatch(message.clone(), window, cx);
+                    }),
+                )
+                .child(label)
+        };
+        if (process_exited || launch_failed) && !compact {
+            controls = controls.child(quiet("Restart", Message::RestartPane(pane_id)));
+        }
+        if launch_pending && !compact {
+            controls = controls.child(quiet("Cancel", Message::CancelTerminalLaunch(pane_id)));
+        }
+        if launch_suppressed && !compact {
+            controls = controls.child(quiet("Start terminal", Message::StartTerminal(pane_id)));
+        }
+        if !compact {
+            controls = controls.child(div().w(px(1.)).h(px(14.)).bg(color(tokens.line_strong)));
+        }
+        controls = controls
             .child(self.header_button(
                 ("overflow", pane_key(pane_id)),
                 IconKind::Overflow,
@@ -287,51 +412,69 @@ impl Root {
                 cx,
             ));
 
+        // What is actually running, when there is room to say so: the
+        // program's name in the terminal face, on a faint chip.
+        let program_chip = app
+            .pane_program(pane_id)
+            .filter(|_| !compact)
+            .map(|program| {
+                let mut chip = color(tokens.text);
+                chip.a = 0.05;
+                div()
+                    .py(px(1.))
+                    .px(px(6.))
+                    .rounded(px(4.))
+                    .bg(chip)
+                    .font_family(terminal_family(&app.settings))
+                    .text_size(px(app.settings.ui_pixels(7.5)))
+                    .text_color(color(tokens.muted))
+                    .child(program)
+            });
+        let state_label = (!compact && state != "Shell").then(|| {
+            div()
+                .text_size(ui_size)
+                .text_color(color(signal_kind.label_color(tokens)))
+                .whitespace_nowrap()
+                .child(state)
+        });
+
+        let mut unfocused = color(tokens.text);
+        unfocused.a = 0.03;
         div()
             .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .h(px(HEADER_HEIGHT))
-            .px(px(12.))
-            .bg(color(if focused {
-                tokens.panel_raised
-            } else {
-                tokens.rail
-            }))
-            .border_b(px(1.))
-            .border_color(color(tokens.line))
+            .flex_col()
+            .h(px(35.))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(6.))
-                    .min_w(px(0.))
-                    .child(div().size(px(7.)).rounded_full().bg(color(signal)))
+                    .gap(px(8.))
+                    .h(px(34.))
+                    .pl(px(12.))
+                    .pr(px(6.))
+                    .rounded_t(px(9.))
+                    .bg(if focused {
+                        color(tokens.panel_raised)
+                    } else {
+                        unfocused
+                    })
+                    .child(div().size(px(6.)).rounded_full().bg(color(signal)))
                     .child(
                         div()
-                            .text_size(px(app.settings.ui_pixels(11.0)))
+                            .min_w(px(0.))
+                            .text_size(ui_size)
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(color(if focused { tokens.text } else { tokens.muted }))
                             .truncate()
                             .child(title),
                     )
-                    // What is actually running, when there is room to say so.
-                    .children(
-                        app.pane_program(pane_id)
-                            .filter(|_| !compact)
-                            .map(|program| {
-                                div()
-                                    .px(px(5.))
-                                    .rounded(px(4.))
-                                    .bg(color(tokens.panel_raised))
-                                    .text_size(px(app.settings.ui_pixels(8.0)))
-                                    .text_color(color(tokens.faint))
-                                    .child(program)
-                            }),
-                    ),
+                    .children(program_chip)
+                    .child(div().flex_grow(1.0))
+                    .children(state_label)
+                    .child(controls),
             )
-            .child(controls)
+            .child(div().h(px(1.)).w_full().bg(color(tokens.line)))
             .into_any_element()
     }
 

@@ -154,6 +154,23 @@ pub(crate) fn system_monospace_family() -> Option<&'static str> {
     resolved_family_name(database()?, None, 400)
 }
 
+/// Concrete family selected by the platform for the generic sans-serif role.
+///
+/// Iced's `Font::DEFAULT` resolves through fontconfig to this family; GPUI,
+/// given no family at all, falls back to a face of its own choosing, and the
+/// two runtimes then set the same copy at visibly different widths. Naming
+/// the family keeps the chrome's type identical across both.
+pub(crate) fn system_sans_family() -> Option<&'static str> {
+    let database = database()?;
+    let query = Query {
+        families: &[Family::SansSerif],
+        weight: Weight(400),
+        stretch: Stretch::Normal,
+        style: Style::Normal,
+    };
+    database.face(database.query(&query)?).map(primary_family)
+}
+
 /// Chooses a face for `character` when the configured font does not cover it.
 ///
 /// Returns `None` in the common case where the configured font has the glyph.

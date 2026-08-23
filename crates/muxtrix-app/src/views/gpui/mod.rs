@@ -69,3 +69,43 @@ pub(crate) fn pane_key(pane_id: muxtrix_domain::PaneId) -> u64 {
 pub(crate) fn tab_key(tab_id: muxtrix_domain::TabId) -> u64 {
     tab_id.as_uuid().as_u128() as u64
 }
+
+/// The terminal face, resolved the way the grid resolves it, for chrome that
+/// shows a program name in monospace.
+pub(crate) fn terminal_family(settings: &crate::settings::AppSettings) -> gpui::SharedString {
+    settings
+        .terminal_font
+        .family_name()
+        .map_or_else(
+            || {
+                crate::metrics::system_monospace_family()
+                    .unwrap_or("monospace")
+                    .to_owned()
+            },
+            ToOwned::to_owned,
+        )
+        .into()
+}
+
+/// The leading mark in a rail row's gutter. Where you already are is one
+/// solid bar; where the keyboard cursor stands is a ladder of accent rungs,
+/// so the two never read as the same thing.
+pub(crate) fn rail_marker(selected: bool, targeted: bool, tokens: DesignTokens) -> Div {
+    let mut marker = div().flex().flex_col().w(px(3.)).flex_shrink_0();
+    if !targeted {
+        return marker.bg(color(if selected {
+            tokens.accent
+        } else {
+            iced::Color::TRANSPARENT
+        }));
+    }
+    for rung in 0..crate::app::RAIL_CURSOR_RUNGS {
+        let filled = rung % 2 == 0;
+        marker = marker.child(div().w(px(3.)).flex_grow(1.0).bg(color(if filled {
+            tokens.accent
+        } else {
+            iced::Color::TRANSPARENT
+        })));
+    }
+    marker
+}

@@ -605,6 +605,13 @@ impl Render for Root {
             .flex_col()
             .bg(color(tokens.app))
             .text_color(color(tokens.text))
+            // The same face iced's `Font::DEFAULT` resolves to. Left unnamed,
+            // GPUI picks a fallback of its own, and the chrome's type came out
+            // a fifth narrower than the iced build's at the same size.
+            .font_family(ui_family(&self.app.settings))
+            .font_weight(gpui::FontWeight(f32::from(
+                crate::settings::weight_numeric(self.app.settings.ui_font_weight.iced()),
+            )))
             .child(match screen {
                 Some(screen) => div().flex_grow(1.0).overflow_hidden().child(screen),
                 None => div()
@@ -634,6 +641,22 @@ impl Focusable for Root {
 ///
 /// [`DesignTokens`] stays the single source of truth for chrome colour under
 /// both runtimes; only the conversion differs.
+/// The chrome's face: the configured UI font, or the platform's sans-serif.
+pub(crate) fn ui_family(settings: &crate::settings::AppSettings) -> gpui::SharedString {
+    settings
+        .ui_font
+        .family_name()
+        .map_or_else(
+            || {
+                crate::metrics::system_sans_family()
+                    .unwrap_or("sans-serif")
+                    .to_owned()
+            },
+            ToOwned::to_owned,
+        )
+        .into()
+}
+
 pub(crate) fn color(value: iced::Color) -> gpui::Rgba {
     gpui::Rgba {
         r: value.r,
