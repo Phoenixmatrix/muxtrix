@@ -1,9 +1,9 @@
 //! App-owned keyboard input: what [`crate::Message`] carries instead of an
-//! `iced::keyboard::Event`.
+//! the framework's keyboard event.
 //!
 //! Key handling is application logic — which chord opens the palette, what
 //! bytes a key sends to the PTY — so it should not be phrased in a rendering
-//! framework's vocabulary. These types mirror the shape iced uses (a named or
+//! framework's vocabulary. These types carry the shape every framework uses (a named or
 //! character key, bitflag modifiers) closely enough that the handler reads the
 //! same, but they belong to this crate, and unit tests build them directly.
 //!
@@ -184,95 +184,6 @@ impl KeyEvent {
     }
 }
 
-fn named_from_iced(named: iced::keyboard::key::Named) -> Option<Named> {
-    use iced::keyboard::key::Named as I;
-    Some(match named {
-        I::ArrowDown => Named::ArrowDown,
-        I::ArrowLeft => Named::ArrowLeft,
-        I::ArrowRight => Named::ArrowRight,
-        I::ArrowUp => Named::ArrowUp,
-        I::Backspace => Named::Backspace,
-        I::Delete => Named::Delete,
-        I::End => Named::End,
-        I::Enter => Named::Enter,
-        I::Escape => Named::Escape,
-        I::F1 => Named::F1,
-        I::F2 => Named::F2,
-        I::F3 => Named::F3,
-        I::F4 => Named::F4,
-        I::F5 => Named::F5,
-        I::F6 => Named::F6,
-        I::F7 => Named::F7,
-        I::F8 => Named::F8,
-        I::F9 => Named::F9,
-        I::F10 => Named::F10,
-        I::F11 => Named::F11,
-        I::F12 => Named::F12,
-        I::Home => Named::Home,
-        I::Insert => Named::Insert,
-        I::PageDown => Named::PageDown,
-        I::PageUp => Named::PageUp,
-        I::Space => Named::Space,
-        I::Tab => Named::Tab,
-        _ => return None,
-    })
-}
-
-fn key_from_iced(key: &iced::keyboard::Key) -> Key {
-    match key {
-        iced::keyboard::Key::Named(named) => {
-            named_from_iced(*named).map_or(Key::Unidentified, Key::Named)
-        }
-        iced::keyboard::Key::Character(character) => Key::Character(character.to_string()),
-        iced::keyboard::Key::Unidentified => Key::Unidentified,
-    }
-}
-
-fn modifiers_from_iced(modifiers: iced::keyboard::Modifiers) -> Modifiers {
-    let mut result = Modifiers::empty();
-    if modifiers.shift() {
-        result = result | Modifiers::SHIFT;
-    }
-    if modifiers.control() {
-        result = result | Modifiers::CTRL;
-    }
-    if modifiers.alt() {
-        result = result | Modifiers::ALT;
-    }
-    if modifiers.logo() {
-        result = result | Modifiers::LOGO;
-    }
-    result
-}
-
-/// Translate an iced keyboard event into the app's own vocabulary.
-///
-/// This is the only place iced's keyboard types are read; everything
-/// downstream works in [`KeyEvent`].
-pub(crate) fn from_iced(event: &iced::keyboard::Event) -> KeyEvent {
-    match event {
-        iced::keyboard::Event::KeyPressed {
-            key,
-            modified_key,
-            modifiers,
-            text,
-            ..
-        } => KeyEvent::Pressed(KeyInput {
-            key: key_from_iced(key),
-            modified_key: key_from_iced(modified_key),
-            modifiers: modifiers_from_iced(*modifiers),
-            text: text.as_ref().map(ToString::to_string),
-            repeat: false,
-        }),
-        iced::keyboard::Event::KeyReleased { modifiers, .. } => KeyEvent::Released {
-            modifiers: modifiers_from_iced(*modifiers),
-        },
-        iced::keyboard::Event::ModifiersChanged(modifiers) => {
-            KeyEvent::ModifiersChanged(modifiers_from_iced(*modifiers))
-        }
-    }
-}
-
 /// Translate a GPUI keystroke into the app's own vocabulary.
 ///
 /// GPUI names keys the way a keymap file does — lower-case, `"pageup"`,
@@ -282,7 +193,6 @@ pub(crate) fn from_iced(event: &iced::keyboard::Event) -> KeyEvent {
 /// must survive a layout (`Cmd+2` for the second workspace) match on `key`;
 /// everything else matches what the user actually produced, so `key_char`
 /// becomes both the modified key and the insertable text.
-#[cfg(feature = "gpui")]
 pub(crate) fn from_keystroke(keystroke: &gpui::Keystroke) -> KeyInput {
     let key = key_from_name(&keystroke.key);
     // A `key_char` that names a single character is a modified key; anything
@@ -300,7 +210,6 @@ pub(crate) fn from_keystroke(keystroke: &gpui::Keystroke) -> KeyInput {
     }
 }
 
-#[cfg(feature = "gpui")]
 pub(crate) fn modifiers_from_gpui(modifiers: gpui::Modifiers) -> Modifiers {
     let mut result = Modifiers::empty();
     if modifiers.shift {
@@ -325,7 +234,6 @@ pub(crate) fn modifiers_from_gpui(modifiers: gpui::Modifiers) -> Modifiers {
 /// Anything not named here is a character key if it is a single character, and
 /// otherwise unmodelled — which reaches the terminal untouched, the same
 /// outcome an unbound key already had.
-#[cfg(feature = "gpui")]
 fn key_from_name(name: &str) -> Key {
     let named = match name {
         "down" => Named::ArrowDown,
@@ -366,7 +274,7 @@ fn key_from_name(name: &str) -> Key {
     Key::Named(named)
 }
 
-#[cfg(all(test, feature = "gpui"))]
+#[cfg(test)]
 mod gpui_tests {
     use super::*;
 

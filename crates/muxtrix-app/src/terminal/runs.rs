@@ -5,28 +5,11 @@
 //! per cell — and the split is deliberately renderer-agnostic so the same
 //! model feeds both the grid and the theme previews.
 
-use iced::Color;
+use crate::theme::Color;
 use muxtrix_terminal::GridSnapshot;
 
 use crate::app::{TerminalLink, detected_web_link_ranges, is_valid_web_url};
-use crate::metrics;
-use crate::settings::{self, AppSettings};
 use crate::themes::TerminalThemePreset;
-
-/// Shrinks bold text when the bold face is wider than one grid cell.
-///
-/// The grid is one uniform advance wide, taken from the regular face. Most
-/// monospace families keep bold at the same advance, so this is usually `1.0`.
-pub(crate) fn bold_size_scale(settings: &AppSettings, cell_ratio: f32) -> f32 {
-    let bold_ratio = metrics::advance_ratio(
-        settings.terminal_font.family_name(),
-        settings::weight_numeric(settings.terminal_font_weight.bold_variant()),
-    );
-    match bold_ratio {
-        Some(bold) if bold > cell_ratio && cell_ratio > 0.0 => cell_ratio / bold,
-        _ => 1.0,
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TerminalRunStyle {
@@ -93,10 +76,6 @@ pub(crate) enum TerminalRunKind {
 }
 
 impl TerminalRunKind {
-    pub(crate) const fn needs_fallback(self) -> bool {
-        matches!(self, Self::JoinedCellGlyph(_) | Self::IsolatedUnicode)
-    }
-
     pub(crate) fn can_join(self, next: Self) -> bool {
         matches!(
             (self, next),

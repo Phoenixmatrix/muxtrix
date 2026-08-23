@@ -1,7 +1,7 @@
 # GPU selection and diagnostics
 
-Muxtrix uses Iced's wgpu compositor. Platform backends are Direct3D 12 on
-Windows, Metal on macOS, and Vulkan or OpenGL/EGL on native Linux.
+Muxtrix draws through GPUI. Platform backends are DirectX on Windows, Metal on
+macOS, and wgpu on Linux, which maps to Vulkan or OpenGL/EGL.
 
 ## WSLg
 
@@ -10,7 +10,7 @@ host, the hardware graphics route is Mesa Gallium's D3D12 driver rather than
 Vulkan:
 
 ```text
-Iced / wgpu GL backend
+GPUI / wgpu GL backend
   -> EGL / OpenGL
   -> Mesa Gallium d3d12
   -> /dev/dxg
@@ -18,7 +18,7 @@ Iced / wgpu GL backend
   -> a discrete NVIDIA GPU
 ```
 
-Before Iced starts, Muxtrix detects WSL and safely re-executes itself with these
+Before GPUI starts, Muxtrix detects WSL and safely re-executes itself with these
 process-local defaults when the corresponding variables are not already set:
 
 ```text
@@ -39,7 +39,7 @@ the NVIDIA adapter is still selected. The process-local
 EGL diagnostics. Set `EGL_LOG_LEVEL` explicitly before launch to choose another
 verbosity.
 
-Re-execution avoids mutating the environment after Rust or Iced has started
+Re-execution avoids mutating the environment after Rust or GPUI has started
 threads. It changes neither the user's shell configuration nor global WSL
 configuration. It also preserves `WAYLAND_DISPLAY`, `DISPLAY`, and
 `XDG_SESSION_TYPE`: the accelerated GL/D3D12 route requires WSLg's native
@@ -67,8 +67,8 @@ cargo run --bin muxtrix-gpu-probe -- \
   --require-adapter NVIDIA
 ```
 
-The probe applies the same bootstrap defaults, enumerates wgpu adapters, uses
-Iced's high-performance power preference, rejects CPU/`llvmpipe` adapters when
+The probe applies the same bootstrap defaults, enumerates wgpu adapters, asks
+for the high-performance power preference, rejects CPU/`llvmpipe` adapters when
 `--require-hardware` is present, and optionally checks the selected adapter's
 description.
 
@@ -83,12 +83,12 @@ GPU requirements satisfied.
 reports `llvmpipe` because the working hardware path is Mesa D3D12 through
 OpenGL/EGL. Use the Muxtrix probe instead.
 
-## GPUI (port in progress)
+## GPUI
 
-`docs/GPUI_PORT_PLAN.md` replaces Iced with GPUI. Phase 1 is a spike —
-`crates/muxtrix-gpui-spike` — that puts the two risky things on screen (the
-stock `gpui-component` widgets and a 200x60 monospace grid shaped one line per
-row) and reports the adapter and frame cost. What it has established so far:
+`docs/GPUI_PORT_PLAN.md` records the port from Iced to GPUI. Its Phase 1 spike
+— `crates/muxtrix-gpui-spike` — put the two risky things on screen (the stock
+`gpui-component` widgets and a 200x60 monospace grid shaped one line per row)
+and reported the adapter and frame cost. What it established:
 
 ### Dependency resolution
 
@@ -116,8 +116,7 @@ to a revision whose lockfile names a zed revision is enough — it is not.
 
 ### Linux build dependencies
 
-GPUI links `xkbcommon-x11`, which Iced did not. Beyond the existing set, a
-Linux build now needs:
+GPUI links `xkbcommon-x11`. Beyond the historical set, a Linux build needs:
 
 ```bash
 sudo apt-get install -y libxkbcommon-x11-dev libgl1-mesa-dev

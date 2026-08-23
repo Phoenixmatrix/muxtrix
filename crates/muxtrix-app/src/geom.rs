@@ -1,11 +1,10 @@
 //! App-owned geometry: the shapes [`crate::Message`] and `update` speak in.
 //!
-//! These deliberately duplicate `iced::Point`, `iced::Size` and
-//! `iced::mouse::ScrollDelta` rather than re-using them. State and message
+//! These are the app's own rather than the framework's. State and message
 //! payloads are application facts, not rendering facts, so they should not
 //! change type when the renderer does — and unit tests can build them without
 //! standing up a UI framework. Conversions at the boundary keep the view layer
-//! talking to iced in iced's own terms.
+//! talking to the framework in its own terms.
 
 /// A position in logical pixels, origin top-left.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -22,18 +21,6 @@ impl Point {
     }
 }
 
-impl From<iced::Point> for Point {
-    fn from(value: iced::Point) -> Self {
-        Self::new(value.x, value.y)
-    }
-}
-
-impl From<Point> for iced::Point {
-    fn from(value: Point) -> Self {
-        Self::new(value.x, value.y)
-    }
-}
-
 /// An extent in logical pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct Size {
@@ -47,18 +34,6 @@ impl Size {
     }
 }
 
-impl From<iced::Size> for Size {
-    fn from(value: iced::Size) -> Self {
-        Self::new(value.width, value.height)
-    }
-}
-
-impl From<Size> for iced::Size {
-    fn from(value: Size) -> Self {
-        Self::new(value.width, value.height)
-    }
-}
-
 /// One wheel or trackpad movement.
 ///
 /// The two variants are not interchangeable: line deltas are discrete notches
@@ -69,11 +44,22 @@ pub(crate) enum ScrollDelta {
     Pixels { x: f32, y: f32 },
 }
 
-impl From<iced::mouse::ScrollDelta> for ScrollDelta {
-    fn from(value: iced::mouse::ScrollDelta) -> Self {
-        match value {
-            iced::mouse::ScrollDelta::Lines { x, y } => Self::Lines { x, y },
-            iced::mouse::ScrollDelta::Pixels { x, y } => Self::Pixels { x, y },
-        }
+/// An axis-aligned rectangle in logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct Rect {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) width: f32,
+    pub(crate) height: f32,
+}
+
+#[cfg(test)]
+impl Rect {
+    pub(crate) const fn position(&self) -> Point {
+        Point::new(self.x, self.y)
+    }
+
+    pub(crate) const fn size(&self) -> Size {
+        Size::new(self.width, self.height)
     }
 }

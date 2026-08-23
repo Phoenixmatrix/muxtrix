@@ -19,8 +19,11 @@ publish = false
 repository = "https://github.com/Phoenixmatrix/muxtrix"
 
 [workspace.dependencies]
+# Only for the headless adapter probe (`gpu.rs`, `doctor`, `muxtrix-gpu-probe`);
+# the window is drawn by GPUI, which carries its own copy at the same version.
+wgpu = { version = "29.0.4", default-features = false, features = ["wgsl", "vulkan", "gles", "dx12", "metal"] }
+pollster = "0.4"
 async-channel = "2.5.0"
-iced = { version = "0.14.0", features = ["advanced", "canvas", "image", "tokio", "wgpu", "svg"] }
 # GPUI predates its Linux wgpu renderer on crates.io, and Muxtrix needs the GL
 # fallback for WSLg, so these come from git rather than a release.
 #

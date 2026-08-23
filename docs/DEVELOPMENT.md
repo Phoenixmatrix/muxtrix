@@ -37,8 +37,8 @@ cargo test -p muxtrix --features e2e --test headless_e2e -- --test-threads=1
 ```
 
 This requires `Xvfb` and `xvfb-run`. The test creates a private virtual display,
-forces winit to X11 and wgpu to Mesa Vulkan/llvmpipe, injects input through the
-XTest extension, captures an Iced GPU screenshot, and exits automatically. It
+forces X11 and wgpu to Mesa Vulkan/llvmpipe, injects input through the XTest
+extension, photographs the window from the X server, and exits automatically. It
 does not connect to WSLg and cannot place a window on the host desktop. See
 `docs/TESTING.md` for its assertions and architecture.
 

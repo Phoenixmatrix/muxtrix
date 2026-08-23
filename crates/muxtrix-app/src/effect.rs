@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use crate::app::Message;
-use crate::geom::Size;
 
 /// A side effect `update` wants performed.
 pub(crate) enum Effect {
@@ -30,8 +29,6 @@ pub(crate) enum Effect {
     /// list whose length is still settling is not the same position.
     #[cfg(feature = "e2e")]
     ScrollToEnd(ScrollTarget),
-    /// Constrain window resizing to whole terminal cells.
-    SetResizeIncrements(Size),
     /// Grab the window's pixels. Only the e2e harness asks for this.
     #[cfg(feature = "e2e")]
     Capture,

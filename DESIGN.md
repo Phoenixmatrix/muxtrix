@@ -1,10 +1,10 @@
 # Muxtrix Design Direction
 
-Muxtrix is a native Rust/Iced live-gate-board interface. Its visual language should make fleet and pane state readable at a glance without inventing activity or metadata.
+Muxtrix is a native Rust/GPUI live-gate-board interface. Its visual language should make fleet and pane state readable at a glance without inventing activity or metadata.
 
 ## Foundations
 
-Use the semantic `DesignTokens` in `crates/muxtrix-app/src/main.rs`. Do not introduce ad hoc colors, spacing, or typography where an existing semantic token applies.
+Use the semantic `DesignTokens` in `crates/muxtrix-app/src/theme.rs`. Do not introduce ad hoc colors, spacing, or typography where an existing semantic token applies.
 
 The appearance setting supports System, Dark, and Light. System currently resolves to dark, and only the dark appearance is polished. Treat Light as supported configuration, not as a visually complete reference.
 
@@ -12,7 +12,7 @@ The default UI type size is 16 pt and its default weight is Regular. Settings
 offers only the weights available for the selected interface family; interface
 family and weight changes take effect after restart. Terminal content defaults
 to 14 pt, using platform point conversion. Ghostty VT content is rendered
-through Iced/wgpu.
+through GPUI.
 
 Terminal box-drawing and block-element sequences retain fixed grid ownership
 without per-cell seams. The complete U+2500..=U+257F box-drawing block renders
@@ -299,8 +299,8 @@ band in settings centers its content: a band that sets a height without
 centering renders flush against its top edge and clips the controls inside it.
 
 The return label and the title sit on one line either side of that rule, so
-they are read against each other and share a baseline. Iced centers each
-label's line box rather than aligning baselines, so the two hold that baseline
+they are read against each other and share a baseline. The toolkit centers
+each label's line box rather than aligning baselines, so the two hold that baseline
 by sharing one type size and separating themselves by weight and color; a
 second size on the line would drift with the interface type-size setting. The
 rule keeps an equal optical gap from the words on both sides, which is not one

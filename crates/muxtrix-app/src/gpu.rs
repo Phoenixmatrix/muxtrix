@@ -3,8 +3,6 @@
 use std::ffi::OsString;
 use std::io;
 
-use iced::wgpu;
-
 pub const WGPU_BACKEND: &str = "WGPU_BACKEND";
 pub const MESA_ADAPTER: &str = "MESA_D3D12_DEFAULT_ADAPTER_NAME";
 pub const GALLIUM_DRIVER: &str = "GALLIUM_DRIVER";
@@ -96,12 +94,11 @@ pub fn is_wsl() -> bool {
 /// policy as the application, without creating a window or surface.
 pub fn probe_adapters() -> Result<AdapterProbe, String> {
     let backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends,
-        ..wgpu::InstanceDescriptor::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
-    let available = instance
-        .enumerate_adapters(backends)
+    let available = pollster::block_on(instance.enumerate_adapters(backends))
         .into_iter()
         .map(|adapter| adapter.get_info())
         .collect::<Vec<_>>();
@@ -109,14 +106,13 @@ pub fn probe_adapters() -> Result<AdapterProbe, String> {
         return Err("wgpu did not enumerate any adapters".into());
     }
 
-    let selected =
-        iced::futures::executor::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .map_err(|error| error.to_string())?
-        .get_info();
+    let selected = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .map_err(|error| error.to_string())?
+    .get_info();
 
     Ok(AdapterProbe {
         backends,

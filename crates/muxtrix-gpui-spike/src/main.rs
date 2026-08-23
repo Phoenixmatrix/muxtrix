@@ -14,9 +14,9 @@ use std::time::Instant;
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext, Bounds, Context, Font, FontFeatures, FontStyle, FontWeight,
-    Hsla, IntoElement, ParentElement, Pixels, Render, SharedString, Styled, TextAlign, TextRun,
-    Window, WindowBounds, WindowOptions, div, point, px, rgb, size,
+    App, AppContext, Bounds, Context, Font, FontFeatures, FontStyle, FontWeight, Hsla, IntoElement,
+    ParentElement, Pixels, Render, SharedString, Styled, TextAlign, TextRun, Window, WindowBounds,
+    WindowOptions, div, point, px, rgb, size,
 };
 
 /// Matches the terminal Muxtrix opens by default, which is the size the grid
@@ -82,10 +82,9 @@ impl Spike {
     fn new() -> Self {
         // A deterministic mix of ASCII, box drawing and wide glyphs — the three
         // things the real grid has to shape.
-        let alphabet: Vec<char> =
-            "abcdefghijklmnopqrstuvwxyz0123456789 ─│┌┐└┘├┤┬┴┼━┃╭╮╰╯█▓▒░"
-                .chars()
-                .collect();
+        let alphabet: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789 ─│┌┐└┘├┤┬┴┼━┃╭╮╰╯█▓▒░"
+            .chars()
+            .collect();
         let rows = (0..GRID_ROWS)
             .map(|row| {
                 let text: String = (0..GRID_COLUMNS)
@@ -154,7 +153,10 @@ impl Render for Spike {
         let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
         let fps = f64::from(self.frames) / elapsed;
 
-        if self.frame_budget.is_some_and(|budget| self.frames >= budget) {
+        if self
+            .frame_budget
+            .is_some_and(|budget| self.frames >= budget)
+        {
             let frames = self.frames;
             println!(
                 "spike: {frames} frames in {elapsed:.2}s ({fps:.0} fps), \
@@ -181,9 +183,13 @@ impl Render for Spike {
                     .flex_col()
                     .gap_2()
                     .child("muxtrix-gpui-spike")
-                    .child(SharedString::from(format!("cols x rows: {GRID_COLUMNS} x {GRID_ROWS}")))
+                    .child(SharedString::from(format!(
+                        "cols x rows: {GRID_COLUMNS} x {GRID_ROWS}"
+                    )))
                     .child(SharedString::from(format!("cell width: {:?}", cell_width)))
-                    .child(SharedString::from(format!("shape: {shape_micros} us/frame")))
+                    .child(SharedString::from(format!(
+                        "shape: {shape_micros} us/frame"
+                    )))
                     .child(SharedString::from(format!("fps: {fps:.0}")))
                     .child(gpui_component::button::Button::new("primary").label("Primary"))
                     .child(gpui_component::checkbox::Checkbox::new("check").label("Checkbox"))

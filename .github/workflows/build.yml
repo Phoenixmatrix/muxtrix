@@ -22,7 +22,7 @@ jobs:
   checks:
     name: Checks and headless E2E
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Check out source
@@ -56,6 +56,8 @@ jobs:
             echo "apt-get update stalled (attempt ${attempt}/3); retrying"
           done
           sudo apt-get install --yes --no-install-recommends \
+            libfontconfig-dev \
+            libfreetype-dev \
             libgl1-mesa-dev \
             libvulkan-dev \
             libwayland-dev \
@@ -67,6 +69,7 @@ jobs:
             libxinerama-dev \
             libxrandr-dev \
             mesa-vulkan-drivers \
+            libzstd-dev \
             pkg-config \
             xauth \
             xvfb

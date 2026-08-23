@@ -612,7 +612,7 @@ impl Root {
                         .child("No other worktrees are registered for this repository."),
                 );
             } else {
-                let pill = |label: String, hue: iced::Color| {
+                let pill = |label: String, hue: crate::theme::Color| {
                     let mut fill = color(hue);
                     fill.a = 0.12;
                     div()
@@ -679,12 +679,12 @@ impl Root {
                             .border_color(if selected {
                                 selected_edge
                             } else {
-                                color(iced::Color::TRANSPARENT)
+                                color(crate::theme::Color::TRANSPARENT)
                             })
                             .bg(if selected {
                                 selected_fill
                             } else {
-                                color(iced::Color::TRANSPARENT)
+                                color(crate::theme::Color::TRANSPARENT)
                             })
                             .child(
                                 div()

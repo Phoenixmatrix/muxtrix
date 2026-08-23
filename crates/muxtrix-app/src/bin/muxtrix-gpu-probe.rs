@@ -2,7 +2,6 @@
 
 use std::process::ExitCode;
 
-use iced::wgpu;
 use muxtrix::gpu;
 
 #[derive(Debug, Default)]

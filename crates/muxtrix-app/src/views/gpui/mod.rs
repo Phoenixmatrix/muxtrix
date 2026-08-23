@@ -98,7 +98,7 @@ pub(crate) fn rail_marker(selected: bool, targeted: bool, tokens: DesignTokens) 
         return marker.bg(color(if selected {
             tokens.accent
         } else {
-            iced::Color::TRANSPARENT
+            crate::theme::Color::TRANSPARENT
         }));
     }
     for rung in 0..crate::app::RAIL_CURSOR_RUNGS {
@@ -106,7 +106,7 @@ pub(crate) fn rail_marker(selected: bool, targeted: bool, tokens: DesignTokens) 
         marker = marker.child(div().w(px(3.)).flex_grow(1.0).bg(color(if filled {
             tokens.accent
         } else {
-            iced::Color::TRANSPARENT
+            crate::theme::Color::TRANSPARENT
         })));
     }
     marker

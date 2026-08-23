@@ -27,7 +27,8 @@ use crate::runtime::gpui::color;
 use crate::settings::AppSettings;
 use crate::terminal::box_painter::GpuiBoxPainter;
 use crate::terminal::runs::{
-    TerminalRunGeometry, TerminalStyleRun, rgb, terminal_row_style_runs, terminal_run_geometry,
+    TerminalRunGeometry, TerminalStyleRun, TerminalUnderlineDecoration, rgb,
+    terminal_row_style_runs, terminal_run_geometry, terminal_underline_decoration,
 };
 use crate::theme::DesignTokens;
 use crate::themes::TerminalThemePreset;
@@ -87,9 +88,6 @@ pub(crate) struct PreparedGrid {
     lines: Vec<PreparedRow>,
     cell_width: Pixels,
     line_height: Pixels,
-    /// Set when the bounds imply a different number of rows or columns than
-    /// the runtime last reported.
-    resized_to: Option<Size>,
     /// The grid's share of the window, which scopes the pointer cursor.
     hitbox: gpui::Hitbox,
 }
@@ -158,12 +156,6 @@ impl TerminalElement {
                 || app.close_workspace_prompt.is_some()
                 || app.default_agent_prompt,
         })
-    }
-
-    /// The size in pixels the grid occupies, which the caller compares against
-    /// the pane to decide whether the PTY needs resizing.
-    pub(crate) fn resized_to(prepared: &PreparedGrid) -> Option<Size> {
-        prepared.resized_to
     }
 }
 
@@ -270,9 +262,17 @@ impl Element for TerminalElement {
             self.theme,
         );
 
+        let bold_weight = self.settings.terminal_font_weight.bold_variant();
         let mut lines = Vec::with_capacity(rows.len());
         for row in &rows {
-            lines.push(prepare_row(row, &font, font_size, cell_width, window));
+            lines.push(prepare_row(
+                row,
+                &font,
+                bold_weight,
+                font_size,
+                cell_width,
+                window,
+            ));
         }
         let _ = usable;
 
@@ -280,7 +280,6 @@ impl Element for TerminalElement {
             lines,
             cell_width,
             line_height,
-            resized_to,
             hitbox: window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
         }
     }
@@ -517,6 +516,8 @@ impl TerminalElement {
                     root.drain_terminals(cx);
                     if inside {
                         root.dispatch_detached(Message::EnterTerminal(pane_id), cx);
+                    } else if root.app.hovered_terminal == Some(pane_id) {
+                        root.dispatch_detached(Message::LeaveTerminal(pane_id), cx);
                     }
                     // A drag that began on the thumb keeps steering it even
                     // once the pointer leaves the lane, which is what makes
@@ -610,6 +611,7 @@ fn terminal_button(button: MouseButton) -> Option<TerminalMouseButton> {
 fn prepare_row(
     row: &[TerminalStyleRun],
     font: &gpui::Font,
+    bold_weight: crate::settings::FontWeight,
     font_size: Pixels,
     cell_width: Pixels,
     window: &mut Window,
@@ -668,8 +670,10 @@ fn prepare_row(
             continue;
         }
         let mut face = font.clone();
+        // Bold steps up from the configured weight rather than to one fixed
+        // face, so a family set to Medium still has somewhere to go.
         face.weight = if run.style.bold {
-            gpui::FontWeight::BOLD
+            gpui::FontWeight(f32::from(bold_weight.numeric()))
         } else {
             font.weight
         };
@@ -678,13 +682,34 @@ fn prepare_row(
         } else {
             gpui::FontStyle::Normal
         };
+        // Links own their underline: dotted until the modifiers make them
+        // clickable, then solid — a printed URL the program itself underlined
+        // must not look live until it is.
+        let foreground: gpui::Hsla = color(rgb(run.style.foreground)).into();
+        let underline = match terminal_underline_decoration(run.style) {
+            TerminalUnderlineDecoration::None => None,
+            TerminalUnderlineDecoration::Dotted => Some(gpui::UnderlineStyle {
+                thickness: px(1.),
+                color: Some(foreground),
+                wavy: true,
+            }),
+            TerminalUnderlineDecoration::Solid => Some(gpui::UnderlineStyle {
+                thickness: px(1.),
+                color: Some(foreground),
+                wavy: false,
+            }),
+        };
+        let strikethrough = run.style.strikethrough.then_some(gpui::StrikethroughStyle {
+            thickness: px(1.),
+            color: Some(foreground),
+        });
         runs.push(TextRun {
             len: run.text.len(),
             font: face,
-            color: color(rgb(run.style.foreground)).into(),
+            color: foreground,
             background_color: None,
-            underline: None,
-            strikethrough: None,
+            underline,
+            strikethrough,
         });
         text.push_str(&run.text);
         column += run.columns;
@@ -720,16 +745,14 @@ pub(crate) fn terminal_font(settings: &AppSettings) -> gpui::Font {
     gpui::Font {
         family: family.into(),
         features: gpui::FontFeatures::default(),
-        weight: gpui::FontWeight(f32::from(crate::settings::weight_numeric(
-            settings.terminal_font_weight.iced(),
-        ))),
+        weight: gpui::FontWeight(f32::from(settings.terminal_font_weight.numeric())),
         style: gpui::FontStyle::Normal,
         fallbacks: None,
     }
 }
 
 /// A grid-local rectangle in window coordinates.
-fn to_bounds(origin: gpui::Point<Pixels>, rect: iced::Rectangle) -> Bounds<Pixels> {
+fn to_bounds(origin: gpui::Point<Pixels>, rect: crate::geom::Rect) -> Bounds<Pixels> {
     Bounds {
         origin: point(origin.x + px(rect.x), origin.y + px(rect.y)),
         size: size(px(rect.width), px(rect.height)),

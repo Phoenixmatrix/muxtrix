@@ -47,7 +47,7 @@ impossible to open a terminal:
 
 ## Goals
 
-1. No external process, filesystem, or IPC operation may block Iced's update or
+1. No external process, filesystem, or IPC operation may block the UI's update or
    rendering thread.
 2. The first usable application frame must not depend on a session daemon or
    terminal process being ready.
@@ -97,7 +97,7 @@ Relevant implementation:
 ### User actions launch synchronously
 
 Split, new-workspace, new-tab, worktree-terminal, and restart paths call
-`TerminalRuntime::launch` directly from Iced message handling. Their model
+`TerminalRuntime::launch` directly from the application's message handling. Their model
 mutation order is inconsistent:
 
 - A split is inserted before launch.
@@ -294,7 +294,7 @@ flows to:
 
 1. Validate local input.
 2. Insert or update the pane model and pending runtime.
-3. Return control to Iced.
+3. Return control to the UI loop.
 4. Submit a launch request as a task.
 5. Apply success or failure only if the attempt ID is current.
 
@@ -305,7 +305,7 @@ silently terminate healthy work while probing a replacement backend.
 ### 2. Move bootstrap behind the first frame
 
 `Muxtrix::new` should build settings, local workspace state, controls, and a
-pending initial pane without launching a process. `boot` should return an Iced
+pending initial pane without launching a process. `boot` should return a UI
 task that initializes the session host and then requests the first terminal.
 
 If the session host cannot initialize, report `Session host unavailable` and
@@ -320,7 +320,7 @@ and IPC dependencies from first-frame availability.
 ### 3. Add a launch supervisor
 
 The first implementation may reuse the existing background-task bridge to move
-launch work off Iced, but the durable owner should be a launch supervisor with:
+launch work off the UI thread, but the durable owner should be a launch supervisor with:
 
 - a bounded command queue;
 - at most one active launch per backend while that backend is unhealthy;
@@ -388,7 +388,7 @@ thread. Split teardown into:
 
 Preserve the existing multiplexer contract: dropping the GUI detaches
 daemon-owned panes, while an explicit pane close requests termination. The
-difference is that neither operation waits on Iced.
+difference is that neither operation waits on the UI thread.
 
 ### 7. Move adjacent probes behind loading states
 
@@ -458,7 +458,7 @@ spawn dispatch, message coalescing, and nonblocking teardown.
 Acceptance:
 
 - A blocked spawn does not delay input or resize in an existing pane.
-- Layout persistence cannot block Iced.
+- Layout persistence cannot block the UI thread.
 - Closing a stuck pane never waits for its worker.
 - Spawn failures retain their structured error text.
 - Writer and launch queues have tested bounds and saturation behavior.
@@ -480,7 +480,7 @@ Acceptance:
 
 ### Stage 4: adjacent section hardening and optional process isolation
 
-Move session and worktree probes off Iced, then decide from Windows evidence
+Move session and worktree probes off the UI thread, then decide from Windows evidence
 whether a per-pane helper is necessary for hard cancellation.
 
 Acceptance:
@@ -529,7 +529,7 @@ Stage 1. It improves the reported incident before changing the daemon protocol.
 ### 1. Add an injectable hung-launch test seam
 
 Why first: the bug is otherwise difficult and unsafe to reproduce. A barrier-
-controlled fake launcher lets every later change prove that the Iced handler
+controlled fake launcher lets every later change prove that the message handler
 returns before the backend does.
 
 Scope:
@@ -579,7 +579,7 @@ Why fourth: this makes a fresh Muxtrix instance a reliable recovery surface.
 Scope:
 
 - Build `Muxtrix` with a pending initial pane.
-- Start session-host initialization through an Iced task.
+- Start session-host initialization through an effect.
 - Chain the initial launch only after host initialization resolves.
 - Add `--no-terminal` while this path is already being separated.
 

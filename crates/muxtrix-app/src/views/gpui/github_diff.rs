@@ -302,7 +302,7 @@ impl Root {
         tokens: DesignTokens,
     ) -> AnyElement {
         let settings = &self.app().settings;
-        let faded = |hue: iced::Color| {
+        let faded = |hue: crate::theme::Color| {
             let mut faded = color(hue);
             faded.a = 0.10;
             faded

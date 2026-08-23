@@ -38,7 +38,7 @@ const GITHUB_LOADING_INTERVAL: Duration = Duration::from_millis(90);
 const E2E_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Start the application and run it until the window closes.
-pub(crate) fn run() -> iced::Result {
+pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
         .run(|cx: &mut App| {
@@ -123,6 +123,7 @@ impl Root {
             let offset = match request {
                 ScrollTo::Ratio(ratio) => travel * ratio.clamp(0.0, 1.0),
                 ScrollTo::Offset(offset) => px(*offset).min(travel),
+                #[cfg(feature = "e2e")]
                 ScrollTo::End => travel,
             };
             handle.set_offset(point(px(0.), -offset));
@@ -272,9 +273,15 @@ impl Root {
         // at one key per frame, because the draw happens inline before the
         // next X event is read — enough to fall seconds behind a paste or an
         // automated run.
-        let terminal_key = matches!(message, Message::Keyboard(KeyEvent::Pressed(_)))
-            && self.app.focus_target().is_none();
-        let before = terminal_key.then(|| (self.app.grid_revision(), self.app.chrome_revision()));
+        // Pointer motion arrives many times a frame and changes nothing to
+        // draw unless a drag is under way; it is fingerprinted like a key.
+        let quiet = (matches!(message, Message::Keyboard(KeyEvent::Pressed(_)))
+            && self.app.focus_target().is_none())
+            || (matches!(message, Message::PointerMoved(_))
+                && self.app.split_drag.is_none()
+                && self.app.tab_drag.is_none()
+                && self.app.terminal_scroll_drag.is_none());
+        let before = quiet.then(|| (self.app.grid_revision(), self.app.chrome_revision()));
         let effects = self.app.update(message);
         let repaint = before
             .is_none_or(|before| before != (self.app.grid_revision(), self.app.chrome_revision()));
@@ -387,9 +394,6 @@ impl Root {
                 let contents = cx.read_from_clipboard().and_then(|item| item.text());
                 self.dispatch_detached(map(contents), cx);
             }
-            // GPUI has no resize-increment API. Documented as an accepted loss
-            // in docs/GPU.md; WSLg and Wayland lose whole-cell resizing.
-            Effect::SetResizeIncrements(_) => {}
             // Focusing needs a window, and effects run without one — a timer
             // can produce them. Recorded here and applied on the next frame,
             // which is soon enough for a caret to appear.
@@ -648,6 +652,24 @@ impl Render for Root {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_key_up(cx.listener(Self::on_key_up))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
+            // Window-level pointer tracking: a split handle or a tab that was
+            // grabbed keeps following the pointer wherever it goes, and a
+            // release anywhere ends whatever was in progress.
+            .on_mouse_move(
+                cx.listener(|root, event: &gpui::MouseMoveEvent, window, cx| {
+                    let position = crate::geom::Point::new(
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                    );
+                    root.dispatch(Message::PointerMoved(position), window, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|root, _: &gpui::MouseUpEvent, window, cx| {
+                    root.dispatch(Message::EndPointerInteraction, window, cx);
+                }),
+            )
             .size_full()
             .flex()
             .flex_col()
@@ -658,7 +680,7 @@ impl Render for Root {
             // a fifth narrower than the iced build's at the same size.
             .font_family(ui_family(&self.app.settings))
             .font_weight(gpui::FontWeight(f32::from(
-                crate::settings::weight_numeric(self.app.settings.ui_font_weight.iced()),
+                self.app.settings.ui_font_weight.numeric(),
             )))
             .child(match screen {
                 Some(screen) => div().flex_grow(1.0).overflow_hidden().child(screen),
@@ -718,8 +740,8 @@ impl Root {
             }
         };
         Theme::change(mode, None, cx);
-        let hsla = |value: iced::Color| -> gpui::Hsla { color(value).into() };
-        let faded = |value: iced::Color, alpha: f32| -> gpui::Hsla {
+        let hsla = |value: crate::theme::Color| -> gpui::Hsla { color(value).into() };
+        let faded = |value: crate::theme::Color, alpha: f32| -> gpui::Hsla {
             let mut faded = color(value);
             faded.a = alpha;
             faded.into()
@@ -763,7 +785,7 @@ impl Root {
         colors.slider_thumb = hsla(tokens.accent);
         colors.switch = hsla(tokens.line_strong);
         colors.switch_thumb = hsla(tokens.text);
-        colors.scrollbar = hsla(iced::Color::TRANSPARENT);
+        colors.scrollbar = hsla(crate::theme::Color::TRANSPARENT);
         colors.scrollbar_thumb = faded(tokens.text, 0.25);
         colors.scrollbar_thumb_hover = faded(tokens.text, 0.4);
         colors.danger = hsla(tokens.danger);
@@ -796,7 +818,7 @@ pub(crate) fn ui_family(settings: &crate::settings::AppSettings) -> gpui::Shared
         .into()
 }
 
-pub(crate) fn color(value: iced::Color) -> gpui::Rgba {
+pub(crate) fn color(value: crate::theme::Color) -> gpui::Rgba {
     gpui::Rgba {
         r: value.r,
         g: value.g,
@@ -841,5 +863,8 @@ impl Scrolls {
 enum ScrollTo {
     Ratio(f32),
     Offset(f32),
+    /// All the way to the end, whatever the extent turns out to be. Only the
+    /// e2e scenarios ask for it.
+    #[cfg(feature = "e2e")]
     End,
 }

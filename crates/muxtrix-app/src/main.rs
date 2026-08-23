@@ -1,9 +1,4 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
-// While the GPUI port is in progress the iced view tree still compiles but
-// nothing under the `gpui` runtime calls it, so every surface not yet ported
-// reads as dead. The warnings would drown the ones that mean something. This
-// comes out in Phase 7 with the iced runtime itself.
-#![cfg_attr(feature = "gpui", allow(dead_code))]
 
 #[cfg(target_os = "windows")]
 use std::collections::HashMap;
@@ -16,19 +11,16 @@ use std::sync::atomic::Ordering;
 mod agent_screen;
 mod agents_roster;
 mod app;
-#[cfg(feature = "gpui")]
 mod assets;
 mod box_drawing;
 mod commands;
 mod doctor;
 mod effect;
-mod ellipsized_text;
 mod geom;
 mod github;
 mod input;
 mod layout;
 mod metrics;
-mod popover;
 mod process;
 mod runtime;
 mod settings;
@@ -40,9 +32,6 @@ mod views;
 
 #[cfg(feature = "e2e")]
 mod e2e;
-#[cfg(feature = "e2e")]
-#[path = "e2e_pixels.rs"]
-mod e2e_pixels;
 
 use app::NO_TERMINAL_STARTUP;
 /*
@@ -68,7 +57,7 @@ FINISH
 unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
 */
 
-pub fn main() -> iced::Result {
+pub fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Session daemon mode: no window, no GPU — just PTYs on a socket. It
     // lives inside this binary so packages ship no extra executable.
     let arguments: Vec<String> = std::env::args().collect();

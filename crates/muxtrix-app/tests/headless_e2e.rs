@@ -400,12 +400,11 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     connection.flush()?;
     eprintln!("injected terminal command with spaces");
 
-    let mut captured: Option<CapturedFrame> = None;
     // GPUI cannot render its window to an image outside its test platform, so
-    // when it is the runtime the frame is grabbed from the X server here. The
-    // app says when the scenario has settled, and waits to be told to quit so
-    // the frame is still on screen when it is taken.
-    if capture_is_external() {
+    // the frame is grabbed from the X server here. The app says when the
+    // scenario has settled, and waits to be told to quit so the frame is
+    // still on screen when it is taken.
+    let captured = {
         let ready = Instant::now() + Duration::from_secs(20);
         loop {
             // The app closes its socket when it gives up, so a lost
@@ -437,8 +436,8 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             frame.width, frame.height
         );
         let _ = control_request(&control_path, r#"{"method":"quit"}"#);
-        captured = Some(frame);
-    }
+        frame
+    };
 
     let deadline = Instant::now() + Duration::from_secs(25);
     loop {
@@ -464,9 +463,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     let mut report: serde_json::Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
     // The application answered for its state; the pixels are answered here,
     // because this is the process that holds them.
-    if let Some(frame) = &captured {
-        merge_pixel_findings(&mut report, frame);
-    }
+    merge_pixel_findings(&mut report, &captured);
     if std::env::var_os("MUXTRIX_E2E_KEEP_REPORT").is_none() {
         let _ = std::fs::remove_file(&report_path);
     } else {
@@ -649,15 +646,6 @@ fn merge_pixel_findings(report: &mut serde_json::Value, frame: &CapturedFrame) {
     report["metrics"]["screenshot_width"] = serde_json::json!(frame.width);
     report["metrics"]["screenshot_height"] = serde_json::json!(frame.height);
     report["metrics"]["screenshot_unique_colors_at_least"] = serde_json::json!(unique);
-}
-
-/// Whether the frame has to be captured from outside the application.
-///
-/// True exactly when the GPUI runtime is the one compiled in, which is the
-/// same feature the app was built with because the test and the binary share
-/// a feature set.
-const fn capture_is_external() -> bool {
-    cfg!(feature = "gpui")
 }
 
 /// One captured frame, as 8-bit RGBA rows.

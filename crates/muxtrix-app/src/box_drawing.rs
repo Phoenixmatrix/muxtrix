@@ -8,31 +8,6 @@
 //! The character specifications and drawing algorithms are adapted from
 //! Ghostty's MIT-licensed `src/font/sprite/draw/box.zig`.
 
-use iced::mouse;
-use iced::widget::canvas::{self, Geometry, Path, Stroke};
-use iced::{Color, Point, Rectangle, Renderer, Size, Theme};
-
-use crate::app::Message;
-
-#[derive(Debug, Clone)]
-pub(crate) struct BoxDrawingRun {
-    text: String,
-    cell_width: f32,
-    cell_height: f32,
-    color: Color,
-}
-
-impl BoxDrawingRun {
-    pub(crate) fn new(text: String, cell_width: f32, cell_height: f32, color: Color) -> Self {
-        Self {
-            text,
-            cell_width,
-            cell_height,
-            color,
-        }
-    }
-}
-
 /// What drawing box glyphs needs from a renderer.
 ///
 /// The geometry in this module is the whole point — arms end exactly on cell
@@ -59,103 +34,6 @@ pub(crate) trait BoxPainter {
 
     /// Move the origin to the given cell, so each glyph draws at (0, 0).
     fn with_cell<F: FnOnce(&mut Self)>(&mut self, offset_x: f32, draw: F);
-}
-
-impl canvas::Program<Message> for BoxDrawingRun {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &Self::State,
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<Geometry> {
-        let mut painter = IcedPainter {
-            frame: canvas::Frame::new(renderer, bounds.size()),
-            color: self.color,
-            offset_x: 0.0,
-        };
-        let metrics = BoxMetrics::new(self.cell_width, self.cell_height);
-        for (column, character) in self.text.chars().enumerate() {
-            draw_cell(
-                &mut painter,
-                metrics,
-                character,
-                column as f32 * self.cell_width,
-            );
-        }
-        vec![painter.frame.into_geometry()]
-    }
-}
-
-/// Draws box geometry into an iced canvas frame.
-struct IcedPainter {
-    frame: canvas::Frame<Renderer>,
-    color: Color,
-    /// The current cell's left edge. Applied here rather than through the
-    /// frame's transform stack so both painters share one notion of
-    /// cell-local coordinates.
-    offset_x: f32,
-}
-
-impl IcedPainter {
-    fn stroke(&self) -> Stroke<'static> {
-        Stroke::default().with_color(self.color)
-    }
-}
-
-impl BoxPainter for IcedPainter {
-    fn fill_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
-        self.frame.fill_rectangle(
-            Point::new(x0 + self.offset_x, y0),
-            Size::new(x1 - x0, y1 - y0),
-            self.color,
-        );
-    }
-
-    fn stroke_polyline(&mut self, points: &[(f32, f32)], width: f32) {
-        let Some((first, rest)) = points.split_first() else {
-            return;
-        };
-        let offset = self.offset_x;
-        let path = Path::new(|path| {
-            path.move_to(Point::new(first.0 + offset, first.1));
-            for point in rest {
-                path.line_to(Point::new(point.0 + offset, point.1));
-            }
-        });
-        self.frame.stroke(&path, self.stroke().with_width(width));
-    }
-
-    fn stroke_rounded_corner(
-        &mut self,
-        start: (f32, f32),
-        arc: [(f32, f32); 4],
-        end: (f32, f32),
-        width: f32,
-    ) {
-        let offset = self.offset_x;
-        let path = Path::new(|path| {
-            path.move_to(Point::new(start.0 + offset, start.1));
-            path.line_to(Point::new(arc[0].0 + offset, arc[0].1));
-            path.bezier_curve_to(
-                Point::new(arc[1].0 + offset, arc[1].1),
-                Point::new(arc[2].0 + offset, arc[2].1),
-                Point::new(arc[3].0 + offset, arc[3].1),
-            );
-            path.line_to(Point::new(end.0 + offset, end.1));
-        });
-        self.frame.stroke(&path, self.stroke().with_width(width));
-    }
-
-    fn with_cell<F: FnOnce(&mut Self)>(&mut self, offset_x: f32, draw: F) {
-        let previous = self.offset_x;
-        self.offset_x = offset_x;
-        draw(self);
-        self.offset_x = previous;
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -805,8 +683,7 @@ fn fill_box(painter: &mut impl BoxPainter, x0: f32, y0: f32, x1: f32, y1: f32) {
 
 /// Draw one box-drawing character at `offset_x` within the run.
 ///
-/// The entry point for renderers that paint runs themselves rather than
-/// through an iced canvas.
+/// The entry point for a renderer's own painter.
 pub(crate) fn draw_cell(
     painter: &mut impl BoxPainter,
     metrics: BoxMetrics,

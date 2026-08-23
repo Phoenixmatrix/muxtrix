@@ -146,7 +146,7 @@ impl Root {
                             .bg(color(if selected {
                                 tokens.accent
                             } else {
-                                iced::Color::TRANSPARENT
+                                crate::theme::Color::TRANSPARENT
                             })),
                     )
                     .child(row),
@@ -195,7 +195,7 @@ impl Root {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|root, _: &MouseDownEvent, window, cx| {
-                        root.dispatch(Message::ToggleCommandPalette, window, cx);
+                        root.dispatch(Message::CloseCommandPalette, window, cx);
                     }),
                 )
                 .child(

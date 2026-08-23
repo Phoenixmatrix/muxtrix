@@ -1,11 +1,9 @@
 //! Pixel assertions on a captured frame.
 //!
-//! Shared by the application and the e2e harness, because which process holds
-//! the pixels depends on the renderer: iced photographs its own window, and
-//! GPUI cannot outside its test platform, so the harness grabs the frame from
-//! the X server instead. The checks themselves are the same either way, and
-//! they are the ones that would catch a terminal drawing glyphs that no longer
-//! join across cells.
+//! Compiled into the e2e harness, which is the process that holds the pixels:
+//! GPUI cannot render its window to an image outside its test platform, so the
+//! harness grabs the frame from the X server. These are the checks that would
+//! catch a terminal drawing glyphs that no longer join across cells.
 
 use std::collections::VecDeque;
 

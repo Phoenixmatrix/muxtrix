@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -19,7 +18,6 @@ use crate::settings::{FleetScope, FleetView};
 use crate::{agent_screen, agents_roster, commands, github};
 
 const REPORT_ENV: &str = "MUXTRIX_E2E_REPORT";
-const SCREENSHOT_ENV: &str = "MUXTRIX_E2E_SCREENSHOT_RGBA";
 const EXTERNAL_MARKER: &str = "alpha beta";
 const TERMINAL_URL_MARKER: &str = "https://example.com/docs";
 const PANE_MENU_CLICK_AWAY_MARKER: &str = "pane-menu-click-away-ready";
@@ -29,14 +27,6 @@ const MOUSE_REPORT_MARKER: &str = "mouse-report-ok";
 // marker that wraps can never be found in a single row of the snapshot.
 const SECOND_MARKER: &str = "p2-mark";
 const THIRD_MARKER: &str = "p3-mark";
-const TERMINAL_RULE_CONTINUITY_PIXELS: usize = 300;
-const TERMINAL_BLOCK_CONTINUITY_PIXELS: usize = 120;
-const TERMINAL_BLOCK_CONTINUITY_ROWS: usize = 8;
-const TERMINAL_ROUNDED_BOX_WIDTH_PIXELS: usize = 200;
-const TERMINAL_ROUNDED_BOX_HEIGHT_PIXELS: usize = 30;
-const TERMINAL_HEAVY_BOX_WIDTH_PIXELS: usize = 120;
-const TERMINAL_HEAVY_BOX_HEIGHT_PIXELS: usize = 30;
-
 /// A bare Down press, shaped exactly as the window delivers one.
 fn arrow_down() -> crate::input::KeyEvent {
     let key = crate::input::Key::Named(crate::input::Named::ArrowDown);
@@ -192,7 +182,6 @@ impl Scenario {
     ///
     /// Only reached under the GPUI runtime, where the frame is captured by the
     /// harness rather than by the application.
-    #[cfg(feature = "gpui")]
     ///
     /// The frame itself is captured by the harness process, so the pixel
     /// checks and their metrics are merged in there. Failing here still fails
@@ -200,7 +189,7 @@ impl Scenario {
     /// photographs it.
     pub(crate) fn capture_state(&self) -> Result<(), String> {
         self.state_report()?;
-        // The same shape the iced report writes, minus what only the pixels
+        // The state half of the report, minus what only the pixels
         // can answer. Reaching here means every state assertion held, so these
         // are true by construction; the harness merges in the pixel results
         // and the frame's dimensions.
@@ -715,9 +704,10 @@ impl Scenario {
                 }
                 if self.capturing("terminal-image")
                     && app.terminals.get(&self.initial_pane).is_none_or(|runtime| {
-                        runtime.snapshot.as_ref().is_none_or(|snapshot| {
-                            snapshot.images.is_empty() || runtime.image_handles.is_empty()
-                        })
+                        runtime
+                            .snapshot
+                            .as_ref()
+                            .is_none_or(|snapshot| snapshot.images.is_empty())
                     })
                 {
                     self.settle_ticks = 1;
@@ -2006,131 +1996,6 @@ impl Scenario {
         Ok(())
     }
 
-    fn success_report(&self, screenshot: &iced::window::Screenshot) -> Result<(), String> {
-        self.state_report()?;
-        let expected_bytes = screenshot.size.width as usize * screenshot.size.height as usize * 4;
-        if screenshot.rgba.len() != expected_bytes {
-            return Err("GPU screenshot byte length did not match its dimensions".into());
-        }
-        let mut colors = HashSet::new();
-        let mut opaque_pixels = 0_usize;
-        for pixel in screenshot.rgba.chunks_exact(4) {
-            colors.insert([pixel[0], pixel[1], pixel[2]]);
-            opaque_pixels += usize::from(pixel[3] == 255);
-            if colors.len() > 64 && opaque_pixels > 10_000 {
-                break;
-            }
-        }
-        if colors.len() < 16 || opaque_pixels < 10_000 {
-            return Err("GPU screenshot did not contain a populated application frame".into());
-        }
-        let frame = crate::e2e_pixels::Frame {
-            rgba: &screenshot.rgba,
-            width: screenshot.size.width as usize,
-            height: screenshot.size.height as usize,
-        };
-        let terminal_glyph_continuity = self
-            .capturing("terminal-glyphs")
-            .then(|| crate::e2e_pixels::light_horizontal_continuity(&frame));
-        let rounded_box_continuity = self
-            .capturing("terminal-glyphs")
-            .then(|| crate::e2e_pixels::magenta_rounded_box_continuity(&frame));
-        let heavy_box_continuity = self
-            .capturing("terminal-glyphs")
-            .then(|| crate::e2e_pixels::cyan_heavy_box_continuity(&frame));
-        if terminal_glyph_continuity.is_some_and(|(longest, solid_rows)| {
-            longest < TERMINAL_RULE_CONTINUITY_PIXELS || solid_rows < TERMINAL_BLOCK_CONTINUITY_ROWS
-        }) {
-            return Err(format!(
-                "terminal drawing glyphs did not produce a {TERMINAL_RULE_CONTINUITY_PIXELS}-pixel rule and at least {TERMINAL_BLOCK_CONTINUITY_ROWS} rows of a {TERMINAL_BLOCK_CONTINUITY_PIXELS}-pixel block"
-            ));
-        }
-        if rounded_box_continuity.is_some_and(|(connected, width, height)| {
-            !connected
-                || width < TERMINAL_ROUNDED_BOX_WIDTH_PIXELS
-                || height < TERMINAL_ROUNDED_BOX_HEIGHT_PIXELS
-        }) {
-            return Err(format!(
-                "rounded terminal border was not one connected component spanning at least {TERMINAL_ROUNDED_BOX_WIDTH_PIXELS}x{TERMINAL_ROUNDED_BOX_HEIGHT_PIXELS} pixels"
-            ));
-        }
-        if heavy_box_continuity.is_some_and(|(connected, width, height)| {
-            !connected
-                || width < TERMINAL_HEAVY_BOX_WIDTH_PIXELS
-                || height < TERMINAL_HEAVY_BOX_HEIGHT_PIXELS
-        }) {
-            return Err(format!(
-                "heavy terminal border was not one connected component spanning at least {TERMINAL_HEAVY_BOX_WIDTH_PIXELS}x{TERMINAL_HEAVY_BOX_HEIGHT_PIXELS} pixels"
-            ));
-        }
-        if let Some(path) = std::env::var_os(SCREENSHOT_ENV) {
-            std::fs::write(path, &screenshot.rgba).map_err(|error| error.to_string())?;
-        }
-
-        self.write_report(json!({
-            "success": true,
-            "checks": {
-                "real_window_and_wgpu_frame": true,
-                "command_palette_shortcut_and_render": true,
-                "command_palette_keyboard_navigation": true,
-                "settings_shortcut_and_render": true,
-                "external_keyboard_input_with_spaces": true,
-                "terminal_url_decoration_rendered": true,
-                "focused_cursor_visible": true,
-                "horizontal_split_resized": true,
-                "vertical_split_resized": true,
-                "split_pane_grids_match_their_panes": true,
-                "pointer_drag_selects_terminal_text": true,
-                "independent_terminal_sessions": true,
-                "focused_pane_close_cleanup": true,
-                "terminal_exit_detach_and_restart": true,
-                "osc_agent_notification_fleet_attention_and_clear": true,
-                "fleet_collapse_pane_maximize_and_overflow": true,
-                "pane_overflow_click_away": true,
-                "terminal_mouse_wheel_scrollback": true,
-                "terminal_scrollbar_click_and_drag": true,
-                "terminal_program_mouse_motion": true,
-                "workspace_tab_default_pane_and_switch": true,
-                "terminal_drawing_glyphs_are_pixel_continuous": terminal_glyph_continuity
-                    .is_none_or(|(longest, solid_rows)| {
-                        longest >= TERMINAL_RULE_CONTINUITY_PIXELS
-                            && solid_rows >= TERMINAL_BLOCK_CONTINUITY_ROWS
-                    }),
-                "terminal_rounded_box_is_pixel_connected": rounded_box_continuity
-                    .is_none_or(|(connected, width, height)| {
-                        connected
-                            && width >= TERMINAL_ROUNDED_BOX_WIDTH_PIXELS
-                            && height >= TERMINAL_ROUNDED_BOX_HEIGHT_PIXELS
-                    }),
-                "terminal_heavy_box_is_pixel_connected": heavy_box_continuity
-                    .is_none_or(|(connected, width, height)| {
-                        connected
-                            && width >= TERMINAL_HEAVY_BOX_WIDTH_PIXELS
-                            && height >= TERMINAL_HEAVY_BOX_HEIGHT_PIXELS
-                    })
-            },
-            "metrics": {
-                "screenshot_width": screenshot.size.width,
-                "screenshot_height": screenshot.size.height,
-                "screenshot_unique_colors_at_least": colors.len(),
-                "initial_columns": self.initial_cols,
-                "initial_rows": self.initial_rows,
-                "terminal_drawing_longest_continuous_run": terminal_glyph_continuity
-                    .map(|(longest, _)| longest),
-                "terminal_block_continuous_rows": terminal_glyph_continuity
-                    .map(|(_, solid_rows)| solid_rows),
-                "terminal_rounded_box_width": rounded_box_continuity
-                    .map(|(_, width, _)| width),
-                "terminal_rounded_box_height": rounded_box_continuity
-                    .map(|(_, _, height)| height),
-                "terminal_heavy_box_width": heavy_box_continuity
-                    .map(|(_, width, _)| width),
-                "terminal_heavy_box_height": heavy_box_continuity
-                    .map(|(_, _, height)| height)
-            }
-        }))
-    }
-
     fn failure_report(&self, error: &str) {
         let _ = self.write_report(json!({
             "success": false,
@@ -2194,23 +2059,6 @@ impl Muxtrix {
             Ok(TickAction::Capture) => vec![Effect::Capture],
             Err(_) => unreachable!("the error case returned above"),
         }
-    }
-
-    pub(super) fn finish_e2e(&mut self, screenshot: iced::window::Screenshot) -> Vec<Effect> {
-        let Some(scenario) = self.e2e.take() else {
-            return vec![Effect::Exit];
-        };
-        if let Err(error) = scenario.success_report(&screenshot) {
-            scenario.failure_report(&error);
-        }
-        vec![Effect::Exit]
-    }
-
-    pub(super) fn fail_e2e(&mut self, error: &str) -> Vec<Effect> {
-        if let Some(scenario) = self.e2e.take() {
-            scenario.failure_report(error);
-        }
-        vec![Effect::Exit]
     }
 }
 

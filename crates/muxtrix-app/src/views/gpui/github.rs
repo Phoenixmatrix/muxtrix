@@ -390,7 +390,7 @@ impl Root {
                     }])
             } else {
                 segment
-                    .border_color(color(iced::Color::TRANSPARENT))
+                    .border_color(color(crate::theme::Color::TRANSPARENT))
                     .text_color(color(tokens.muted))
                     .hover(move |style| style.bg(hover))
             };
@@ -1617,7 +1617,7 @@ enum GitHubButton {
 /// A small rounded pill with a tinted fill, for a state.
 fn status_pill(
     label: String,
-    hue: iced::Color,
+    hue: crate::theme::Color,
     settings: &crate::settings::AppSettings,
 ) -> gpui::Div {
     let mut fill = color(hue);

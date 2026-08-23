@@ -4,9 +4,42 @@
 //! shell only. Both light and dark ramps are defined here so the appearance
 //! switch is a pure function of [`Appearance`].
 
-use iced::Color;
-
 use crate::settings::Appearance;
+
+/// A straight-alpha sRGB colour, the shape every chrome token is written in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Color {
+    pub(crate) r: f32,
+    pub(crate) g: f32,
+    pub(crate) b: f32,
+    pub(crate) a: f32,
+}
+
+impl Color {
+    pub(crate) const TRANSPARENT: Self = Self::from_rgba(0.0, 0.0, 0.0, 0.0);
+    pub(crate) const WHITE: Self = Self::from_rgb(1.0, 1.0, 1.0);
+
+    pub(crate) const fn from_rgb(r: f32, g: f32, b: f32) -> Self {
+        Self { r, g, b, a: 1.0 }
+    }
+
+    pub(crate) const fn from_rgba(r: f32, g: f32, b: f32, a: f32) -> Self {
+        Self { r, g, b, a }
+    }
+
+    pub(crate) fn from_rgb8(r: u8, g: u8, b: u8) -> Self {
+        Self::from_rgba8(r, g, b, 1.0)
+    }
+
+    pub(crate) fn from_rgba8(r: u8, g: u8, b: u8, a: f32) -> Self {
+        Self {
+            r: f32::from(r) / 255.0,
+            g: f32::from(g) / 255.0,
+            b: f32::from(b) / 255.0,
+            a,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DesignTokens {

@@ -62,7 +62,7 @@ impl Root {
             .flex_col()
             .size_full()
             .child(self.tab_strip(cx))
-            .child(div().flex_grow(1.0).overflow_hidden().child(tree))
+            .child(div().flex_grow(1.0).overflow_hidden().p(px(8.)).child(tree))
             .into_any_element()
     }
 
@@ -79,11 +79,8 @@ impl Root {
             .flex_row()
             .items_center()
             .gap(px(3.))
-            .h(px(APP_BAR_HEIGHT))
-            .px(px(8.))
-            .bg(color(tokens.rail))
-            .border_b(px(1.))
-            .border_color(color(tokens.line));
+            .flex_grow(1.0)
+            .min_w(px(0.));
 
         let workspace_id = workspace.id;
         for (index, tab) in workspace.tabs.iter().enumerate() {
@@ -190,18 +187,114 @@ impl Root {
             );
         }
 
-        strip
+        strip = strip.child(
+            icon_button(
+                gpui::ElementId::from("new-tab"),
+                IconKind::Add,
+                tokens,
+                false,
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|root, _: &MouseDownEvent, window, cx| {
+                    root.dispatch(Message::NewTab, window, cx);
+                }),
+            ),
+        );
+
+        // The Commands entry: icon, label, and the real keycap for the
+        // palette; then the settings control behind a rule.
+        let mut keycap_fill = color(tokens.text);
+        keycap_fill.a = 0.05;
+        let mut pill_fill = color(tokens.text);
+        pill_fill.a = 0.04;
+        let mut pill_hover = color(tokens.text);
+        pill_hover.a = 0.07;
+        let commands = div()
+            .id("commands-pill")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(7.))
+            .h(px(29.))
+            .px(px(9.))
+            .rounded(px(7.))
+            .bg(pill_fill)
+            .border_1()
+            .border_color(color(tokens.line_strong))
+            .cursor_pointer()
+            .hover(move |style| style.bg(pill_hover))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|root, _: &MouseDownEvent, window, cx| {
+                    root.dispatch(Message::ToggleCommandPalette, window, cx);
+                }),
+            )
+            .child(
+                svg()
+                    .path(icon_path(IconKind::Command))
+                    .size(px(13.))
+                    .text_color(color(tokens.muted)),
+            )
+            .child(
+                div()
+                    .text_size(px(app.settings.ui_pixels(9.0)))
+                    .line_height(px(app.settings.ui_pixels(9.0) * 1.3))
+                    .text_color(color(tokens.muted))
+                    .child("Commands"),
+            )
+            .child(
+                div()
+                    .py(px(1.))
+                    .px(px(5.))
+                    .rounded(px(4.))
+                    .bg(keycap_fill)
+                    .border_1()
+                    .border_color(color(tokens.line_strong))
+                    .font_family(crate::views::gpui::terminal_family(&app.settings))
+                    .text_size(px(app.settings.ui_pixels(7.5)))
+                    .line_height(px(app.settings.ui_pixels(7.5) * 1.3))
+                    .text_color(color(tokens.muted))
+                    .child(if cfg!(target_os = "macos") {
+                        "Cmd+P"
+                    } else {
+                        "Ctrl+P"
+                    }),
+            );
+
+        let tab_count = workspace.tabs.len();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .h(px(APP_BAR_HEIGHT))
+            .px(px(10.))
+            .bg(color(tokens.rail))
+            .border_b(px(1.))
+            .border_color(color(tokens.line))
+            // Dragging a tab past the last chip drops it at the end.
+            .on_mouse_move(
+                cx.listener(move |root, _: &gpui::MouseMoveEvent, window, cx| {
+                    if root.app.tab_drag.is_some() {
+                        root.dispatch(Message::TabDragOver(workspace_id, tab_count), window, cx);
+                    }
+                }),
+            )
+            .child(strip)
+            .child(commands)
+            .child(div().w(px(1.)).h(px(16.)).bg(color(tokens.line_strong)))
             .child(
                 icon_button(
-                    gpui::ElementId::from("new-tab"),
-                    IconKind::Add,
+                    gpui::ElementId::from("open-settings"),
+                    IconKind::Settings,
                     tokens,
                     false,
                 )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|root, _: &MouseDownEvent, window, cx| {
-                        root.dispatch(Message::NewTab, window, cx);
+                        root.dispatch(Message::OpenSettings, window, cx);
                     }),
                 ),
             )

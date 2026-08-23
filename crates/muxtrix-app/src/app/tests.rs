@@ -150,36 +150,6 @@ fn installed_version_mismatch_requests_a_restart() {
 }
 
 #[test]
-fn github_file_window_bounds_long_lists_with_overscan() {
-    let window = |offset| github_virtual_window(74, offset, 300.0, GITHUB_FILE_ROW_HEIGHT);
-    assert_eq!(window(0.0), (0, 18));
-    let (first, last) = window(1_680.0);
-    assert_eq!((first, last), (35, 53));
-    assert!(last - first < 74);
-    assert_eq!(
-        github_virtual_window(3, 9_999.0, 300.0, GITHUB_FILE_ROW_HEIGHT),
-        (0, 3)
-    );
-    assert_eq!(
-        github_virtual_window(1, 50_000.0, 420.0, GITHUB_PULL_REQUEST_ROW_HEIGHT),
-        (0, 1),
-        "filtering a deeply scrolled list must keep the remaining row visible"
-    );
-    assert_eq!(
-        github_clamped_scroll_offset(3, 9_999.0, 300.0, GITHUB_FILE_ROW_HEIGHT),
-        0.0
-    );
-    let (first, last) = github_virtual_window(
-        1_000,
-        GITHUB_PULL_REQUEST_ROW_HEIGHT * 500.0,
-        420.0,
-        GITHUB_PULL_REQUEST_ROW_HEIGHT,
-    );
-    assert!(first >= 495);
-    assert!(last - first < 30);
-}
-
-#[test]
 fn github_diff_window_bounds_large_files_with_overscan() {
     let line_starts = (0..=50_000).collect::<Vec<_>>();
     assert_eq!(
@@ -1589,37 +1559,6 @@ fn github_panel_tab_model_reaches_tabs_search_list_and_back() {
     );
 }
 
-#[test]
-fn captured_keyboard_events_do_not_reach_the_global_terminal_handler() {
-    // This one drives the iced boundary itself, so it has to speak iced.
-    let event = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-        key: iced::keyboard::Key::Character("search text".into()),
-        modified_key: iced::keyboard::Key::Character("search text".into()),
-        physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyS),
-        location: iced::keyboard::Location::Standard,
-        modifiers: iced::keyboard::Modifiers::default(),
-        text: None,
-        repeat: false,
-    });
-
-    assert!(
-        app_event(
-            event.clone(),
-            iced::event::Status::Captured,
-            iced::window::Id::unique(),
-        )
-        .is_none()
-    );
-    assert!(
-        app_event(
-            event,
-            iced::event::Status::Ignored,
-            iced::window::Id::unique(),
-        )
-        .is_some()
-    );
-}
-
 struct BlockingLauncher {
     entered: std::sync::mpsc::SyncSender<CreationDirectoryPolicy>,
     finished: std::sync::mpsc::SyncSender<()>,
@@ -2026,29 +1965,6 @@ fn key_press(modified_key: Key, modifiers: Modifiers) -> KeyEvent {
     })
 }
 
-// The window icon is an iced-runtime concern: GPUI has no runtime icon API and
-// takes the icon from the desktop file or the executable's resources instead.
-#[cfg(not(feature = "gpui"))]
-#[test]
-fn embedded_window_icon_has_the_expected_rgba_shape() {
-    assert_eq!(
-        include_bytes!("../../assets/muxtrix-icon.rgba").len(),
-        256 * 256 * 4
-    );
-    assert!(crate::runtime::iced::muxtrix_window_icon().is_some());
-}
-
-#[cfg(all(target_os = "linux", not(feature = "gpui")))]
-#[test]
-fn linux_application_id_matches_the_desktop_file() {
-    assert_eq!(
-        crate::runtime::iced::muxtrix_window_settings()
-            .platform_specific
-            .application_id,
-        "muxtrix"
-    );
-}
-
 #[test]
 fn no_terminal_flag_is_explicit() {
     assert!(crate::no_terminal_requested(&[
@@ -2427,10 +2343,6 @@ fn closing_the_hovered_pane_clears_the_hover() {
     let _ = app.update(Message::ClosePane(closed_pane));
     assert_eq!(app.hovered_terminal, None);
 
-    let _ = app.update(Message::ScrollHoveredTerminal(ScrollDelta::Lines {
-        x: 0.0,
-        y: -1.0,
-    }));
     assert!(
         !app.status.contains("Terminal scroll failed"),
         "scrolling after the hovered pane closed must not report a missing pane: {}",
@@ -2684,10 +2596,7 @@ fn repeated_box_and_block_glyphs_use_continuous_geometry_runs() {
     let first_row = &rows[0];
 
     assert!(first_row.iter().any(|run| {
-        run.text == "────────"
-            && run.columns == 8
-            && run.kind == TerminalRunKind::BoxDrawing
-            && !run.kind.needs_fallback()
+        run.text == "────────" && run.columns == 8 && run.kind == TerminalRunKind::BoxDrawing
     }));
     assert!(first_row.iter().any(|run| {
         run.text == "█████" && run.columns == 5 && run.kind == TerminalRunKind::JoinedCellGlyph('█')
@@ -2729,7 +2638,6 @@ fn rounded_box_borders_group_corners_and_horizontal_arms_together() {
             .expect("rounded border should be one geometry run");
         assert_eq!(border.columns, 8);
         assert_eq!(border.kind, TerminalRunKind::BoxDrawing);
-        assert!(!border.kind.needs_fallback());
     }
     assert!(rows[1].iter().any(|run| {
         run.text == "│" && run.columns == 1 && run.kind == TerminalRunKind::BoxDrawing
@@ -3046,11 +2954,6 @@ fn web_urls_are_dotted_by_default_and_solid_when_clickable() {
     assert!(!terminal_link_modifiers(
         Modifiers::CTRL | Modifiers::SHIFT | Modifiers::ALT
     ));
-    assert_eq!(terminal_mouse_interaction(false), mouse::Interaction::Idle);
-    assert_eq!(
-        terminal_mouse_interaction(true),
-        mouse::Interaction::Pointer
-    );
 
     let default_runs = terminal_row_style_runs(
         &snapshot,
@@ -6698,30 +6601,6 @@ fn ctrl_c_marks_only_the_interrupted_running_agent_idle() {
 }
 
 #[test]
-fn wsl_wayland_resizes_snap_to_terminal_cells_without_affecting_other_backends() {
-    let settings = AppSettings::default();
-    assert_eq!(
-        wsl_wayland_resize_increments(true, true, false, &settings),
-        Some(Size::new(
-            settings.terminal_cell_width().round(),
-            settings.terminal_cell_height().round(),
-        ))
-    );
-    assert_eq!(
-        wsl_wayland_resize_increments(false, true, false, &settings),
-        None
-    );
-    assert_eq!(
-        wsl_wayland_resize_increments(true, false, false, &settings),
-        None
-    );
-    assert_eq!(
-        wsl_wayland_resize_increments(true, true, true, &settings),
-        None
-    );
-}
-
-#[test]
 fn terminal_wheel_delta_maps_to_ghostty_scrollback_lines() {
     assert_eq!(
         terminal_scroll_lines(ScrollDelta::Lines { x: 0.0, y: 1.0 }, 20.0),
@@ -6780,31 +6659,6 @@ fn pane_headers_consolidate_actions_when_space_is_dense() {
     assert!(pane_header_is_compact(720.0, 1));
     assert!(pane_header_is_compact(1_280.0, 3));
     assert!(!pane_header_is_compact(1_280.0, 2));
-}
-
-#[test]
-fn pane_titles_spend_the_width_the_header_chrome_leaves_them() {
-    let character = 12.0 * UI_TEXT_ADVANCE_RATIO;
-    // A wide pane carrying only the fixed band should read far past the 24
-    // characters the fixed budget allowed.
-    let roomy = pane_title_char_budget(900.0 - PANE_HEADER_FIXED_WIDTH, character);
-    assert!(
-        roomy > 24,
-        "a 900px pane should beat the old fixed budget, got {roomy}"
-    );
-    // Chrome is paid for out of the title, so a busier header truncates
-    // sooner than a bare one at the same width.
-    let crowded = pane_title_char_budget(900.0 - PANE_HEADER_FIXED_WIDTH - 220.0, character);
-    assert!(
-        crowded < roomy,
-        "trailing chrome must shrink the title: {crowded} vs {roomy}"
-    );
-    // The budget must never claim more than the space it was handed, or
-    // the state label and controls get pushed off the card.
-    let available = 900.0 - PANE_HEADER_FIXED_WIDTH - 220.0;
-    assert!((crowded as f32) * character <= available);
-    // Panes narrower than their own chrome still show something.
-    assert_eq!(pane_title_char_budget(0.0, character), 1);
 }
 
 #[test]

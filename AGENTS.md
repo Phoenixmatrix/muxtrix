@@ -19,7 +19,7 @@
 
 # Seeing the UI
 
-Muxtrix is a native Iced/wgpu app, so a visible change cannot be judged from the
+Muxtrix is a native GPUI app, so a visible change cannot be judged from the
 code. Capture a real frame headlessly instead — Xvfb plus a software Vulkan
 adapter, driven by the e2e harness. No visible window is ever opened.
 

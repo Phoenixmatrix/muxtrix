@@ -232,7 +232,7 @@ fn session_finding(path: Option<&Path>) -> Finding {
     }
 }
 
-fn adapter_description(info: &iced::wgpu::AdapterInfo) -> String {
+fn adapter_description(info: &wgpu::AdapterInfo) -> String {
     format!(
         "{} (backend={:?}, type={:?}, driver={}, driver_info={})",
         info.name, info.backend, info.device_type, info.driver, info.driver_info

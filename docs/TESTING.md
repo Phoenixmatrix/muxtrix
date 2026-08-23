@@ -2,7 +2,7 @@
 
 Muxtrix uses three headless layers. Together they cover serialized workspace
 state, real PTYs and Ghostty parsing, application runtime ownership, actual OS
-keyboard delivery, and a complete Iced/wgpu render frame.
+keyboard delivery, and a complete GPUI render frame.
 
 ## Deterministic suite
 
@@ -66,8 +66,8 @@ test launches the production Muxtrix binary with feature-gated observability:
 Rust E2E test
   -> private Xvfb display (never WSLg)
   -> real Muxtrix process
-  -> winit X11 window
-  -> Iced/wgpu Vulkan renderer
+  -> GPUI X11 window
+  -> wgpu Vulkan renderer
   -> Mesa llvmpipe offscreen frame
 ```
 
@@ -97,8 +97,8 @@ The running app then performs and asserts:
 - sidebar collapse/expand, pane maximize/restore, and pane overflow preserve all
   terminal runtimes and render through real application state;
 - the domain pane tree remains valid; and
-- Iced returns a populated 1280x800 RGBA screenshot with meaningful color
-  diversity, proving that a complete wgpu frame rendered.
+- the harness grabs a populated 1280x800 RGBA frame from the X server with
+  meaningful color diversity, proving that a complete wgpu frame rendered.
 
 The default E2E ends at 1280x800. A compact responsive frame can be exercised
 without changing the host session:
@@ -135,7 +135,8 @@ Combine any capture with
 `MUXTRIX_E2E_SCREENSHOT_RGBA=/tmp/muxtrix-settings.rgba` when inspecting the GPU
 output without exposing a host window.
 
-The app writes a temporary JSON report and exits through `iced::exit`. Process
+The app writes a temporary JSON report and, once told to quit over the control
+socket, exits. Process
 guards terminate the app and X server on failures. The E2E scenario is compiled
 only with the `e2e` feature and activates only when the test supplies its report
 path, so normal builds and launches have no test behavior.

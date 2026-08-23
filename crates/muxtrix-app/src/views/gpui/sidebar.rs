@@ -23,10 +23,6 @@ use crate::settings::{FleetScope, FleetView};
 use crate::theme::DesignTokens;
 use crate::views::gpui::{icon_button, pane_key, rail_marker, terminal_family};
 
-/// The rail header's height. Matches the app bar so the two headers' text
-/// shares one baseline across the seam.
-const HEADER_HEIGHT: f32 = 44.0;
-
 impl Root {
     pub(crate) fn view_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let app = self.app();
@@ -351,7 +347,7 @@ impl Root {
                     }])
             } else {
                 segment
-                    .border_color(color(iced::Color::TRANSPARENT))
+                    .border_color(color(crate::theme::Color::TRANSPARENT))
                     .text_color(color(tokens.muted))
                     .hover(move |style| style.bg(hover))
             };
@@ -406,7 +402,7 @@ impl Root {
             .border_color(color(if targeted {
                 tokens.accent
             } else {
-                iced::Color::TRANSPARENT
+                crate::theme::Color::TRANSPARENT
             }))
             .bg(if targeted {
                 targeted_fill
@@ -448,7 +444,7 @@ impl Root {
             .child(div().size(px(6.)).rounded_full().bg(color(if warning {
                 tokens.warning
             } else {
-                iced::Color::TRANSPARENT
+                crate::theme::Color::TRANSPARENT
             })));
         if !targeted {
             band = band.hover(move |style| style.bg(hover));
@@ -635,7 +631,7 @@ impl Root {
             fill.a = 0.07;
             fill
         } else {
-            color(iced::Color::TRANSPARENT)
+            color(crate::theme::Color::TRANSPARENT)
         };
         let mut hover = color(tokens.text);
         hover.a = 0.04;
@@ -798,10 +794,11 @@ impl Root {
         } else {
             tokens.warning
         };
-        let has_pull_request = app
+        let pull_request = app
             .pane_repositories
             .get(&pane_id)
-            .is_some_and(|repository| repository.pull_request.is_some());
+            .and_then(|repository| repository.pull_request.clone());
+        let has_pull_request = pull_request.is_some();
         let selected = focused && !has_pull_request;
         let cursor = targeted && !has_pull_request;
 
@@ -814,7 +811,7 @@ impl Root {
             fill.a = 0.07;
             fill
         } else {
-            color(iced::Color::TRANSPARENT)
+            color(crate::theme::Color::TRANSPARENT)
         };
         let mut hover = color(tokens.text);
         hover.a = 0.04;
@@ -919,57 +916,322 @@ impl Root {
                                         .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                                         .text_color(color(state_color))
                                         .whitespace_nowrap()
-                                        .child(state_label),
+                                        .child(state_label.clone()),
                                 )
                             }),
                     ),
             )
+            // A linked pull request shares the title's first-line baseline as
+            // its marker, with the lifecycle state beneath it.
+            .children(pull_request.map(|pull_request| {
+                let (icon_kind, hue) = match pull_request.state {
+                    github::CurrentPullRequestState::Open => {
+                        (IconKind::PullRequestOpen, tokens.github_open)
+                    }
+                    github::CurrentPullRequestState::Draft => {
+                        (IconKind::PullRequestDraft, tokens.muted)
+                    }
+                    github::CurrentPullRequestState::Closed => {
+                        (IconKind::PullRequestClosed, tokens.faint)
+                    }
+                    github::CurrentPullRequestState::Merged => {
+                        (IconKind::PullRequestMerged, tokens.github_merged)
+                    }
+                };
+                let url = pull_request.url.clone();
+                let mut marker_hover = color(tokens.text);
+                marker_hover.a = 0.04;
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .h(px(52.))
+                    .py(px(5.))
+                    .px(px(2.))
+                    .child(
+                        div()
+                            .id(("fleet-pr", pane_key(pane_id)))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(3.))
+                            .h(px(30.))
+                            .px(px(3.))
+                            .rounded(px(5.))
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(marker_hover))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    root.dispatch(
+                                        Message::OpenGitHubPullRequest(url.clone()),
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            )
+                            .child(
+                                svg()
+                                    .path(crate::assets::icon_path(icon_kind))
+                                    .size(px(app.settings.ui_pixels(9.0)))
+                                    .text_color(color(hue)),
+                            )
+                            .child(
+                                div()
+                                    .font_family(terminal_family(&app.settings))
+                                    .text_size(px(app.settings.ui_pixels(8.5)))
+                                    .line_height(px(app.settings.ui_pixels(8.5) * 1.3))
+                                    .text_color(color(hue))
+                                    .child(format!("#{}", pull_request.number)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(app.settings.ui_pixels(9.0)))
+                            .line_height(px(app.settings.ui_pixels(9.0) * 1.3))
+                            .text_color(color(state_color))
+                            .whitespace_nowrap()
+                            .child(state_label),
+                    )
+            }))
             .into_any_element()
     }
 
-    /// The 46 px rail: markers and signal dots only.
+    /// The 46 px rail: numbered workspaces and panes with their signal dots,
+    /// a new-workspace control above and GitHub and expand below — the iced
+    /// collapsed rail.
     fn collapsed_sidebar(&self, tokens: DesignTokens, cx: &mut Context<Self>) -> AnyElement {
         let app = self.app();
-        let mut rail = div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(6.))
-            .w(px(COLLAPSED_SIDEBAR_WIDTH))
-            .h_full()
-            .py(px(8.))
-            .bg(color(tokens.rail))
-            .border_r(px(1.))
-            .border_color(color(tokens.line));
+        let ui = |points: f32| px(app.settings.ui_pixels(points));
+        let mut fill_selected = color(tokens.text);
+        fill_selected.a = 0.07;
+        let mut fill_targeted = color(tokens.accent);
+        fill_targeted.a = 0.18;
+        let mut hover = color(tokens.text);
+        hover.a = 0.04;
+        let row_fill = |selected: bool, targeted: bool| {
+            if targeted {
+                fill_targeted
+            } else if selected {
+                fill_selected
+            } else {
+                color(crate::theme::Color::TRANSPARENT)
+            }
+        };
 
-        for workspace in &app.session.workspaces {
+        let mut items = div().flex().flex_col().items_center().w_full();
+        for (index, workspace) in app.session.workspaces.iter().enumerate() {
             let workspace_id = workspace.id;
             let selected = workspace_id == app.session.active_workspace_id;
+            let targeted = app.rail_nav == Some(RailTarget::Workspace(workspace_id));
             let signal = app.workspace_signal_kind(workspace).color(tokens);
-            rail = rail.child(
+            items = items
+                .child(
+                    div()
+                        .id(("collapsed-workspace", workspace_key(workspace_id)))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(6.))
+                        .w(px(COLLAPSED_SIDEBAR_WIDTH - 2.0))
+                        .h(px(43.))
+                        .cursor_pointer()
+                        .bg(row_fill(selected, targeted))
+                        .when(targeted, |row| {
+                            row.border_1().border_color(color(tokens.accent))
+                        })
+                        .when(!selected && !targeted, |row| {
+                            row.hover(move |style| style.bg(hover))
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                                root.dispatch(Message::SwitchWorkspace(workspace_id), window, cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .text_size(ui(10.0))
+                                .line_height(px(app.settings.ui_pixels(10.0) * 1.3))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                // The collapsed rail has no room for a rung
+                                // bar, so identity carries the cursor here.
+                                .text_color(color(if targeted {
+                                    tokens.accent
+                                } else {
+                                    tokens.text
+                                }))
+                                .child((index + 1).to_string()),
+                        )
+                        .child(div().size(px(7.)).rounded_full().bg(color(signal))),
+                )
+                .child(div().h(px(1.)).w_full().bg(color(tokens.line)));
+        }
+        // Workspaces and fleet panes are both numbered from one, so a rule in
+        // the strong line colour separates the two ledgers.
+        let entries = app.fleet_entries();
+        if !entries.is_empty() {
+            items = items
+                .child(div().h(px(7.)))
+                .child(
+                    div()
+                        .h(px(1.))
+                        .w(px(COLLAPSED_SIDEBAR_WIDTH - 18.0))
+                        .bg(color(tokens.line_strong)),
+                )
+                .child(div().h(px(7.)));
+        }
+        for (index, (workspace_id, pane_id)) in entries.into_iter().enumerate() {
+            let Some(workspace) = app
+                .session
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+            else {
+                continue;
+            };
+            let Some(pane) = workspace.pane(pane_id) else {
+                continue;
+            };
+            let focused = workspace.id == app.session.active_workspace_id
+                && workspace
+                    .active_tab()
+                    .is_some_and(|tab| tab.focused_pane_id == pane_id);
+            let targeted = app.rail_nav == Some(RailTarget::FleetPane(workspace_id, pane_id));
+            let attention = app.pane_needs_attention(pane_id, pane.attention.unread_count);
+            let signal = app.pane_signal_kind(pane_id, attention).color(tokens);
+            // The keyboard cursor outranks attention: it marks where the user
+            // is looking right now, and it moves away again.
+            let identity_color = if targeted {
+                tokens.accent
+            } else if attention {
+                tokens.warning
+            } else {
+                tokens.text
+            };
+            let pip = if app.shows_agents_roster(pane_id) {
+                let mut ring = color(signal);
+                ring.a *= 0.7;
                 div()
-                    .id(("collapsed-workspace", workspace_key(workspace_id)))
+                    .size(px(7.))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(28.))
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .bg(color(if selected {
-                        tokens.panel_raised
-                    } else {
-                        tokens.rail
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |root, _: &MouseDownEvent, window, cx| {
-                            root.dispatch(Message::SwitchWorkspace(workspace_id), window, cx);
-                        }),
-                    )
-                    .child(div().size(px(9.)).rounded_full().bg(color(signal))),
-            );
+                    .rounded_full()
+                    .border_1()
+                    .border_color(ring)
+                    .child(div().size(px(3.)).rounded_full().bg(color(signal)))
+            } else {
+                div().size(px(7.)).rounded_full().bg(color(signal))
+            };
+            items = items
+                .child(
+                    div()
+                        .id(("collapsed-pane", pane_key(pane_id)))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(6.))
+                        .w(px(COLLAPSED_SIDEBAR_WIDTH - 2.0))
+                        .h(px(43.))
+                        .cursor_pointer()
+                        .bg(row_fill(focused, targeted))
+                        .when(targeted, |row| {
+                            row.border_1().border_color(color(tokens.accent))
+                        })
+                        .when(!focused && !targeted, |row| {
+                            row.hover(move |style| style.bg(hover))
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                                root.dispatch(
+                                    Message::FocusFleetPane(workspace_id, pane_id),
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .child(
+                            div()
+                                .text_size(ui(10.0))
+                                .line_height(px(app.settings.ui_pixels(10.0) * 1.3))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(color(identity_color))
+                                .child((index + 1).to_string()),
+                        )
+                        .child(pip),
+                )
+                .child(div().h(px(1.)).w_full().bg(color(tokens.line)));
         }
-        rail.into_any_element()
+
+        let centred = |child: AnyElement| {
+            div()
+                .h(px(44.))
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(child)
+        };
+        div()
+            .flex()
+            .flex_row()
+            .h_full()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(COLLAPSED_SIDEBAR_WIDTH - 1.0))
+                    .h_full()
+                    .bg(color(tokens.rail))
+                    .child(centred(
+                        icon_button(
+                            gpui::ElementId::from("collapsed-new-workspace"),
+                            IconKind::Add,
+                            tokens,
+                            false,
+                        )
+                        .size(px(32.))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|root, _: &MouseDownEvent, window, cx| {
+                                root.dispatch(Message::NewWorkspace, window, cx);
+                            }),
+                        )
+                        .into_any_element(),
+                    ))
+                    .child(
+                        div()
+                            .id("collapsed-scroll")
+                            .flex_grow(1.0)
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .child(items),
+                    )
+                    .child(centred(self.github_status_button(tokens, true, cx)))
+                    .child(centred(
+                        icon_button(
+                            gpui::ElementId::from("expand-sidebar"),
+                            IconKind::Expand,
+                            tokens,
+                            false,
+                        )
+                        .size(px(31.))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|root, _: &MouseDownEvent, window, cx| {
+                                root.dispatch(Message::ToggleSidebar, window, cx);
+                            }),
+                        )
+                        .into_any_element(),
+                    )),
+            )
+            .child(div().w(px(1.)).h_full().bg(color(tokens.line)))
+            .into_any_element()
     }
 }
 

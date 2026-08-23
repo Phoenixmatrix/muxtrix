@@ -87,6 +87,7 @@ impl Root {
 
                 let drag_key = key.clone();
                 let drag_axis = *axis;
+                let root_handle = cx.entity();
                 let handle = div()
                     .id(("split", split_id(&key)))
                     .flex()
@@ -104,11 +105,34 @@ impl Root {
                         }),
                     );
 
+                // The drag converts pointer travel into a ratio of the split's
+                // own extent, so the split has to be told how big it is.
+                let sized_key = key.clone();
+                let report_size = gpui::canvas(
+                    move |bounds, _, cx| {
+                        let size = crate::geom::Size::new(
+                            f32::from(bounds.size.width),
+                            f32::from(bounds.size.height),
+                        );
+                        let key = sized_key.clone();
+                        root_handle.update(cx, |root, cx| {
+                            if root.app.split_sizes.get(&key) != Some(&size) {
+                                root.dispatch_detached(Message::ResizeSplit(key, size), cx);
+                            }
+                        });
+                    },
+                    |_, (), _, _| {},
+                )
+                .absolute()
+                .inset_0();
+
                 match axis {
                     SplitAxis::Horizontal => div()
+                        .relative()
                         .flex()
                         .flex_row()
                         .size_full()
+                        .child(report_size)
                         .child(
                             div()
                                 .flex_grow(1.0)
@@ -129,9 +153,11 @@ impl Root {
                         )
                         .into_any_element(),
                     SplitAxis::Vertical => div()
+                        .relative()
                         .flex()
                         .flex_col()
                         .size_full()
+                        .child(report_size)
                         .child(
                             div()
                                 .flex_grow(1.0)

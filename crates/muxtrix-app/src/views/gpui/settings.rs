@@ -99,7 +99,7 @@ impl Root {
             .px(px(SETTINGS_NAV_QUIET_PADDING_X))
             .rounded(px(5.))
             .border_1()
-            .border_color(color(iced::Color::TRANSPARENT))
+            .border_color(color(crate::theme::Color::TRANSPARENT))
             .cursor_pointer()
             .text_size(label_size)
             .line_height((label_size) * 1.3)
@@ -219,7 +219,7 @@ impl Root {
                     }])
             } else {
                 segment
-                    .border_color(color(iced::Color::TRANSPARENT))
+                    .border_color(color(crate::theme::Color::TRANSPARENT))
                     .text_color(color(tokens.muted))
                     .hover(move |style| style.bg(hover))
             };
@@ -434,7 +434,7 @@ impl Root {
             .border_color(color(tokens.line))
             .font_family(terminal_family(draft))
             .font_weight(gpui::FontWeight(f32::from(
-                crate::settings::weight_numeric(draft.terminal_font_weight.iced()),
+                draft.terminal_font_weight.numeric(),
             )))
             .text_size(px(draft.terminal_font_pixels()))
             .line_height(px(draft.terminal_cell_height()))
@@ -1104,7 +1104,7 @@ impl Root {
                     .border_color(color(if selected {
                         tokens.accent
                     } else {
-                        iced::Color::TRANSPARENT
+                        crate::theme::Color::TRANSPARENT
                     }))
                     .when(!selected, |card| {
                         card.hover(move |style| style.border_color(color(tokens.line_strong)))
@@ -1186,10 +1186,10 @@ impl Root {
                 (fill, hover, tokens.danger, edge, tokens.danger)
             }
             SettingsButtonKind::Quiet => (
-                color(iced::Color::TRANSPARENT),
+                color(crate::theme::Color::TRANSPARENT),
                 color(tokens.panel_raised),
                 tokens.muted,
-                iced::Color::TRANSPARENT,
+                crate::theme::Color::TRANSPARENT,
                 tokens.line_strong,
             ),
         };
@@ -1581,7 +1581,7 @@ impl Root {
         let path_size = draft.ui_pixels(8.0);
         let branch_size = draft.ui_pixels(9.0);
         let detail_size = draft.ui_pixels(8.0);
-        let text = |size: f32, hue: iced::Color, copy: String| {
+        let text = |size: f32, hue: crate::theme::Color, copy: String| {
             div()
                 .text_size(px(size))
                 .line_height(px(size * 1.3))
@@ -1590,7 +1590,7 @@ impl Root {
                 .overflow_hidden()
                 .child(copy)
         };
-        let mono = |size: f32, hue: iced::Color, copy: String| {
+        let mono = |size: f32, hue: crate::theme::Color, copy: String| {
             text(size, hue, copy).font_family(terminal_family(draft))
         };
         let identity = div()
@@ -1774,7 +1774,7 @@ impl Root {
             .child(div().w(px(3.)).flex_shrink_0().bg(color(if selected {
                 tokens.accent
             } else {
-                iced::Color::TRANSPARENT
+                crate::theme::Color::TRANSPARENT
             })))
             .child(
                 div()
@@ -1832,7 +1832,7 @@ impl Root {
         title: &str,
         body: &str,
         recovery: &str,
-        hue: iced::Color,
+        hue: crate::theme::Color,
         tokens: DesignTokens,
     ) -> AnyElement {
         let draft = &self.app().settings_draft;
@@ -1949,10 +1949,10 @@ impl Root {
                 (fill, hover, tokens.danger, edge, tokens.danger)
             }
             SettingsButtonKind::Quiet => (
-                color(iced::Color::TRANSPARENT),
+                color(crate::theme::Color::TRANSPARENT),
                 color(tokens.panel_raised),
                 tokens.muted,
-                iced::Color::TRANSPARENT,
+                crate::theme::Color::TRANSPARENT,
                 tokens.line_strong,
             ),
         };

@@ -16,17 +16,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
-use iced::advanced::image::Handle as ImageHandle;
-use iced::futures::StreamExt as _;
-use iced::mouse;
-use iced::widget::{
-    button, canvas, column, container, mouse_area, rich_text, row, span, stack, svg, text, tooltip,
-};
-use iced::{
-    Alignment, Border, Color, Element, Fill, Font, Length, Padding, Pixels, Shadow, Subscription,
-    Theme, Vector, font,
-};
 use libghostty_vt::TerminalOptions;
 use muxtrix_control::{
     Agent, AgentState, ControlRequest, ControlResponse, ControlServer, Endpoint, HookAction,
@@ -38,17 +27,14 @@ use muxtrix_domain::{
 };
 use muxtrix_platform::{LaunchPlan, PtySize};
 use muxtrix_terminal::{
-    EventNotifier, GridSnapshot, ImageLayer, LiveSession, LiveSessionEvent, ScrollbarSnapshot,
-    TerminalActor, TerminalMouseAction, TerminalMouseButton, TerminalMouseEvent,
-    TerminalNotification, TerminalTheme,
+    EventNotifier, GridSnapshot, LiveSession, LiveSessionEvent, ScrollbarSnapshot, TerminalActor,
+    TerminalMouseAction, TerminalMouseButton, TerminalMouseEvent, TerminalNotification,
+    TerminalTheme,
 };
 
 #[cfg(feature = "e2e")]
 use crate::e2e;
-use crate::{
-    agent_screen, agents_roster, box_drawing, commands, effect, github, input, metrics, settings,
-    terminal_image,
-};
+use crate::{agent_screen, agents_roster, commands, effect, github, settings};
 
 use crate::commands::CommandAction;
 use crate::effect::{Effect, FocusTarget, ScrollTarget};
@@ -68,15 +54,14 @@ use crate::process::{
 use crate::settings::WindowsShellBackend;
 use crate::settings::{
     AppSettings, Appearance, DEFAULT_TERMINAL_SCROLLBACK_LINES, FleetScope, FleetView, FontWeight,
-    InstalledFontCatalog, TerminalFont, UiFont, font_with_style,
+    InstalledFontCatalog, TerminalFont, UiFont,
 };
 #[cfg(test)]
-use crate::terminal::runs::terminal_style_runs;
 use crate::terminal::runs::{
-    TerminalRunGeometry, TerminalRunKind, TerminalUnderlineDecoration, bold_size_scale, rgb,
-    terminal_row_style_runs, terminal_run_geometry, terminal_underline_decoration,
+    TerminalRunKind, TerminalUnderlineDecoration, terminal_row_style_runs, terminal_style_runs,
+    terminal_underline_decoration,
 };
-use crate::theme::DesignTokens;
+use crate::theme::{Color, DesignTokens};
 use crate::themes::{TerminalThemeId, TerminalThemePreset};
 
 pub(crate) static NO_TERMINAL_STARTUP: AtomicBool = AtomicBool::new(false);
@@ -86,10 +71,7 @@ pub(crate) static NO_TERMINAL_STARTUP: AtomicBool = AtomicBool::new(false);
 /// The compositor is a real thing users are told about when a GPU goes wrong,
 /// so it has to name the one actually in the binary rather than whichever was
 /// there when the string was written.
-#[cfg(feature = "gpui")]
 pub(crate) const COMPOSITOR_NAME: &str = "GPUI/wgpu";
-#[cfg(not(feature = "gpui"))]
-pub(crate) const COMPOSITOR_NAME: &str = "Iced/wgpu";
 
 pub(crate) const TERMINAL_PADDING: f32 = 16.0;
 
@@ -159,13 +141,6 @@ pub(crate) const GITHUB_PULL_REQUEST_SEARCH_HEIGHT: f32 = 66.0;
 
 pub(crate) const GITHUB_PULL_REQUEST_SUMMARY_HEIGHT: f32 = 34.0;
 
-/// Keep the list viewport fixed while refresh hides search and summary chrome.
-/// Otherwise centered loading copy jumps upward by half the removed height.
-pub(crate) const GITHUB_PULL_REQUEST_LIST_CHROME_HEIGHT: f32 =
-    GITHUB_PULL_REQUEST_SEARCH_HEIGHT + GITHUB_PULL_REQUEST_SUMMARY_HEIGHT + 1.0;
-
-pub(crate) const GITHUB_FILE_OVERSCAN: usize = 5;
-
 /// Keep installed-font menus scannable instead of letting a large system font
 /// catalog consume the window. Iced's menu overlay uses the resulting height
 /// when choosing the side with more available viewport space, and scrolls any
@@ -173,22 +148,6 @@ pub(crate) const GITHUB_FILE_OVERSCAN: usize = 5;
 pub(crate) const FONT_FAMILY_MENU_MAX_HEIGHT: f32 = 320.0;
 
 pub(crate) const SPLIT_HANDLE_SIZE: f32 = 8.0;
-
-pub(crate) const PALETTE_INPUT_ID: &str = "muxtrix-command-palette-input";
-
-pub(crate) const SETTINGS_SCROLL_ID: &str = "muxtrix-settings-scroll";
-
-pub(crate) const PALETTE_SCROLL_ID: &str = "muxtrix-command-palette-scroll";
-
-pub(crate) const GITHUB_FILE_SCROLL_ID: &str = "muxtrix-github-file-scroll";
-
-pub(crate) const GITHUB_PULL_REQUEST_SCROLL_ID: &str = "muxtrix-github-pull-request-scroll";
-
-pub(crate) const GITHUB_PULL_REQUEST_QUERY_ID: &str = "muxtrix-github-pull-request-query";
-
-/// Deliberately not attached to any widget. Focusing it takes focus away from
-/// the search field so list keys reach the panel handler.
-pub(crate) const GITHUB_KEYBOARD_SINK_ID: &str = "muxtrix-github-keyboard-sink";
 
 pub(crate) const GITHUB_DIFF_LINE_HEIGHT: f32 = 24.0;
 
@@ -199,12 +158,6 @@ pub(crate) const GITHUB_DIFF_CHROME_WIDTH: f32 = 122.0;
 pub(crate) const GITHUB_DIFF_MIN_WRAP_COLUMNS: usize = 80;
 
 pub(crate) const GITHUB_LOADING_DOT_COUNT: u8 = 9;
-
-pub(crate) const WORKSPACE_CREATE_INPUT_ID: &str = "muxtrix-workspace-create-input";
-
-pub(crate) const RENAME_INPUT_ID: &str = "muxtrix-rename-input";
-
-pub(crate) const WORKTREE_INPUT_ID: &str = "muxtrix-worktree-input";
 
 pub(crate) const NO_REPO_GROUP: &str = "No Repo";
 
@@ -263,30 +216,6 @@ pub(crate) const WORKTREE_PAGE_MAX_WIDTH: f32 = 1480.0;
 /// Reserve for the scrollable's overlay scrollbar, which draws over the
 /// content's right edge rather than displacing it.
 pub(crate) const WORKTREE_SCROLLBAR_RESERVE: f32 = 12.0;
-
-/// Header chrome the title can never have: the band's 12/6 padding, the signal
-/// dot, the five 8px gaps in the row, and a reserve so proportional copy stops
-/// short of the state label instead of crowding it.
-pub(crate) const PANE_HEADER_FIXED_WIDTH: f32 = 12.0 + 6.0 + 6.0 + 8.0 * 5.0 + 12.0;
-
-pub(crate) const PANE_HEADER_ICON_BUTTON: f32 = 24.0;
-
-pub(crate) const PANE_HEADER_DIVIDER: f32 = 1.0;
-
-pub(crate) const PANE_HEADER_CONTROL_SPACING: f32 = 2.0;
-
-/// Horizontal padding of the command chip and of a labelled header button.
-pub(crate) const PANE_HEADER_CHIP_PADDING: f32 = 12.0;
-
-pub(crate) const PANE_HEADER_LABEL_PADDING: f32 = 16.0;
-
-/// Even a pane too narrow to hold its own chrome shows some title; a header
-/// that tight is already compact and has shed its chip and state label.
-pub(crate) const PANE_TITLE_MIN_WIDTH: f32 = 48.0;
-
-/// Budget for the frames before a pane has reported its size — wide enough not
-/// to bind, since the character budget still truncates.
-pub(crate) const PANE_TITLE_UNMEASURED_WIDTH: f32 = 4_096.0;
 
 pub(crate) static SESSION_HOST: std::sync::Mutex<Option<SessionHost>> = std::sync::Mutex::new(None);
 
@@ -442,7 +371,6 @@ pub(crate) struct TerminalRuntime {
     pub(crate) preview: String,
     pub(crate) snapshot: Option<GridSnapshot>,
     pub(crate) snapshot_revision: u64,
-    pub(crate) image_handles: BTreeMap<u64, ImageHandle>,
     pub(crate) session: Option<LiveSession>,
     pub(crate) fallback_title: String,
     pub(crate) display_title: String,
@@ -1220,15 +1148,6 @@ pub(crate) struct TabDrag {
     pub(crate) target_index: usize,
 }
 
-#[derive(Clone)]
-pub(crate) struct EventSubscription(async_channel::Receiver<()>);
-
-impl Hash for EventSubscription {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        "muxtrix-event-subscription".hash(state);
-    }
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct CommandPalette {
     pub(crate) visible: bool,
@@ -1340,7 +1259,6 @@ pub(crate) enum Message {
     ClipboardPasted(PaneId, Option<String>),
     TerminalLinkOpened(String, Result<(), String>),
     ScrollTerminal(PaneId, ScrollDelta),
-    ScrollHoveredTerminal(ScrollDelta),
     WindowOpened(Size),
     WindowResized(Size),
     WindowFocusChanged(bool),
@@ -1474,10 +1392,6 @@ pub(crate) enum Message {
     GalleryThemeChosen(TerminalThemeId),
     #[cfg(feature = "e2e")]
     E2eTick,
-    #[cfg(feature = "e2e")]
-    E2eScreenshot(iced::window::Screenshot),
-    #[cfg(feature = "e2e")]
-    E2eWindowMissing,
 }
 
 impl Muxtrix {
@@ -2070,47 +1984,6 @@ impl Muxtrix {
         )
     }
 
-    pub(crate) fn theme(&self) -> Theme {
-        match self.settings.appearance {
-            Appearance::Light => Theme::Light,
-            Appearance::System | Appearance::Dark => Theme::TokyoNight,
-        }
-    }
-
-    pub(crate) fn subscription(&self) -> Subscription<Message> {
-        let mut subscriptions = vec![
-            Subscription::run_with(
-                EventSubscription(self.event_receiver.clone()),
-                event_subscription,
-            ),
-            iced::time::every(std::time::Duration::from_millis(500)).map(|_| Message::BlinkCursor),
-            iced::event::listen_with(app_event),
-        ];
-        if self.github_loading_animating() {
-            subscriptions.push(
-                iced::time::every(std::time::Duration::from_millis(90))
-                    .map(|_| Message::AnimateGitHubLoading),
-            );
-        }
-        if self.github_pull_requests_refresh_pending {
-            subscriptions.push(
-                iced::time::every(std::time::Duration::from_millis(1))
-                    .map(|_| Message::RefreshGitHubPullRequestsAfterAgentTurn),
-            );
-        }
-        #[cfg(feature = "e2e")]
-        let subscriptions = if self.has_e2e_scenario() {
-            let mut with_e2e = subscriptions;
-            with_e2e.push(
-                iced::time::every(std::time::Duration::from_millis(50)).map(|_| Message::E2eTick),
-            );
-            with_e2e
-        } else {
-            subscriptions
-        };
-        Subscription::batch(subscriptions)
-    }
-
     /// The pane the keyboard is currently aimed at, if a workspace is open.
     pub(crate) fn focused_pane_id(&self) -> Option<PaneId> {
         self.active_workspace()
@@ -2124,7 +1997,6 @@ impl Muxtrix {
     /// Polling a terminal that produced no output must not repaint: under a
     /// software renderer a full-window repaint costs more than the poll, and
     /// doing one per poll is what makes timers slip under load.
-    #[cfg(feature = "gpui")]
     pub(crate) fn grid_revision(&self) -> u64 {
         self.terminals
             .values()
@@ -2138,7 +2010,6 @@ impl Muxtrix {
     /// changed nothing skip its repaint. Under a software renderer a
     /// full-window repaint is expensive enough that doing one twenty times a
     /// second starves the subprocesses the app is supposed to be hosting.
-    #[cfg(feature = "gpui")]
     pub(crate) fn chrome_revision(&self) -> u64 {
         let mut revision = 0u64;
         let mut bit =
@@ -2180,7 +2051,6 @@ impl Muxtrix {
     ///
     /// Focus is derived from state rather than remembered, so closing a
     /// surface cannot leave its field holding keys the terminal needs.
-    #[cfg(feature = "gpui")]
     pub(crate) fn focus_target(&self) -> Option<crate::effect::FocusTarget> {
         use crate::effect::FocusTarget;
         if self.palette.visible {
@@ -2559,32 +2429,13 @@ impl Muxtrix {
                 }
                 return Vec::new();
             }
-            Message::ScrollHoveredTerminal(delta) => {
-                let Some(pane_id) = self.hovered_terminal else {
-                    return Vec::new();
-                };
-                let result = self.scroll_terminal(pane_id, delta);
-                match result {
-                    Ok(()) =>
-                    {
-                        #[cfg(feature = "e2e")]
-                        if let Some(scenario) = &mut self.e2e {
-                            scenario.observe_terminal_scroll();
-                        }
-                    }
-                    Err(error) => self.status = format!("Terminal scroll failed: {error}"),
-                }
-                return Vec::new();
-            }
             Message::WindowOpened(size) => {
                 self.window_open = true;
                 self.window_size = size;
-                let resize = self.window_resize_increment_task();
-                let terminal = self
+                return self
                     .startup_terminal_pending
                     .take()
                     .map_or_else(Vec::new, |pane_id| self.prepare_session_host(pane_id));
-                return effect::batch([resize, terminal]);
             }
             Message::WindowResized(size) => {
                 self.window_size = size;
@@ -3670,10 +3521,6 @@ impl Muxtrix {
             }
             #[cfg(feature = "e2e")]
             Message::E2eTick => return self.drive_e2e(),
-            #[cfg(feature = "e2e")]
-            Message::E2eScreenshot(screenshot) => return self.finish_e2e(screenshot),
-            #[cfg(feature = "e2e")]
-            Message::E2eWindowMissing => return self.fail_e2e("Iced window was not available"),
         };
 
         self.status = match result {
@@ -3681,24 +3528,6 @@ impl Muxtrix {
             Err(error) => error,
         };
         Vec::new()
-    }
-
-    pub(crate) fn window_resize_increment_task(&self) -> Vec<Effect> {
-        // Before the window exists there is nothing to constrain; the effect
-        // is re-issued once it opens.
-        if !self.window_open {
-            return Vec::new();
-        }
-        let Some(increments) = wsl_wayland_resize_increments(
-            muxtrix::gpu::is_wsl(),
-            std::env::var_os("WAYLAND_DISPLAY").is_some(),
-            std::env::var_os("WINIT_UNIX_BACKEND")
-                .is_some_and(|backend| backend.to_string_lossy().eq_ignore_ascii_case("x11")),
-            &self.settings,
-        ) else {
-            return Vec::new();
-        };
-        vec![Effect::SetResizeIncrements(increments)]
     }
 
     pub(crate) fn default_terminal_profile(&self) -> Result<LaunchProfile, String> {
@@ -4389,27 +4218,6 @@ impl Muxtrix {
     pub(crate) fn copy_terminal_selection(&mut self, text: String) -> Vec<Effect> {
         self.show_toast("Copied to clipboard");
         vec![Effect::ClipboardWrite(text)]
-    }
-
-    /// `weight` snapped to a face the configured interface family installs.
-    ///
-    /// Emphasis levels in the rail are derived, not configured, so nothing
-    /// validates them against the chosen family the way the settings picker
-    /// validates the base weight. A family without the requested face makes the
-    /// shaper substitute a different family for that run, changing the typeface
-    /// and the shape of glyphs like `…` between adjacent rows.
-    pub(crate) fn ui_weight(&self, weight: FontWeight) -> font::Weight {
-        self.installed_fonts
-            .nearest_ui_weight(&self.settings.ui_font, weight)
-            .iced()
-    }
-
-    /// `weight` snapped against the family `Font::DEFAULT` resolves to, for
-    /// chrome that deliberately stays on the system sans.
-    pub(crate) fn default_family_weight(&self, weight: FontWeight) -> font::Weight {
-        self.installed_fonts
-            .nearest_ui_weight(&UiFont::SystemSans, weight)
-            .iced()
     }
 
     /// Bottom-center feedback. Prefix and rail-navigation hints are modal,
@@ -6923,7 +6731,7 @@ impl Muxtrix {
             ),
             (Err(error), _) => format!("Could not save settings: {error}"),
         };
-        let mut tasks = vec![self.window_resize_increment_task()];
+        let mut tasks = Vec::new();
         if github_host_changed {
             self.github_auth_generation = self.github_auth_generation.wrapping_add(1);
             let generation = self.github_auth_generation;
@@ -7915,11 +7723,13 @@ impl Muxtrix {
         }
     }
 
-    /// Assert the scenario's state and write its half of the report.
-    ///
-    /// Only the GPUI runtime needs this: the iced one still photographs its
-    /// own window, so it writes the whole report in one go.
-    #[cfg(all(feature = "e2e", feature = "gpui"))]
+    pub(crate) fn github_panel_visible(&self) -> bool {
+        self.github_panel.is_some()
+    }
+
+    /// Assert the scenario's state and write its half of the report; the
+    /// harness photographs the window and merges in what only pixels answer.
+    #[cfg(feature = "e2e")]
     pub(crate) fn report_e2e_capture(&self) -> Result<(), String> {
         self.e2e
             .as_ref()
@@ -8783,15 +8593,6 @@ impl Muxtrix {
                 .is_some_and(|status| status.state == AgentState::Completed)
     }
 
-    pub(crate) fn pane_signal_color(
-        &self,
-        pane_id: PaneId,
-        attention: bool,
-        tokens: DesignTokens,
-    ) -> Color {
-        self.pane_signal_kind(pane_id, attention).color(tokens)
-    }
-
     pub(crate) fn tab_signal_kind(&self, tab: &WorkspaceTab) -> PaneSignalKind {
         tab.root
             .pane_ids()
@@ -9015,23 +8816,6 @@ impl Muxtrix {
             .find(|workspace| workspace.id == self.session.active_workspace_id)
             .ok_or_else(|| "active workspace is missing".into())
     }
-}
-
-pub(crate) fn github_virtual_window(
-    item_count: usize,
-    offset: f32,
-    viewport_height: f32,
-    row_height: f32,
-) -> (usize, usize) {
-    let visible = (viewport_height / row_height.max(1.0)).ceil() as usize;
-    let raw_first = (offset.max(0.0) / row_height.max(1.0)).floor() as usize;
-    // A filter or refresh may make a formerly valid deep scroll offset point
-    // past the new end. Anchor to the last full viewport before overscanning
-    // so the virtualized body can never render as a blank list.
-    let anchored_first = raw_first.min(item_count.saturating_sub(visible));
-    let first = anchored_first.saturating_sub(GITHUB_FILE_OVERSCAN);
-    let last = (first + visible + GITHUB_FILE_OVERSCAN * 2).min(item_count);
-    (first, last)
 }
 
 pub(crate) fn github_clamped_scroll_offset(
@@ -10128,24 +9912,6 @@ pub(crate) fn create_git_worktree(
     }
 }
 
-/// Coarse "3h ago"-style label from a unix timestamp.
-pub(crate) fn age_label(created_unix: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    let elapsed = now.saturating_sub(created_unix);
-    if created_unix == 0 {
-        return "unknown age".into();
-    }
-    match elapsed {
-        0..=59 => "just now".into(),
-        60..=3599 => format!("{}m ago", elapsed / 60),
-        3600..=86_399 => format!("{}h ago", elapsed / 3600),
-        86_400..=31_535_999 => format!("{}d ago", elapsed / 86_400),
-        _ => "a long time ago".into(),
-    }
-}
-
 pub(crate) fn split_ratio_at(tree: &PaneTree, path: &[SplitBranch]) -> Option<SplitRatio> {
     if path.is_empty() {
         return match tree {
@@ -10211,262 +9977,10 @@ pub(crate) enum IconKind {
     PullRequestMerged,
 }
 
-pub(crate) fn icon<'a>(kind: IconKind, color: Color, size: f32) -> svg::Svg<'a> {
-    let bytes: &'static [u8] = match kind {
-        IconKind::Back => include_bytes!("../assets/icons/back.svg"),
-        IconKind::Add => include_bytes!("../assets/icons/add.svg"),
-        IconKind::Collapse => include_bytes!("../assets/icons/collapse.svg"),
-        IconKind::Expand => include_bytes!("../assets/icons/expand.svg"),
-        IconKind::SplitRight => include_bytes!("../assets/icons/split-right.svg"),
-        IconKind::SplitDown => include_bytes!("../assets/icons/split-down.svg"),
-        IconKind::Maximize => include_bytes!("../assets/icons/maximize.svg"),
-        IconKind::Restore => include_bytes!("../assets/icons/restore.svg"),
-        IconKind::Settings => include_bytes!("../assets/icons/settings.svg"),
-        IconKind::Command => include_bytes!("../assets/icons/command.svg"),
-        IconKind::GitHub => include_bytes!("../assets/icons/github.svg"),
-        IconKind::Refresh => include_bytes!("../assets/icons/refresh.svg"),
-        IconKind::Branch => include_bytes!("../assets/icons/branch.svg"),
-        IconKind::File => include_bytes!("../assets/icons/file.svg"),
-        IconKind::Close => include_bytes!("../assets/icons/close.svg"),
-        IconKind::Overflow => include_bytes!("../assets/icons/overflow.svg"),
-        IconKind::StatusReady => include_bytes!("../assets/icons/status-ready.svg"),
-        IconKind::StatusWarning => include_bytes!("../assets/icons/status-warning.svg"),
-        IconKind::StatusError => include_bytes!("../assets/icons/status-error.svg"),
-        IconKind::StatusInfo => include_bytes!("../assets/icons/status-info.svg"),
-        IconKind::PullRequestOpen => include_bytes!("../assets/icons/pull-request-open.svg"),
-        IconKind::PullRequestDraft => include_bytes!("../assets/icons/pull-request-draft.svg"),
-        IconKind::PullRequestClosed => include_bytes!("../assets/icons/pull-request-closed.svg"),
-        IconKind::PullRequestMerged => include_bytes!("../assets/icons/pull-request-merged.svg"),
-    };
-    svg(svg::Handle::from_memory(bytes))
-        .width(size)
-        .height(size)
-        .style(move |_, _| svg::Style { color: Some(color) })
-}
-
-/// The 2px accent bar that marks the selected row in a ruled list — always
-/// present so selection never shifts layout, transparent when inactive.
-/// Small tinted state pill sitting beside an identity line in list rows —
-/// keeps state out of the meta column's lane so long meta never collides
-/// with it.
-pub(crate) fn status_pill(
-    label: &str,
-    hue: Color,
-    settings: &AppSettings,
-) -> Element<'static, Message> {
-    container(
-        text(label.to_owned())
-            .size(settings.ui_pixels(7.5))
-            .font(Font {
-                weight: font::Weight::Semibold,
-                ..Font::DEFAULT
-            })
-            .color(hue)
-            .wrapping(iced::widget::text::Wrapping::None),
-    )
-    .padding([2, 8])
-    .style(move |_| {
-        container::Style::default()
-            .background(Color { a: 0.12, ..hue })
-            .border(Border {
-                color: Color { a: 0.3, ..hue },
-                width: 1.0,
-                radius: 999.0.into(),
-            })
-    })
-    .into()
-}
-
-pub(crate) fn selection_bar(selected: bool, tokens: DesignTokens) -> Element<'static, Message> {
-    container("")
-        .width(3)
-        .height(Length::Fill)
-        .style(move |_| {
-            container::Style::default().background(if selected {
-                tokens.accent
-            } else {
-                Color::TRANSPARENT
-            })
-        })
-        .into()
-}
-
-/// The leading mark in a rail row's gutter. Where you already are is one
-/// unbroken accent bar; where the keyboard cursor would land is that same bar
-/// cut into rungs. Solid reads as committed and broken reads as proposed, and
-/// the pair stays legible in a 3px gutter where two shades of one accent would
-/// collapse into each other. The cursor wins the gutter when it sits on the
-/// focused row, matching the row fill, which resolves the overlap the same way.
-pub(crate) fn rail_marker(
-    selected: bool,
-    targeted: bool,
-    tokens: DesignTokens,
-) -> Element<'static, Message> {
-    if !targeted {
-        return selection_bar(selected, tokens);
-    }
-    let mut ladder = column![].width(3).height(Length::Fill);
-    for rung in 0..RAIL_CURSOR_RUNGS {
-        let filled = rung % 2 == 0;
-        ladder = ladder.push(container("").width(3).height(Length::Fill).style(move |_| {
-            container::Style::default().background(if filled {
-                tokens.accent
-            } else {
-                Color::TRANSPARENT
-            })
-        }));
-    }
-    ladder.into()
-}
-
-pub(crate) fn signal_dot(color: Color, size: f32) -> Element<'static, Message> {
-    container("")
-        .width(size)
-        .height(size)
-        .style(move |_| {
-            container::Style::default()
-                .background(color)
-                .border(Border::default().rounded(size / 2.0))
-        })
-        .into()
-}
-
-/// The pip for a pane projecting Claude Code's roster: the same footprint and
-/// the same rolled-up signal colour as a lifecycle dot, drawn as a core inside
-/// a ring so the row reads as a container of agents rather than as one agent's
-/// own state. It keeps the shared left edge every fleet row aligns to.
-///
-/// The ring alone was not enough. At the quiet end of the palette a hairline
-/// outline of `faint` or `muted` on the rail's own background reads as no pip
-/// at all — which is the state a healthy fleet spends most of its time in — so
-/// the mark keeps a solid centre at every signal.
-pub(crate) fn roster_ring(color: Color, size: f32) -> Element<'static, Message> {
-    container(signal_dot(color, (size * 0.45).round().max(3.0)))
-        .width(size)
-        .height(size)
-        .align_x(iced::alignment::Horizontal::Center)
-        .align_y(iced::alignment::Vertical::Center)
-        .style(move |_| {
-            container::Style::default().border(Border {
-                color: Color {
-                    a: color.a * 0.7,
-                    ..color
-                },
-                width: 1.0,
-                radius: (size / 2.0).into(),
-            })
-        })
-        .into()
-}
-
-pub(crate) fn section_label(
-    label: &'static str,
-    settings: &AppSettings,
-    tokens: DesignTokens,
-) -> Element<'static, Message> {
-    container(
-        text(label)
-            .size(settings.ui_pixels(9.0))
-            .color(tokens.faint)
-            .font(Font {
-                weight: font::Weight::Semibold,
-                ..Font::DEFAULT
-            }),
-    )
-    .padding([6, 6])
-    .into()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FleetGroupLevel {
     Workspace,
     Nested,
-}
-
-/// A fleet group band with an amber rollup dot when any pane inside needs a
-/// person. Workspace bands carry stronger type and the rail surface; nested
-/// tab and repository bands stay smaller and recessed on the app surface.
-pub(crate) fn fleet_group_label(
-    label: String,
-    level: FleetGroupLevel,
-    warning: bool,
-    targeted: bool,
-    on_press: Option<Message>,
-    settings: &AppSettings,
-    tokens: DesignTokens,
-) -> Element<'static, Message> {
-    let workspace = level == FleetGroupLevel::Workspace;
-    let content = row![
-        text(ellipsize(
-            &label.to_uppercase(),
-            settings.ui_char_budget(if workspace { 24 } else { 26 })
-        ))
-        .size(settings.ui_pixels(if workspace { 9.0 } else { 8.0 }))
-        .font(Font {
-            weight: if workspace {
-                font::Weight::Bold
-            } else {
-                font::Weight::Semibold
-            },
-            ..Font::DEFAULT
-        })
-        .color(if targeted {
-            tokens.accent
-        } else if workspace {
-            tokens.muted
-        } else {
-            tokens.faint
-        })
-        .width(Fill)
-        .wrapping(iced::widget::text::Wrapping::None),
-        if warning {
-            signal_dot(tokens.warning, 6.0)
-        } else {
-            signal_dot(Color::TRANSPARENT, 6.0)
-        },
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
-    let mut band = button(centered_button_content(content))
-        .height(if workspace { 32 } else { 30 })
-        .padding([0, if workspace { 12 } else { 16 }])
-        .width(Fill)
-        .style(move |_, status| {
-            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-            button::Style {
-                background: Some(iced::Background::Color(if targeted {
-                    Color {
-                        a: 0.12,
-                        ..tokens.accent
-                    }
-                } else if hovered {
-                    Color {
-                        a: 0.04,
-                        ..tokens.text
-                    }
-                } else if workspace {
-                    tokens.rail
-                } else {
-                    tokens.app
-                })),
-                text_color: if targeted { tokens.text } else { tokens.faint },
-                border: Border {
-                    color: if targeted {
-                        tokens.accent
-                    } else {
-                        Color::TRANSPARENT
-                    },
-                    width: if targeted { 1.0 } else { 0.0 },
-                    radius: 0.0.into(),
-                },
-                shadow: Shadow::default(),
-                snap: true,
-            }
-        });
-    if let Some(message) = on_press {
-        band = band.on_press(message);
-    }
-    band.into()
 }
 
 pub(crate) const fn pane_signal_priority(kind: PaneSignalKind) -> u8 {
@@ -10547,332 +10061,6 @@ pub(crate) fn git_branch_for_directory(cwd: Option<&str>) -> Option<String> {
             return None;
         }
     }
-}
-
-/// Rail rows are square and full-bleed. Real selection keeps the familiar
-/// neutral fill plus its solid 3px leading bar; the keyboard cursor takes an
-/// accent tint, a complete accent perimeter, accent headline text, and a rung
-/// bar, so current location and proposed destination remain unmistakably
-/// different, even when they overlap. The cursor is transient and answers a
-/// question the eye is actively asking, so it is allowed to shout where
-/// selection stays quiet.
-pub(crate) fn rail_row_style(
-    tokens: DesignTokens,
-    selected: bool,
-    targeted: bool,
-    status: button::Status,
-) -> button::Style {
-    if targeted {
-        return button::Style {
-            background: Some(
-                Color {
-                    a: 0.18,
-                    ..tokens.accent
-                }
-                .into(),
-            ),
-            text_color: tokens.text,
-            border: Border {
-                color: tokens.accent,
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        };
-    }
-
-    button::Style {
-        border: Border::default(),
-        ..quiet_button_style(tokens, selected, status)
-    }
-}
-
-pub(crate) fn quiet_button_style(
-    tokens: DesignTokens,
-    selected: bool,
-    status: button::Status,
-) -> button::Style {
-    // Text-derived translucent fills read correctly on every surface in both
-    // appearances: light overlay on dark text-on-dark, dark overlay on light.
-    let background = if selected {
-        Some(Color {
-            a: 0.07,
-            ..tokens.text
-        })
-    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-        Some(Color {
-            a: 0.04,
-            ..tokens.text
-        })
-    } else {
-        None
-    };
-    button::Style {
-        background: background.map(iced::Background::Color),
-        text_color: tokens.text,
-        border: Border::default().rounded(6.0),
-        shadow: Shadow::default(),
-        snap: true,
-    }
-}
-
-/// A fleet-view segment inside the recessed toggle track. The selected thumb
-/// is a raised, bordered chip with its own shadow so the control reads as a
-/// physical toggle: dark well, light thumb.
-pub(crate) fn fleet_toggle_style(
-    tokens: DesignTokens,
-    selected: bool,
-    status: button::Status,
-) -> button::Style {
-    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-    let background = if selected {
-        Some(tokens.panel_raised)
-    } else if hovered {
-        Some(Color {
-            a: 0.05,
-            ..tokens.text
-        })
-    } else {
-        None
-    };
-    button::Style {
-        background: background.map(iced::Background::Color),
-        text_color: if selected { tokens.text } else { tokens.muted },
-        border: Border {
-            color: if selected {
-                tokens.line_strong
-            } else {
-                Color::TRANSPARENT
-            },
-            width: 1.0,
-            radius: 5.0.into(),
-        },
-        shadow: if selected {
-            Shadow {
-                color: Color::from_rgba8(0, 0, 0, 0.35),
-                offset: Vector::new(0.0, 1.0),
-                blur_radius: 3.0,
-            }
-        } else {
-            Shadow::default()
-        },
-        snap: true,
-    }
-}
-
-pub(crate) fn add_tab_button_style(tokens: DesignTokens, status: button::Status) -> button::Style {
-    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-    button::Style {
-        background: hovered.then_some(iced::Background::Color(tokens.panel_raised)),
-        text_color: tokens.text,
-        border: Border {
-            color: if hovered {
-                tokens.line_strong
-            } else {
-                Color::TRANSPARENT
-            },
-            width: 1.0,
-            radius: 5.0.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
-    }
-}
-
-pub(crate) fn palette_button_style(
-    tokens: DesignTokens,
-    selected: bool,
-    enabled: bool,
-    status: button::Status,
-) -> button::Style {
-    let hovered = enabled && matches!(status, button::Status::Hovered | button::Status::Pressed);
-    let background = if selected && enabled {
-        Color {
-            a: 0.14,
-            ..tokens.accent
-        }
-    } else if hovered {
-        tokens.panel
-    } else {
-        Color::TRANSPARENT
-    };
-    button::Style {
-        background: Some(iced::Background::Color(background)),
-        text_color: if enabled { tokens.text } else { tokens.faint },
-        border: Border::default().rounded(5.0),
-        shadow: Shadow::default(),
-        snap: true,
-    }
-}
-
-pub(crate) fn ruled_surface(background: Color, line: Color) -> container::Style {
-    container::Style::default()
-        .background(background)
-        .border(Border {
-            color: line,
-            width: 1.0,
-            radius: 0.0.into(),
-        })
-}
-
-pub(crate) fn modal_surface(tokens: DesignTokens) -> container::Style {
-    container::Style::default()
-        .background(tokens.overlay)
-        .border(Border {
-            color: tokens.line_strong,
-            width: 1.0,
-            radius: 8.0.into(),
-        })
-        .shadow(Shadow {
-            color: Color::from_rgba8(0, 0, 0, 0.45),
-            offset: Vector::new(0.0, 10.0),
-            blur_radius: 28.0,
-        })
-}
-
-pub(crate) fn centered_button_content<'a>(
-    content: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    container(content)
-        .height(Fill)
-        .align_y(iced::alignment::Vertical::Center)
-        .into()
-}
-
-pub(crate) fn centered_button_label(label: &'static str, size: f32) -> Element<'static, Message> {
-    centered_button_content(text(label).size(size))
-}
-
-pub(crate) fn app_tooltip<'a>(
-    content: impl Into<Element<'a, Message>>,
-    label: impl Into<String>,
-    position: tooltip::Position,
-    tokens: DesignTokens,
-    font_size: f32,
-) -> Element<'a, Message> {
-    tooltip(
-        content,
-        text(label.into()).size(font_size).color(tokens.text),
-        position,
-    )
-    .gap(6)
-    .padding(8)
-    .style(move |_| ruled_surface(tokens.overlay, tokens.line_strong))
-    .into()
-}
-
-pub(crate) fn pane_icon_button(
-    kind: IconKind,
-    label: &'static str,
-    message: Message,
-    tokens: DesignTokens,
-) -> Element<'static, Message> {
-    app_tooltip(
-        button(
-            container(icon(kind, tokens.muted, 14.0))
-                .width(Fill)
-                .height(Fill)
-                .center_x(Fill)
-                .align_y(iced::alignment::Vertical::Center),
-        )
-        .on_press(message)
-        .width(30)
-        .height(28)
-        .padding(0)
-        .style(move |_, status| quiet_button_style(tokens, false, status)),
-        label,
-        tooltip::Position::Bottom,
-        tokens,
-        12.0,
-    )
-}
-
-/// A context-menu row: label, optional trailing shortcut hint, and an
-/// optional message — `None` renders the row disabled in place so menu
-/// positions never shift with selection or process state.
-pub(crate) fn pane_menu_entry(
-    label: &'static str,
-    hint: &'static str,
-    message: Option<Message>,
-    danger: bool,
-    tokens: DesignTokens,
-    settings: &AppSettings,
-) -> Element<'static, Message> {
-    let label_color = if message.is_none() {
-        tokens.faint
-    } else if danger {
-        tokens.danger
-    } else {
-        tokens.text
-    };
-    let mut entry = button(centered_button_content(
-        row![
-            text(label)
-                .size(settings.ui_pixels(9.0))
-                .color(label_color)
-                .width(Fill)
-                .wrapping(iced::widget::text::Wrapping::None),
-            text(hint)
-                .font(settings.terminal_font.iced())
-                .size(settings.ui_pixels(7.5))
-                .color(tokens.faint)
-                .wrapping(iced::widget::text::Wrapping::None),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center),
-    ))
-    .width(Fill)
-    .height(30)
-    .padding([0, 9])
-    .style(move |_, status| pane_menu_entry_style(tokens, danger, status));
-    if let Some(message) = message {
-        entry = entry.on_press(message);
-    }
-    entry.into()
-}
-
-/// Menu rows sit on the raised panel, so the hover fill must come from a
-/// different token than the panel itself or hovering is invisible.
-pub(crate) fn pane_menu_entry_style(
-    tokens: DesignTokens,
-    danger: bool,
-    status: button::Status,
-) -> button::Style {
-    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-    let background = if !hovered {
-        None
-    } else if danger {
-        Some(Color {
-            a: 0.14,
-            ..tokens.danger
-        })
-    } else {
-        // A text-derived tint stays visible on the overlay surface, where
-        // the line token would disappear into the fill.
-        Some(Color {
-            a: 0.08,
-            ..tokens.text
-        })
-    };
-    button::Style {
-        background: background.map(iced::Background::Color),
-        text_color: tokens.text,
-        border: Border::default().rounded(4.0),
-        shadow: Shadow::default(),
-        snap: true,
-    }
-}
-
-pub(crate) fn pane_menu_divider(tokens: DesignTokens) -> Element<'static, Message> {
-    container(
-        container("")
-            .height(1)
-            .width(Fill)
-            .style(move |_| container::Style::default().background(tokens.line)),
-    )
-    .padding([3, 4])
-    .into()
 }
 
 #[derive(Clone, Copy)]
@@ -10968,176 +10156,8 @@ pub(crate) fn github_readiness_copy(
     }
 }
 
-pub(crate) fn github_action_button_style(
-    tokens: DesignTokens,
-    keyboard_selected: bool,
-    status: button::Status,
-) -> button::Style {
-    let mut style = settings_button_style(tokens, SettingsButtonKind::Secondary, status);
-    if keyboard_selected && !matches!(status, button::Status::Disabled) {
-        style.border.color = tokens.accent;
-    }
-    style
-}
-
-pub(crate) fn github_merge_button_style(
-    tokens: DesignTokens,
-    keyboard_selected: bool,
-    status: button::Status,
-) -> button::Style {
-    if matches!(status, button::Status::Disabled) {
-        return button::Style {
-            background: Some(tokens.panel.into()),
-            text_color: tokens.faint,
-            border: Border {
-                color: tokens.line,
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..button::Style::default()
-        };
-    }
-    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-    button::Style {
-        background: Some(
-            Color {
-                a: if hovered { 0.88 } else { 1.0 },
-                ..tokens.success
-            }
-            .into(),
-        ),
-        text_color: tokens.app,
-        border: Border {
-            color: if keyboard_selected {
-                tokens.accent
-            } else {
-                tokens.success
-            },
-            width: 1.0,
-            radius: 6.0.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
-    }
-}
-
-pub(crate) fn settings_button_style(
-    tokens: DesignTokens,
-    kind: SettingsButtonKind,
-    status: button::Status,
-) -> button::Style {
-    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-    // An un-pressable button must not impersonate a live one.
-    if matches!(status, button::Status::Disabled) {
-        return button::Style {
-            background: Some(tokens.panel.into()),
-            text_color: tokens.faint,
-            border: Border {
-                color: tokens.line,
-                width: 1.0,
-                radius: 7.0.into(),
-            },
-            ..button::Style::default()
-        };
-    }
-    let (background, text_color, border_color) = match kind {
-        SettingsButtonKind::Primary => (
-            if hovered {
-                Color {
-                    a: 0.86,
-                    ..tokens.accent
-                }
-            } else {
-                tokens.accent
-            },
-            tokens.app,
-            tokens.accent,
-        ),
-        SettingsButtonKind::Secondary => (
-            if hovered {
-                tokens.panel_raised
-            } else {
-                tokens.panel
-            },
-            tokens.text,
-            tokens.line_strong,
-        ),
-        SettingsButtonKind::Danger => (
-            if hovered {
-                Color {
-                    a: 0.12,
-                    ..tokens.danger
-                }
-            } else {
-                Color {
-                    a: 0.05,
-                    ..tokens.danger
-                }
-            },
-            tokens.danger,
-            // tokens.line (6% white) rendered these borders invisible.
-            if hovered {
-                tokens.danger
-            } else {
-                Color {
-                    a: 0.45,
-                    ..tokens.danger
-                }
-            },
-        ),
-        SettingsButtonKind::Quiet => (
-            if hovered {
-                tokens.panel_raised
-            } else {
-                Color::TRANSPARENT
-            },
-            if hovered { tokens.text } else { tokens.muted },
-            if hovered {
-                tokens.line_strong
-            } else {
-                Color::TRANSPARENT
-            },
-        ),
-    };
-    button::Style {
-        background: Some(iced::Background::Color(background)),
-        text_color,
-        border: Border {
-            color: border_color,
-            width: 1.0,
-            radius: 5.0.into(),
-        },
-        shadow: Shadow::default(),
-        snap: true,
-    }
-}
-
-pub(crate) fn settings_action_button(
-    label: &'static str,
-    message: Message,
-    kind: SettingsButtonKind,
-    settings: &AppSettings,
-) -> Element<'static, Message> {
-    settings_action_button_maybe(label, Some(message), kind, settings)
-}
-
 pub(crate) fn settings_have_changes(saved: &AppSettings, draft: &AppSettings) -> bool {
     draft != saved
-}
-
-pub(crate) fn settings_action_button_maybe(
-    label: &'static str,
-    message: Option<Message>,
-    kind: SettingsButtonKind,
-    settings: &AppSettings,
-) -> Element<'static, Message> {
-    let tokens = DesignTokens::for_appearance(settings.appearance);
-    button(centered_button_label(label, settings.ui_pixels(9.0)))
-        .on_press_maybe(message)
-        .height(30)
-        .padding([0, 11])
-        .style(move |_, status| settings_button_style(tokens, kind, status))
-        .into()
 }
 
 /// Whether the settings top bar has to shorten its return label.
@@ -11147,130 +10167,6 @@ pub(crate) fn settings_action_button_maybe(
 /// enough at the default size can be too narrow once the type is scaled up.
 pub(crate) fn settings_nav_is_crowded(window_width: f32, settings: &AppSettings) -> bool {
     window_width < SETTINGS_NAV_LABEL_WIDTHS * settings.ui_pixels(SETTINGS_NAV_LABEL_POINTS)
-}
-
-/// The Preferences/Worktrees page switcher, built on the same recessed-well
-/// toggle the fleet heading uses: a dark track with one raised thumb, so the
-/// current page is unambiguous without inventing a second selection idiom.
-pub(crate) fn settings_page_toggle(
-    current: SettingsPage,
-    settings: &AppSettings,
-) -> Element<'static, Message> {
-    let tokens = DesignTokens::for_appearance(settings.appearance);
-    let segment = |label: &'static str, page: SettingsPage| {
-        let selected = current == page;
-        button(centered_button_content(
-            text(label)
-                .size(settings.ui_pixels(9.5))
-                .wrapping(iced::widget::text::Wrapping::None),
-        ))
-        .on_press(Message::OpenSettingsPage(page))
-        .height(26)
-        .padding([0, 13])
-        .style(move |_, status| fleet_toggle_style(tokens, selected, status))
-    };
-    container(
-        row![
-            segment("Preferences", SettingsPage::Preferences),
-            segment("Worktrees", SettingsPage::Worktrees),
-        ]
-        .spacing(2),
-    )
-    .padding(2)
-    .style(move |_| {
-        container::Style::default()
-            .background(tokens.app)
-            .border(Border {
-                color: tokens.line,
-                width: 1.0,
-                radius: 7.0.into(),
-            })
-    })
-    .into()
-}
-
-pub(crate) fn settings_notice<'a>(
-    title: impl Into<String>,
-    body: impl Into<String>,
-    recovery: impl Into<String>,
-    hue: Color,
-    settings: &AppSettings,
-) -> Element<'a, Message> {
-    let tokens = DesignTokens::for_appearance(settings.appearance);
-    let title_size = settings.ui_pixels(11.0);
-    container(
-        row![
-            // Centred against the title's line box rather than the row's top
-            // edge: aligned to Start the dot floated above the cap height of
-            // the words it belongs to.
-            container(signal_dot(hue, 7.0))
-                .height(title_size * 1.3)
-                .align_y(iced::alignment::Vertical::Center),
-            column![
-                text(title.into())
-                    .size(title_size)
-                    .font(Font {
-                        weight: font::Weight::Semibold,
-                        ..Font::DEFAULT
-                    })
-                    .color(tokens.text),
-                text(body.into())
-                    .size(settings.ui_pixels(9.5))
-                    .color(tokens.muted),
-                text(recovery.into())
-                    .size(settings.ui_pixels(8.5))
-                    .color(hue),
-            ]
-            .spacing(3)
-            .width(Fill),
-        ]
-        .spacing(11)
-        .align_y(Alignment::Start),
-    )
-    .padding([12, 14])
-    .width(Fill)
-    .style(move |_| {
-        container::Style::default()
-            .background(Color { a: 0.06, ..hue })
-            .border(Border {
-                color: Color { a: 0.35, ..hue },
-                width: 1.0,
-                radius: 6.0.into(),
-            })
-    })
-    .into()
-}
-
-pub(crate) fn worktree_status_tag(
-    label: &str,
-    hue: Color,
-    settings: &AppSettings,
-) -> Element<'static, Message> {
-    container(
-        row![
-            signal_dot(hue, 5.0),
-            text(label.to_owned())
-                .size(settings.ui_pixels(8.0))
-                .font(Font {
-                    weight: font::Weight::Semibold,
-                    ..Font::DEFAULT
-                })
-                .color(hue),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center),
-    )
-    .padding([3, 7])
-    .style(move |_| {
-        container::Style::default()
-            .background(Color { a: 0.08, ..hue })
-            .border(Border {
-                color: Color { a: 0.28, ..hue },
-                width: 1.0,
-                radius: 4.0.into(),
-            })
-    })
-    .into()
 }
 
 /// Lane widths for the worktree inventory, derived once from the table's real
@@ -11353,216 +10249,6 @@ pub(crate) fn worktree_mono_budget(width: f32, size: f32, settings: &AppSettings
     )
 }
 
-/// One keyboard affordance in the inventory footer: the real key drawn as a
-/// keycap in the terminal face, then what it does. Same grammar as the command
-/// palette's keycap, so the two teach the same thing the same way.
-pub(crate) fn worktree_footer_hint(
-    keys: &'static str,
-    label: &'static str,
-    settings: &AppSettings,
-) -> Element<'static, Message> {
-    let tokens = DesignTokens::for_appearance(settings.appearance);
-    row![
-        container(
-            text(keys)
-                .font(settings.terminal_font.iced())
-                .size(settings.ui_pixels(8.5))
-                .color(tokens.text)
-                .wrapping(iced::widget::text::Wrapping::None),
-        )
-        .padding([1.0, 5.0])
-        .style(move |_| {
-            container::Style::default()
-                .background(tokens.panel_raised)
-                .border(Border {
-                    color: tokens.line_strong,
-                    width: 1.0,
-                    radius: 4.0.into(),
-                })
-        }),
-        text(label)
-            .size(settings.ui_pixels(9.0))
-            .color(tokens.muted)
-            .wrapping(iced::widget::text::Wrapping::None),
-    ]
-    .spacing(7)
-    .align_y(Alignment::Center)
-    .into()
-}
-
-pub(crate) fn worktree_table_header(
-    settings: &AppSettings,
-    lanes: WorktreeLanes,
-) -> Element<'static, Message> {
-    let tokens = DesignTokens::for_appearance(settings.appearance);
-    let label = |copy: &'static str| {
-        text(copy)
-            .size(settings.ui_pixels(8.0))
-            .font(Font {
-                weight: font::Weight::Semibold,
-                ..Font::DEFAULT
-            })
-            .color(tokens.faint)
-            .wrapping(iced::widget::text::Wrapping::None)
-    };
-    container(
-        row![
-            label("WORKTREE").width(lanes.identity),
-            label("BRANCH").width(lanes.branch),
-            label("STATUS").width(lanes.status),
-            label("LOCAL COMMITS").width(lanes.commits),
-            label("ACTION").width(lanes.action),
-        ]
-        .spacing(WORKTREE_LANE_SPACING),
-    )
-    // The extra 3px on the left absorbs the selection-bar gutter every row
-    // reserves, so each label sits exactly over the copy it names.
-    .padding(Padding {
-        top: 9.0,
-        bottom: 9.0,
-        left: WORKTREE_ROW_PADDING_X + 3.0,
-        right: WORKTREE_ROW_PADDING_X,
-    })
-    .into()
-}
-
-pub(crate) fn terminal_theme_preview(
-    preset: TerminalThemePreset,
-    settings: &AppSettings,
-) -> Element<'static, Message> {
-    terminal_theme_preview_with_caption(preset, settings, true)
-}
-
-pub(crate) fn terminal_theme_preview_with_caption(
-    preset: TerminalThemePreset,
-    settings: &AppSettings,
-    caption: bool,
-) -> Element<'static, Message> {
-    let tokens = DesignTokens::for_appearance(settings.appearance);
-    let terminal_font = settings.terminal_font.iced();
-    let preview_size = settings.terminal_font_pixels().clamp(13.0, 18.0);
-    let mode = if preset.is_light { "Light" } else { "Dark" };
-    let sample_spans: Vec<iced::widget::text::Span<'static, (), Font>> = vec![
-        span("❯ ").color(rgb(preset.ansi[10])),
-        span("cargo test ").color(rgb(preset.foreground)),
-        span("--workspace\n").color(rgb(preset.ansi[12])),
-        span("   Compiling ").color(rgb(preset.ansi[3])),
-        span("muxtrix\n").color(rgb(preset.foreground)),
-        span("   Finished ").color(rgb(preset.ansi[2])),
-        span("95 tests passed  ").color(rgb(preset.foreground)),
-        span(" selected ")
-            .color(rgb(preset.selection_foreground))
-            .background(rgb(preset.selection_background)),
-        span("  ").color(rgb(preset.foreground)),
-        span(" C ")
-            .color(rgb(preset.cursor_text))
-            .background(rgb(preset.cursor)),
-    ];
-    let sample = rich_text(sample_spans)
-        .font(terminal_font)
-        .size(preview_size)
-        .line_height(Pixels(preview_size * 1.35));
-
-    let mut normal = row![].spacing(5);
-    let mut bright = row![].spacing(5);
-    for (index, color) in preset.ansi.into_iter().enumerate() {
-        let swatch = container("")
-            .width(Fill)
-            .max_width(24)
-            .height(12)
-            .style(move |_| {
-                container::Style::default()
-                    .background(rgb(color))
-                    .border(Border::default().rounded(2.0))
-            });
-        if index < 8 {
-            normal = normal.push(swatch);
-        } else {
-            bright = bright.push(swatch);
-        }
-    }
-
-    container(
-        column![
-            row![
-                text(preset.name)
-                    .size(settings.ui_pixels(11.0))
-                    .font(Font {
-                        weight: font::Weight::Semibold,
-                        ..Font::DEFAULT
-                    })
-                    .color(rgb(preset.foreground))
-                    .width(Fill)
-                    .wrapping(iced::widget::text::Wrapping::None),
-                if caption {
-                    // In the gallery, section headings already say the mode;
-                    // repeating a pill on every card is noise, and long
-                    // names were clipping it against the card edge.
-                    Element::from(
-                        container(
-                            text(mode)
-                                .size(settings.ui_pixels(8.0))
-                                .color(rgb(preset.background)),
-                        )
-                        .padding([2, 7])
-                        .style(move |_| {
-                            container::Style::default()
-                                .background(rgb(preset.foreground))
-                                .border(Border::default().rounded(4.0))
-                        }),
-                    )
-                } else {
-                    container("").width(0).into()
-                },
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-            sample,
-            column![normal, bright].spacing(5),
-            if caption {
-                Element::from(
-                    text("Theme colors set defaults · direct RGB and application OSC colors stay intact")
-                        .size(settings.ui_pixels(8.0))
-                        .color(rgb(preset.ansi[8])),
-                )
-            } else {
-                container("").width(0).height(0).into()
-            },
-        ]
-        .spacing(12),
-    )
-    .padding([14, 16])
-    .width(Fill)
-    .style(move |_| {
-        container::Style::default()
-            .background(rgb(preset.background))
-            .border(Border {
-                color: tokens.line_strong,
-                width: 1.0,
-                radius: 6.0.into(),
-            })
-    })
-    .into()
-}
-
-pub(crate) fn settings_hook_button(
-    label: &'static str,
-    agent: Agent,
-    action: HookAction,
-    kind: SettingsButtonKind,
-    settings: &AppSettings,
-) -> Element<'static, Message> {
-    settings_action_button(label, Message::ManageHooks(agent, action), kind, settings)
-}
-
-pub(crate) fn settings_divider(tokens: DesignTokens) -> Element<'static, Message> {
-    container("")
-        .width(Fill)
-        .height(1)
-        .style(move |_| container::Style::default().background(tokens.line))
-        .into()
-}
-
 pub(crate) fn installed_version_restart_copy(state: &InstalledVersionsState) -> Option<String> {
     let InstalledVersionsState::Ready(versions) = state else {
         return None;
@@ -11586,106 +10272,6 @@ pub(crate) fn installed_version_restart_copy(state: &InstalledVersionsState) -> 
     None
 }
 
-pub(crate) fn settings_version_value(
-    running: &'static str,
-    installed: Option<&Result<String, String>>,
-    fallback: &'static str,
-    settings: &AppSettings,
-) -> Element<'static, Message> {
-    let tokens = DesignTokens::for_appearance(settings.appearance);
-    let (detail, detail_color) = match installed {
-        Some(Ok(version)) if version == running => {
-            ("Running · matches installed".to_owned(), tokens.muted)
-        }
-        Some(Ok(version)) => (format!("Running · v{version} installed"), tokens.warning),
-        Some(Err(_)) => (
-            "Running · installed binary unavailable".into(),
-            tokens.faint,
-        ),
-        None => (fallback.to_owned(), tokens.muted),
-    };
-    column![
-        text(format!("v{running}"))
-            .font(settings.terminal_font.iced())
-            .size(settings.ui_pixels(10.0))
-            .color(tokens.text),
-        text(detail)
-            .size(settings.ui_pixels(8.5))
-            .color(detail_color),
-    ]
-    .spacing(2)
-    .align_x(Alignment::End)
-    .into()
-}
-
-pub(crate) fn settings_row<'a>(
-    label: &'static str,
-    description: &'static str,
-    control: impl Into<Element<'a, Message>>,
-    settings: &AppSettings,
-) -> Element<'a, Message> {
-    let tokens = DesignTokens::for_appearance(settings.appearance);
-    container(
-        row![
-            column![
-                text(label)
-                    .size(settings.ui_pixels(11.0))
-                    .font(Font {
-                        weight: font::Weight::Semibold,
-                        ..Font::DEFAULT
-                    })
-                    .color(tokens.text),
-                text(description)
-                    .size(settings.ui_pixels(9.0))
-                    .color(tokens.muted),
-            ]
-            .spacing(2)
-            .width(Fill),
-            container(control).align_y(iced::alignment::Vertical::Center),
-        ]
-        .spacing(18)
-        .align_y(Alignment::Center),
-    )
-    .padding([12, 14])
-    .width(Fill)
-    .into()
-}
-
-pub(crate) fn settings_section<'a>(
-    title: &'static str,
-    description: &'static str,
-    content: iced::widget::Column<'a, Message>,
-    settings: &AppSettings,
-) -> Element<'a, Message> {
-    let tokens = DesignTokens::for_appearance(settings.appearance);
-    column![
-        column![
-            text(title)
-                .size(settings.ui_pixels(13.0))
-                .font(Font {
-                    weight: font::Weight::Semibold,
-                    ..Font::DEFAULT
-                })
-                .color(tokens.text),
-            text(description)
-                .size(settings.ui_pixels(9.0))
-                .color(tokens.muted),
-        ]
-        .spacing(2),
-        container(content).width(Fill).style(move |_| {
-            container::Style::default()
-                .background(tokens.panel)
-                .border(Border {
-                    color: tokens.line,
-                    width: 1.0,
-                    radius: 10.0.into(),
-                })
-        }),
-    ]
-    .spacing(8)
-    .into()
-}
-
 #[derive(Default)]
 pub(crate) struct RuntimePoll {
     pub(crate) status: Option<String>,
@@ -11707,7 +10293,6 @@ impl TerminalRuntime {
             preview: preview.into(),
             snapshot: None,
             snapshot_revision: 0,
-            image_handles: BTreeMap::new(),
             session,
             fallback_title: fallback_title.into(),
             display_title: fallback_title.into(),
@@ -11842,24 +10427,6 @@ impl TerminalRuntime {
     }
 
     pub(crate) fn set_snapshot(&mut self, snapshot: GridSnapshot) {
-        let generations = snapshot
-            .images
-            .iter()
-            .map(|placement| placement.image.generation)
-            .collect::<BTreeSet<_>>();
-        self.image_handles
-            .retain(|generation, _| generations.contains(generation));
-        for placement in &snapshot.images {
-            self.image_handles
-                .entry(placement.image.generation)
-                .or_insert_with(|| {
-                    ImageHandle::from_rgba(
-                        placement.image.width,
-                        placement.image.height,
-                        Bytes::from_owner(Arc::clone(&placement.image.rgba)),
-                    )
-                });
-        }
         self.snapshot_revision = self.snapshot_revision.wrapping_add(1);
         self.snapshot = Some(snapshot);
     }
@@ -12071,14 +10638,6 @@ pub(crate) fn terminal_selection_drag_started(origin: Point, current: Point) -> 
 
 pub(crate) fn terminal_link_modifiers(modifiers: Modifiers) -> bool {
     modifiers.control() && modifiers.shift() && !modifiers.alt() && !modifiers.logo()
-}
-
-pub(crate) fn terminal_mouse_interaction(link_hovered: bool) -> mouse::Interaction {
-    if link_hovered {
-        mouse::Interaction::Pointer
-    } else {
-        mouse::Interaction::Idle
-    }
 }
 
 pub(crate) fn terminal_link_at(
@@ -12294,51 +10853,6 @@ pub(crate) fn terminal_scrollbar_geometry(
     }
 }
 
-pub(crate) fn terminal_scrollbar(
-    pane_id: PaneId,
-    scrollbar: ScrollbarSnapshot,
-    viewport_height: f32,
-    tokens: DesignTokens,
-) -> Element<'static, Message> {
-    let geometry = terminal_scrollbar_geometry(scrollbar, viewport_height);
-    let track = column![
-        container("").height(Length::Fixed(geometry.thumb_top)),
-        container("")
-            .height(Length::Fixed(geometry.thumb_height))
-            .width(3)
-            .style(move |_| {
-                container::Style::default()
-                    .background(tokens.line_strong)
-                    .border(Border::default().rounded(2.0))
-            }),
-        container("").height(Fill),
-    ]
-    .height(Fill)
-    .align_x(Alignment::End);
-    let hit_target = mouse_area(
-        container(track)
-            .width(12)
-            .height(Fill)
-            .align_x(iced::alignment::Horizontal::Right)
-            .padding(Padding {
-                top: geometry.track_top,
-                right: 3.0,
-                bottom: geometry.track_top,
-                left: 0.0,
-            }),
-    )
-    .on_move(move |position| Message::TerminalScrollbarMoved(pane_id, position.into()))
-    .on_press(Message::BeginTerminalScroll(pane_id))
-    // A scrollbar is not a draggable object: the grab interaction renders as
-    // the four-direction move cross on some platforms. Plain arrow.
-    .interaction(mouse::Interaction::Idle);
-    container(hit_target)
-        .width(Fill)
-        .height(Fill)
-        .align_x(iced::alignment::Horizontal::Right)
-        .into()
-}
-
 pub(crate) fn pane_header_is_compact(window_width: f32, pane_count: usize) -> bool {
     window_width < 1_080.0 || pane_count > 2
 }
@@ -12350,63 +10864,6 @@ pub(crate) fn pane_header_is_compact(window_width: f32, pane_count: usize) -> bo
 /// toward and past the card's right edge.
 pub(crate) fn pane_title_char_budget(available: f32, character_width: f32) -> usize {
     ((available.max(0.0) / character_width.max(1.0)).floor() as usize).max(1)
-}
-
-pub(crate) fn event_subscription(
-    subscription: &EventSubscription,
-) -> impl iced::futures::Stream<Item = Message> + use<> {
-    subscription.0.clone().map(|()| Message::PollTerminal)
-}
-
-pub(crate) fn app_event(
-    event: iced::Event,
-    status: iced::event::Status,
-    _window: iced::window::Id,
-) -> Option<Message> {
-    match event {
-        // Text inputs and focused buttons own captured keys. Forwarding them
-        // to the global keyboard handler as well would type into the terminal
-        // underneath the GitHub search field or double-trigger controls.
-        iced::Event::Keyboard(event) => {
-            let event = input::from_iced(&event);
-            // Tab and Escape are claimed even when a widget captured them:
-            // they close the palette and move pane focus, and a focused text
-            // input would otherwise swallow both.
-            let always_ours = matches!(
-                &event,
-                KeyEvent::Pressed(KeyInput {
-                    modified_key: Key::Named(Named::Tab | Named::Escape),
-                    ..
-                })
-            );
-            (status == iced::event::Status::Ignored || always_ours)
-                .then_some(Message::Keyboard(event))
-        }
-        iced::Event::Mouse(mouse::Event::CursorMoved { position }) => {
-            Some(Message::PointerMoved(position.into()))
-        }
-        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-            Some(Message::EndPointerInteraction)
-        }
-        iced::Event::Mouse(mouse::Event::WheelScrolled { delta })
-            if status == iced::event::Status::Ignored =>
-        {
-            Some(Message::ScrollHoveredTerminal(delta.into()))
-        }
-        iced::Event::Window(iced::window::Event::Opened { size, .. }) => {
-            Some(Message::WindowOpened(size.into()))
-        }
-        iced::Event::Window(iced::window::Event::Resized(size)) => {
-            Some(Message::WindowResized(size.into()))
-        }
-        iced::Event::Window(iced::window::Event::Focused) => {
-            Some(Message::WindowFocusChanged(true))
-        }
-        iced::Event::Window(iced::window::Event::Unfocused) => {
-            Some(Message::WindowFocusChanged(false))
-        }
-        _ => None,
-    }
 }
 
 pub(crate) fn terminal_empty_state_copy(runtime: Option<&TerminalRuntime>) -> Option<&str> {
@@ -12426,239 +10883,6 @@ pub(crate) fn terminal_surface_background(
     snapshot.map_or(theme.background, |snapshot| snapshot.default_background)
 }
 
-pub(crate) fn styled_terminal(
-    snapshot: &GridSnapshot,
-    image_handles: &BTreeMap<u64, ImageHandle>,
-    focused: bool,
-    cursor_phase_visible: bool,
-    hovered_link: Option<&TerminalLink>,
-    settings: &AppSettings,
-) -> Element<'static, Message> {
-    let theme = settings.terminal_theme.preset();
-    let cell_width = settings.terminal_cell_width();
-    let cell_height = settings.terminal_cell_height();
-    let font_size = settings.terminal_font_pixels();
-    let terminal_font = settings.terminal_font.iced();
-    let family = settings.terminal_font.family_name();
-    let cell_ratio = settings.terminal_advance_ratio();
-    // A bold face may be wider than the regular one it shares a grid with. The
-    // grid stays uniform, so shrink bold text instead of letting it overrun.
-    let bold_scale = bold_size_scale(settings, cell_ratio);
-    let mut backgrounds = column![].spacing(0);
-    let mut overlays = column![].spacing(0);
-    let mut text_grid = column![].spacing(0);
-    for runs in
-        terminal_row_style_runs(snapshot, focused, cursor_phase_visible, hovered_link, theme)
-    {
-        let mut background_line = row![].spacing(0).height(Length::Fixed(cell_height));
-        let mut overlay_line = row![].spacing(0).height(Length::Fixed(cell_height));
-        let mut text_line = row![].spacing(0).height(Length::Fixed(cell_height));
-        for run in runs.into_iter().filter(|run| run.columns > 0) {
-            let alpha = if run.style.faint { 0.6 } else { 1.0 };
-            let foreground = if run.style.selected {
-                theme.selection_foreground
-            } else {
-                run.style.foreground
-            };
-            let foreground_color =
-                Color::from_rgba8(foreground.red, foreground.green, foreground.blue, alpha);
-            let background = run.style.background;
-            let overlay_background = run.style.overlay_background;
-            let run_width = cell_width * run.columns as f32;
-            background_line = background_line.push(
-                container("")
-                    .width(Length::Fixed(run_width))
-                    .height(Length::Fixed(cell_height))
-                    .style(move |_| {
-                        background.map_or_else(container::Style::default, |background| {
-                            container::Style::default().background(rgb(background))
-                        })
-                    }),
-            );
-            overlay_line = overlay_line.push(
-                container("")
-                    .width(Length::Fixed(run_width))
-                    .height(Length::Fixed(cell_height))
-                    .style(move |_| {
-                        overlay_background.map_or_else(container::Style::default, |background| {
-                            container::Style::default().background(rgb(background))
-                        })
-                    }),
-            );
-            if run.kind == TerminalRunKind::BoxDrawing {
-                let content = canvas(box_drawing::BoxDrawingRun::new(
-                    run.text,
-                    cell_width,
-                    cell_height,
-                    foreground_color,
-                ))
-                .width(Length::Fixed(run_width))
-                .height(Length::Fixed(cell_height));
-                text_line = text_line.push(
-                    container(content)
-                        .width(Length::Fixed(run_width))
-                        .height(Length::Fixed(cell_height))
-                        .clip(true),
-                );
-                continue;
-            }
-            let weight = if run.style.bold {
-                settings.terminal_font_weight.bold_variant()
-            } else {
-                settings.terminal_font_weight.iced()
-            };
-            // Only Unicode runs can miss the configured face; ASCII runs are
-            // guaranteed present and skip the lookup entirely.
-            let fallback = run.kind.needs_fallback().then_some(()).and_then(|()| {
-                metrics::glyph_fallback(
-                    family,
-                    settings::weight_numeric(weight),
-                    &run.text,
-                    cell_ratio,
-                    settings.terminal_line_height,
-                )
-            });
-            // A substitute is requested at the weight and style its own face
-            // ships. Shaping drops the family rather than relaxing either, so a
-            // single-weight face silently falls through to another family.
-            let (base_font, run_weight, run_style) = match fallback {
-                Some(fallback) => (
-                    Font::with_name(fallback.family),
-                    settings::weight_from_numeric(fallback.weight),
-                    font::Style::Normal,
-                ),
-                None => (
-                    terminal_font,
-                    weight,
-                    if run.style.italic {
-                        font::Style::Italic
-                    } else {
-                        font::Style::Normal
-                    },
-                ),
-            };
-            let size_scale = fallback.map_or_else(
-                || if run.style.bold { bold_scale } else { 1.0 },
-                |fallback| fallback.size_scale,
-            );
-            // A substituted glyph is placed by its run's line height, which only
-            // moves it while the paragraph is top-aligned; centering it in the
-            // cell cancels the term out.
-            let line_height =
-                fallback.map_or(cell_height, |fallback| font_size * fallback.line_height_em);
-            let geometry = terminal_run_geometry(&run);
-            let underline_decoration = terminal_underline_decoration(run.style);
-            let run_span: iced::widget::text::Span<'static, (), Font> = span(run.text)
-                .color(foreground_color)
-                .size(font_size * size_scale)
-                .font(font_with_style(base_font, run_weight, run_style))
-                .underline(underline_decoration == TerminalUnderlineDecoration::Solid)
-                .strikethrough(run.style.strikethrough);
-            let mut content = rich_text(vec![run_span])
-                .size(font_size)
-                .line_height(Pixels(line_height))
-                .font(terminal_font)
-                .wrapping(iced::widget::text::Wrapping::None);
-            if fallback.is_some_and(|fallback| fallback.color) {
-                // A colour glyph is drawn wider than its cell, and a container
-                // cannot offset content it does not fit. Centring at shaping
-                // time is what produces the negative offset it needs.
-                content = content
-                    .width(Length::Fixed(cell_width * run.columns as f32))
-                    .align_x(iced::alignment::Horizontal::Center);
-            }
-            let vertical = if fallback.is_some() {
-                iced::alignment::Vertical::Top
-            } else {
-                iced::alignment::Vertical::Center
-            };
-            let horizontal = if fallback.is_some() {
-                iced::alignment::Horizontal::Center
-            } else {
-                iced::alignment::Horizontal::Left
-            };
-            let content: Element<'static, Message> = match geometry {
-                Some(TerminalRunGeometry::FullBlock) => {
-                    // U+2588 means the whole terminal cell, while many fonts
-                    // leave a fractional side bearing around its outline.
-                    // Drawing that semantic cell area directly keeps progress
-                    // bars solid across fractional GPU clip boundaries.
-                    container("")
-                        .width(Length::Fixed(run_width))
-                        .height(Length::Fixed(cell_height))
-                        .style(move |_| container::Style::default().background(foreground_color))
-                        .into()
-                }
-                None if underline_decoration == TerminalUnderlineDecoration::Dotted => {
-                    const LINK_DOT_SIZE: f32 = 5.0;
-                    let dot_advance = (cell_ratio * LINK_DOT_SIZE).max(1.0);
-                    let dot_count = (run_width / dot_advance).ceil() as usize;
-                    let dots = container(
-                        text(".".repeat(dot_count))
-                            .font(terminal_font)
-                            .size(LINK_DOT_SIZE)
-                            .line_height(Pixels(LINK_DOT_SIZE))
-                            .color(Color::from_rgba8(
-                                foreground.red,
-                                foreground.green,
-                                foreground.blue,
-                                alpha,
-                            ))
-                            .wrapping(iced::widget::text::Wrapping::None),
-                    )
-                    .width(Length::Fixed(run_width))
-                    .height(Length::Fixed(cell_height))
-                    .align_x(iced::alignment::Horizontal::Left)
-                    .align_y(iced::alignment::Vertical::Bottom)
-                    .clip(true);
-                    stack([content.into(), dots.into()]).into()
-                }
-                _ => content.into(),
-            };
-            text_line = text_line.push(
-                container(content)
-                    .width(Length::Fixed(run_width))
-                    .height(Length::Fixed(cell_height))
-                    .align_x(horizontal)
-                    .align_y(vertical)
-                    // A colour glyph is sized to match the text beside it, which
-                    // needs marginally more than one cell on a square canvas.
-                    .clip(!fallback.is_some_and(|fallback| fallback.color)),
-            );
-        }
-        backgrounds = backgrounds.push(background_line);
-        overlays = overlays.push(overlay_line);
-        text_grid = text_grid.push(text_line);
-    }
-    stack([
-        terminal_image::layer(
-            snapshot,
-            image_handles,
-            ImageLayer::BelowBackground,
-            cell_width,
-            cell_height,
-        ),
-        backgrounds.into(),
-        terminal_image::layer(
-            snapshot,
-            image_handles,
-            ImageLayer::BelowText,
-            cell_width,
-            cell_height,
-        ),
-        overlays.into(),
-        text_grid.into(),
-        terminal_image::layer(
-            snapshot,
-            image_handles,
-            ImageLayer::AboveText,
-            cell_width,
-            cell_height,
-        ),
-    ])
-    .into()
-}
-
 pub(crate) fn pty_size_for_pane(size: Size, settings: &AppSettings) -> PtySize {
     let cell_width = settings.terminal_cell_width();
     let cell_height = settings.terminal_cell_height();
@@ -12672,22 +10896,6 @@ pub(crate) fn pty_size_for_pane(size: Size, settings: &AppSettings) -> PtySize {
         pixel_width: width.round().clamp(0.0, f32::from(u16::MAX)) as u16,
         pixel_height: height.round().clamp(0.0, f32::from(u16::MAX)) as u16,
     }
-}
-
-pub(crate) fn wsl_wayland_resize_increments(
-    is_wsl: bool,
-    wayland_is_available: bool,
-    x11_is_forced: bool,
-    settings: &AppSettings,
-) -> Option<Size> {
-    if !is_wsl || !wayland_is_available || x11_is_forced {
-        return None;
-    }
-
-    Some(Size::new(
-        settings.terminal_cell_width().round().clamp(4.0, 32.0),
-        settings.terminal_cell_height().round().clamp(4.0, 32.0),
-    ))
 }
 
 pub(crate) fn initial_pty_size() -> PtySize {
