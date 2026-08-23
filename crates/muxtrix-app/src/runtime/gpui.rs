@@ -401,6 +401,7 @@ impl Render for Root {
             _ => None,
         };
         let sidebar = self.view_sidebar(cx);
+        let github = self.github_panel(cx);
         let palette = self.command_palette(cx);
         let dialog = self.dialog(cx);
         let toast = self.toast();
@@ -449,7 +450,8 @@ impl Render for Root {
                     .flex_grow(1.0)
                     .overflow_hidden()
                     .child(sidebar)
-                    .child(div().flex_grow(1.0).overflow_hidden().child(workspace)),
+                    .child(div().flex_grow(1.0).overflow_hidden().child(workspace))
+                    .children(github),
             })
             .children(status_bar)
             .children(menu)

@@ -21,6 +21,12 @@ impl Root {
     pub(crate) fn view_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let app = self.app();
         let tokens = DesignTokens::for_appearance(app.settings.appearance);
+        if app.active_view == crate::app::ActiveView::ThemeGallery {
+            return self.theme_gallery(tokens, cx);
+        }
+        if app.settings_page == crate::app::SettingsPage::Worktrees {
+            return self.worktree_manager(tokens, cx);
+        }
         let draft = &app.settings_draft;
         let changed = settings_have_changes(&app.settings, draft);
 
@@ -153,6 +159,17 @@ impl Root {
                     ),
                 ],
                 tokens,
+            ))
+            .child(self.section(
+                "Repository",
+                vec![self.link_row(
+                    "Worktrees",
+                    "Manage",
+                    Message::OpenSettingsPage(crate::app::SettingsPage::Worktrees),
+                    tokens,
+                    cx,
+                )],
+                tokens,
             ));
 
         div()
@@ -167,6 +184,235 @@ impl Root {
                     .flex_grow(1.0)
                     .overflow_y_scroll()
                     .child(body),
+            )
+            .into_any_element()
+    }
+
+    /// Every terminal palette, two per row, each showing its own colours.
+    ///
+    /// The swatch is the preview: a palette is its colours, and a sample of
+    /// them says more than the name does.
+    fn theme_gallery(&self, tokens: DesignTokens, cx: &mut Context<Self>) -> AnyElement {
+        let app = self.app();
+        let chosen = app.settings_draft.terminal_theme;
+        let mut grid = div().flex().flex_row().flex_wrap().gap(px(10.)).p(px(20.));
+        for id in crate::themes::TerminalThemeId::ALL {
+            let preset = id.preset();
+            let selected = id == chosen;
+            let mut swatches = div().flex().flex_row().gap(px(3.));
+            for hue in [
+                preset.ansi[1],
+                preset.ansi[2],
+                preset.ansi[3],
+                preset.ansi[4],
+                preset.ansi[5],
+                preset.ansi[6],
+            ] {
+                swatches = swatches.child(
+                    div()
+                        .size(px(12.))
+                        .rounded(px(2.))
+                        .bg(color(crate::terminal::runs::rgb(hue))),
+                );
+            }
+            grid = grid.child(
+                div()
+                    .id(SharedString::from(preset.name))
+                    .w(px(320.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .p(px(12.))
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .bg(color(crate::terminal::runs::rgb(preset.background)))
+                    .border_1()
+                    .border_color(color(if selected { tokens.accent } else { tokens.line }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                            root.dispatch(Message::GalleryThemeChosen(id), window, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(app.settings.ui_pixels(11.0)))
+                            .text_color(color(crate::terminal::runs::rgb(preset.foreground)))
+                            .child(preset.name),
+                    )
+                    .child(swatches),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(color(tokens.app))
+            .child(self.screen_bar("Terminal palettes", Message::CloseThemeGallery, tokens, cx))
+            .child(
+                div()
+                    .id("gallery-scroll")
+                    .flex_grow(1.0)
+                    .overflow_y_scroll()
+                    .child(grid),
+            )
+            .into_any_element()
+    }
+
+    /// Every worktree this repository has, with what is holding each one.
+    fn worktree_manager(&self, tokens: DesignTokens, cx: &mut Context<Self>) -> AnyElement {
+        let app = self.app();
+        let mut rows = div().flex().flex_col().gap(px(2.)).p(px(20.));
+        let manager = app.worktree_manager.as_ref();
+        if let Some(failure) = manager.and_then(|manager| manager.failure.as_deref()) {
+            rows = rows.child(
+                div()
+                    .text_size(px(app.settings.ui_pixels(10.0)))
+                    .text_color(color(tokens.muted))
+                    .child(failure.to_owned()),
+            );
+        }
+        for (index, entry) in manager
+            .map(|manager| manager.entries.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
+            // A worktree in use, or the primary one, cannot be removed; the
+            // row says which rather than offering an action that would fail.
+            let blocker = entry.deletion_blocker.clone().or_else(|| {
+                entry
+                    .used_by
+                    .clone()
+                    .map(|title| format!("in use by {title}"))
+            });
+            rows = rows.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.))
+                    .h(px(44.))
+                    .px(px(12.))
+                    .rounded(px(6.))
+                    .bg(color(tokens.panel))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .child(
+                                div()
+                                    .text_size(px(app.settings.ui_pixels(10.0)))
+                                    .text_color(color(tokens.text))
+                                    .truncate()
+                                    .child(entry.path.file_name().map_or_else(
+                                        || entry.path.display().to_string(),
+                                        |name| name.to_string_lossy().into_owned(),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(app.settings.ui_pixels(8.0)))
+                                    .text_color(color(tokens.faint))
+                                    .truncate()
+                                    .child(
+                                        entry.branch.clone().unwrap_or_else(|| "detached".into()),
+                                    ),
+                            ),
+                    )
+                    .children((entry.unpushed_commits > 0).then(|| {
+                        div()
+                            .text_size(px(app.settings.ui_pixels(9.0)))
+                            .text_color(color(tokens.warning))
+                            .child(format!("{} unpushed", entry.unpushed_commits))
+                    }))
+                    .child(match blocker {
+                        Some(reason) => div()
+                            .text_size(px(app.settings.ui_pixels(9.0)))
+                            .text_color(color(tokens.faint))
+                            .child(reason)
+                            .into_any_element(),
+                        None => div()
+                            .id(("worktree-delete", index as u64))
+                            .h(px(24.))
+                            .px(px(10.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(5.))
+                            .cursor_pointer()
+                            .bg(color(tokens.panel_raised))
+                            .text_size(px(app.settings.ui_pixels(9.0)))
+                            .text_color(color(tokens.danger))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                                    root.dispatch(
+                                        Message::WorktreeManagerDelete(index),
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            )
+                            .child("Delete")
+                            .into_any_element(),
+                    }),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(color(tokens.app))
+            .child(self.screen_bar("Worktrees", Message::CloseWorktreeManager, tokens, cx))
+            .child(
+                div()
+                    .id("worktrees-scroll")
+                    .flex_grow(1.0)
+                    .overflow_y_scroll()
+                    .child(rows),
+            )
+            .into_any_element()
+    }
+
+    /// A screen's top bar: a title and the way back.
+    fn screen_bar(
+        &self,
+        title: &str,
+        back: Message,
+        tokens: DesignTokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.))
+            .h(px(43.))
+            .px(px(10.))
+            .bg(color(tokens.rail))
+            .border_b(px(1.))
+            .border_color(color(tokens.line))
+            .child(
+                icon_button(
+                    gpui::ElementId::from("screen-back"),
+                    IconKind::Back,
+                    tokens,
+                    false,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                        root.dispatch(back.clone(), window, cx);
+                    }),
+                ),
+            )
+            .child(
+                div()
+                    .text_size(px(self.app().settings.ui_pixels(13.0)))
+                    .text_color(color(tokens.text))
+                    .child(title.to_owned()),
             )
             .into_any_element()
     }
