@@ -347,13 +347,16 @@ impl Root {
             cx,
         );
 
-        let hit = self
-            .terminal_regions
-            .iter()
-            .find(|(pane_id, (bounds, _))| {
-                self.terminal_pane_visible(**pane_id) && bounds.contains(&position)
-            })
-            .map(|(pane_id, region)| (*pane_id, *region));
+        let hit = if self.app.terminal_pointer_obscured() {
+            None
+        } else {
+            self.terminal_regions
+                .iter()
+                .find(|(pane_id, (bounds, _))| {
+                    self.terminal_pane_visible(**pane_id) && bounds.contains(&position)
+                })
+                .map(|(pane_id, region)| (*pane_id, *region))
+        };
         let hit_pane = hit.map(|(pane_id, _)| pane_id);
         if self.app.hovered_terminal != hit_pane {
             if let Some(previous) = self.app.hovered_terminal {

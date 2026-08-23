@@ -146,14 +146,7 @@ impl TerminalElement {
                 .map(|snapshot| snapshot.scrollbar)
                 .filter(|scrollbar| scrollbar.is_scrollable()),
             images,
-            obscured: app.pane_menu.is_some()
-                || app.palette.visible
-                || app.workspace_create_visible
-                || app.rename_prompt.is_some()
-                || app.worktree_prompt.is_some()
-                || app.session_picker.is_some()
-                || app.close_workspace_prompt.is_some()
-                || app.default_agent_prompt,
+            obscured: app.terminal_pointer_obscured(),
         })
     }
 }
@@ -475,15 +468,12 @@ impl TerminalElement {
     ) {
         let pane_id = self.pane_id;
         let root = self.root.clone();
-        if self.obscured {
-            root.update(cx, |root, _| {
-                root.terminal_regions.remove(&pane_id);
-            });
-            return;
-        }
         root.update(cx, |root, _| {
             root.terminal_regions.insert(pane_id, (bounds, origin));
         });
+        if self.obscured {
+            return;
+        }
 
         // A hovered link only becomes clickable while the modifiers are held,
         // and the cursor is what says so.

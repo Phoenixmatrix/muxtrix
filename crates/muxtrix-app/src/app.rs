@@ -2219,6 +2219,21 @@ impl Muxtrix {
             .wrapping_add(std::hash::Hasher::finish(&text))
     }
 
+    /// Whether a modal workspace surface owns pointer input above terminals.
+    ///
+    /// A drag or mouse-reporting capture that began in a terminal may still
+    /// continue through an overlay; callers make that exception explicitly.
+    pub(crate) fn terminal_pointer_obscured(&self) -> bool {
+        self.pane_menu.is_some()
+            || self.palette.visible
+            || self.workspace_create_visible
+            || self.rename_prompt.is_some()
+            || self.worktree_prompt.is_some()
+            || self.session_picker.is_some()
+            || self.close_workspace_prompt.is_some()
+            || self.default_agent_prompt
+    }
+
     /// Which text field should hold focus, given what is open.
     ///
     /// Focus is derived from state rather than remembered, so closing a
