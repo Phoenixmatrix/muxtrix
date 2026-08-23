@@ -13,11 +13,13 @@ use muxtrix_domain::{PaneId, PaneTree, SplitAxis, Workspace, WorkspaceTab};
 
 use crate::app::{
     IconKind, Message, SPLIT_HANDLE_SIZE, SplitBranch, SplitKey, terminal_empty_state_copy,
+    terminal_surface_background,
 };
 use crate::commands;
 use crate::layout::expanded_stack_pane;
 use crate::runtime::gpui::{Root, color};
 use crate::terminal::element::TerminalElement;
+use crate::terminal::runs::rgb;
 use crate::theme::DesignTokens;
 use crate::views::gpui::{icon_button, pane_key};
 
@@ -174,6 +176,15 @@ impl Root {
             && tab.focused_pane_id == pane_id;
         let runtime = app.terminals.get(&pane_id);
 
+        // The surface takes the terminal's own background, not the chrome's:
+        // a program that sets one (OSC 11) is honoured, and otherwise the
+        // theme's, which is what makes a light appearance still host a dark
+        // terminal. The grid only paints cells that carry a colour of their
+        // own, so this is what shows through everywhere else.
+        let surface = color(rgb(terminal_surface_background(
+            runtime.and_then(|runtime| runtime.snapshot.as_ref()),
+            app.settings.terminal_theme.preset(),
+        )));
         let body = match TerminalElement::for_pane(
             app,
             pane_id,
@@ -186,6 +197,7 @@ impl Root {
                 .relative()
                 .size_full()
                 .overflow_hidden()
+                .bg(surface)
                 .child(terminal)
                 .into_any_element(),
             // No grid yet: either the shell has not spoken or the launch

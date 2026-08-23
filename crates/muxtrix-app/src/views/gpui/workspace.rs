@@ -5,13 +5,13 @@
 
 use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Styled, Window, div, px,
+    ParentElement, Styled, Window, div, px, svg,
 };
 
-use crate::app::{IconKind, Message};
+use crate::app::{IconKind, Message, ellipsize};
 use crate::runtime::gpui::{Root, color};
 use crate::theme::DesignTokens;
-use crate::views::gpui::{icon_button, tab_key};
+use crate::views::gpui::{icon_button, icon_path, tab_key};
 
 /// The app bar's height, matching the iced build.
 const APP_BAR_HEIGHT: f32 = 43.0;
@@ -78,7 +78,7 @@ impl Root {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(4.))
+            .gap(px(3.))
             .h(px(APP_BAR_HEIGHT))
             .px(px(8.))
             .bg(color(tokens.rail))
@@ -88,40 +88,104 @@ impl Root {
         let workspace_id = workspace.id;
         for (index, tab) in workspace.tabs.iter().enumerate() {
             let tab_id = tab.id;
-            let active = tab.id == workspace.active_tab_id;
-            let title = app.pane_title(workspace, tab.focused_pane_id).to_owned();
+            let selected = tab.id == workspace.active_tab_id;
+            let drop_target = app.tab_drag.is_some_and(|drag| {
+                drag.target_workspace_id == workspace.id && drag.target_index == index
+            });
+            let signal = app.tab_signal_kind(tab).color(tokens);
+            let name = ellipsize(&tab.name, app.settings.ui_char_budget(20));
+            // The chip carries fill, border and radius; the label and the
+            // close are transparent children so the whole chip reads as one
+            // control — as the iced strip draws it.
+            let (fill, edge) = if selected {
+                (0.08, tokens.line_strong)
+            } else {
+                (0.03, tokens.line)
+            };
+            let mut fill_color = color(tokens.text);
+            fill_color.a = fill;
+            let mut close_hover = color(tokens.text);
+            close_hover.a = 0.10;
             strip = strip.child(
                 div()
                     .id(("tab", tab_key(tab_id)))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(6.))
-                    .h(px(27.))
-                    .px(px(10.))
-                    .rounded(px(5.))
-                    .cursor_pointer()
-                    .bg(color(if active {
-                        tokens.panel_raised
-                    } else {
-                        tokens.panel
-                    }))
-                    .text_size(px(app.settings.ui_pixels(11.0)))
-                    .text_color(color(if active { tokens.text } else { tokens.muted }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |root, _: &MouseDownEvent, window, cx| {
-                            // The same message the iced strip sends: a click
-                            // is a zero-distance drag, and dragging a tab is
-                            // also how it is reordered.
-                            root.dispatch(
-                                Message::BeginTabDrag(workspace_id, tab_id, index),
-                                window,
-                                cx,
-                            );
-                        }),
+                    .h(px(29.))
+                    .pr(px(5.))
+                    .rounded(px(7.))
+                    .bg(fill_color)
+                    .border_1()
+                    .border_color(color(if drop_target { tokens.accent } else { edge }))
+                    .cursor_grab()
+                    .on_mouse_move(cx.listener(
+                        move |root, _: &gpui::MouseMoveEvent, window, cx| {
+                            if root.app.tab_drag.is_some() {
+                                root.dispatch(
+                                    Message::TabDragOver(workspace_id, index),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        },
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(7.))
+                            .h(px(27.))
+                            .pl(px(11.))
+                            .pr(px(4.))
+                            .text_size(px(app.settings.ui_pixels(9.0)))
+                            .text_color(color(if selected { tokens.text } else { tokens.muted }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                                    // The same message the iced strip sends: a
+                                    // click is a zero-distance drag, and
+                                    // dragging a tab is also how it is
+                                    // reordered.
+                                    root.dispatch(
+                                        Message::BeginTabDrag(workspace_id, tab_id, index),
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            )
+                            .child(div().size(px(6.)).rounded_full().bg(color(signal)))
+                            .child(name),
                     )
-                    .child(title),
+                    .child(
+                        div()
+                            .id(("close-tab", tab_key(tab_id)))
+                            .size(px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(close_hover))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    root.dispatch(
+                                        Message::CloseTab(workspace_id, tab_id),
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            )
+                            .child(
+                                svg()
+                                    .path(icon_path(IconKind::Close))
+                                    .size(px(11.))
+                                    .text_color(color(tokens.muted)),
+                            ),
+                    ),
             );
         }
 
