@@ -178,6 +178,7 @@ enum TickAction {
     ScrollSettingsToGitHub,
     ScrollGitHubToEnd,
     ScrollGitHubPullRequestsToEnd,
+    SeedClipboard,
     Capture,
 }
 
@@ -821,10 +822,14 @@ impl Scenario {
                     return Ok(TickAction::ScrollSettingsToEnd);
                 }
                 if (self.capturing("settings-github-enterprise")
-                    || self.capturing("settings-github-invalid"))
+                    || self.capturing("settings-github-invalid")
+                    || self.capturing("settings-github-typing"))
                     && self.settle_ticks == 2
                 {
                     return Ok(TickAction::ScrollSettingsToGitHub);
+                }
+                if self.capturing("settings-github-typing") && self.settle_ticks == 3 {
+                    return Ok(TickAction::SeedClipboard);
                 }
                 if self.capturing("github-pull-requests-scrolled") && self.settle_ticks == 2 {
                     return Ok(TickAction::ScrollGitHubPullRequestsToEnd);
@@ -983,7 +988,10 @@ impl Scenario {
                     .into_bytes(),
                 )
                 .map_err(|error| error.to_string())?;
-        } else if self.capturing("settings") || self.capturing("settings-scrollback") {
+        } else if self.capturing("settings")
+            || self.capturing("settings-scrollback")
+            || self.capturing("settings-github-typing")
+        {
             drop(app.open_settings());
         } else if self.capturing("settings-github-enterprise") {
             drop(app.open_settings());
@@ -1850,7 +1858,7 @@ impl Scenario {
             app.maximized_pane = Some(self.second_pane()?);
         } else if self.capturing("prefix-armed") {
             app.prefix_armed = true;
-        } else if self.capturing("workspace-create") {
+        } else if self.capturing("workspace-create") || self.capturing("workspace-create-buttons") {
             app.workspace_create_visible = true;
             app.workspace_name_draft = "release-audit".into();
         } else if self.capturing("rename-workspace") {
@@ -2163,6 +2171,9 @@ impl Muxtrix {
             }
             Ok(TickAction::ScrollSettingsToGitHub) => {
                 vec![Effect::ScrollToRatio(ScrollTarget::Settings, 0.65)]
+            }
+            Ok(TickAction::SeedClipboard) => {
+                vec![Effect::ClipboardWrite("github.pasted.example".into())]
             }
             Ok(TickAction::ScrollGitHubToEnd) => {
                 vec![Effect::ScrollToEnd(ScrollTarget::GitHubFiles)]

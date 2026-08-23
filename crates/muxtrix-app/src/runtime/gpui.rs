@@ -14,7 +14,7 @@ use gpui::{
 
 use crate::app::{Message, Muxtrix};
 use crate::effect::Effect;
-use crate::input::KeyEvent;
+use crate::input::{Key, KeyEvent, Named};
 use crate::theme::DesignTokens;
 
 /// How often the terminals are drained when nothing has woken them.
@@ -472,15 +472,32 @@ impl Root {
         .detach();
     }
 
+    /// Settings widgets own their editing keys. Sending the same key through
+    /// the application reducer synchronizes the old draft back into the widget
+    /// before its `InputEvent::Change` subscription can publish the edit.
+    fn settings_component_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
+        self.app.active_view == crate::app::ActiveView::Settings
+            && self.focus.contains_focused(window, cx)
+            && !self.focus.is_focused(window)
+    }
+
     /// Every key the window receives, in the app's own vocabulary.
     /// The terminal receives every key the application does not explicitly
     /// claim; this adapter does not maintain a second keymap.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let input = crate::input::from_keystroke(&event.keystroke);
+        if self.settings_component_focused(window, cx)
+            && !matches!(input.modified_key.as_ref(), Key::Named(Named::Escape))
+        {
+            return;
+        }
         self.dispatch(Message::Keyboard(KeyEvent::Pressed(input)), window, cx);
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_component_focused(window, cx) {
+            return;
+        }
         let modifiers = crate::input::modifiers_from_gpui(event.keystroke.modifiers);
         self.dispatch(
             Message::Keyboard(KeyEvent::Released { modifiers }),
@@ -495,6 +512,9 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings_component_focused(window, cx) {
+            return;
+        }
         let modifiers = crate::input::modifiers_from_gpui(event.modifiers);
         self.dispatch(
             Message::Keyboard(KeyEvent::ModifiersChanged(modifiers)),

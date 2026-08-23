@@ -3237,10 +3237,17 @@ fn naming_dialogs_submit_with_enter_and_cancel_from_the_button_row() {
     assert!(!app.workspace_create_visible);
 
     let _ = app.open_workspace_create();
+    assert_eq!(app.focus_target(), Some(FocusTarget::WorkspaceCreate));
     let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowDown), Modifiers::empty()));
+    assert_eq!(app.focus_target(), None);
     let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowLeft), Modifiers::empty()));
     assert_eq!(app.dialog_button, Some(DialogButton::Cancel));
-
+    assert_eq!(app.focus_target(), None);
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowUp), Modifiers::empty()));
+    assert_eq!(app.dialog_button, None);
+    assert_eq!(app.focus_target(), Some(FocusTarget::WorkspaceCreate));
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowDown), Modifiers::empty()));
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowLeft), Modifiers::empty()));
     let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
 
     assert_eq!(app.session.workspaces.len(), original_workspaces + 1);
@@ -3432,9 +3439,7 @@ fn replayed_claude_screen_recovers_status_without_a_hook() {
     assert_eq!(status.state, AgentState::Idle);
 }
 
-/// A Claude Code frame mid-turn, as painted by 2.1.235: the harness
-/// keeps its empty composer under the loading footer while it works.
-fn claude_working_snapshot(title: &str) -> GridSnapshot {
+fn claude_snapshot(title: &str, frame: &str) -> GridSnapshot {
     let actor = TerminalActor::spawn(TerminalOptions {
         cols: 100,
         rows: 24,
@@ -3442,16 +3447,249 @@ fn claude_working_snapshot(title: &str) -> GridSnapshot {
     })
     .expect("terminal actor should start");
     actor
-        .feed(
-            format!(
-                "\u{1b}]0;{title}\u{7}\u{1b}[2J\u{1b}[H✶ Sock-hopping… (1m 28s · ↓ 4.9k tokens)\n\n────────────────────────\n❯\n────────────────────────\n  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents"
-            )
-            .into_bytes(),
-        )
+        .feed(format!("\u{1b}]0;{title}\u{7}\u{1b}[2J\u{1b}[H{frame}").into_bytes())
         .expect("terminal should accept Claude chrome");
     let snapshot = actor.snapshot().expect("snapshot should render");
     actor.shutdown().expect("terminal actor should stop");
     snapshot
+}
+
+/// A Claude Code frame mid-turn, as painted by 2.1.235: the harness
+/// keeps its empty composer under the loading footer while it works.
+fn claude_working_snapshot(title: &str) -> GridSnapshot {
+    claude_snapshot(
+        title,
+        "✶ Sock-hopping… (1m 28s · ↓ 4.9k tokens)\n\n────────────────────────\n❯\n────────────────────────\n  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents",
+    )
+}
+
+fn claude_idle_snapshot() -> GridSnapshot {
+    claude_snapshot(
+        "current session",
+        "────────────────────────\n❯\n────────────────────────\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+    )
+}
+
+fn claude_waiting_snapshot() -> GridSnapshot {
+    claude_snapshot(
+        "Claude",
+        "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel",
+    )
+}
+
+#[test]
+fn structured_busy_status_overrides_an_idle_looking_claude_composer() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    app.agent_statuses.insert(
+        pane_id,
+        AgentPaneStatus {
+            agent: "claude".into(),
+            display_name: None,
+            state: AgentState::Idle,
+            activity: Some("Ready for input".into()),
+            session_id: Some("live-session".into()),
+            cwd: Some("/work/repo".into()),
+            git_branch: None,
+        },
+    );
+    let runtime = app.terminals.get_mut(&pane_id).expect("terminal runtime");
+    runtime.session = None;
+    runtime.snapshot = Some(claude_idle_snapshot());
+    runtime.snapshot_revision += 1;
+    app.claude_interactive_sessions = vec![agents_roster::InteractiveSession {
+        pid: Some(42),
+        session_id: Some("live-session".into()),
+        cwd: Some("/work/repo".into()),
+        state: agents_roster::InteractiveState::Working,
+    }];
+
+    app.poll_terminal();
+
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+    assert_eq!(app.pane_state_label(pane_id), "Running");
+    assert_eq!(app.pane_signal_kind(pane_id, false), PaneSignalKind::Active);
+}
+
+#[test]
+fn roster_failure_releases_structured_busy_from_the_retained_idle_frame() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    app.agent_statuses.insert(
+        pane_id,
+        AgentPaneStatus {
+            agent: "claude".into(),
+            display_name: None,
+            state: AgentState::Idle,
+            activity: Some("Ready for input".into()),
+            session_id: Some("transient-session".into()),
+            cwd: None,
+            git_branch: None,
+        },
+    );
+    let runtime = app.terminals.get_mut(&pane_id).expect("terminal runtime");
+    runtime.session = None;
+    runtime.snapshot = Some(claude_idle_snapshot());
+    runtime.snapshot_revision += 1;
+    app.claude_interactive_sessions = vec![agents_roster::InteractiveSession {
+        pid: None,
+        session_id: Some("transient-session".into()),
+        cwd: None,
+        state: agents_roster::InteractiveState::Working,
+    }];
+    app.reconcile_claude_interactive_sessions();
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+    assert_eq!(
+        app.agent_running_frame_revisions.get(&pane_id),
+        Some(&app.terminals[&pane_id].snapshot_revision)
+    );
+
+    let _ = app.update(Message::AgentsRosterLoaded(Err(
+        "transient roster failure".into()
+    )));
+
+    assert!(app.claude_interactive_sessions.is_empty());
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Idle);
+    assert!(!app.agent_running_frame_revisions.contains_key(&pane_id));
+}
+
+#[test]
+fn visible_claude_blocker_outranks_structured_busy_status() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    app.agent_statuses.insert(
+        pane_id,
+        AgentPaneStatus {
+            agent: "claude".into(),
+            display_name: None,
+            state: AgentState::Idle,
+            activity: None,
+            session_id: Some("blocked-session".into()),
+            cwd: None,
+            git_branch: None,
+        },
+    );
+    let runtime = app.terminals.get_mut(&pane_id).expect("terminal runtime");
+    runtime.session = None;
+    runtime.snapshot = Some(claude_waiting_snapshot());
+    runtime.snapshot_revision += 1;
+    app.claude_interactive_sessions = vec![agents_roster::InteractiveSession {
+        pid: None,
+        session_id: Some("blocked-session".into()),
+        cwd: None,
+        state: agents_roster::InteractiveState::Working,
+    }];
+
+    app.poll_terminal();
+
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Waiting);
+    assert_eq!(app.pane_state_label(pane_id), "Needs input");
+}
+
+#[test]
+fn visible_claude_working_frame_outranks_structured_idle_status() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    app.agent_statuses.insert(
+        pane_id,
+        AgentPaneStatus {
+            agent: "claude".into(),
+            display_name: None,
+            state: AgentState::Running,
+            activity: None,
+            session_id: Some("working-session".into()),
+            cwd: None,
+            git_branch: None,
+        },
+    );
+    let runtime = app.terminals.get_mut(&pane_id).expect("terminal runtime");
+    runtime.session = None;
+    runtime.snapshot = Some(claude_working_snapshot("Working"));
+    runtime.snapshot_revision += 1;
+    app.claude_interactive_sessions = vec![agents_roster::InteractiveSession {
+        pid: None,
+        session_id: Some("working-session".into()),
+        cwd: None,
+        state: agents_roster::InteractiveState::Idle,
+    }];
+
+    app.poll_terminal();
+
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+}
+
+#[test]
+fn structured_idle_status_clears_stale_running_without_screen_evidence() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    app.agent_statuses.insert(
+        pane_id,
+        AgentPaneStatus {
+            agent: "claude".into(),
+            display_name: None,
+            state: AgentState::Running,
+            activity: Some("Agent is working".into()),
+            session_id: Some("resting-session".into()),
+            cwd: None,
+            git_branch: None,
+        },
+    );
+    app.terminals
+        .get_mut(&pane_id)
+        .expect("terminal runtime")
+        .snapshot = None;
+    app.claude_interactive_sessions = vec![agents_roster::InteractiveSession {
+        pid: None,
+        session_id: Some("resting-session".into()),
+        cwd: None,
+        state: agents_roster::InteractiveState::Idle,
+    }];
+
+    app.reconcile_claude_interactive_sessions();
+
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Idle);
+    assert_eq!(
+        app.agent_statuses[&pane_id].activity.as_deref(),
+        Some("Ready for input")
+    );
+}
+
+#[test]
+fn interactive_session_matching_rejects_ambiguous_cwds_and_accepts_exact_pids() {
+    let first = PaneId::new();
+    let second = PaneId::new();
+    let ambiguous = vec![
+        ClaudePaneIdentity {
+            pane_id: first,
+            session_id: None,
+            process_id: None,
+            cwd: Some("/work/repo".into()),
+        },
+        ClaudePaneIdentity {
+            pane_id: second,
+            session_id: None,
+            process_id: None,
+            cwd: Some("/work/repo/".into()),
+        },
+    ];
+    let sessions = vec![agents_roster::InteractiveSession {
+        pid: Some(42),
+        session_id: None,
+        cwd: Some("/work/repo".into()),
+        state: agents_roster::InteractiveState::Working,
+    }];
+    assert!(match_claude_interactive_sessions(&ambiguous, &sessions).is_empty());
+
+    let exact = vec![ClaudePaneIdentity {
+        pane_id: first,
+        session_id: None,
+        process_id: Some(42),
+        cwd: Some("/work/repo".into()),
+    }];
+    assert_eq!(
+        match_claude_interactive_sessions(&exact, &sessions).get(&first),
+        Some(&0)
+    );
 }
 
 #[test]
@@ -4142,10 +4380,10 @@ fn agent_status_returns_to_shell_after_hooked_process_exits() {
         app.detected_agents.contains_key(&pane_id),
         "hook-owned statuses must retain process-exit observation"
     );
-    app.detected_agents.insert(
-        pane_id,
-        std::time::Instant::now() - std::time::Duration::from_secs(3),
-    );
+    app.detected_agents
+        .get_mut(&pane_id)
+        .expect("detected process")
+        .last_seen = std::time::Instant::now() - std::time::Duration::from_secs(3);
     app.send_terminal_input(vec![0x03]).expect("ctrl+c");
     let gone_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < gone_deadline {
@@ -6301,8 +6539,13 @@ fn created_worktree_restart_preserves_identity_and_clears_transient_state() {
             git_branch: Some("old".into()),
         },
     );
-    app.detected_agents
-        .insert(pane_id, std::time::Instant::now());
+    app.detected_agents.insert(
+        pane_id,
+        DetectedAgentProcess {
+            process_id: 42,
+            last_seen: std::time::Instant::now(),
+        },
+    );
 
     app.open_created_worktree(WorktreePromptTarget::RestartPane(pane_id), target.clone())
         .expect("fresh terminal should launch in the requested directory");
@@ -7753,12 +7996,15 @@ fn a_roster_that_cannot_be_read_says_so_instead_of_waiting_forever() {
 
     // A later read that lands replaces the reason with the counts.
     let _ = app.update(Message::AgentsRosterLoaded(Ok(
-        agents_roster::AgentsRoster {
-            working: 1,
-            blocked: 0,
-            failed: 0,
-            completed: 0,
-            idle: 0,
+        agents_roster::AgentsSnapshot {
+            roster: agents_roster::AgentsRoster {
+                working: 1,
+                blocked: 0,
+                failed: 0,
+                completed: 0,
+                idle: 0,
+            },
+            interactive_sessions: Vec::new(),
         },
     )));
     assert_eq!(app.pane_state_label(pane), "1 working");

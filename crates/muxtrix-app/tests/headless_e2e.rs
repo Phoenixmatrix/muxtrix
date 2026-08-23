@@ -490,6 +490,35 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             thread::sleep(Duration::from_millis(1_000));
             eprintln!("clicked and typed in the pull request filter");
         }
+        if capture == "settings-github-typing" {
+            let origin = pin_window(&connection, root, window)?;
+            let input_x = origin
+                .dst_x
+                .saturating_add(i16::try_from(final_viewport.0.saturating_sub(385))?);
+            let input_y = origin.dst_y.saturating_add(542);
+            click_at(&connection, root, input_x, input_y)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(750));
+            chord(&connection, 0xffe3, 'a' as u32)?;
+            type_text(&connection, "github.typed.example")?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("clicked, selected, and typed in the GitHub host field");
+            chord(&connection, 0xffe3, 'a' as u32)?;
+            chord(&connection, 0xffe3, 'v' as u32)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("selected the host and pasted from the GPUI clipboard");
+        }
+        if capture == "workspace-create-buttons" {
+            tap_keysym(&connection, 0xff54)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(500));
+            tap_keysym(&connection, 0xff51)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("moved from the naming input to the dialog button row");
+        }
         let frame = grab_window(&connection, window)?;
         std::fs::write(&screenshot_path, &frame.rgba)?;
         eprintln!(

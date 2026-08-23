@@ -337,17 +337,21 @@ pub(crate) struct Muxtrix {
     /// Pi's lifecycle owns this interval: an erroneously idle OSC title must
     /// not demote work that the harness still reports as active.
     pub(crate) pi_active_lifecycles: BTreeSet<PaneId>,
-    /// Panes where process-tree detection has observed a live agent, with the
-    /// instant it last saw that process. Lifecycle hooks enrich the same
-    /// status but do not disable exit observation; the entry self-cleans after
-    /// the harness process remains absent.
-    pub(crate) detected_agents: BTreeMap<PaneId, std::time::Instant>,
+    /// Panes where process-tree detection has observed a live agent. The PID
+    /// links Claude's machine-readable interactive-session state back to the
+    /// exact pane when hooks are missing; the timestamp still provides the
+    /// process-exit grace period.
+    pub(crate) detected_agents: BTreeMap<PaneId, DetectedAgentProcess>,
     /// Panes currently showing Claude Code's Agents view. Their rows project
     /// `agents_roster` instead of one conversation's lifecycle.
     pub(crate) agents_view_panes: BTreeSet<PaneId>,
     /// Latest machine-wide roster, or `None` until the first read lands. An
     /// error leaves the previous roster in place rather than inventing counts.
     pub(crate) agents_roster: Option<agents_roster::AgentsRoster>,
+    /// Machine-readable state for interactive Claude sessions. Unlike the
+    /// aggregate roster counts, these records are dropped on a failed read so
+    /// stale `busy` evidence can never keep a pane Running indefinitely.
+    pub(crate) claude_interactive_sessions: Vec<agents_roster::InteractiveSession>,
     /// One roster read at a time: polls must not stack up behind a slow harness.
     pub(crate) agents_roster_pending: bool,
     /// Why the last read failed, while no roster has ever landed. A roll-up
@@ -1031,6 +1035,130 @@ pub(crate) struct AgentPaneStatus {
     pub(crate) git_branch: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DetectedAgentProcess {
+    pub(crate) process_id: u32,
+    pub(crate) last_seen: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PaneAgentProcess {
+    agent: String,
+    process_id: u32,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudePaneIdentity {
+    pane_id: PaneId,
+    session_id: Option<String>,
+    process_id: Option<u32>,
+    cwd: Option<String>,
+}
+
+fn same_claude_directory(left: &str, right: &str) -> bool {
+    if cfg!(target_os = "windows") {
+        left.trim_end_matches(['/', '\\'])
+            .eq_ignore_ascii_case(right.trim_end_matches(['/', '\\']))
+    } else {
+        left.trim_end_matches('/') == right.trim_end_matches('/')
+    }
+}
+
+fn assign_unique_claude_matches(
+    panes: &[ClaudePaneIdentity],
+    sessions: &[agents_roster::InteractiveSession],
+    matched: &mut BTreeMap<PaneId, usize>,
+    used_sessions: &mut BTreeSet<usize>,
+    evidence_matches: impl Fn(&ClaudePaneIdentity, &agents_roster::InteractiveSession) -> bool,
+) {
+    for pane in panes {
+        if matched.contains_key(&pane.pane_id) {
+            continue;
+        }
+        let session_index = {
+            let mut candidates = sessions
+                .iter()
+                .enumerate()
+                .filter(|(index, session)| {
+                    !used_sessions.contains(index) && evidence_matches(pane, session)
+                })
+                .map(|(index, _)| index);
+            match (candidates.next(), candidates.next()) {
+                (Some(index), None) => Some(index),
+                _ => None,
+            }
+        };
+        let Some(session_index) = session_index else {
+            continue;
+        };
+        if panes
+            .iter()
+            .filter(|candidate| {
+                !matched.contains_key(&candidate.pane_id)
+                    && evidence_matches(candidate, &sessions[session_index])
+            })
+            .count()
+            != 1
+        {
+            continue;
+        }
+        matched.insert(pane.pane_id, session_index);
+        used_sessions.insert(session_index);
+    }
+}
+
+/// Associates Claude's machine-wide interactive records with panes only when
+/// the evidence is one-to-one. Session ID is portable and strongest; Linux can
+/// recover without hooks from the exact process PID; a unique cwd pair is the
+/// conservative final fallback for platforms whose terminal host hides PIDs.
+fn match_claude_interactive_sessions(
+    panes: &[ClaudePaneIdentity],
+    sessions: &[agents_roster::InteractiveSession],
+) -> BTreeMap<PaneId, usize> {
+    let mut matched = BTreeMap::new();
+    let mut used_sessions = BTreeSet::new();
+    assign_unique_claude_matches(
+        panes,
+        sessions,
+        &mut matched,
+        &mut used_sessions,
+        |pane, session| {
+            let Some(pane_session_id) = pane
+                .session_id
+                .as_deref()
+                .filter(|session_id| !session_id.trim().is_empty())
+            else {
+                return false;
+            };
+            session.session_id.as_deref() == Some(pane_session_id)
+        },
+    );
+    assign_unique_claude_matches(
+        panes,
+        sessions,
+        &mut matched,
+        &mut used_sessions,
+        |pane, session| pane.process_id.is_some() && pane.process_id == session.pid,
+    );
+    assign_unique_claude_matches(
+        panes,
+        sessions,
+        &mut matched,
+        &mut used_sessions,
+        |pane, session| {
+            let Some(pane_cwd) = pane.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) else {
+                return false;
+            };
+            session
+                .cwd
+                .as_deref()
+                .filter(|cwd| !cwd.trim().is_empty())
+                .is_some_and(|session_cwd| same_claude_directory(pane_cwd, session_cwd))
+        },
+    );
+    matched
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PaneRepository {
     pub(crate) directory: std::path::PathBuf,
@@ -1267,7 +1395,7 @@ pub(crate) enum Message {
     CancelTerminalLaunch(PaneId),
     SessionHostInitialized(PaneId, Result<Vec<muxtrix_sessions::SessionRecord>, String>),
     PollTerminal,
-    AgentsRosterLoaded(Result<agents_roster::AgentsRoster, String>),
+    AgentsRosterLoaded(Result<agents_roster::AgentsSnapshot, String>),
     PaneRepositoriesLoaded(u64, Result<Vec<(PaneId, PaneRepository)>, String>),
     BlinkCursor,
     AnimateGitHubLoading,
@@ -1982,6 +2110,7 @@ impl Muxtrix {
             detected_agents: BTreeMap::new(),
             agents_view_panes: BTreeSet::new(),
             agents_roster: None,
+            claude_interactive_sessions: Vec::new(),
             agents_roster_pending: false,
             agents_roster_error: None,
             agents_roster_checked: None,
@@ -2064,6 +2193,8 @@ impl Muxtrix {
         bit(self.session_picker.is_some());
         bit(self.close_workspace_prompt.is_some());
         bit(self.default_agent_prompt);
+        bit(self.dialog_button == Some(DialogButton::Cancel));
+        bit(self.dialog_button == Some(DialogButton::Confirm));
         bit(self.github_panel.is_some());
         bit(self.toast.is_some());
         bit(self.sidebar_collapsed);
@@ -2097,13 +2228,13 @@ impl Muxtrix {
         if self.palette.visible {
             return Some(FocusTarget::CommandPalette);
         }
-        if self.workspace_create_visible {
+        if self.workspace_create_visible && self.dialog_button.is_none() {
             return Some(FocusTarget::WorkspaceCreate);
         }
-        if self.rename_prompt.is_some() {
+        if self.rename_prompt.is_some() && self.dialog_button.is_none() {
             return Some(FocusTarget::Rename);
         }
-        if self.worktree_prompt.is_some() {
+        if self.worktree_prompt.is_some() && self.dialog_button.is_none() {
             return Some(FocusTarget::Worktree);
         }
         if self
@@ -2223,16 +2354,22 @@ impl Muxtrix {
             }
             Message::AgentsRosterLoaded(result) => {
                 self.agents_roster_pending = false;
-                // A failed read keeps the last roster rather than inventing
-                // counts or blanking a row that is still showing the view. It
-                // is still recorded: with no roster to fall back on, the reason
-                // is the only thing the row can honestly report.
+                // Aggregate counts may remain visible while the Agents view is
+                // open after a transient failure. Pane-local lifecycle cannot:
+                // stale `busy` evidence would otherwise pin an idle session to
+                // Running until the helper command recovered.
                 match result {
-                    Ok(roster) => {
-                        self.agents_roster = Some(roster);
+                    Ok(snapshot) => {
+                        self.discard_claude_interactive_sessions();
+                        self.agents_roster = Some(snapshot.roster);
+                        self.claude_interactive_sessions = snapshot.interactive_sessions;
                         self.agents_roster_error = None;
+                        self.reconcile_claude_interactive_sessions();
                     }
-                    Err(error) => self.agents_roster_error = Some(error),
+                    Err(error) => {
+                        self.discard_claude_interactive_sessions();
+                        self.agents_roster_error = Some(error);
+                    }
                 }
                 return Vec::new();
             }
@@ -4629,6 +4766,7 @@ impl Muxtrix {
         self.pi_active_lifecycles.clear();
         self.detected_agents.clear();
         self.agents_view_panes.clear();
+        self.claude_interactive_sessions.clear();
         self.pane_layouts.clear();
         self.base_pane_layouts.clear();
         self.pane_resize_history.clear();
@@ -7045,15 +7183,20 @@ impl Muxtrix {
         let pane_ids: Vec<PaneId> = self.terminals.keys().copied().collect();
         for pane_id in pane_ids {
             match self.pane_agent_process(pane_id) {
-                Some(agent) => {
-                    self.detected_agents
-                        .insert(pane_id, std::time::Instant::now());
+                Some(process) => {
+                    self.detected_agents.insert(
+                        pane_id,
+                        DetectedAgentProcess {
+                            process_id: process.process_id,
+                            last_seen: std::time::Instant::now(),
+                        },
+                    );
                     if !self.agent_statuses.contains_key(&pane_id) {
-                        self.record_running_agent(pane_id, agent, None);
+                        self.record_running_agent(pane_id, process.agent, None);
                     }
                 }
-                None if self.detected_agents.get(&pane_id).is_some_and(|last_seen| {
-                    last_seen.elapsed() > std::time::Duration::from_secs(2)
+                None if self.detected_agents.get(&pane_id).is_some_and(|process| {
+                    process.last_seen.elapsed() > std::time::Duration::from_secs(2)
                 }) =>
                 {
                     self.agent_statuses.remove(&pane_id);
@@ -7064,12 +7207,13 @@ impl Muxtrix {
                 None => {}
             }
         }
+        self.reconcile_claude_interactive_sessions();
     }
 
     /// Walks the pane's process tree via /proc looking for a known agent
     /// executable. Bounded breadth-first walk; the shell itself is skipped.
     #[cfg(target_os = "linux")]
-    pub(crate) fn pane_agent_process(&self, pane_id: PaneId) -> Option<String> {
+    fn pane_agent_process(&self, pane_id: PaneId) -> Option<PaneAgentProcess> {
         let root = self
             .terminals
             .get(&pane_id)?
@@ -7097,13 +7241,22 @@ impl Muxtrix {
             {
                 let comm = comm.trim().to_ascii_lowercase();
                 if comm == "codex" || comm == codex {
-                    return Some("codex".into());
+                    return Some(PaneAgentProcess {
+                        agent: "codex".into(),
+                        process_id: pid,
+                    });
                 }
                 if comm == "claude" || comm == "claude-code" || comm == claude {
-                    return Some("claude".into());
+                    return Some(PaneAgentProcess {
+                        agent: "claude".into(),
+                        process_id: pid,
+                    });
                 }
                 if comm == "omp" || comm == "pi" || comm == pi {
-                    return Some("pi".into());
+                    return Some(PaneAgentProcess {
+                        agent: "pi".into(),
+                        process_id: pid,
+                    });
                 }
             }
             if let Ok(children) =
@@ -7120,7 +7273,7 @@ impl Muxtrix {
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub(crate) fn pane_agent_process(&self, _pane_id: PaneId) -> Option<String> {
+    fn pane_agent_process(&self, _pane_id: PaneId) -> Option<PaneAgentProcess> {
         None
     }
 
@@ -7639,6 +7792,7 @@ impl Muxtrix {
         for (pane_id, agent, revision, classification) in classifications {
             self.apply_agent_screen_classification(pane_id, &agent, revision, classification);
         }
+        self.reconcile_claude_interactive_sessions();
         // Which panes are projecting Claude Code's roster. Derived from the
         // same frames as the classification above, so entering or leaving the
         // view is reflected on the very next paint rather than on a poll.
@@ -7689,16 +7843,148 @@ impl Muxtrix {
         }
     }
 
-    /// Reads the machine-wide roster while at least one pane projects it.
-    ///
-    /// The read costs a short-lived subprocess, so it is paced rather than run
-    /// per frame, and only one may be in flight. Entering the view clears the
-    /// timestamp, making that first read immediate.
+    fn claude_pane_identities(&self) -> Vec<ClaudePaneIdentity> {
+        self.agent_statuses
+            .iter()
+            .filter(|(_, status)| pane_agent(&status.agent) == Some(PaneAgent::ClaudeCode))
+            .map(|(pane_id, status)| ClaudePaneIdentity {
+                pane_id: *pane_id,
+                session_id: status.session_id.clone(),
+                process_id: self
+                    .detected_agents
+                    .get(pane_id)
+                    .map(|process| process.process_id),
+                cwd: status.cwd.clone().or_else(|| {
+                    self.pane_working_directory(*pane_id)
+                        .map(|directory| directory.to_string_lossy().into_owned())
+                }),
+            })
+            .collect()
+    }
+
+    /// Release the same-frame guard installed by structured `busy` before
+    /// dropping or replacing those records, then immediately re-evaluate the
+    /// retained terminal frame. Otherwise a failed roster read can leave an
+    /// idle composer pinned to Running at that revision.
+    fn discard_claude_interactive_sessions(&mut self) {
+        if self.claude_interactive_sessions.is_empty() {
+            return;
+        }
+        let panes = self.claude_pane_identities();
+        let affected = match_claude_interactive_sessions(&panes, &self.claude_interactive_sessions)
+            .into_iter()
+            .filter_map(|(pane_id, session_index)| {
+                (self.claude_interactive_sessions[session_index].state
+                    == agents_roster::InteractiveState::Working)
+                    .then_some(pane_id)
+            })
+            .collect::<Vec<_>>();
+        self.claude_interactive_sessions.clear();
+
+        for pane_id in &affected {
+            self.agent_running_frame_revisions.remove(pane_id);
+        }
+        let classifications = affected
+            .into_iter()
+            .filter_map(|pane_id| {
+                let agent = self.agent_statuses.get(&pane_id)?.agent.clone();
+                let runtime = self.terminals.get(&pane_id)?;
+                let classification = agent_screen::classify(&agent, runtime.snapshot.as_ref()?)?;
+                Some((pane_id, agent, runtime.snapshot_revision, classification))
+            })
+            .collect::<Vec<_>>();
+        for (pane_id, agent, revision, classification) in classifications {
+            self.apply_agent_screen_classification(pane_id, &agent, revision, classification);
+        }
+    }
+
+    /// Merges Claude's structured interactive-session status with the pane's
+    /// live screen. A visible blocker always wins. Structured `busy` then
+    /// outranks an idle-looking composer, while positive working chrome
+    /// outranks a lagging `idle` record.
+    fn reconcile_claude_interactive_sessions(&mut self) {
+        if self.claude_interactive_sessions.is_empty() {
+            return;
+        }
+        let panes = self.claude_pane_identities();
+        let matches = match_claude_interactive_sessions(&panes, &self.claude_interactive_sessions);
+
+        for (pane_id, session_index) in matches {
+            let Some(session) = self.claude_interactive_sessions.get(session_index) else {
+                continue;
+            };
+            let visible_state = self
+                .terminals
+                .get(&pane_id)
+                .and_then(|runtime| runtime.snapshot.as_ref())
+                .and_then(|snapshot| agent_screen::classify("claude", snapshot))
+                .map(|classification| classification.state);
+            let Some(current_state) = self.agent_statuses.get(&pane_id).map(|status| status.state)
+            else {
+                continue;
+            };
+            if matches!(current_state, AgentState::Failed | AgentState::Stopped) {
+                continue;
+            }
+            let next = match session.state {
+                agents_roster::InteractiveState::Working
+                    if visible_state != Some(agent_screen::ScreenState::Waiting) =>
+                {
+                    Some((AgentState::Running, agent_screen::ScreenState::Running))
+                }
+                agents_roster::InteractiveState::Idle
+                    if current_state == AgentState::Running
+                        && !matches!(
+                            visible_state,
+                            Some(
+                                agent_screen::ScreenState::Running
+                                    | agent_screen::ScreenState::Waiting
+                            )
+                        ) =>
+                {
+                    Some((AgentState::Idle, agent_screen::ScreenState::Idle))
+                }
+                _ => None,
+            };
+            let Some((next_state, screen_state)) = next else {
+                continue;
+            };
+            if next_state == current_state {
+                continue;
+            }
+            let resolved_waiting =
+                current_state == AgentState::Waiting && next_state != AgentState::Waiting;
+            if let Some(status) = self.agent_statuses.get_mut(&pane_id) {
+                status.state = next_state;
+                status.activity = Some(agent_state_activity(screen_state).into());
+            }
+            if next_state == AgentState::Running {
+                let revision = self
+                    .terminals
+                    .get(&pane_id)
+                    .map_or(0, |runtime| runtime.snapshot_revision);
+                self.agent_running_frame_revisions.insert(pane_id, revision);
+            } else {
+                self.agent_running_frame_revisions.remove(&pane_id);
+            }
+            if resolved_waiting {
+                self.clear_pane_attention(pane_id);
+            }
+        }
+    }
+
+    /// Reads Claude Code's machine-wide structured session state while any
+    /// Claude pane exists. Background records roll up the Agents view; exact
+    /// interactive records correct pane lifecycle when hook or screen chrome
+    /// is missing. One paced helper process serves both jobs.
     pub(crate) fn refresh_agents_roster(&mut self) -> Vec<Effect> {
-        if self.agents_view_panes.is_empty() {
-            // Nothing projects it any more; drop it so a later view cannot
-            // paint a stale count before its own read lands.
+        let has_claude_pane = self
+            .agent_statuses
+            .values()
+            .any(|status| pane_agent(&status.agent) == Some(PaneAgent::ClaudeCode));
+        if !has_claude_pane && self.agents_view_panes.is_empty() {
             self.agents_roster = None;
+            self.claude_interactive_sessions.clear();
             self.agents_roster_error = None;
             self.agents_roster_checked = None;
             return Vec::new();
@@ -7712,9 +7998,14 @@ impl Muxtrix {
         self.agents_roster_pending = true;
         self.agents_roster_checked = Some(std::time::Instant::now());
         let command = self.settings.claude_command.clone();
+        #[cfg(target_os = "windows")]
+        let wsl_distribution = (self.settings.windows_shell_backend == WindowsShellBackend::Wsl)
+            .then(|| self.settings.wsl_distribution.clone());
+        #[cfg(not(target_os = "windows"))]
+        let wsl_distribution: Option<String> = None;
         perform_blocking(
-            move || agents_roster::load(&command),
-            |result| Message::AgentsRosterLoaded(result.and_then(|roster| roster)),
+            move || agents_roster::load(&command, wsl_distribution.as_deref()),
+            |result| Message::AgentsRosterLoaded(result.and_then(|snapshot| snapshot)),
         )
     }
 
