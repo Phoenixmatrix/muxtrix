@@ -265,7 +265,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         connection.flush()?;
         thread::sleep(Duration::from_millis(120));
     }
-    eprintln!("delivered pointer motion to a mouse-reporting terminal program");
+    eprintln!("delivered pointer motion to a mouse-reporting terminal program ({step} nudges)");
     connection.flush()?;
     // The probe reads whatever reaches the pty first and judges that. Pointer
     // and keyboard arrive over separate X streams with no ordering promised
@@ -574,7 +574,7 @@ finally:
     except OSError:
         pass
 
-print("mouse-report-ok" if data.startswith(b"\x1b[<35;") else "mouse-report-fail")
+print("mouse-report-ok" if data.startswith(b"\x1b[<35;") else "mouse-report-fail " + repr(data))
 "#,
     )?;
     let mut permissions = std::fs::metadata(path)?.permissions();

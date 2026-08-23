@@ -304,15 +304,12 @@ impl Scenario {
                 .and_then(|runtime| runtime.snapshot.as_ref())
                 .map(|snapshot| {
                     let text = snapshot.text();
-                    let tail: String = text
-                        .chars()
-                        .rev()
-                        .take(160)
+                    let probe: String = text
+                        .lines()
+                        .filter(|line| line.contains("mouse-report"))
                         .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect();
-                    format!("reporting_now={} tail={tail:?}", snapshot.mouse_reporting)
+                        .join(" | ");
+                    format!("reporting_now={} probe={probe:?}", snapshot.mouse_reporting)
                 });
             let (polls, ticks) = app.e2e_clock_trace;
             let (window_moves, polls) = (polls / 1_000_000, polls % 1_000_000);
