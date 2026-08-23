@@ -28,11 +28,17 @@ use crate::views::{icon_button, terminal_family};
 impl Root {
     /// The panel, when one is open.
     pub(crate) fn github_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Some(panel) = self.app.github_panel.as_ref() else {
+            self.github_panel_bounds.replace(None);
+            return None;
+        };
         let app = self.app();
-        let panel = app.github_panel.as_ref()?;
         let tokens = DesignTokens::for_appearance(app.settings.appearance);
         let floating =
             app.active_view == crate::app::ActiveView::Workspace && app.window_size.width < 1_080.0;
+        if !floating {
+            self.github_panel_bounds.replace(None);
+        }
 
         let body = if panel.context_loading {
             self.github_loading(panel, tokens)
@@ -146,11 +152,22 @@ impl Root {
             .child(surface);
         Some(if floating {
             // Over the workspace, hugging the right edge.
+            let recorded = self.github_panel_bounds.clone();
             div()
                 .absolute()
                 .top_0()
                 .bottom_0()
                 .right_0()
+                .child(
+                    gpui::canvas(
+                        move |bounds, _, _| {
+                            recorded.replace(Some(bounds));
+                        },
+                        |_, (), _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
                 .child(panel_element)
                 .into_any_element()
         } else {

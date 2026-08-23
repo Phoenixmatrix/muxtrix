@@ -94,6 +94,11 @@ pub(crate) struct Root {
         muxtrix_domain::PaneId,
         (Bounds<gpui::Pixels>, Point<gpui::Pixels>),
     >,
+    /// Bounds of the GitHub panel only while it floats over the workspace.
+    ///
+    /// A pointer over this region must not start terminal hover/reporting, but
+    /// a terminal capture that began elsewhere still continues through it.
+    pub(crate) github_panel_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<gpui::Pixels>>>>,
     /// Inline terminal images, decoded once and kept while the emulator still
     /// references them. Keyed by the emulator's own generation, so an image
     /// that is redrawn unchanged is not decoded again.
@@ -244,6 +249,7 @@ impl Root {
             component_theme: None,
             pane_bounds: std::rc::Rc::default(),
             terminal_regions: std::collections::HashMap::new(),
+            github_panel_bounds: std::rc::Rc::default(),
             images: std::collections::BTreeMap::new(),
             scrolls: Scrolls::default(),
             pending_scrolls: Vec::new(),
@@ -347,7 +353,11 @@ impl Root {
             cx,
         );
 
-        let hit = if self.app.terminal_pointer_obscured() {
+        let github_panel_hit = self
+            .github_panel_bounds
+            .borrow()
+            .is_some_and(|bounds| bounds.contains(&position));
+        let hit = if self.app.terminal_pointer_obscured() || github_panel_hit {
             None
         } else {
             self.terminal_regions
