@@ -72,6 +72,37 @@ impl Root {
                     cx,
                 ),
             )
+        } else if app.default_agent_prompt {
+            (
+                Message::CloseDefaultAgentPrompt,
+                self.confirm(
+                    "No default agent",
+                    "This command starts an agent, and none is configured yet.",
+                    ("Not now", Message::CloseDefaultAgentPrompt),
+                    ("Open settings", Message::OpenDefaultAgentSettings),
+                    false,
+                    tokens,
+                    cx,
+                ),
+            )
+        } else if let Some(picker) = app.session_picker.as_ref() {
+            (
+                Message::CloseSessionPicker,
+                self.session_picker(picker, tokens, cx),
+            )
+        } else if app.worktree_manager.as_ref().is_some_and(restart_is_open) {
+            (
+                Message::CancelWorktreeManagerRestart,
+                self.confirm(
+                    "Restart in worktree",
+                    "The pane's terminal is replaced, and anything running in it ends.",
+                    ("Cancel", Message::CancelWorktreeManagerRestart),
+                    ("Restart", Message::ConfirmWorktreeManagerRestart),
+                    true,
+                    tokens,
+                    cx,
+                ),
+            )
         } else {
             let workspace_id = app.close_workspace_prompt?;
             let name = app
@@ -110,6 +141,105 @@ impl Root {
                 )
                 .child(card)
                 .into_any_element(),
+        )
+    }
+
+    /// The sessions this machine still has running, offered for resuming.
+    ///
+    /// Shown before a new daemon is started when unattached sessions exist;
+    /// declining it is what explicitly starts a fresh one.
+    fn session_picker(
+        &self,
+        picker: &crate::app::SessionPickerState,
+        tokens: DesignTokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let app = self.app();
+        let mut rows = div().flex().flex_col().gap(px(2.)).max_h(px(320.));
+        for (index, entry) in picker.entries.iter().enumerate() {
+            let selected = index == picker.selected;
+            let panes = entry.pane_count;
+            rows = rows.child(
+                div()
+                    .id(("session", index as u64))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .h(px(38.))
+                    .px(px(10.))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .bg(color(if selected {
+                        tokens.panel_raised
+                    } else {
+                        tokens.panel
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                            root.dispatch(Message::SessionPickerResume(index), window, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .child(
+                                div()
+                                    .text_size(px(app.settings.ui_pixels(11.0)))
+                                    .text_color(color(tokens.text))
+                                    .truncate()
+                                    .child(entry.record.id.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(app.settings.ui_pixels(9.0)))
+                                    .text_color(color(tokens.faint))
+                                    .child(format!(
+                                        "{panes} pane{}{}",
+                                        if panes == 1 { "" } else { "s" },
+                                        if entry.alive { "" } else { " · not running" }
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(("session-kill", index as u64))
+                            .h(px(24.))
+                            .px(px(10.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(5.))
+                            .cursor_pointer()
+                            .bg(color(tokens.panel_raised))
+                            .text_size(px(app.settings.ui_pixels(9.0)))
+                            .text_color(color(tokens.danger))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                                    root.dispatch(Message::SessionPickerKill(index), window, cx);
+                                }),
+                            )
+                            .child("Kill"),
+                    ),
+            );
+        }
+        self.card(
+            "Resume a session",
+            picker
+                .error
+                .as_deref()
+                .unwrap_or("These sessions are still running. Resume one, or start fresh."),
+            vec![rows.into_any_element()],
+            ("Kill all", Message::SessionPickerKillAll),
+            ("Start fresh", Message::CloseSessionPicker),
+            false,
+            tokens,
+            cx,
         )
     }
 
@@ -258,4 +388,9 @@ impl Root {
             .child(label.to_owned())
             .into_any_element()
     }
+}
+
+/// Whether a restart confirmation is standing over the worktree manager.
+fn restart_is_open(manager: &crate::app::WorktreeManagerState) -> bool {
+    manager.restart_target.is_some()
 }
