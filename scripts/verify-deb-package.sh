@@ -40,8 +40,8 @@ if [[ "${dependencies}" != *"libc6 (>= "* ]]; then
     exit 1
 fi
 while read -r libc_requirement; do
-    if dpkg --compare-versions "${libc_requirement}" gt 2.34; then
-        echo "error: libc6 requirement ${libc_requirement} exceeds the 2.34 release baseline" >&2
+    if dpkg --compare-versions "${libc_requirement}" gt 2.35; then
+        echo "error: libc6 requirement ${libc_requirement} exceeds the 2.35 release baseline" >&2
         exit 1
     fi
 done < <(grep --only-matching --extended-regexp 'libc6 \(>= [^)]+\)' <<< "${dependencies}" \

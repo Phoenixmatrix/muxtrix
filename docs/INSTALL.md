@@ -5,8 +5,8 @@ plus a Debian package. The macOS binaries are ad-hoc signed but are not
 Developer ID signed or notarized; all other builds are unsigned. Verify
 downloads against the `SHA256SUMS` file published with each release.
 
-Linux x64 releases target glibc 2.34, which covers Ubuntu 22.04 LTS and newer
-and avoids tying packages to the distribution used to build a release.
+Linux x64 releases are built on Ubuntu 22.04 LTS and require its glibc 2.35,
+which covers Ubuntu 22.04 LTS and newer and every distribution released since.
 
 ## macOS — Homebrew
 
