@@ -99,6 +99,7 @@ impl Root {
             .border_color(color(iced::Color::TRANSPARENT))
             .cursor_pointer()
             .text_size(label_size)
+            .line_height((label_size) * 1.3)
             .text_color(color(tokens.muted))
             .whitespace_nowrap()
             .hover(move |style| {
@@ -144,6 +145,7 @@ impl Root {
             .child(
                 div()
                     .text_size(label_size)
+                    .line_height((label_size) * 1.3)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(color(tokens.text))
                     .whitespace_nowrap()
@@ -185,6 +187,7 @@ impl Root {
                 .border_1()
                 .cursor_pointer()
                 .text_size(px(app.settings_draft.ui_pixels(9.5)))
+                .line_height((px(app.settings_draft.ui_pixels(9.5))) * 1.3)
                 .whitespace_nowrap()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -244,12 +247,14 @@ impl Root {
             .child(
                 div()
                     .text_size(ui(22.0))
+                    .line_height((ui(22.0)) * 1.3)
                     .font_weight(gpui::FontWeight::BOLD)
                     .child("Preferences"),
             )
             .child(
                 div()
                     .text_size(ui(11.0))
+                    .line_height((ui(11.0)) * 1.3)
                     .text_color(color(tokens.muted))
                     .child("Tune the interface, terminal, and developer integrations."),
             );
@@ -276,6 +281,7 @@ impl Root {
                     div()
                         .w(px(52.))
                         .text_size(ui(10.0))
+                        .line_height((ui(10.0)) * 1.3)
                         .text_color(color(tokens.muted))
                         .child(readout),
                 )
@@ -400,6 +406,7 @@ impl Root {
                 .child(
                     div()
                         .text_size(ui(10.0))
+                        .line_height((ui(10.0)) * 1.3)
                         .text_color(color(tokens.muted))
                         .child("lines"),
                 ),
@@ -409,6 +416,7 @@ impl Root {
                 div()
                     .w(px(260.))
                     .text_size(ui(9.0))
+                    .line_height((ui(9.0)) * 1.3)
                     .text_color(color(tokens.danger))
                     .child(error),
             );
@@ -490,6 +498,7 @@ impl Root {
                 div()
                     .w(px(320.))
                     .text_size(ui(9.0))
+                    .line_height((ui(9.0)) * 1.3)
                     .text_color(color(tokens.danger))
                     .child(error),
             );
@@ -523,7 +532,7 @@ impl Root {
                     .child(
                         div()
                             .flex_grow(1.0)
-                            .text_size(ui(10.0))
+                            .text_size(ui(10.0)).line_height((ui(10.0)) * 1.3)
                             .text_color(color(tokens.muted))
                             .child("Hook changes apply immediately. Muxtrix updates only its tagged entries. Project hooks remain available in muxtrixctl."),
                     )
@@ -582,6 +591,7 @@ impl Root {
                 .border_1()
                 .border_color(color(tokens.line))
                 .text_size(ui(9.0))
+                .line_height((ui(9.0)) * 1.3)
                 .text_color(color(tokens.faint))
                 .whitespace_nowrap()
                 .child(apply_label)
@@ -601,7 +611,7 @@ impl Root {
             .child(
                 div()
                     .flex_grow(1.0)
-                    .text_size(ui(9.0))
+                    .text_size(ui(9.0)).line_height((ui(9.0)) * 1.3)
                     .text_color(color(tokens.faint))
                     .child(format!("{font_restart}Preferences apply when saved; shell and scrollback affect new and restarted panes; hook actions apply immediately")),
             )
@@ -670,12 +680,14 @@ impl Root {
                     div()
                         .font_family(terminal_family(draft))
                         .text_size(ui(10.0))
+                        .line_height((ui(10.0)) * 1.3)
                         .text_color(color(tokens.text))
                         .child(format!("v{running}")),
                 )
                 .child(
                     div()
                         .text_size(ui(8.5))
+                        .line_height((ui(8.5)) * 1.3)
                         .text_color(color(detail_color))
                         .child(detail),
                 )
@@ -704,6 +716,7 @@ impl Root {
                             .child(
                                 div()
                                     .text_size(ui(10.5))
+                                    .line_height((ui(10.5)) * 1.3)
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(color(tokens.text))
                                     .child("Restart to use the installed build"),
@@ -711,6 +724,7 @@ impl Root {
                             .child(
                                 div()
                                     .text_size(ui(9.0))
+                                    .line_height((ui(9.0)) * 1.3)
                                     .text_color(color(tokens.warning))
                                     .child(copy),
                             ),
@@ -829,6 +843,7 @@ impl Root {
             actions = actions.child(
                 div()
                     .text_size(ui(9.0))
+                    .line_height((ui(9.0)) * 1.3)
                     .text_color(color(tokens.muted))
                     .child("Updating…"),
             );
@@ -857,6 +872,7 @@ impl Root {
                             .child(
                                 div()
                                     .text_size(ui(13.0))
+                                    .line_height((ui(13.0)) * 1.3)
                                     .font_weight(gpui::FontWeight::BOLD)
                                     .child(match agent {
                                         Agent::Codex => "Codex",
@@ -867,6 +883,7 @@ impl Root {
                             .child(
                                 div()
                                     .text_size(ui(10.0))
+                                    .line_height((ui(10.0)) * 1.3)
                                     .text_color(color(if installed {
                                         tokens.success
                                     } else if repair_needed {
@@ -920,6 +937,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(px(draft.ui_pixels(13.0)))
+                            .line_height((px(draft.ui_pixels(13.0))) * 1.3)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(color(tokens.text))
                             .child(title),
@@ -927,6 +945,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(px(draft.ui_pixels(9.0)))
+                            .line_height((px(draft.ui_pixels(9.0))) * 1.3)
                             .text_color(color(tokens.muted))
                             .child(description),
                     ),
@@ -962,6 +981,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(px(draft.ui_pixels(11.0)))
+                            .line_height((px(draft.ui_pixels(11.0))) * 1.3)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(color(tokens.text))
                             .child(label),
@@ -969,6 +989,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(px(draft.ui_pixels(9.0)))
+                            .line_height((px(draft.ui_pixels(9.0))) * 1.3)
                             .text_color(color(tokens.muted))
                             .child(description),
                     ),
@@ -1002,6 +1023,7 @@ impl Root {
             .child(
                 div()
                     .text_size(px(draft.ui_pixels(18.0)))
+                    .line_height(px(draft.ui_pixels(18.0) * 1.3))
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(color(tokens.text))
                     .child("Theme gallery"),
@@ -1011,6 +1033,7 @@ impl Root {
                 div()
                     .pt(px(count_nudge))
                     .text_size(px(draft.ui_pixels(9.5)))
+                    .line_height((px(draft.ui_pixels(9.5))) * 1.3)
                     .text_color(color(tokens.faint))
                     .child(format!(
                         "Current: {} · {} themes",
@@ -1060,6 +1083,7 @@ impl Root {
                         .pt(px(8.))
                         .pl(px(3.))
                         .text_size(px(draft.ui_pixels(8.5)))
+                        .line_height(px(draft.ui_pixels(8.5) * 1.3))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(color(tokens.faint))
                         .child(if preset.is_light { "LIGHT" } else { "DARK" }),
@@ -1178,6 +1202,7 @@ impl Root {
             .border_1()
             .border_color(color(edge))
             .text_size(px(app.settings_draft.ui_pixels(9.0)))
+            .line_height((px(app.settings_draft.ui_pixels(9.0))) * 1.3)
             .text_color(color(text))
             .whitespace_nowrap()
             .hover(move |style| style.bg(hover).border_color(color(hover_edge)))
@@ -1200,6 +1225,7 @@ impl Root {
             rows = rows.child(
                 div()
                     .text_size(px(app.settings.ui_pixels(10.0)))
+                    .line_height((px(app.settings.ui_pixels(10.0))) * 1.3)
                     .text_color(color(tokens.muted))
                     .child(failure.to_owned()),
             );
@@ -1237,6 +1263,7 @@ impl Root {
                             .child(
                                 div()
                                     .text_size(px(app.settings.ui_pixels(10.0)))
+                                    .line_height((px(app.settings.ui_pixels(10.0))) * 1.3)
                                     .text_color(color(tokens.text))
                                     .truncate()
                                     .child(entry.path.file_name().map_or_else(
@@ -1247,6 +1274,7 @@ impl Root {
                             .child(
                                 div()
                                     .text_size(px(app.settings.ui_pixels(8.0)))
+                                    .line_height((px(app.settings.ui_pixels(8.0))) * 1.3)
                                     .text_color(color(tokens.faint))
                                     .truncate()
                                     .child(
@@ -1257,12 +1285,14 @@ impl Root {
                     .children((entry.unpushed_commits > 0).then(|| {
                         div()
                             .text_size(px(app.settings.ui_pixels(9.0)))
+                            .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                             .text_color(color(tokens.warning))
                             .child(format!("{} unpushed", entry.unpushed_commits))
                     }))
                     .child(match blocker {
                         Some(reason) => div()
                             .text_size(px(app.settings.ui_pixels(9.0)))
+                            .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                             .text_color(color(tokens.faint))
                             .child(reason)
                             .into_any_element(),
@@ -1276,6 +1306,7 @@ impl Root {
                             .cursor_pointer()
                             .bg(color(tokens.panel_raised))
                             .text_size(px(app.settings.ui_pixels(9.0)))
+                            .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                             .text_color(color(tokens.danger))
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -1441,6 +1472,7 @@ pub(crate) fn theme_preview_card(
                         .flex_grow(1.0)
                         .min_w(px(0.))
                         .text_size(px(settings.ui_pixels(11.0)))
+                        .line_height((px(settings.ui_pixels(11.0))) * 1.3)
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(color(rgb(preset.foreground)))
                         .whitespace_nowrap()
@@ -1457,6 +1489,7 @@ pub(crate) fn theme_preview_card(
                             .rounded(px(4.))
                             .bg(color(rgb(preset.foreground)))
                             .text_size(px(settings.ui_pixels(8.0)))
+                            .line_height((px(settings.ui_pixels(8.0))) * 1.3)
                             .text_color(color(rgb(preset.background)))
                             .child(mode),
                     )
@@ -1475,6 +1508,7 @@ pub(crate) fn theme_preview_card(
         card = card.child(
             div()
                 .text_size(px(settings.ui_pixels(8.0)))
+                .line_height((px(settings.ui_pixels(8.0))) * 1.3)
                 .text_color(color(rgb(preset.ansi[8])))
                 .child(
                     "Theme colors set defaults · direct RGB and application OSC colors stay intact",

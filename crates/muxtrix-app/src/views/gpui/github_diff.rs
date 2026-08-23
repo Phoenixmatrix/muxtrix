@@ -55,6 +55,7 @@ impl Root {
                 div()
                     .font_family(terminal_family(settings))
                     .text_size(px(settings.ui_pixels(size)))
+                    .line_height((px(settings.ui_pixels(size))) * 1.3)
                     .text_color(color(hue))
                     .child(copy)
             })
@@ -62,6 +63,7 @@ impl Root {
         let status = |size: f32| {
             div()
                 .text_size(ui(size))
+                .line_height((ui(size)) * 1.3)
                 .text_color(color(tokens.faint))
                 .whitespace_nowrap()
                 .child(diff.status.clone())
@@ -102,6 +104,7 @@ impl Root {
                                 .flex_grow(1.0)
                                 .min_w(px(0.))
                                 .text_size(ui(9.5))
+                                .line_height((ui(9.5)) * 1.3)
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(color(tokens.text))
                                 .truncate()
@@ -130,6 +133,7 @@ impl Root {
                         .child(
                             div()
                                 .text_size(ui(10.5))
+                                .line_height((ui(10.5)) * 1.3)
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(color(tokens.text))
                                 .truncate()
@@ -279,6 +283,7 @@ impl Root {
                             .px(px(12.))
                             .bg(fill)
                             .text_size(px(app.settings.ui_pixels(8.0)))
+                            .line_height((px(app.settings.ui_pixels(8.0))) * 1.3)
                             .text_color(color(tokens.warning))
                             .child(notice.to_owned()),
                     )
@@ -378,6 +383,7 @@ impl Root {
             .child(
                 div()
                     .text_size(px(settings.ui_pixels(13.0)))
+                    .line_height((px(settings.ui_pixels(13.0))) * 1.3)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(color(tokens.text))
                     .child(title.to_owned()),
@@ -386,6 +392,7 @@ impl Root {
                 div()
                     .w(px(280.))
                     .text_size(px(settings.ui_pixels(9.0)))
+                    .line_height((px(settings.ui_pixels(9.0))) * 1.3)
                     .text_color(color(tokens.muted))
                     .text_center()
                     .child(detail.to_owned()),
@@ -406,6 +413,7 @@ impl Root {
                     .border_1()
                     .border_color(color(tokens.accent))
                     .text_size(px(settings.ui_pixels(9.0)))
+                    .line_height((px(settings.ui_pixels(9.0))) * 1.3)
                     .text_color(color(tokens.app))
                     .hover(move |style| style.bg(hover))
                     .on_mouse_down(

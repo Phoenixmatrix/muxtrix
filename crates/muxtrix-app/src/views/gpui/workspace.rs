@@ -140,6 +140,7 @@ impl Root {
                             .pl(px(11.))
                             .pr(px(4.))
                             .text_size(px(app.settings.ui_pixels(9.0)))
+                            .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                             .text_color(color(if selected { tokens.text } else { tokens.muted }))
                             .on_mouse_down(
                                 MouseButton::Left,

@@ -81,6 +81,11 @@ pub(crate) struct Root {
     title: String,
     /// The appearance `gpui-component`'s theme was last synced to.
     component_theme: Option<crate::settings::Appearance>,
+    /// Where each pane card was painted last frame, so a menu can be placed
+    /// against its own pane the way the iced popover was.
+    pub(crate) pane_bounds: std::rc::Rc<
+        std::cell::RefCell<std::collections::HashMap<muxtrix_domain::PaneId, Bounds<gpui::Pixels>>>,
+    >,
     /// Inline terminal images, decoded once and kept while the emulator still
     /// references them. Keyed by the emulator's own generation, so an image
     /// that is redrawn unchanged is not decoded again.
@@ -229,6 +234,7 @@ impl Root {
             pending_focus: None,
             title: String::new(),
             component_theme: None,
+            pane_bounds: std::rc::Rc::default(),
             images: std::collections::BTreeMap::new(),
             scrolls: Scrolls::default(),
             pending_scrolls: Vec::new(),
@@ -605,6 +611,17 @@ impl Render for Root {
         // and is consumed — the behaviour the iced `Popover` had, and what
         // `pane_menu_click_away_observed` asserts.
         let menu = self.pane_menu(cx).map(|menu| {
+            // Under the pane's own overflow button, as the iced popover put
+            // it: six pixels in from the card's right edge and 38 down from
+            // its top, kept inside the window.
+            let anchor = self
+                .app
+                .pane_menu
+                .and_then(|pane_id| self.pane_bounds.borrow().get(&pane_id).copied())
+                .map_or_else(
+                    || root_menu_anchor(window),
+                    |bounds| point(bounds.right() - px(6.), bounds.top() + px(38.)),
+                );
             div()
                 .absolute()
                 .inset_0()
@@ -617,7 +634,7 @@ impl Render for Root {
                 .child(
                     gpui::deferred(
                         gpui::anchored()
-                            .position(root_menu_anchor(window))
+                            .position(anchor)
                             .anchor(gpui::Anchor::TopRight)
                             .snap_to_window_with_margin(px(6.))
                             .child(menu),

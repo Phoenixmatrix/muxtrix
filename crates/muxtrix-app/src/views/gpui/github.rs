@@ -184,6 +184,7 @@ impl Root {
                 .child(
                     div()
                         .text_size(ui(10.0))
+                        .line_height((ui(10.0)) * 1.3)
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(color(tokens.text))
                         .child("GitHub"),
@@ -191,6 +192,7 @@ impl Root {
                 .child(
                     div()
                         .text_size(ui(8.0))
+                        .line_height((ui(8.0)) * 1.3)
                         .text_color(color(tokens.faint))
                         .child("Reading focused pane…"),
                 )
@@ -204,6 +206,7 @@ impl Root {
                 .child(
                     div()
                         .text_size(ui(10.0))
+                        .line_height((ui(10.0)) * 1.3)
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(color(tokens.text))
                         .truncate()
@@ -226,6 +229,7 @@ impl Root {
                             div()
                                 .min_w(px(0.))
                                 .text_size(ui(8.0))
+                                .line_height((ui(8.0)) * 1.3)
                                 .text_color(color(tokens.faint))
                                 .truncate()
                                 .child(panel.repository.branch.clone()),
@@ -254,6 +258,7 @@ impl Root {
                     .cursor_pointer()
                     .font_family(terminal_family(&app.settings))
                     .text_size(ui(8.5))
+                    .line_height((ui(8.5)) * 1.3)
                     .text_color(color(hue))
                     .hover(move |style| style.bg(hover))
                     .on_mouse_down(
@@ -354,6 +359,7 @@ impl Root {
                 .rounded(px(5.))
                 .border_1()
                 .text_size(px(app.settings.ui_pixels(9.0)))
+                .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                 .whitespace_nowrap()
                 .child(label);
             if !busy {
@@ -448,6 +454,7 @@ impl Root {
             .child(
                 div()
                     .text_size(ui(8.0))
+                    .line_height((ui(8.0)) * 1.3)
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(color(tokens.faint))
                     .child(label),
@@ -455,6 +462,7 @@ impl Root {
             .child(
                 div()
                     .text_size(ui(8.0))
+                    .line_height((ui(8.0)) * 1.3)
                     .text_color(color(tokens.muted))
                     .child(count.to_string()),
             )
@@ -463,6 +471,7 @@ impl Root {
                 div()
                     .font_family(terminal_family(settings))
                     .text_size(ui(8.0))
+                    .line_height((ui(8.0)) * 1.3)
                     .text_color(color(tokens.success))
                     .child(format!("+{additions}")),
             )
@@ -470,6 +479,7 @@ impl Root {
                 div()
                     .font_family(terminal_family(settings))
                     .text_size(ui(8.0))
+                    .line_height((ui(8.0)) * 1.3)
                     .text_color(color(tokens.danger))
                     .child(format!("−{deletions}")),
             )
@@ -514,6 +524,7 @@ impl Root {
                 .child(
                     div()
                         .text_size(ui(8.5))
+                        .line_height((ui(8.5)) * 1.3)
                         .text_color(color(tokens.muted))
                         .child("Pull requests"),
                 )
@@ -522,6 +533,7 @@ impl Root {
                     div()
                         .font_family(terminal_family(&app.settings))
                         .text_size(ui(8.0))
+                        .line_height((ui(8.0)) * 1.3)
                         .text_color(color(tokens.faint))
                         .child(format!("#{number}")),
                 );
@@ -634,6 +646,7 @@ impl Root {
             .child(
                 div()
                     .text_size(ui(7.2))
+                    .line_height((ui(7.2)) * 1.3)
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(color(tokens.faint))
                     .child("SEARCH"),
@@ -663,6 +676,7 @@ impl Root {
             .child(
                 div()
                     .text_size(ui(8.0))
+                    .line_height((ui(8.0)) * 1.3)
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(color(tokens.faint))
                     .child(summary_label),
@@ -670,6 +684,7 @@ impl Root {
             .child(
                 div()
                     .text_size(ui(8.0))
+                    .line_height((ui(8.0)) * 1.3)
                     .text_color(color(tokens.muted))
                     .child(if filtered.len() == pull_requests.len() {
                         filtered.len().to_string()
@@ -795,6 +810,7 @@ impl Root {
                                     .flex_grow(1.0)
                                     .min_w(px(0.))
                                     .text_size(ui(8.8))
+                                    .line_height((ui(8.8)) * 1.3)
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(color(tokens.text))
                                     .truncate()
@@ -823,6 +839,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(ui(7.4))
+                            .line_height((ui(7.4)) * 1.3)
                             .text_color(color(tokens.faint))
                             .truncate()
                             .child(format!(
@@ -953,6 +970,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(ui(9.0))
+                            .line_height((ui(9.0)) * 1.3)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(color(readiness_color))
                             .child(readiness_label),
@@ -960,6 +978,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(ui(7.5))
+                            .line_height((ui(7.5)) * 1.3)
                             .text_color(color(tokens.muted))
                             .child(readiness_detail),
                     ),
@@ -993,6 +1012,7 @@ impl Root {
             .child(
                 div()
                     .text_size(ui(11.0))
+                    .line_height((ui(11.0)) * 1.3)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(color(tokens.text))
                     .child(pull_request.title.clone()),
@@ -1000,6 +1020,7 @@ impl Root {
             .child(
                 div()
                     .text_size(ui(8.0))
+                    .line_height((ui(8.0)) * 1.3)
                     .text_color(color(tokens.faint))
                     .truncate()
                     .child(format!(
@@ -1025,6 +1046,7 @@ impl Root {
             .child(
                 div()
                     .text_size(ui(8.0))
+                    .line_height((ui(8.0)) * 1.3)
                     .text_color(color(tokens.muted))
                     .child(format!("{} files", pull_request.changed_files)),
             )
@@ -1032,6 +1054,7 @@ impl Root {
                 div()
                     .font_family(terminal_family(settings))
                     .text_size(ui(8.0))
+                    .line_height((ui(8.0)) * 1.3)
                     .text_color(color(tokens.success))
                     .child(format!("+{}", pull_request.additions)),
             )
@@ -1039,6 +1062,7 @@ impl Root {
                 div()
                     .font_family(terminal_family(settings))
                     .text_size(ui(8.0))
+                    .line_height((ui(8.0)) * 1.3)
                     .text_color(color(tokens.danger))
                     .child(format!("−{}", pull_request.deletions)),
             )
@@ -1047,6 +1071,7 @@ impl Root {
             .child(
                 div()
                     .text_size(ui(7.5))
+                    .line_height((ui(7.5)) * 1.3)
                     .text_color(color(tokens.muted))
                     .child(format!(
                         "{} passed · {} pending · {} failed",
@@ -1086,6 +1111,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(ui(8.0))
+                            .line_height((ui(8.0)) * 1.3)
                             .text_color(color(tokens.danger))
                             .child(error.to_owned()),
                     ),
@@ -1147,6 +1173,7 @@ impl Root {
                             .child(
                                 div()
                                     .text_size(ui(9.0))
+                                    .line_height((ui(9.0)) * 1.3)
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(color(tokens.accent))
                                     .child(format!(
@@ -1157,6 +1184,7 @@ impl Root {
                             .child(
                                 div()
                                     .text_size(ui(8.0))
+                                    .line_height((ui(8.0)) * 1.3)
                                     .text_color(color(tokens.muted))
                                     .child(
                                         "GitHub is creating the merge commit. The branch is kept.",
@@ -1184,6 +1212,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(ui(9.0))
+                            .line_height((ui(9.0)) * 1.3)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(color(tokens.text))
                             .child(format!("Merge pull request #{}?", pull_request.number)),
@@ -1191,6 +1220,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(ui(8.0))
+                            .line_height((ui(8.0)) * 1.3)
                             .text_color(color(tokens.muted))
                             .child("This creates a merge commit on GitHub. The branch is kept."),
                     )
@@ -1273,6 +1303,7 @@ impl Root {
             .border_1()
             .border_color(color(edge))
             .text_size(px(settings.ui_pixels(8.5)))
+            .line_height((px(settings.ui_pixels(8.5))) * 1.3)
             .text_color(color(text))
             .whitespace_nowrap()
             .child(label);
@@ -1323,12 +1354,14 @@ impl Root {
                         .child(
                             div()
                                 .text_size(px(settings.ui_pixels(10.0)))
+                                .line_height((px(settings.ui_pixels(10.0))) * 1.3)
                                 .text_color(color(tokens.text))
                                 .child(empty_title),
                         )
                         .child(
                             div()
                                 .text_size(px(settings.ui_pixels(8.5)))
+                                .line_height((px(settings.ui_pixels(8.5))) * 1.3)
                                 .text_color(color(tokens.muted))
                                 .child(empty_detail),
                         ),
@@ -1424,6 +1457,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(ui(8.8))
+                            .line_height((ui(8.8)) * 1.3)
                             .text_color(color(tokens.text))
                             .truncate()
                             .child(single_line_ellipsize(
@@ -1434,6 +1468,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(ui(7.2))
+                            .line_height((ui(7.2)) * 1.3)
                             .text_color(color(status_color))
                             .child(file.status.clone()),
                     ),
@@ -1442,6 +1477,7 @@ impl Root {
                 div()
                     .font_family(terminal_family(settings))
                     .text_size(ui(7.5))
+                    .line_height((ui(7.5)) * 1.3)
                     .text_color(color(tokens.success))
                     .child(format!("+{}", file.additions)),
             )
@@ -1449,6 +1485,7 @@ impl Root {
                 div()
                     .font_family(terminal_family(settings))
                     .text_size(ui(7.5))
+                    .line_height((ui(7.5)) * 1.3)
                     .text_color(color(tokens.danger))
                     .child(format!("−{}", file.deletions)),
             )
@@ -1552,6 +1589,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(px(settings.ui_pixels(13.0)))
+                            .line_height((px(settings.ui_pixels(13.0))) * 1.3)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(color(tokens.text))
                             .child(title),
@@ -1560,6 +1598,7 @@ impl Root {
                         div()
                             .w(px(280.))
                             .text_size(px(settings.ui_pixels(9.0)))
+                            .line_height((px(settings.ui_pixels(9.0))) * 1.3)
                             .text_color(color(tokens.muted))
                             .text_center()
                             .child(detail),
@@ -1589,6 +1628,7 @@ fn status_pill(
         .rounded(px(999.))
         .bg(fill)
         .text_size(px(settings.ui_pixels(7.5)))
+        .line_height((px(settings.ui_pixels(7.5))) * 1.3)
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(color(hue))
         .whitespace_nowrap()

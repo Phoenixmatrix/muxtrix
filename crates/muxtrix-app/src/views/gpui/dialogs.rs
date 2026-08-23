@@ -195,6 +195,7 @@ impl Root {
                             .child(
                                 div()
                                     .text_size(px(app.settings.ui_pixels(11.0)))
+                                    .line_height((px(app.settings.ui_pixels(11.0))) * 1.3)
                                     .text_color(color(tokens.text))
                                     .truncate()
                                     .child(entry.record.id.to_string()),
@@ -202,6 +203,7 @@ impl Root {
                             .child(
                                 div()
                                     .text_size(px(app.settings.ui_pixels(9.0)))
+                                    .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                                     .text_color(color(tokens.faint))
                                     .child(format!(
                                         "{panes} pane{}{}",
@@ -221,6 +223,7 @@ impl Root {
                             .cursor_pointer()
                             .bg(color(tokens.panel_raised))
                             .text_size(px(app.settings.ui_pixels(9.0)))
+                            .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                             .text_color(color(tokens.danger))
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -327,12 +330,14 @@ impl Root {
             .child(
                 div()
                     .text_size(px(app.settings.ui_pixels(15.0)))
+                    .line_height((px(app.settings.ui_pixels(15.0))) * 1.3)
                     .text_color(color(tokens.text))
                     .child(title.to_owned()),
             )
             .child(
                 div()
                     .text_size(px(app.settings.ui_pixels(10.0)))
+                    .line_height((px(app.settings.ui_pixels(10.0))) * 1.3)
                     .text_color(color(tokens.muted))
                     .child(body.to_owned()),
             )
@@ -439,6 +444,7 @@ impl Root {
         let title = |copy: &'static str| {
             div()
                 .text_size(ui(18.0))
+                .line_height((ui(18.0)) * 1.3)
                 .font_weight(gpui::FontWeight::BOLD)
                 .text_color(color(tokens.text))
                 .child(copy)
@@ -472,10 +478,10 @@ impl Root {
                 } else {
                     "Restart pane?"
                 }))
-                .child(div().text_size(ui(10.5)).text_color(color(tokens.text)).child(question))
+                .child(div().text_size(ui(10.5)).line_height((ui(10.5)) * 1.3).text_color(color(tokens.text)).child(question))
                 .child(
                     div()
-                        .text_size(ui(9.5))
+                        .text_size(ui(9.5)).line_height((ui(9.5)) * 1.3)
                         .text_color(color(tokens.muted))
                         .child("The current process and terminal history will close. The pane stays in its present tab and position."),
                 )
@@ -489,7 +495,7 @@ impl Root {
                         .border_1()
                         .border_color(color(tokens.line))
                         .font_family(terminal_family(settings))
-                        .text_size(ui(9.0))
+                        .text_size(ui(9.0)).line_height((ui(9.0)) * 1.3)
                         .text_color(color(tokens.text))
                         .whitespace_nowrap()
                         .overflow_hidden()
@@ -504,7 +510,7 @@ impl Root {
                         .child(
                             div()
                                 .flex_grow(1.0)
-                                .text_size(ui(8.0))
+                                .text_size(ui(8.0)).line_height((ui(8.0)) * 1.3)
                                 .text_color(color(tokens.faint))
                                 .child("Enter restarts · Esc goes back"),
                         )
@@ -563,20 +569,20 @@ impl Root {
                             .flex_grow(1.0)
                             .child(
                                 div()
-                                    .text_size(ui(11.0))
+                                    .text_size(ui(11.0)).line_height((ui(11.0)) * 1.3)
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(color(tokens.text))
                                     .child("Loading worktrees"),
                             )
                             .child(
                                 div()
-                                    .text_size(ui(9.5))
+                                    .text_size(ui(9.5)).line_height((ui(9.5)) * 1.3)
                                     .text_color(color(tokens.muted))
                                     .child("Reading registered checkouts and local commit status in the background."),
                             )
                             .child(
                                 div()
-                                    .text_size(ui(8.5))
+                                    .text_size(ui(8.5)).line_height((ui(8.5)) * 1.3)
                                     .text_color(color(tokens.accent))
                                     .child("The terminal remains responsive while this finishes."),
                             ),
@@ -586,13 +592,14 @@ impl Root {
             body = body.child(
                 div()
                     .text_size(ui(10.0))
+                    .line_height((ui(10.0)) * 1.3)
                     .text_color(color(tokens.danger))
                     .child(failure.clone()),
             );
         } else if manager.repo_root.is_some() {
             body = body.child(
                 div()
-                    .text_size(ui(10.0))
+                    .text_size(ui(10.0)).line_height((ui(10.0)) * 1.3)
                     .text_color(color(tokens.muted))
                     .child("Choose another checkout. You’ll confirm before the current terminal closes."),
             );
@@ -600,6 +607,7 @@ impl Root {
                 body = body.child(
                     div()
                         .text_size(ui(9.5))
+                        .line_height((ui(9.5)) * 1.3)
                         .text_color(color(tokens.faint))
                         .child("No other worktrees are registered for this repository."),
                 );
@@ -613,6 +621,7 @@ impl Root {
                         .rounded(px(999.))
                         .bg(fill)
                         .text_size(ui(7.5))
+                        .line_height((ui(7.5)) * 1.3)
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(color(hue))
                         .whitespace_nowrap()
@@ -696,6 +705,7 @@ impl Root {
                                                     .flex_grow(1.0)
                                                     .min_w(px(0.))
                                                     .text_size(ui(11.0))
+                                                    .line_height((ui(11.0)) * 1.3)
                                                     .font_weight(gpui::FontWeight::MEDIUM)
                                                     .text_color(color(tokens.text))
                                                     .truncate()
@@ -718,6 +728,7 @@ impl Root {
                                                     .min_w(px(0.))
                                                     .font_family(terminal_family(settings))
                                                     .text_size(ui(8.5))
+                                                    .line_height((ui(8.5)) * 1.3)
                                                     .text_color(color(tokens.faint))
                                                     .truncate()
                                                     .child(ellipsize(
@@ -750,6 +761,7 @@ impl Root {
                 body = body.child(
                     div()
                         .text_size(ui(9.0))
+                        .line_height((ui(9.0)) * 1.3)
                         .text_color(color(tokens.danger))
                         .child(error.clone()),
                 );
@@ -770,6 +782,7 @@ impl Root {
                     div()
                         .flex_grow(1.0)
                         .text_size(ui(8.0))
+                        .line_height((ui(8.0)) * 1.3)
                         .text_color(color(tokens.faint))
                         .child(hint),
                 )

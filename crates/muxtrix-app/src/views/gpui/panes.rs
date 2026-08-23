@@ -252,6 +252,18 @@ impl Root {
                 inset: false,
             }]);
         }
+        // Record where the card lands so the menu can be placed against it.
+        let recorded = self.pane_bounds.clone();
+        card = card.child(
+            gpui::canvas(
+                move |bounds, _, _| {
+                    recorded.borrow_mut().insert(pane_id, bounds);
+                },
+                |_, (), _, _| {},
+            )
+            .absolute()
+            .inset_0(),
+        );
         card.on_mouse_down(
             MouseButton::Left,
             cx.listener(move |root, _: &MouseDownEvent, window, cx| {
@@ -372,6 +384,7 @@ impl Root {
                 .rounded(px(5.))
                 .cursor_pointer()
                 .text_size(ui_size)
+                .line_height((ui_size) * 1.3)
                 .text_color(color(tokens.text))
                 .hover(move |style| style.bg(hover))
                 .on_mouse_down(
@@ -427,12 +440,14 @@ impl Root {
                     .bg(chip)
                     .font_family(terminal_family(&app.settings))
                     .text_size(px(app.settings.ui_pixels(7.5)))
+                    .line_height((px(app.settings.ui_pixels(7.5))) * 1.3)
                     .text_color(color(tokens.muted))
                     .child(program)
             });
         let state_label = (!compact && state != "Shell").then(|| {
             div()
                 .text_size(ui_size)
+                .line_height((ui_size) * 1.3)
                 .text_color(color(signal_kind.label_color(tokens)))
                 .whitespace_nowrap()
                 .child(state)
@@ -464,6 +479,7 @@ impl Root {
                         div()
                             .min_w(px(0.))
                             .text_size(ui_size)
+                            .line_height((ui_size) * 1.3)
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(color(if focused { tokens.text } else { tokens.muted }))
                             .truncate()
@@ -723,6 +739,7 @@ impl MenuEntry {
                             .flex_grow(1.0)
                             .min_w(px(0.))
                             .text_size(px(app.settings.ui_pixels(9.0)))
+                            .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                             .text_color(color(foreground))
                             .whitespace_nowrap()
                             .child(label),
@@ -731,6 +748,7 @@ impl MenuEntry {
                         div()
                             .font_family(terminal_family(&app.settings))
                             .text_size(px(app.settings.ui_pixels(7.5)))
+                            .line_height((px(app.settings.ui_pixels(7.5))) * 1.3)
                             .text_color(color(tokens.faint))
                             .whitespace_nowrap()
                             .child(shortcut.to_owned()),

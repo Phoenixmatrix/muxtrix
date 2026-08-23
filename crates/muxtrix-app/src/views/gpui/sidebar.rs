@@ -50,6 +50,7 @@ impl Root {
                     div()
                         .flex_grow(1.0)
                         .text_size(px(app.settings.ui_pixels(9.0)))
+                        .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                         .font_weight(gpui::FontWeight::BOLD)
                         .text_color(color(tokens.faint))
                         .child("WORKSPACES"),
@@ -140,12 +141,14 @@ impl Root {
                             .child(
                                 div()
                                     .text_size(px(app.settings.ui_pixels(9.0)))
+                                    .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                                     .text_color(color(tokens.muted))
                                     .child("No agent panes"),
                             )
                             .child(
                                 div()
                                     .text_size(px(app.settings.ui_pixels(8.0)))
+                                    .line_height((px(app.settings.ui_pixels(8.0))) * 1.3)
                                     .text_color(color(tokens.faint))
                                     .child("Launch Codex or Claude Code from the command palette"),
                             ),
@@ -230,6 +233,7 @@ impl Root {
                     div()
                         .p(px(6.))
                         .text_size(px(app.settings.ui_pixels(9.0)))
+                        .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(color(tokens.faint))
                         .child("ATTENTION"),
@@ -318,6 +322,7 @@ impl Root {
                 .cursor_pointer()
                 .border_1()
                 .text_size(px(app.settings.ui_pixels(10.0)))
+                .line_height((px(app.settings.ui_pixels(10.0))) * 1.3)
                 .whitespace_nowrap()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -419,6 +424,9 @@ impl Root {
                     } else {
                         8.0
                     })))
+                    .line_height(
+                        (px(app.settings.ui_pixels(if workspace { 9.0 } else { 8.0 }))) * 1.3,
+                    )
                     .font_weight(if workspace {
                         gpui::FontWeight::BOLD
                     } else {
@@ -486,6 +494,7 @@ impl Root {
                                     .flex_grow(1.0)
                                     .min_w(px(0.))
                                     .text_size(px(app.settings.ui_pixels(11.0)))
+                                    .line_height((px(app.settings.ui_pixels(11.0))) * 1.3)
                                     .text_color(color(tokens.text))
                                     .truncate()
                                     .child(alert.title.clone()),
@@ -515,6 +524,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(px(app.settings.ui_pixels(9.0)))
+                            .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                             .text_color(color(tokens.muted))
                             .child(alert.body.clone()),
                     ),
@@ -575,6 +585,7 @@ impl Root {
                 div()
                     .max_w(px(GITHUB_STATUS_LABEL_WIDTH))
                     .text_size(px(app.settings.ui_pixels(10.0)))
+                    .line_height((px(app.settings.ui_pixels(10.0))) * 1.3)
                     .text_color(color(tokens.muted))
                     .truncate()
                     .child(label),
@@ -689,6 +700,7 @@ impl Root {
                                     .flex_grow(1.0)
                                     .min_w(px(0.))
                                     .text_size(px(app.settings.ui_pixels(11.0)))
+                                    .line_height((px(app.settings.ui_pixels(11.0))) * 1.3)
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     // One accent headline means one thing
                                     // everywhere in the rail: the keyboard
@@ -707,6 +719,7 @@ impl Root {
                             .child(
                                 div()
                                     .text_size(px(app.settings.ui_pixels(9.0)))
+                                    .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                                     .text_color(color(signal_kind.label_color(tokens)))
                                     .whitespace_nowrap()
                                     .child(app.workspace_state_label(workspace)),
@@ -715,6 +728,7 @@ impl Root {
                     .child(
                         div()
                             .text_size(px(app.settings.ui_pixels(9.0)))
+                            .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                             .text_color(color(tokens.muted))
                             .child(format!(
                                 "{tabs} tab{} · {panes} pane{}",
@@ -726,6 +740,7 @@ impl Root {
                         div()
                             .font_family(terminal_family(&app.settings))
                             .text_size(px(app.settings.ui_pixels(8.5)))
+                            .line_height((px(app.settings.ui_pixels(8.5))) * 1.3)
                             .text_color(color(tokens.faint))
                             .whitespace_nowrap()
                             .overflow_hidden()
@@ -865,6 +880,7 @@ impl Root {
                                     .flex_grow(1.0)
                                     .min_w(px(0.))
                                     .text_size(px(app.settings.ui_pixels(10.5)))
+                                    .line_height((px(app.settings.ui_pixels(10.5))) * 1.3)
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(color(if targeted {
                                         tokens.accent
@@ -887,6 +903,7 @@ impl Root {
                                     .min_w(px(0.))
                                     .pl(px(15.))
                                     .text_size(px(app.settings.ui_pixels(9.0)))
+                                    .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                                     .text_color(color(if focused || targeted {
                                         tokens.text
                                     } else {
@@ -899,6 +916,7 @@ impl Root {
                                 line.child(
                                     div()
                                         .text_size(px(app.settings.ui_pixels(9.0)))
+                                        .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                                         .text_color(color(state_color))
                                         .whitespace_nowrap()
                                         .child(state_label),

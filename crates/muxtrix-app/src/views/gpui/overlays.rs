@@ -113,6 +113,7 @@ impl Root {
                         div()
                             .font_family(terminal_family(settings))
                             .text_size(ui(7.5))
+                            .line_height((ui(7.5)) * 1.3)
                             .text_color(color(tokens.faint))
                             .whitespace_nowrap()
                             .child(command.shortcut),
@@ -157,10 +158,16 @@ impl Root {
                 .flex_col()
                 .gap(px(4.))
                 .p(px(18.))
-                .child(div().text_size(ui(11.0)).child("No matching commands"))
+                .child(
+                    div()
+                        .text_size(ui(11.0))
+                        .line_height((ui(11.0)) * 1.3)
+                        .child("No matching commands"),
+                )
                 .child(
                     div()
                         .text_size(ui(9.0))
+                        .line_height((ui(9.0)) * 1.3)
                         .text_color(color(tokens.muted))
                         .child("Try searching for split, terminal, or settings."),
                 )
@@ -236,6 +243,7 @@ impl Root {
                                     div()
                                         .flex_grow(1.0)
                                         .text_size(ui(8.5))
+                                        .line_height((ui(8.5)) * 1.3)
                                         .text_color(color(tokens.muted))
                                         .child("↑/↓ or Tab Navigate  ·  Enter Run  ·  Esc Close"),
                                 )
@@ -243,6 +251,7 @@ impl Root {
                                     div()
                                         .font_family(terminal_family(settings))
                                         .text_size(ui(8.0))
+                                        .line_height((ui(8.0)) * 1.3)
                                         .text_color(color(tokens.accent))
                                         .child(if cfg!(target_os = "macos") {
                                             "Cmd+P"
@@ -312,6 +321,7 @@ impl Root {
                             inset: false,
                         }])
                         .text_size(px(app.settings.ui_pixels(9.5)))
+                        .line_height((px(app.settings.ui_pixels(9.5))) * 1.3)
                         .text_color(color(text))
                         .child(message.to_owned()),
                 )
@@ -346,6 +356,7 @@ impl Root {
                     div()
                         .flex_grow(1.0)
                         .text_size(px(app.settings.ui_pixels(9.0)))
+                        .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                         .text_color(color(tokens.muted))
                         .truncate()
                         .child(app.status.clone()),
@@ -353,6 +364,7 @@ impl Root {
                 .child(
                     div()
                         .text_size(px(app.settings.ui_pixels(9.0)))
+                        .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                         .text_color(color(tokens.faint))
                         .child(format!("{panes} pane{}", if panes == 1 { "" } else { "s" })),
                 )
