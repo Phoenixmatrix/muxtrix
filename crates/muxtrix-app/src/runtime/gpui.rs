@@ -19,6 +19,16 @@ use crate::effect::Effect;
 use crate::input::KeyEvent;
 use crate::theme::DesignTokens;
 
+/// How often the terminals are drained when nothing has woken them.
+///
+/// Wakeups coalesce through a one-slot channel, so a burst of output can
+/// produce a single signal and the grid then sits unread until the next one.
+/// Anything that reads the grid to decide what to do — whether a program has
+/// asked for mouse reporting, where the cursor is — would be acting on a stale
+/// answer. A poll that finds nothing new does not repaint, so this costs
+/// almost nothing.
+const POLL_INTERVAL: Duration = Duration::from_millis(16);
+
 /// How often the cursor blink phase flips.
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 /// The GitHub panel's loading animation step.
@@ -64,6 +74,9 @@ pub(crate) struct Root {
     pub(crate) inputs: crate::views::gpui::inputs::Inputs,
     /// A focus request waiting for a frame to apply it against.
     pending_focus: Option<crate::effect::FocusTarget>,
+    /// The title the window already carries, so an unchanged one costs
+    /// nothing.
+    title: String,
     /// Inline terminal images, decoded once and kept while the emulator still
     /// references them. Keyed by the emulator's own generation, so an image
     /// that is redrawn unchanged is not decoded again.
@@ -207,6 +220,7 @@ impl Root {
             app,
             inputs,
             pending_focus: None,
+            title: String::new(),
             images: std::collections::BTreeMap::new(),
             scrolls: Scrolls::default(),
             pending_scrolls: Vec::new(),
@@ -232,22 +246,75 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // What a key or a click means can depend on terminal state the PTY
+        // has already reported but this process has not read yet — whether
+        // the program is in mouse-reporting mode, say. Draining first means
+        // the decision is made against what is true now rather than against
+        // whatever the last frame happened to see.
+        self.drain_terminals(cx);
+        // A key the terminal owns changes nothing this process draws: the
+        // program echoes, and the echo arrives as terminal output that
+        // repaints on its own. Drawing for the keystroke as well caps input
+        // at one key per frame, because the draw happens inline before the
+        // next X event is read — enough to fall seconds behind a paste or an
+        // automated run.
+        let terminal_key = matches!(message, Message::Keyboard(KeyEvent::Pressed(_)))
+            && self.app.focus_target().is_none();
+        let before = terminal_key.then(|| (self.app.grid_revision(), self.app.chrome_revision()));
         let effects = self.app.update(message);
+        let repaint = before
+            .is_none_or(|before| before != (self.app.grid_revision(), self.app.chrome_revision()));
         self.run_effects(effects, window, cx);
         self.sync_inputs(window, cx);
-        window.set_window_title(&self.app.title());
-        cx.notify();
+        // Setting the title is a round trip to the X server. The title
+        // changes when a pane's does; a keystroke is not that, and paying for
+        // one per key is enough to fall behind a fast typist.
+        let title = self.app.title();
+        if self.title != title {
+            window.set_window_title(&title);
+            self.title = title;
+        }
+        if repaint {
+            cx.notify();
+        }
+    }
+
+    /// Drain the terminals once per frame.
+    ///
+    /// The X11 backend drives a redraw every display refresh whether or not
+    /// anything is dirty, and it services that timer from the same event loop
+    /// that runs spawned tasks. Under a software renderer a frame can outlast
+    /// the interval, and the executor then goes seconds without running a
+    /// task — long enough for the queue to coalesce away the frame that
+    /// carried a mode change, which is how a program that had turned mouse
+    /// reporting on could be missed entirely.
+    ///
+    /// The frame itself is the one clock that cannot be starved by drawing, so
+    /// the drain hangs off it. [`POLL_INTERVAL`] stays as the fallback for
+    /// when there are no frames at all: a hidden or unmapped window stops the
+    /// refresh loop, and a terminal still has to be read.
+    pub(crate) fn drain_terminals(&mut self, cx: &mut Context<Self>) {
+        let effects = self.app.update(Message::PollTerminal);
+        self.run_detached_effects(effects, cx);
+        self.sync_images();
     }
 
     /// Deliver a message from a context that has no `Window` — a timer or a
     /// channel. The window is reached through the entity's own handle.
     pub(crate) fn dispatch_detached(&mut self, message: Message, cx: &mut Context<Self>) {
-        // A poll that found nothing new should not repaint. Everything else
-        // might have changed something this cannot see, so it repaints.
-        let quiet_poll = matches!(message, Message::PollTerminal);
-        let before = quiet_poll.then(|| self.app.grid_revision());
+        // A tick that changed nothing should not repaint. Polls and the e2e
+        // clock both fire many times a second and usually change nothing;
+        // under a software renderer, repainting for each of them starves the
+        // very subprocesses this app exists to host. Everything else might
+        // have changed something these fingerprints cannot see, so it
+        // repaints unconditionally.
+        let quiet = matches!(message, Message::PollTerminal);
+        #[cfg(feature = "e2e")]
+        let quiet = quiet || matches!(message, Message::E2eTick);
+        let before = quiet.then(|| (self.app.grid_revision(), self.app.chrome_revision()));
         let effects = self.app.update(message);
-        let repaint = before.is_none_or(|before| before != self.app.grid_revision());
+        let repaint = before
+            .is_none_or(|before| before != (self.app.grid_revision(), self.app.chrome_revision()));
         self.run_detached_effects(effects, cx);
         if repaint {
             self.sync_images();
@@ -347,6 +414,9 @@ impl Root {
     /// conditions stay where they are readable and a paused animation costs
     /// nothing but a sleeping task.
     fn spawn_timers(&mut self, cx: &mut Context<Self>) {
+        repeat(cx, POLL_INTERVAL, |root| {
+            (!root.app.terminals.is_empty()).then_some(Message::PollTerminal)
+        });
         repeat(cx, BLINK_INTERVAL, |_| Some(Message::BlinkCursor));
         repeat(cx, GITHUB_LOADING_INTERVAL, |root| {
             root.app
@@ -460,6 +530,7 @@ where
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.drain_terminals(cx);
         // Both of these read what the last frame laid out, so they belong at
         // the start of the next one.
         self.apply_pending_scrolls();

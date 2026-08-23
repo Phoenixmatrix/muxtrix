@@ -337,6 +337,14 @@ impl Scenario {
                 }
                 if !self.pane_menu_click_open_observed {
                     app.pane_menu = Some(self.initial_pane);
+                    // Recorded here rather than waiting for a later tick to
+                    // notice: the outside click can land before the next one,
+                    // and a step that only trusts what it has seen open would
+                    // then open the menu again — over a click that has already
+                    // been spent, leaving it open for the rest of the run with
+                    // every later pointer event going to the menu's backdrop
+                    // instead of the terminal underneath.
+                    self.pane_menu_click_open_observed = true;
                     return Ok(TickAction::Wait);
                 }
                 if app.pane_menu.is_some() {

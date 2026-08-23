@@ -511,6 +511,10 @@ impl TerminalElement {
                 let grid_point = position_in_grid(event.position);
                 let pane_point = position_in_pane(event.position);
                 root.update(cx, |root, cx| {
+                    // Whether this motion belongs to the program or to a
+                    // selection depends on a mode the PTY may have set since
+                    // the last frame, so read what is pending before deciding.
+                    root.drain_terminals(cx);
                     if inside {
                         root.dispatch_detached(Message::EnterTerminal(pane_id), cx);
                     }

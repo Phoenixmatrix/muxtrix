@@ -197,24 +197,55 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     )?;
     tap_keysym(&connection, 0xff0d)?;
     connection.flush()?;
-    thread::sleep(Duration::from_millis(300));
-    connection
-        .xtest_fake_input(
-            MOTION_NOTIFY_EVENT,
-            0,
-            0,
-            root,
-            terminal_x.saturating_add(32),
-            terminal_y,
-            0,
-        )?
-        .check()?;
-    connection.flush()?;
-    thread::sleep(Duration::from_millis(350));
+    // The probe only listens once the shell has read the line and the
+    // interpreter has started, and how long that takes has nothing to do with
+    // what is being tested. It touches a file as soon as it has mouse
+    // reporting on, so wait for that rather than guessing at the cost of a
+    // process start.
+    let ready_marker = std::path::PathBuf::from(format!("{}.ready", mouse_probe_path.display()));
+    let waiting_since = std::time::Instant::now();
+    while !ready_marker.exists() {
+        if waiting_since.elapsed() > Duration::from_secs(10) {
+            return Err("the mouse probe never enabled mouse reporting".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(50));
+    // Every step lands somewhere new. A client that is busy drawing makes the
+    // server compress the motion it missed into one event at the final
+    // position, so a pointer that returns to where it started compresses to no
+    // movement at all and nothing is delivered. Sweeping in one direction
+    // means whatever survives compression is still a move onto a fresh cell,
+    // which is what the program under test has asked to hear about.
+    for step in 1..=12 {
+        connection
+            .xtest_fake_input(
+                MOTION_NOTIFY_EVENT,
+                0,
+                0,
+                root,
+                terminal_x.saturating_add(step * 8),
+                terminal_y,
+                0,
+            )?
+            .check()?;
+        connection.flush()?;
+        thread::sleep(Duration::from_millis(120));
+    }
     eprintln!("delivered pointer motion to a mouse-reporting terminal program");
-    connection
-        .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, terminal_x, terminal_y, 0)?
-        .check()?;
+    connection.flush()?;
+    // The probe reads whatever reaches the pty first and judges that. Pointer
+    // and keyboard arrive over separate X streams with no ordering promised
+    // between them, so typing here lets the keystrokes overtake the motion and
+    // be mistaken for its report. The probe drops its marker when it is done,
+    // so wait for that and leave the pty to it until then.
+    let probe_finished_by = std::time::Instant::now();
+    while ready_marker.exists() {
+        if probe_finished_by.elapsed() > Duration::from_secs(10) {
+            return Err("the mouse probe never finished listening".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     type_text(&connection, "seq 1 120")?;
     tap_keysym(&connection, 0xff0d)?;
     connection.flush()?;
@@ -414,6 +445,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     }
     let _ = std::fs::remove_file(&config_path);
     let _ = std::fs::remove_file(&control_path);
+    let _ = std::fs::remove_file(format!("{}.ready", mouse_probe_path.display()));
     let _ = std::fs::remove_file(&mouse_probe_path);
     let _ = std::fs::remove_dir_all(&home_path);
     if requested_screenshot.is_none() {
@@ -475,12 +507,17 @@ try:
     tty.setraw(fd)
     sys.stdout.write("\x1b[?1003h\x1b[?1006h")
     sys.stdout.flush()
-    if select.select([fd], [], [], 3)[0]:
+    open(sys.argv[0] + ".ready", "w").close()
+    if select.select([fd], [], [], 6)[0]:
         data = os.read(fd, 64)
 finally:
     sys.stdout.write("\x1b[?1003l\x1b[?1006l\r\n")
     sys.stdout.flush()
     termios.tcsetattr(fd, termios.TCSADRAIN, original)
+    try:
+        os.remove(sys.argv[0] + ".ready")
+    except OSError:
+        pass
 
 print("mouse-report-ok" if data.startswith(b"\x1b[<35;") else "mouse-report-fail")
 "#,

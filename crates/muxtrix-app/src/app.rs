@@ -2132,6 +2132,39 @@ impl Muxtrix {
             .fold(0u64, u64::wrapping_add)
     }
 
+    /// A cheap fingerprint of everything the chrome draws from.
+    ///
+    /// Paired with [`Self::grid_revision`], this is what lets a tick that
+    /// changed nothing skip its repaint. Under a software renderer a
+    /// full-window repaint is expensive enough that doing one twenty times a
+    /// second starves the subprocesses the app is supposed to be hosting.
+    #[cfg(feature = "gpui")]
+    pub(crate) fn chrome_revision(&self) -> u64 {
+        let mut revision = 0u64;
+        let mut bit =
+            |flag: bool| revision = revision.wrapping_mul(2).wrapping_add(u64::from(flag));
+        bit(self.cursor_phase_visible);
+        bit(self.palette.visible);
+        bit(self.pane_menu.is_some());
+        bit(self.workspace_create_visible);
+        bit(self.rename_prompt.is_some());
+        bit(self.worktree_prompt.is_some());
+        bit(self.session_picker.is_some());
+        bit(self.close_workspace_prompt.is_some());
+        bit(self.default_agent_prompt);
+        bit(self.github_panel.is_some());
+        bit(self.toast.is_some());
+        bit(self.sidebar_collapsed);
+        bit(self.maximized_pane.is_some());
+        let mut text = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&self.status, &mut text);
+        revision
+            .wrapping_add(self.active_view as u64)
+            .wrapping_add(self.palette.selected as u64)
+            .wrapping_add(self.session.workspaces.len() as u64)
+            .wrapping_add(std::hash::Hasher::finish(&text))
+    }
+
     /// Which text field should hold focus, given what is open.
     ///
     /// Focus is derived from state rather than remembered, so closing a
