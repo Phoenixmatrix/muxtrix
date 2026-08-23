@@ -9,9 +9,13 @@ use gpui::{
     ParentElement, Styled, div, px,
 };
 
-use crate::app::{Message, RenameTarget, ellipsize};
+use crate::app::{
+    Message, RenameTarget, SettingsButtonKind, WorktreeManagerMode, WorktreeManagerState,
+    agent_display_name, ellipsize, worktree_display_name,
+};
 use crate::runtime::gpui::{Root, color};
 use crate::theme::DesignTokens;
+use crate::views::gpui::terminal_family;
 
 impl Root {
     /// The dialog that is up, with the message that dismisses it.
@@ -90,19 +94,19 @@ impl Root {
                 Message::CloseSessionPicker,
                 self.session_picker(picker, tokens, cx),
             )
-        } else if app.worktree_manager.as_ref().is_some_and(restart_is_open) {
-            (
-                Message::CancelWorktreeManagerRestart,
-                self.confirm(
-                    "Restart in worktree",
-                    "The pane's terminal is replaced, and anything running in it ends.",
-                    ("Cancel", Message::CancelWorktreeManagerRestart),
-                    ("Restart", Message::ConfirmWorktreeManagerRestart),
-                    true,
-                    tokens,
-                    cx,
-                ),
-            )
+        } else if let Some(manager) = app
+            .worktree_manager
+            .as_ref()
+            .filter(|manager| manager.mode != WorktreeManagerMode::Manage)
+        {
+            // Choosing a worktree and confirming the restart are two steps of
+            // one dialog; Esc from the second goes back to the first.
+            let dismiss = if manager.restart_target.is_some() {
+                Message::CancelWorktreeManagerRestart
+            } else {
+                Message::CloseWorktreeManager
+            };
+            (dismiss, self.worktree_restart_dialog(manager, tokens, cx))
         } else {
             let workspace_id = app.close_workspace_prompt?;
             let name = app
@@ -390,7 +394,394 @@ impl Root {
     }
 }
 
-/// Whether a restart confirmation is standing over the worktree manager.
-fn restart_is_open(manager: &crate::app::WorktreeManagerState) -> bool {
-    manager.restart_target.is_some()
+impl Root {
+    /// Restart a pane in another worktree: pick the checkout, then confirm.
+    fn worktree_restart_dialog(
+        &self,
+        manager: &WorktreeManagerState,
+        tokens: DesignTokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let app = self.app();
+        let settings = &app.settings;
+        let ui = |points: f32| px(settings.ui_pixels(points));
+        let restart_agent = match manager.mode {
+            WorktreeManagerMode::RestartPaneWithAgent(_, agent) => Some(agent),
+            WorktreeManagerMode::RestartPane(_) | WorktreeManagerMode::Manage => None,
+        };
+        let card = || {
+            div()
+                .w(px(600.))
+                .flex()
+                .flex_col()
+                .gap(px(14.))
+                .p(px(18.))
+                .rounded(px(8.))
+                .bg(color(tokens.overlay))
+                .border_1()
+                .border_color(color(tokens.line_strong))
+                .shadow(vec![gpui::BoxShadow {
+                    color: gpui::Rgba {
+                        r: 0.,
+                        g: 0.,
+                        b: 0.,
+                        a: 0.45,
+                    }
+                    .into(),
+                    offset: gpui::point(px(0.), px(10.)),
+                    blur_radius: px(28.),
+                    spread_radius: px(0.),
+                    inset: false,
+                }])
+                // Clicking inside must not reach the scrim's dismiss handler.
+                .occlude()
+        };
+        let title = |copy: &'static str| {
+            div()
+                .text_size(ui(18.0))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(color(tokens.text))
+                .child(copy)
+        };
+
+        // Step two: the confirmation for a chosen worktree.
+        if let Some(entry) = manager
+            .restart_target
+            .and_then(|index| manager.entries.get(index))
+        {
+            let name = entry.branch.clone().unwrap_or_else(|| {
+                entry
+                    .path
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or("selected worktree")
+                    .to_owned()
+            });
+            let question = restart_agent.map_or_else(
+                || format!("Open a fresh terminal in {name}?"),
+                |agent| {
+                    format!(
+                        "Open a fresh terminal in {name} and launch {}?",
+                        agent_display_name(&agent.to_string())
+                    )
+                },
+            );
+            return card()
+                .child(title(if restart_agent.is_some() {
+                    "Restart pane and launch agent?"
+                } else {
+                    "Restart pane?"
+                }))
+                .child(div().text_size(ui(10.5)).text_color(color(tokens.text)).child(question))
+                .child(
+                    div()
+                        .text_size(ui(9.5))
+                        .text_color(color(tokens.muted))
+                        .child("The current process and terminal history will close. The pane stays in its present tab and position."),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .py(px(9.))
+                        .px(px(12.))
+                        .rounded(px(7.))
+                        .bg(color(tokens.panel))
+                        .border_1()
+                        .border_color(color(tokens.line))
+                        .font_family(terminal_family(settings))
+                        .text_size(ui(9.0))
+                        .text_color(color(tokens.text))
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(entry.path.display().to_string()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_grow(1.0)
+                                .text_size(ui(8.0))
+                                .text_color(color(tokens.faint))
+                                .child("Enter restarts · Esc goes back"),
+                        )
+                        .child(self.settings_action_button(
+                            "worktree-restart-cancel",
+                            "Cancel",
+                            Message::CancelWorktreeManagerRestart,
+                            SettingsButtonKind::Secondary,
+                            tokens,
+                            cx,
+                        ))
+                        .child(self.settings_action_button(
+                            "worktree-restart-confirm",
+                            if restart_agent.is_some() { "Restart and launch" } else { "Restart pane" },
+                            Message::ConfirmWorktreeManagerRestart,
+                            SettingsButtonKind::Danger,
+                            tokens,
+                            cx,
+                        )),
+                )
+                .into_any_element();
+        }
+
+        // Step one: the list.
+        let mut body = card().child(title(if restart_agent.is_some() {
+            "Restart pane with agent in worktree"
+        } else {
+            "Restart pane in worktree"
+        }));
+        if manager.loading {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(11.))
+                    .w_full()
+                    .py(px(12.))
+                    .px(px(14.))
+                    .rounded(px(7.))
+                    .bg(color(tokens.panel))
+                    .border_1()
+                    .border_color(color(tokens.line))
+                    .child(
+                        div()
+                            .h(px(settings.ui_pixels(11.0) * 1.3))
+                            .flex()
+                            .items_center()
+                            .child(div().size(px(7.)).rounded_full().bg(color(tokens.accent))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.))
+                            .flex_grow(1.0)
+                            .child(
+                                div()
+                                    .text_size(ui(11.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(color(tokens.text))
+                                    .child("Loading worktrees"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(ui(9.5))
+                                    .text_color(color(tokens.muted))
+                                    .child("Reading registered checkouts and local commit status in the background."),
+                            )
+                            .child(
+                                div()
+                                    .text_size(ui(8.5))
+                                    .text_color(color(tokens.accent))
+                                    .child("The terminal remains responsive while this finishes."),
+                            ),
+                    ),
+            );
+        } else if let Some(failure) = &manager.failure {
+            body = body.child(
+                div()
+                    .text_size(ui(10.0))
+                    .text_color(color(tokens.danger))
+                    .child(failure.clone()),
+            );
+        } else if manager.repo_root.is_some() {
+            body = body.child(
+                div()
+                    .text_size(ui(10.0))
+                    .text_color(color(tokens.muted))
+                    .child("Choose another checkout. You’ll confirm before the current terminal closes."),
+            );
+            if manager.entries.is_empty() {
+                body = body.child(
+                    div()
+                        .text_size(ui(9.5))
+                        .text_color(color(tokens.faint))
+                        .child("No other worktrees are registered for this repository."),
+                );
+            } else {
+                let pill = |label: String, hue: iced::Color| {
+                    let mut fill = color(hue);
+                    fill.a = 0.12;
+                    div()
+                        .py(px(2.))
+                        .px(px(8.))
+                        .rounded(px(999.))
+                        .bg(fill)
+                        .text_size(ui(7.5))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(color(hue))
+                        .whitespace_nowrap()
+                        .child(label)
+                };
+                let mut list = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .max_h(px(320.))
+                    .overflow_hidden();
+                for (index, entry) in manager.entries.iter().enumerate() {
+                    let selected = index == manager.selected;
+                    let name = worktree_display_name(&entry.path);
+                    let branch = entry
+                        .branch
+                        .clone()
+                        .unwrap_or_else(|| "Detached HEAD".to_owned());
+                    let status = match &entry.used_by {
+                        Some(pane) => pill(
+                            format!("In use · {}", ellipsize(pane, settings.ui_char_budget(18))),
+                            tokens.warning,
+                        ),
+                        None => pill("Idle".to_owned(), tokens.faint),
+                    };
+                    let push_status = (entry.unpushed_commits > 0).then(|| {
+                        pill(
+                            format!(
+                                "{} unpushed {}",
+                                entry.unpushed_commits,
+                                if entry.unpushed_commits == 1 {
+                                    "commit"
+                                } else {
+                                    "commits"
+                                }
+                            ),
+                            tokens.warning,
+                        )
+                    });
+                    let mut selected_fill = color(tokens.accent);
+                    selected_fill.a = 0.16;
+                    let mut selected_edge = color(tokens.accent);
+                    selected_edge.a = 0.55;
+                    list = list.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(10.))
+                            .w_full()
+                            .py(px(9.))
+                            .px(px(12.))
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(if selected {
+                                selected_edge
+                            } else {
+                                color(iced::Color::TRANSPARENT)
+                            })
+                            .bg(if selected {
+                                selected_fill
+                            } else {
+                                color(iced::Color::TRANSPARENT)
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(3.))
+                                    .flex_grow(1.0)
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(10.))
+                                            .child(
+                                                div()
+                                                    .flex_grow(1.0)
+                                                    .min_w(px(0.))
+                                                    .text_size(ui(11.0))
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(color(tokens.text))
+                                                    .truncate()
+                                                    .child(ellipsize(
+                                                        &name,
+                                                        settings.ui_char_budget(34),
+                                                    )),
+                                            )
+                                            .child(status),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(10.))
+                                            .child(
+                                                div()
+                                                    .flex_grow(1.0)
+                                                    .min_w(px(0.))
+                                                    .font_family(terminal_family(settings))
+                                                    .text_size(ui(8.5))
+                                                    .text_color(color(tokens.faint))
+                                                    .truncate()
+                                                    .child(ellipsize(
+                                                        &branch,
+                                                        settings.ui_char_budget(34),
+                                                    )),
+                                            )
+                                            .children(push_status),
+                                    ),
+                            )
+                            .child(div().w(px(92.)).flex().justify_end().child(
+                                self.settings_action_button(
+                                    "worktree-restart-pick",
+                                    "Restart",
+                                    Message::WorktreeManagerRestart(index),
+                                    if selected {
+                                        SettingsButtonKind::Primary
+                                    } else {
+                                        SettingsButtonKind::Secondary
+                                    },
+                                    tokens,
+                                    cx,
+                                ),
+                            )),
+                    );
+                }
+                body = body.child(list);
+            }
+            if let Some(error) = &manager.error {
+                body = body.child(
+                    div()
+                        .text_size(ui(9.0))
+                        .text_color(color(tokens.danger))
+                        .child(error.clone()),
+                );
+            }
+        }
+        let hint = if manager.failure.is_none() && !manager.entries.is_empty() {
+            "↑↓ select · Enter reviews · Esc closes"
+        } else {
+            ""
+        };
+        body.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_grow(1.0)
+                        .text_size(ui(8.0))
+                        .text_color(color(tokens.faint))
+                        .child(hint),
+                )
+                .child(self.settings_action_button(
+                    "worktree-restart-close",
+                    "Close",
+                    Message::CloseWorktreeManager,
+                    SettingsButtonKind::Secondary,
+                    tokens,
+                    cx,
+                )),
+        )
+        .into_any_element()
+    }
 }

@@ -1119,7 +1119,7 @@ impl Root {
     }
 
     /// A settings-page action: the same three kinds the iced page draws.
-    fn settings_action_button(
+    pub(crate) fn settings_action_button(
         &self,
         id: &'static str,
         label: &'static str,

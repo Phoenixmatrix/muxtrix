@@ -2156,12 +2156,23 @@ impl Muxtrix {
         bit(self.toast.is_some());
         bit(self.sidebar_collapsed);
         bit(self.maximized_pane.is_some());
+        bit(self.worktree_manager.is_some());
+        bit(self
+            .worktree_manager
+            .as_ref()
+            .is_some_and(|manager| manager.restart_target.is_some()));
+        bit(!self.global_alerts.is_empty());
         let mut text = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&self.status, &mut text);
         revision
             .wrapping_add(self.active_view as u64)
             .wrapping_add(self.palette.selected as u64)
             .wrapping_add(self.session.workspaces.len() as u64)
+            .wrapping_add(
+                self.worktree_manager
+                    .as_ref()
+                    .map_or(0, |manager| manager.selected as u64 + 1),
+            )
             .wrapping_add(std::hash::Hasher::finish(&text))
     }
 

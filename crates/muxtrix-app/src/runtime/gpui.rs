@@ -404,6 +404,10 @@ impl Root {
             }
             #[cfg(feature = "e2e")]
             Effect::Capture => {
+                // The scenario staged a state for this frame to show. Whatever
+                // the tick's fingerprint thought, this is the one frame that
+                // has to be drawn before anyone looks.
+                cx.notify();
                 // The frame is grabbed from outside this process; all that
                 // happens here is asserting state and saying so on the control
                 // socket, which `capture_ready` already reports. The window
