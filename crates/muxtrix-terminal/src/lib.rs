@@ -57,17 +57,29 @@ impl graphics::DecodePng for PngDecoder {
         match info.color_type {
             png::ColorType::Rgba => rgba.copy_from_slice(source),
             png::ColorType::Rgb => {
-                for (source, target) in source.chunks_exact(3).zip(rgba.chunks_exact_mut(4)) {
+                for (source, target) in source
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .zip(rgba.as_chunks_mut::<4>().0.iter_mut())
+                {
                     target.copy_from_slice(&[source[0], source[1], source[2], u8::MAX]);
                 }
             }
             png::ColorType::GrayscaleAlpha => {
-                for (source, target) in source.chunks_exact(2).zip(rgba.chunks_exact_mut(4)) {
+                for (source, target) in source
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(rgba.as_chunks_mut::<4>().0.iter_mut())
+                {
                     target.copy_from_slice(&[source[0], source[0], source[0], source[1]]);
                 }
             }
             png::ColorType::Grayscale => {
-                for (source, target) in source.iter().zip(rgba.chunks_exact_mut(4)) {
+                for (source, target) in
+                    source.iter().zip(rgba.as_chunks_mut::<4>().0.iter_mut())
+                {
                     target.copy_from_slice(&[*source, *source, *source, u8::MAX]);
                 }
             }
@@ -958,12 +970,12 @@ fn image_rgba(width: u32, height: u32, format: ImageFormat, data: &[u8]) -> Opti
     let mut rgba = Vec::with_capacity(pixels.checked_mul(4)?);
     match format {
         ImageFormat::Rgb => {
-            for pixel in data.chunks_exact(3) {
+            for pixel in data.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], u8::MAX]);
             }
         }
         ImageFormat::GrayAlpha => {
-            for pixel in data.chunks_exact(2) {
+            for pixel in data.as_chunks::<2>().0 {
                 rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
             }
         }
