@@ -522,6 +522,13 @@ impl Root {
                         },
                     );
             }
+            Effect::OpenUrl(url) => {
+                if let Some(url) = platform_web_url(&url) {
+                    cx.open_url(url);
+                } else {
+                    eprintln!("muxtrix: refused to open a non-HTTP(S) URL");
+                }
+            }
             Effect::ClipboardWrite(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
@@ -537,15 +544,14 @@ impl Root {
             // not been laid out yet — opening a panel and scrolling it are one
             // gesture — and a handle with no content reports nowhere to go.
             Effect::ScrollToRatio(target, ratio) => {
-                self.pending_scrolls.push((target, ScrollTo::Ratio(ratio)));
+                queue_pending_scroll(&mut self.pending_scrolls, target, ScrollTo::Ratio(ratio));
             }
             Effect::ScrollToOffset(target, offset) => {
-                self.pending_scrolls
-                    .push((target, ScrollTo::Offset(offset)));
+                queue_pending_scroll(&mut self.pending_scrolls, target, ScrollTo::Offset(offset));
             }
             #[cfg(feature = "e2e")]
             Effect::ScrollToEnd(target) => {
-                self.pending_scrolls.push((target, ScrollTo::End));
+                queue_pending_scroll(&mut self.pending_scrolls, target, ScrollTo::End);
             }
             #[cfg(feature = "e2e")]
             Effect::Capture => {
@@ -578,11 +584,6 @@ impl Root {
             root.app
                 .github_loading_animating()
                 .then_some(Message::AnimateGitHubLoading)
-        });
-        repeat(cx, Duration::from_millis(1), |root| {
-            root.app
-                .github_pull_requests_refresh_pending
-                .then_some(Message::RefreshGitHubPullRequestsAfterAgentTurn)
         });
         #[cfg(feature = "e2e")]
         repeat(cx, E2E_INTERVAL, |root| {
@@ -704,6 +705,10 @@ where
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Paint repopulates this map with only the terminal bodies present in
+        // the new frame. Keeping old entries made pointer hit-testing grow
+        // with every pane ever shown during a long-running session.
+        self.terminal_regions.clear();
         self.drain_terminals(cx);
         self.sync_component_theme(window, cx);
         // Both of these read what the last frame laid out, so they belong at
@@ -1021,6 +1026,7 @@ impl Scrolls {
 }
 
 /// Where a scroll request wants its surface to end up.
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum ScrollTo {
     Ratio(f32),
     Offset(f32),
@@ -1028,4 +1034,76 @@ enum ScrollTo {
     /// e2e scenarios ask for it.
     #[cfg(feature = "e2e")]
     End,
+}
+
+/// Keep only the newest deferred request for each surface.
+///
+/// A surface that currently fits has no scroll extent, so its request can
+/// legitimately survive several frames. Appending every keyboard step while
+/// that is true made the render-time scan grow without bound over a long
+/// session.
+fn queue_pending_scroll(
+    pending: &mut Vec<(crate::effect::ScrollTarget, ScrollTo)>,
+    target: crate::effect::ScrollTarget,
+    request: ScrollTo,
+) {
+    if let Some((_, queued)) = pending
+        .iter_mut()
+        .find(|(queued_target, _)| *queued_target == target)
+    {
+        *queued = request;
+    } else {
+        pending.push((target, request));
+    }
+}
+
+fn platform_web_url(uri: &str) -> Option<&str> {
+    crate::app::is_valid_web_url(uri).then_some(uri)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ScrollTo, platform_web_url, queue_pending_scroll};
+    use crate::effect::ScrollTarget;
+
+    #[test]
+    fn deferred_scroll_queue_stays_bounded_by_surface() {
+        let mut pending = Vec::new();
+        for offset in 0..100_000 {
+            queue_pending_scroll(
+                &mut pending,
+                ScrollTarget::CommandPalette,
+                ScrollTo::Offset(offset as f32),
+            );
+        }
+        queue_pending_scroll(&mut pending, ScrollTarget::Settings, ScrollTo::Ratio(0.75));
+
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending[0],
+            (ScrollTarget::CommandPalette, ScrollTo::Offset(99_999.0))
+        );
+        assert_eq!(pending[1], (ScrollTarget::Settings, ScrollTo::Ratio(0.75)));
+    }
+
+    #[test]
+    fn platform_url_boundary_rejects_non_web_schemes() {
+        assert_eq!(
+            platform_web_url("https://example.com/docs"),
+            Some("https://example.com/docs")
+        );
+        assert_eq!(
+            platform_web_url("http://localhost:3000"),
+            Some("http://localhost:3000")
+        );
+        for uri in [
+            "file:///etc/passwd",
+            "mailto:person@example.com",
+            "javascript:alert(1)",
+            "muxtrix://settings",
+            "https://",
+        ] {
+            assert_eq!(platform_web_url(uri), None, "{uri} must be rejected");
+        }
+    }
 }

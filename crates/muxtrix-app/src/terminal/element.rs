@@ -42,6 +42,8 @@ const SCROLLBAR_LANE: f32 = 24.0;
 const SCROLLBAR_WIDTH: f32 = 12.0;
 const SCROLLBAR_INSET: f32 = 3.0;
 const SCROLLBAR_THUMB_WIDTH: f32 = 3.0;
+const LINK_UNDERLINE_DOT_SIZE: f32 = 1.0;
+const LINK_UNDERLINE_DOT_STEP: f32 = 3.0;
 
 /// What the element needs to draw one pane, gathered before layout.
 pub(crate) struct TerminalElement {
@@ -95,6 +97,9 @@ struct PreparedRow {
     shaped: ShapedLine,
     /// Background spans, already in columns, so paint does no measuring.
     backgrounds: Vec<(usize, usize, Hsla)>,
+    /// Link underlines GPUI cannot shape natively: one-pixel dots rather than
+    /// its spell-checker wave.
+    dotted_underlines: Vec<(usize, usize, Hsla)>,
     /// Runs drawn as geometry rather than glyphs: box drawing, whose arms have
     /// to meet exactly on cell edges, and the full block, which has to fill
     /// its cell completely. A font gives neither reliably across faces.
@@ -351,6 +356,15 @@ impl Element for TerminalElement {
                     window,
                     cx,
                 );
+                for (start, columns, color) in &row.dotted_underlines {
+                    let left = origin.x + prepared.cell_width * *start;
+                    paint_dotted_underline(
+                        point(left, top + prepared.line_height - px(2.)),
+                        prepared.cell_width * *columns,
+                        *color,
+                        window,
+                    );
+                }
             }
             self.paint_images(origin, prepared, ImageLayer::AboveText, window);
         });
@@ -592,6 +606,7 @@ fn prepare_row(
     let mut runs = Vec::with_capacity(row.len());
     let mut backgrounds = Vec::new();
     let mut backgrounds_geometry: Vec<GeometryRun> = Vec::new();
+    let mut dotted_underlines = Vec::new();
     let mut column = 0usize;
 
     for run in row {
@@ -660,11 +675,10 @@ fn prepare_row(
         let foreground: gpui::Hsla = color(rgb(run.style.foreground)).into();
         let underline = match terminal_underline_decoration(run.style) {
             TerminalUnderlineDecoration::None => None,
-            TerminalUnderlineDecoration::Dotted => Some(gpui::UnderlineStyle {
-                thickness: px(1.),
-                color: Some(foreground),
-                wavy: true,
-            }),
+            TerminalUnderlineDecoration::Dotted => {
+                dotted_underlines.push((column, run.columns, foreground));
+                None
+            }
             TerminalUnderlineDecoration::Solid => Some(gpui::UnderlineStyle {
                 thickness: px(1.),
                 color: Some(foreground),
@@ -693,6 +707,35 @@ fn prepare_row(
             .shape_line(text.into(), font_size, &runs, Some(cell_width)),
         backgrounds,
         geometry: backgrounds_geometry,
+        dotted_underlines,
+    }
+}
+
+/// Paint a crisp one-pixel dotted underline over one terminal run.
+fn paint_dotted_underline(
+    origin: gpui::Point<Pixels>,
+    width: Pixels,
+    color: Hsla,
+    window: &mut Window,
+) {
+    for index in 0..dotted_underline_dot_count(width) {
+        let left = origin.x + px(index as f32 * LINK_UNDERLINE_DOT_STEP);
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(left, origin.y),
+                size: size(px(LINK_UNDERLINE_DOT_SIZE), px(LINK_UNDERLINE_DOT_SIZE)),
+            },
+            color,
+        ));
+    }
+}
+
+fn dotted_underline_dot_count(width: Pixels) -> usize {
+    let width = f32::from(width);
+    if width < LINK_UNDERLINE_DOT_SIZE {
+        0
+    } else {
+        ((width - LINK_UNDERLINE_DOT_SIZE) / LINK_UNDERLINE_DOT_STEP).floor() as usize + 1
     }
 }
 
@@ -728,5 +771,28 @@ fn to_bounds(origin: gpui::Point<Pixels>, rect: crate::geom::Rect) -> Bounds<Pix
     Bounds {
         origin: point(origin.x + px(rect.x), origin.y + px(rect.y)),
         size: size(px(rect.width), px(rect.height)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LINK_UNDERLINE_DOT_SIZE, LINK_UNDERLINE_DOT_STEP, dotted_underline_dot_count};
+    use gpui::px;
+
+    #[test]
+    fn dotted_underline_never_paints_past_its_run() {
+        for width in [0.0, 0.5, 1.0, 3.9, 6.2, 15.5, 127.75] {
+            let count = dotted_underline_dot_count(px(width));
+            if count == 0 {
+                assert!(width < LINK_UNDERLINE_DOT_SIZE);
+            } else {
+                let final_dot_end =
+                    (count - 1) as f32 * LINK_UNDERLINE_DOT_STEP + LINK_UNDERLINE_DOT_SIZE;
+                assert!(
+                    final_dot_end <= width,
+                    "dot ended at {final_dot_end} for a {width}-pixel run"
+                );
+            }
+        }
     }
 }
