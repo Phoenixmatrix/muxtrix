@@ -658,6 +658,23 @@ flow.
 
 Exit: `main` builds without `iced` anywhere in `Cargo.lock`; release v0.2.0.
 
+**Decisions taken (Aug 2026):**
+
+- *zigbuild:* dropped. GPUI links the host's `libxkbcommon` dynamically, and a
+  24.04 library needs glibc 2.38 symbols a 2.34-pinned link cannot promise.
+  The Linux release job runs on `ubuntu-22.04` with plain `cargo build`; the
+  package baseline in `scripts/verify-deb-package.sh` is glibc 2.35, which is
+  the same "Ubuntu 22.04 LTS and newer" floor the install notes always gave.
+- *Headless e2e on a two-core llvmpipe runner:* the scenario records what it
+  has to have seen on every frame, not only on its tick; the harness keeps
+  key auto-repeat off, re-pins the window before aiming pointer events, sweeps
+  the mouse probe until the probe itself stops listening, and clicks the
+  initial pane before typing the probe (the scenario's own splits move focus).
+  Budgets are 60 s. The `e2e_*_trace` counters in `app.rs` feed the failure
+  report; CI cannot be watched, so the report has to carry the evidence.
+- *Item 4 (visual polish pass)* is not part of the cut-over PR; parity with
+  the Iced gallery (8.4 % mean pixel diff, 164/186 states under 15 %) is.
+
 ---
 
 ## 5. Mapping tables for the porting agent
@@ -719,7 +736,7 @@ replaced by `E2eCaptureReady`).
 | WSLg picks the broken `dzn` Vulkan adapter | Phase 1 spike; local `WGPU_BACKEND` patch via `vendor/` or user-owned fork (no upstream PR); existing `gpu.rs` re-exec stays |
 | GPUI git API churn between pins | Single `<ZED_REV>` in one place; bump only at phase boundaries; gpui-component pinned to a rev that locks the same zed rev |
 | Cold build time / CI minutes | `sccache`/`~/.cargo/git` cache; measure in Phase 1; consider building GPUI deps once in a container image |
-| `cargo zigbuild` glibc 2.34 vs font-kit/fontconfig | Decide in Phase 7; fallback Ubuntu 22.04 container build |
+| `cargo zigbuild` glibc 2.34 vs font-kit/fontconfig | Resolved in Phase 7: release built on `ubuntu-22.04`, baseline glibc 2.35 |
 | Pixel-exact expectations (`DESIGN.md` baselines, box-drawing continuity) | Phase 0 baseline PNGs; per-phase ±1 px checks; e2e continuity checks moved to the test binary |
 | IME/composition on Windows and macOS | `EntityInputHandler` on the terminal element (Phase 2), manual check by host user |
 | No runtime window icon / resize increments in GPUI | Desktop file + resource icon; increments dropped (documented) |
