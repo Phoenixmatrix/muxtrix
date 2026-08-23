@@ -140,15 +140,6 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
 
     let window = wait_for_app_window(&connection, root, Duration::from_secs(8))?;
     let final_viewport = requested_viewport()?;
-    let window_origin = connection
-        .translate_coordinates(window, root, 0, 0)?
-        .reply()?;
-    let terminal_x = window_origin.dst_x.saturating_add(
-        i16::try_from(final_viewport.0 / 2).map_err(|_| "viewport width exceeds X11 range")?,
-    );
-    let terminal_y = window_origin.dst_y.saturating_add(
-        i16::try_from(final_viewport.1 / 2).map_err(|_| "viewport height exceeds X11 range")?,
-    );
     eprintln!("Muxtrix window mapped as X11 window {window}");
     let control_response = control_request(&control_path, r#"{"method":"ping"}"#)?;
     assert_eq!(control_response["ok"], true);
@@ -158,6 +149,20 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     let control_response = control_request(&control_path, r#"{"method":"ping"}"#)?;
     assert_eq!(control_response["ok"], true);
     eprintln!("survived repeated real-window resizes with control service responsive");
+    // Read after the resizes, not before. A toolkit that centres its window
+    // on the screen moves it when it grows, and a screen sized to hold a wide
+    // viewport starts with the window well inside it. Pointer input is in root
+    // coordinates, so an origin read at map time would aim every click a few
+    // hundred pixels left of where the window now is.
+    let window_origin = connection
+        .translate_coordinates(window, root, 0, 0)?
+        .reply()?;
+    let terminal_x = window_origin.dst_x.saturating_add(
+        i16::try_from(final_viewport.0 / 2).map_err(|_| "viewport width exceeds X11 range")?,
+    );
+    let terminal_y = window_origin.dst_y.saturating_add(
+        i16::try_from(final_viewport.1 / 2).map_err(|_| "viewport height exceeds X11 range")?,
+    );
     connection
         .set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME)?
         .check()?;
@@ -246,10 +251,34 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         }
         thread::sleep(Duration::from_millis(20));
     }
-    type_text(&connection, "seq 1 120")?;
+    // The drag that follows needs scrollback to exist, so the lines have to
+    // have been printed — not merely typed — before it starts. The shell
+    // touches a file once `seq` has run; waiting for that is how long it
+    // actually took, which at a large viewport under a software renderer is
+    // not a number worth guessing at.
+    let scrollback_marker = mouse_probe_path.with_file_name(format!(
+        "{}.scrollback",
+        mouse_probe_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("non-UTF-8 mouse probe path")?
+    ));
+    type_text(
+        &connection,
+        &format!("seq 1 120; touch {}", scrollback_marker.display()),
+    )?;
     tap_keysym(&connection, 0xff0d)?;
     connection.flush()?;
-    thread::sleep(Duration::from_millis(350));
+    let scrollback_since = std::time::Instant::now();
+    while !scrollback_marker.exists() {
+        if scrollback_since.elapsed() > Duration::from_secs(10) {
+            return Err("the scrollback seeding command never finished".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    // The emulator has the bytes once the shell is back at its prompt, but
+    // the app reads them on its own clock; give it a frame or two.
+    thread::sleep(Duration::from_millis(150));
     // The content area carries 8px padding and each pane card a 1px border,
     // so the right pane's scrollbar hit area ends ~9px inside the window edge.
     let scrollbar_x = window_origin.dst_x.saturating_add(
@@ -446,6 +475,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     let _ = std::fs::remove_file(&config_path);
     let _ = std::fs::remove_file(&control_path);
     let _ = std::fs::remove_file(format!("{}.ready", mouse_probe_path.display()));
+    let _ = std::fs::remove_file(&scrollback_marker);
     let _ = std::fs::remove_file(&mouse_probe_path);
     let _ = std::fs::remove_dir_all(&home_path);
     if requested_screenshot.is_none() {
@@ -543,10 +573,19 @@ fn stress_resize_window(
     ];
     viewports.push(final_viewport);
     for (width, height) in viewports {
+        // Pinned to the screen's corner as well as sized. A toolkit that
+        // centres the window where it first maps leaves it there when it
+        // grows, and the private screen is only as large as the final
+        // viewport — so a window that grew in place would hang off the
+        // screen's right and bottom edges, where no pointer event can reach.
         connection
             .configure_window(
                 window,
-                &ConfigureWindowAux::new().width(width).height(height),
+                &ConfigureWindowAux::new()
+                    .x(0)
+                    .y(0)
+                    .width(width)
+                    .height(height),
             )?
             .check()?;
         connection.flush()?;

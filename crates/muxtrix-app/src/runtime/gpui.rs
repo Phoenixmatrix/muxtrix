@@ -308,7 +308,7 @@ impl Root {
         // very subprocesses this app exists to host. Everything else might
         // have changed something these fingerprints cannot see, so it
         // repaints unconditionally.
-        let quiet = matches!(message, Message::PollTerminal);
+        let quiet = matches!(message, Message::PollTerminal | Message::BlinkCursor);
         #[cfg(feature = "e2e")]
         let quiet = quiet || matches!(message, Message::E2eTick);
         let before = quiet.then(|| (self.app.grid_revision(), self.app.chrome_revision()));

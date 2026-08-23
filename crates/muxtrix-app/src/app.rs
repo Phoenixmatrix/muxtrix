@@ -2330,7 +2330,15 @@ impl Muxtrix {
                 return Vec::new();
             }
             Message::BlinkCursor => {
-                self.cursor_phase_visible = !self.cursor_phase_visible;
+                // Only where a cursor is actually drawn. Settings and the
+                // theme gallery replace the whole shell, so flipping the phase
+                // there changes nothing on screen while still telling the
+                // runtime the frame is stale — and a full repaint twice a
+                // second of a wide window full of live previews is enough, on
+                // a software renderer, to leave nothing else a turn to run.
+                if self.active_view == ActiveView::Workspace {
+                    self.cursor_phase_visible = !self.cursor_phase_visible;
+                }
                 // The notifier channel deliberately coalesces wakeups. A
                 // periodic drain is the safety net when a launch completion
                 // and its first resized frame arrive under one wake token.
