@@ -154,9 +154,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     // viewport starts with the window well inside it. Pointer input is in root
     // coordinates, so an origin read at map time would aim every click a few
     // hundred pixels left of where the window now is.
-    let window_origin = connection
-        .translate_coordinates(window, root, 0, 0)?
-        .reply()?;
+    let window_origin = pin_window(&connection, root, window)?;
     let terminal_x = window_origin.dst_x.saturating_add(
         i16::try_from(final_viewport.0 / 2).map_err(|_| "viewport width exceeds X11 range")?,
     );
@@ -227,6 +225,17 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     // its marker when it has heard a report or given up — rather than for a
     // fixed count, because how long the app takes to learn that reporting is
     // on is the renderer's business, and a slow one needs more nudges.
+    // The toolkit may have moved the window since it was pinned — a late
+    // configure of its own lands whenever the event loop gets to it — and a
+    // pointer event is in root coordinates. Put it back before aiming.
+    let moved = pin_window(&connection, root, window)?;
+    if (moved.dst_x, moved.dst_y) != (window_origin.dst_x, window_origin.dst_y) {
+        return Err(format!(
+            "the window moved to ({}, {}) after being pinned at ({}, {})",
+            moved.dst_x, moved.dst_y, window_origin.dst_x, window_origin.dst_y
+        )
+        .into());
+    }
     let mut step: i16 = 0;
     while ready_marker.exists() && step < 64 {
         step += 1;
@@ -560,6 +569,26 @@ print("mouse-report-ok" if data.startswith(b"\x1b[<35;") else "mouse-report-fail
     permissions.set_mode(0o700);
     std::fs::set_permissions(path, permissions)?;
     Ok(())
+}
+
+/// Put the window at the screen's corner and report where it actually is.
+///
+/// A toolkit that centres its window re-issues that placement on its own
+/// schedule, so pinning once is not enough: this is asked again before any
+/// phase that aims pointer events in root coordinates.
+fn pin_window(
+    connection: &RustConnection,
+    root: u32,
+    window: u32,
+) -> Result<x11rb::protocol::xproto::TranslateCoordinatesReply, Box<dyn std::error::Error>> {
+    connection
+        .configure_window(window, &ConfigureWindowAux::new().x(0).y(0))?
+        .check()?;
+    connection.flush()?;
+    thread::sleep(Duration::from_millis(120));
+    Ok(connection
+        .translate_coordinates(window, root, 0, 0)?
+        .reply()?)
 }
 
 fn stress_resize_window(
