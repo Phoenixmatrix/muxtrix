@@ -21,15 +21,18 @@ use muxtrix_control::{Agent, HookAction, HookScope};
 use crate::app::{
     FONT_FAMILY_MENU_MAX_HEIGHT, IconKind, InstalledVersionsState, Message,
     SETTINGS_NAV_LABEL_POINTS, SETTINGS_NAV_QUIET_PADDING_X, SETTINGS_NAV_RULE_GAP,
-    SETTINGS_PAGE_PADDING_X, SettingsButtonKind, installed_version_restart_copy,
-    settings_have_changes, settings_nav_is_crowded,
+    SETTINGS_PAGE_PADDING_X, SettingsButtonKind, WORKTREE_LANE_SPACING, WORKTREE_PAGE_MAX_WIDTH,
+    WORKTREE_ROW_PADDING_X, WorktreeLanes, WorktreeManagerEntry, WorktreeManagerState, ellipsize,
+    ellipsize_start, installed_version_restart_copy, settings_have_changes,
+    settings_nav_is_crowded, single_line_ellipsize, unused_worktree_paths, worktree_display_name,
+    worktree_mono_budget, worktree_ui_budget,
 };
 use crate::commands::CommandAction;
 use crate::runtime::gpui::{Root, color};
 use crate::settings::FleetScope;
 use crate::theme::DesignTokens;
 use crate::views::gpui::settings_widgets::Picker;
-use crate::views::gpui::{icon_button, terminal_family};
+use crate::views::gpui::terminal_family;
 
 impl Root {
     pub(crate) fn view_settings(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1217,118 +1220,245 @@ impl Root {
     }
 
     /// Every worktree this repository has, with what is holding each one.
+    ///
+    /// The iced page: a heading with Refresh and Remove unused, then either a
+    /// notice or the lane table — identity, branch, status, local commits,
+    /// action — stacked per row when the window is narrow, over a footer of
+    /// key hints.
     fn worktree_manager(&self, tokens: DesignTokens, cx: &mut Context<Self>) -> AnyElement {
         let app = self.app();
-        let mut rows = div().flex().flex_col().gap(px(2.)).p(px(20.));
-        let manager = app.worktree_manager.as_ref();
-        if let Some(failure) = manager.and_then(|manager| manager.failure.as_deref()) {
-            rows = rows.child(
-                div()
-                    .text_size(px(app.settings.ui_pixels(10.0)))
-                    .line_height((px(app.settings.ui_pixels(10.0))) * 1.3)
-                    .text_color(color(tokens.muted))
-                    .child(failure.to_owned()),
-            );
-        }
-        for (index, entry) in manager
-            .map(|manager| manager.entries.as_slice())
-            .unwrap_or_default()
-            .iter()
-            .enumerate()
-        {
-            // A worktree in use, or the primary one, cannot be removed; the
-            // row says which rather than offering an action that would fail.
-            let blocker = entry.deletion_blocker.clone().or_else(|| {
-                entry
-                    .used_by
-                    .clone()
-                    .map(|title| format!("in use by {title}"))
-            });
-            rows = rows.child(
+        let draft = &app.settings_draft;
+        let ui = |points: f32| px(draft.ui_pixels(points));
+        let compact = app.window_size.width < 900.0;
+        let lanes = WorktreeLanes::for_window(app.window_size.width, compact);
+        let Some(manager) = app.worktree_manager.as_ref() else {
+            return div()
+                .size_full()
+                .p(px(28.))
+                .child(self.settings_notice(
+                    "Worktrees are not loaded",
+                    "Choose Refresh to inspect the focused terminal's repository.",
+                    "Muxtrix only reads local Git metadata and never fetches from a remote.",
+                    tokens.muted,
+                    tokens,
+                ))
+                .into_any_element();
+        };
+        let unused_count = unused_worktree_paths(&manager.entries).len();
+        let repository = manager
+            .repo_root
+            .as_ref()
+            .map(|root| format!("{} · {}", worktree_display_name(root), root.display()));
+
+        let remove_label = if manager.busy {
+            "Removing…".to_owned()
+        } else {
+            format!("Remove unused ({unused_count})")
+        };
+        let remove_enabled = unused_count > 0 && !manager.busy && !manager.loading;
+        let heading = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .child(
                 div()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(12.))
-                    .h(px(44.))
-                    .px(px(12.))
-                    .rounded(px(6.))
-                    .bg(color(tokens.panel))
+                    .flex_col()
+                    .gap(px(4.))
+                    .flex_grow(1.0)
+                    .min_w(px(0.))
                     .child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .flex_grow(1.0)
-                            .min_w(px(0.))
-                            .child(
-                                div()
-                                    .text_size(px(app.settings.ui_pixels(10.0)))
-                                    .line_height((px(app.settings.ui_pixels(10.0))) * 1.3)
-                                    .text_color(color(tokens.text))
-                                    .truncate()
-                                    .child(entry.path.file_name().map_or_else(
-                                        || entry.path.display().to_string(),
-                                        |name| name.to_string_lossy().into_owned(),
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(app.settings.ui_pixels(8.0)))
-                                    .line_height((px(app.settings.ui_pixels(8.0))) * 1.3)
-                                    .text_color(color(tokens.faint))
-                                    .truncate()
-                                    .child(
-                                        entry.branch.clone().unwrap_or_else(|| "detached".into()),
-                                    ),
-                            ),
+                            .text_size(ui(22.0))
+                            .line_height(px(draft.ui_pixels(22.0) * 1.3))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("Worktrees"),
                     )
-                    .children((entry.unpushed_commits > 0).then(|| {
+                    .child(
                         div()
-                            .text_size(px(app.settings.ui_pixels(9.0)))
-                            .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
-                            .text_color(color(tokens.warning))
-                            .child(format!("{} unpushed", entry.unpushed_commits))
-                    }))
-                    .child(match blocker {
-                        Some(reason) => div()
-                            .text_size(px(app.settings.ui_pixels(9.0)))
-                            .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
-                            .text_color(color(tokens.faint))
-                            .child(reason)
-                            .into_any_element(),
-                        None => div()
-                            .id(("worktree-delete", index as u64))
-                            .h(px(24.))
-                            .px(px(10.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(5.))
-                            .cursor_pointer()
-                            .bg(color(tokens.panel_raised))
-                            .text_size(px(app.settings.ui_pixels(9.0)))
-                            .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
-                            .text_color(color(tokens.danger))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |root, _: &MouseDownEvent, window, cx| {
-                                    root.dispatch(
-                                        Message::WorktreeManagerDelete(index),
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                            )
-                            .child("Delete")
-                            .into_any_element(),
-                    }),
+                            .text_size(ui(10.0))
+                            .line_height(px(draft.ui_pixels(10.0) * 1.3))
+                            .text_color(color(tokens.muted))
+                            .child(repository.unwrap_or_else(|| {
+                                "Registered checkouts for the focused terminal's repository"
+                                    .to_owned()
+                            })),
+                    ),
+            )
+            .child(self.settings_action_button(
+                "worktrees-refresh",
+                "Refresh",
+                Message::RefreshWorktreeManager,
+                SettingsButtonKind::Secondary,
+                tokens,
+                cx,
+            ))
+            .child(self.settings_button_maybe(
+                "worktrees-remove-unused",
+                remove_label,
+                remove_enabled.then_some(Message::WorktreeManagerDeleteUnused),
+                SettingsButtonKind::Danger,
+                30.0,
+                tokens,
+                cx,
+            ));
+
+        let mut page = div()
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .w_full()
+            .max_w(px(WORKTREE_PAGE_MAX_WIDTH))
+            .child(heading);
+        if manager.loading {
+            page = page.child(self.settings_notice(
+                "Loading repository",
+                "Discovering registered worktrees and checking local-only commits in the background.",
+                "You can return to the terminal immediately; this screen will update when discovery finishes.",
+                tokens.accent,
+                tokens,
+            ));
+        } else if let Some(failure) = &manager.failure {
+            page = page.child(self.settings_notice(
+                "Worktrees unavailable",
+                failure,
+                "Focus a terminal inside a Git repository, then choose Refresh.",
+                tokens.warning,
+                tokens,
+            ));
+        } else {
+            if let Some(error) = &manager.error {
+                page = page.child(self.settings_notice(
+                    "Worktree action failed",
+                    error,
+                    "Nothing else was changed. Resolve the Git issue and choose Refresh to try again.",
+                    tokens.danger,
+                    tokens,
+                ));
+            }
+            if manager.entries.is_empty() {
+                page = page.child(self.settings_notice(
+                    "No registered worktrees",
+                    "This repository only has its current checkout, or Git returned an empty worktree list.",
+                    "Create a checkout from the command palette with New worktree pane or New worktree tab.",
+                    tokens.muted,
+                    tokens,
+                ));
+            } else {
+                let mut rows = div().flex().flex_col().w_full();
+                if !compact {
+                    rows = rows.child(self.worktree_table_header(lanes, tokens));
+                }
+                for (index, entry) in manager.entries.iter().enumerate() {
+                    if index > 0 || !compact {
+                        rows = rows.child(div().h(px(1.)).w_full().bg(color(tokens.line)));
+                    }
+                    rows = rows.child(
+                        self.worktree_row(index, entry, manager, compact, lanes, tokens, cx),
+                    );
+                }
+                page = page.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_size(ui(11.0))
+                                        .line_height(px(draft.ui_pixels(11.0) * 1.3))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child(format!(
+                                            "{} registered {}",
+                                            manager.entries.len(),
+                                            if manager.entries.len() == 1 {
+                                                "checkout"
+                                            } else {
+                                                "checkouts"
+                                            }
+                                        )),
+                                )
+                                .child(div().flex_grow(1.0))
+                                .child(
+                                    div()
+                                        .text_size(ui(8.5))
+                                        .line_height(px(draft.ui_pixels(8.5) * 1.3))
+                                        .text_color(color(tokens.faint))
+                                        .child("Local status only · no network fetch"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .rounded(px(6.))
+                                .bg(color(tokens.panel))
+                                .border_1()
+                                .border_color(color(tokens.line))
+                                .overflow_hidden()
+                                .child(rows),
+                        ),
+                );
+            }
+        }
+
+        // A key is only advertised while it can act.
+        let navigable =
+            !manager.loading && manager.failure.is_none() && !manager.entries.is_empty();
+        let mut hints =
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(if compact { 16. } else { 20. }));
+        if navigable {
+            hints = hints
+                .child(self.worktree_footer_hint("↑↓", "Select", tokens))
+                .child(self.worktree_footer_hint(
+                    "Del",
+                    if compact { "Remove" } else { "Remove checkout" },
+                    tokens,
+                ));
+        }
+        hints = hints.child(self.worktree_footer_hint(
+            "Esc",
+            if compact {
+                "Terminal"
+            } else {
+                "Back to terminal"
+            },
+            tokens,
+        ));
+        let mut footer = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(20.))
+            .h(px(44.))
+            .px(px(SETTINGS_PAGE_PADDING_X))
+            .bg(color(tokens.rail))
+            .border_t(px(1.))
+            .border_color(color(tokens.line))
+            .child(hints);
+        if !compact && navigable {
+            footer = footer.child(div().flex_grow(1.0)).child(
+                div()
+                    .text_size(ui(9.0))
+                    .line_height(px(draft.ui_pixels(9.0) * 1.3))
+                    .text_color(color(tokens.faint))
+                    .whitespace_nowrap()
+                    .child("Protected and in-use worktrees cannot be removed"),
             );
         }
+
         div()
             .flex()
             .flex_col()
             .size_full()
-            .bg(color(tokens.app))
-            .child(self.screen_bar("Worktrees", Message::CloseWorktreeManager, tokens, cx))
             .child(
                 div()
                     .id("worktrees-scroll")
@@ -1336,49 +1466,519 @@ impl Root {
                     .min_h(px(0.))
                     .overflow_y_scroll()
                     .track_scroll(&self.scrolls.settings)
-                    .child(rows),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_center()
+                            .w_full()
+                            .py(px(24.))
+                            .px(px(SETTINGS_PAGE_PADDING_X))
+                            .child(page),
+                    ),
+            )
+            .child(footer)
+            .into_any_element()
+    }
+
+    fn worktree_table_header(&self, lanes: WorktreeLanes, tokens: DesignTokens) -> AnyElement {
+        let draft = &self.app().settings_draft;
+        let label = |copy: &'static str, width: f32| {
+            div()
+                .w(px(width))
+                .flex_shrink_0()
+                .text_size(px(draft.ui_pixels(8.0)))
+                .line_height(px(draft.ui_pixels(8.0) * 1.3))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(color(tokens.faint))
+                .whitespace_nowrap()
+                .child(copy)
+        };
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(WORKTREE_LANE_SPACING))
+            .py(px(9.))
+            // The extra 3px on the left absorbs the selection-bar gutter every
+            // row reserves, so each label sits exactly over the copy it names.
+            .pl(px(WORKTREE_ROW_PADDING_X + 3.0))
+            .pr(px(WORKTREE_ROW_PADDING_X))
+            .child(label("WORKTREE", lanes.identity))
+            .child(label("BRANCH", lanes.branch))
+            .child(label("STATUS", lanes.status))
+            .child(label("LOCAL COMMITS", lanes.commits))
+            .child(label("ACTION", lanes.action))
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn worktree_row(
+        &self,
+        index: usize,
+        entry: &WorktreeManagerEntry,
+        manager: &WorktreeManagerState,
+        compact: bool,
+        lanes: WorktreeLanes,
+        tokens: DesignTokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let draft = &self.app().settings_draft;
+        let selected = manager.selected == index;
+        let name = worktree_display_name(&entry.path);
+        let branch = entry
+            .branch
+            .clone()
+            .unwrap_or_else(|| "Detached HEAD".to_owned());
+        let (status_label, status_hue) = if let Some(blocker) = &entry.deletion_blocker {
+            (blocker.clone(), tokens.faint)
+        } else if entry.used_by.is_some() {
+            ("In use".to_owned(), tokens.warning)
+        } else {
+            ("Available".to_owned(), tokens.muted)
+        };
+        let status_detail = entry.used_by.clone().unwrap_or_else(|| {
+            if entry.deletion_blocker.is_some() {
+                "Removal disabled"
+            } else {
+                "Not used by an open pane"
+            }
+            .to_owned()
+        });
+        let commit_color = if entry.unpushed_commits > 0 {
+            tokens.warning
+        } else {
+            tokens.faint
+        };
+        let commit_copy = if entry.unpushed_commits == 0 {
+            "None".to_owned()
+        } else {
+            format!(
+                "{} local-only {}",
+                entry.unpushed_commits,
+                if entry.unpushed_commits == 1 {
+                    "commit"
+                } else {
+                    "commits"
+                }
+            )
+        };
+        let blocked = entry.deletion_blocker.is_some() || entry.used_by.is_some();
+        let removing = manager.busy && selected;
+        let delete = self.settings_button_maybe(
+            "worktree-remove",
+            if removing { "Removing…" } else { "Remove" }.to_owned(),
+            (!blocked && !manager.busy).then_some(Message::WorktreeManagerDelete(index)),
+            SettingsButtonKind::Danger,
+            28.0,
+            tokens,
+            cx,
+        );
+        let location = entry.path.parent().map_or_else(
+            || entry.path.display().to_string(),
+            |parent| parent.display().to_string(),
+        );
+        let name_size = draft.ui_pixels(11.0);
+        let path_size = draft.ui_pixels(8.0);
+        let branch_size = draft.ui_pixels(9.0);
+        let detail_size = draft.ui_pixels(8.0);
+        let text = |size: f32, hue: iced::Color, copy: String| {
+            div()
+                .text_size(px(size))
+                .line_height(px(size * 1.3))
+                .text_color(color(hue))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(copy)
+        };
+        let mono = |size: f32, hue: iced::Color, copy: String| {
+            text(size, hue, copy).font_family(terminal_family(draft))
+        };
+        let identity = div()
+            .flex()
+            .flex_col()
+            .gap(px(3.))
+            .min_w(px(0.))
+            .child(
+                text(
+                    name_size,
+                    tokens.text,
+                    ellipsize(&name, worktree_ui_budget(lanes.identity, name_size)),
+                )
+                .font_weight(gpui::FontWeight::SEMIBOLD),
+            )
+            .child(mono(
+                path_size,
+                tokens.faint,
+                ellipsize_start(
+                    &location,
+                    worktree_mono_budget(lanes.identity, path_size, draft),
+                ),
+            ));
+        let mut tag_fill = color(status_hue);
+        tag_fill.a = 0.08;
+        let mut tag_edge = color(status_hue);
+        tag_edge.a = 0.28;
+        let status_tag = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
+            .py(px(3.))
+            .px(px(7.))
+            .rounded(px(4.))
+            .bg(tag_fill)
+            .border_1()
+            .border_color(tag_edge)
+            .child(div().size(px(5.)).rounded_full().bg(color(status_hue)))
+            .child(
+                div()
+                    .text_size(px(draft.ui_pixels(8.0)))
+                    .line_height(px(draft.ui_pixels(8.0) * 1.3))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(color(status_hue))
+                    .whitespace_nowrap()
+                    .child(status_label),
+            );
+        let status_column = div()
+            .flex()
+            .flex_col()
+            .items_start()
+            .gap(px(4.))
+            .min_w(px(0.))
+            .child(status_tag)
+            .child(text(
+                detail_size,
+                tokens.faint,
+                single_line_ellipsize(
+                    &status_detail,
+                    worktree_ui_budget(lanes.status, detail_size),
+                ),
+            ));
+        let commit_column = div()
+            .flex()
+            .flex_col()
+            .gap(px(3.))
+            .min_w(px(0.))
+            .child(text(branch_size, commit_color, commit_copy))
+            .child(text(
+                detail_size,
+                tokens.faint,
+                if entry.unpushed_commits > 0 {
+                    "Not on any remote ref"
+                } else {
+                    "Safe from local-only loss"
+                }
+                .to_owned(),
+            ));
+        let branch_text = |width: f32| {
+            mono(
+                branch_size,
+                tokens.text,
+                ellipsize(&branch, worktree_mono_budget(width, branch_size, draft)),
+            )
+        };
+        let content = if compact {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .w_full()
+                .child(identity)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(WorktreeLanes::STACKED_GAP))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.))
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(text(detail_size, tokens.faint, "Branch".to_owned()))
+                                .child(branch_text(lanes.branch)),
+                        )
+                        .child(status_column.flex_1()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(WorktreeLanes::STACKED_GAP))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.))
+                                .flex_grow(1.0)
+                                .min_w(px(0.))
+                                .child(text(detail_size, tokens.faint, "Local commits".to_owned()))
+                                .child(commit_column),
+                        )
+                        .child(delete),
+                )
+        } else {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(WORKTREE_LANE_SPACING))
+                .w_full()
+                .child(
+                    div()
+                        .w(px(lanes.identity))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .child(identity),
+                )
+                .child(
+                    div()
+                        .w(px(lanes.branch))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .child(branch_text(lanes.branch)),
+                )
+                .child(
+                    div()
+                        .w(px(lanes.status))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .child(status_column),
+                )
+                .child(
+                    div()
+                        .w(px(lanes.commits))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .child(commit_column),
+                )
+                .child(
+                    div()
+                        .w(px(lanes.action))
+                        .flex_shrink_0()
+                        .flex()
+                        .justify_end()
+                        .child(delete),
+                )
+        };
+        let mut selected_fill = color(tokens.accent);
+        selected_fill.a = 0.10;
+        div()
+            .flex()
+            .flex_row()
+            .items_stretch()
+            .w_full()
+            .when(selected, |row| row.bg(selected_fill))
+            .child(div().w(px(3.)).flex_shrink_0().bg(color(if selected {
+                tokens.accent
+            } else {
+                iced::Color::TRANSPARENT
+            })))
+            .child(
+                div()
+                    .flex_grow(1.0)
+                    .min_w(px(0.))
+                    .py(px(12.))
+                    .px(px(WORKTREE_ROW_PADDING_X))
+                    .child(content),
             )
             .into_any_element()
     }
 
-    /// A screen's top bar: a title and the way back.
-    fn screen_bar(
+    fn worktree_footer_hint(
         &self,
-        title: &str,
-        back: Message,
+        keys: &'static str,
+        label: &'static str,
         tokens: DesignTokens,
-        cx: &mut Context<Self>,
     ) -> AnyElement {
+        let draft = &self.app().settings_draft;
         div()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(10.))
-            .h(px(43.))
-            .px(px(10.))
-            .bg(color(tokens.rail))
-            .border_b(px(1.))
-            .border_color(color(tokens.line))
+            .gap(px(7.))
             .child(
-                icon_button(
-                    gpui::ElementId::from("screen-back"),
-                    IconKind::Back,
-                    tokens,
-                    false,
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |root, _: &MouseDownEvent, window, cx| {
-                        root.dispatch(back.clone(), window, cx);
-                    }),
-                ),
+                div()
+                    .py(px(1.))
+                    .px(px(5.))
+                    .rounded(px(4.))
+                    .bg(color(tokens.panel_raised))
+                    .border_1()
+                    .border_color(color(tokens.line_strong))
+                    .font_family(terminal_family(draft))
+                    .text_size(px(draft.ui_pixels(8.5)))
+                    .line_height(px(draft.ui_pixels(8.5) * 1.3))
+                    .text_color(color(tokens.text))
+                    .whitespace_nowrap()
+                    .child(keys),
             )
             .child(
                 div()
-                    .text_size(px(self.app().settings.ui_pixels(13.0)))
-                    .text_color(color(tokens.text))
-                    .child(title.to_owned()),
+                    .text_size(px(draft.ui_pixels(9.0)))
+                    .line_height(px(draft.ui_pixels(9.0) * 1.3))
+                    .text_color(color(tokens.muted))
+                    .whitespace_nowrap()
+                    .child(label),
             )
+            .into_any_element()
+    }
+
+    /// A titled notice with a coloured dot: the settings pages' way of saying
+    /// what happened and what to do about it.
+    fn settings_notice(
+        &self,
+        title: &str,
+        body: &str,
+        recovery: &str,
+        hue: iced::Color,
+        tokens: DesignTokens,
+    ) -> AnyElement {
+        let draft = &self.app().settings_draft;
+        let title_size = draft.ui_pixels(11.0);
+        div()
+            .flex()
+            .flex_row()
+            .items_start()
+            .gap(px(11.))
+            .w_full()
+            .py(px(12.))
+            .px(px(14.))
+            .rounded(px(7.))
+            .bg(color(tokens.panel))
+            .border_1()
+            .border_color(color(tokens.line))
+            .child(
+                div()
+                    .h(px(title_size * 1.3))
+                    .flex()
+                    .items_center()
+                    .child(div().size(px(7.)).rounded_full().bg(color(hue))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .flex_grow(1.0)
+                    .min_w(px(0.))
+                    .child(
+                        div()
+                            .text_size(px(title_size))
+                            .line_height(px(title_size * 1.3))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(color(tokens.text))
+                            .child(title.to_owned()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(draft.ui_pixels(9.5)))
+                            .line_height(px(draft.ui_pixels(9.5) * 1.3))
+                            .text_color(color(tokens.muted))
+                            .child(body.to_owned()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(draft.ui_pixels(8.5)))
+                            .line_height(px(draft.ui_pixels(8.5) * 1.3))
+                            .text_color(color(hue))
+                            .child(recovery.to_owned()),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// A settings button that may be disabled: drawn flat in the faint colour
+    /// then, so an un-pressable button never impersonates a live one.
+    #[allow(clippy::too_many_arguments)]
+    fn settings_button_maybe(
+        &self,
+        id: &'static str,
+        label: String,
+        message: Option<Message>,
+        kind: SettingsButtonKind,
+        height: f32,
+        tokens: DesignTokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let draft = &self.app().settings_draft;
+        let Some(message) = message else {
+            return div()
+                .h(px(height))
+                .px(px(11.))
+                .flex()
+                .items_center()
+                .rounded(px(5.))
+                .bg(color(tokens.panel))
+                .border_1()
+                .border_color(color(tokens.line))
+                .text_size(px(draft.ui_pixels(9.0)))
+                .line_height(px(draft.ui_pixels(9.0) * 1.3))
+                .text_color(color(tokens.faint))
+                .whitespace_nowrap()
+                .child(label)
+                .into_any_element();
+        };
+        let (fill, hover, text, edge, hover_edge) = match kind {
+            SettingsButtonKind::Primary => {
+                let mut hover = color(tokens.accent);
+                hover.a = 0.86;
+                (
+                    color(tokens.accent),
+                    hover,
+                    tokens.app,
+                    tokens.accent,
+                    tokens.accent,
+                )
+            }
+            SettingsButtonKind::Secondary => (
+                color(tokens.panel),
+                color(tokens.panel_raised),
+                tokens.text,
+                tokens.line_strong,
+                tokens.line_strong,
+            ),
+            SettingsButtonKind::Danger => {
+                let mut fill = color(tokens.danger);
+                fill.a = 0.05;
+                let mut hover = color(tokens.danger);
+                hover.a = 0.12;
+                let mut edge = tokens.danger;
+                edge.a = 0.45;
+                (fill, hover, tokens.danger, edge, tokens.danger)
+            }
+            SettingsButtonKind::Quiet => (
+                color(iced::Color::TRANSPARENT),
+                color(tokens.panel_raised),
+                tokens.muted,
+                iced::Color::TRANSPARENT,
+                tokens.line_strong,
+            ),
+        };
+        div()
+            .id(id)
+            .h(px(height))
+            .px(px(if height < 30.0 { 12. } else { 11. }))
+            .flex()
+            .items_center()
+            .rounded(px(5.))
+            .cursor_pointer()
+            .bg(fill)
+            .border_1()
+            .border_color(color(edge))
+            .text_size(px(draft.ui_pixels(9.0)))
+            .line_height(px(draft.ui_pixels(9.0) * 1.3))
+            .text_color(color(text))
+            .whitespace_nowrap()
+            .hover(move |style| style.bg(hover).border_color(color(hover_edge)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                    root.dispatch(message.clone(), window, cx);
+                }),
+            )
+            .child(label)
             .into_any_element()
     }
 }
