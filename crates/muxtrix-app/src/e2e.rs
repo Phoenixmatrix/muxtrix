@@ -318,9 +318,20 @@ impl Scenario {
             self.pointer_trace = format!(
                 "pointer motions={moves}, while reporting={reporting_moves}, \
                  reporting ever seen={reporting_seen}, hovered={:?}, polls={polls}, \
-                 ticks={ticks}, window moves={window_moves}, elapsed={:?}, initial pane: {initial:?}",
+                 ticks={ticks}, window moves={window_moves}, elapsed={:?}, view={:?}, \
+                 palette={}, menu={}, prompts={}{}{}{}{}{}, maximized={:?}, initial pane: {initial:?}",
                 app.hovered_terminal,
-                self.started.elapsed()
+                self.started.elapsed(),
+                app.active_view,
+                app.palette.visible,
+                app.pane_menu.is_some(),
+                u8::from(app.workspace_create_visible),
+                u8::from(app.rename_prompt.is_some()),
+                u8::from(app.worktree_prompt.is_some()),
+                u8::from(app.session_picker.is_some()),
+                u8::from(app.close_workspace_prompt.is_some()),
+                u8::from(app.default_agent_prompt),
+                app.maximized_pane,
             );
         }
     }
