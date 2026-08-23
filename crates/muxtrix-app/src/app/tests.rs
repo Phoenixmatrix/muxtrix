@@ -7632,6 +7632,23 @@ fn redesigned_workspace_chrome_is_stateful_without_affecting_terminals() {
 }
 
 #[test]
+fn modal_workspace_surfaces_own_pointer_motion_above_terminals() {
+    let mut app = Muxtrix::new();
+    assert!(!app.terminal_pointer_obscured());
+
+    app.palette.visible = true;
+    assert!(app.terminal_pointer_obscured());
+    app.palette.visible = false;
+
+    app.workspace_create_visible = true;
+    assert!(app.terminal_pointer_obscured());
+    app.workspace_create_visible = false;
+
+    app.pane_menu = Some(active_pane_id(&app));
+    assert!(app.terminal_pointer_obscured());
+}
+
+#[test]
 fn pane_menu_dismisses_without_reaching_the_terminal() {
     let mut app = Muxtrix::new();
     let pane_id = active_pane_id(&app);
