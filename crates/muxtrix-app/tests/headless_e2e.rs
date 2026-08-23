@@ -266,6 +266,18 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         thread::sleep(Duration::from_millis(120));
     }
     eprintln!("delivered pointer motion to a mouse-reporting terminal program ({step} nudges)");
+    let result_marker = std::path::PathBuf::from(format!("{}.result", mouse_probe_path.display()));
+    let result_deadline = Instant::now() + Duration::from_secs(10);
+    while !result_marker.exists() && Instant::now() < result_deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!(
+        "mouse probe result: {}",
+        std::fs::read_to_string(&result_marker)
+            .unwrap_or_else(|_| "none written".into())
+            .trim()
+    );
+    let _ = std::fs::remove_file(&result_marker);
     connection.flush()?;
     // The probe reads whatever reaches the pty first and judges that. Pointer
     // and keyboard arrive over separate X streams with no ordering promised
@@ -555,9 +567,13 @@ import sys
 import termios
 import tty
 
+import time
+
 fd = sys.stdin.fileno()
 original = termios.tcgetattr(fd)
 data = b""
+started = time.monotonic()
+waited = None
 try:
     tty.setraw(fd)
     sys.stdout.write("\x1b[?1003h\x1b[?1006h")
@@ -565,6 +581,11 @@ try:
     open(sys.argv[0] + ".ready", "w").close()
     if select.select([fd], [], [], 8)[0]:
         data = os.read(fd, 64)
+    waited = time.monotonic() - started
+    # What the probe saw, for the harness log: the app's own report cannot
+    # say what reached the pty.
+    with open(sys.argv[0] + ".result", "w") as result:
+        result.write("waited=%r data=%r\n" % (waited, data))
 finally:
     sys.stdout.write("\x1b[?1003l\x1b[?1006l\r\n")
     sys.stdout.flush()
