@@ -735,3 +735,15 @@ jobs:
           done
           echo "::error::Public apt source did not serve muxtrix ${VERSION}-1"
           exit 1
+
+  verify_release_channels:
+    name: Verify published channel installations
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - publish_tag
+      - publish_scoop
+      - publish_homebrew
+      - publish_apt
+    uses: ./.github/workflows/verify-release-channels.yml
+    with:
+      version: ${{ needs.publish_tag.outputs.version }}
