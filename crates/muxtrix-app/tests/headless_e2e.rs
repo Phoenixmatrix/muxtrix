@@ -103,6 +103,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         std::env::temp_dir().join(format!("muxtrix-e2e-home-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&home_path)?;
     let requested_screenshot = std::env::var_os("MUXTRIX_E2E_SCREENSHOT_RGBA");
+    let capture = std::env::var("MUXTRIX_E2E_CAPTURE").unwrap_or_default();
     let screenshot_path = requested_screenshot.clone().map_or_else(
         || {
             std::env::temp_dir().join(format!(
@@ -474,6 +475,20 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
                 .into());
             }
             thread::sleep(Duration::from_millis(50));
+        }
+        if capture == "github-pull-request-search" {
+            let origin = pin_window(&connection, root, window)?;
+            let search_x = origin
+                .dst_x
+                .saturating_add(i16::try_from(final_viewport.0.saturating_sub(186))?);
+            let search_y = origin.dst_y.saturating_add(135);
+            click_at(&connection, root, search_x, search_y)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(750));
+            type_text(&connection, "mouse")?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("clicked and typed in the pull request filter");
         }
         let frame = grab_window(&connection, window)?;
         std::fs::write(&screenshot_path, &frame.rgba)?;

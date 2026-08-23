@@ -654,6 +654,12 @@ impl Root {
             .child(
                 div()
                     .h(px(30.))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|root, _: &MouseDownEvent, window, cx| {
+                            root.dispatch(Message::FocusGitHubPullRequestQuery, window, cx);
+                        }),
+                    )
                     .child(gpui_component::input::Input::new(&self.inputs.github_query)),
             );
         let summary_label = if pull_requests

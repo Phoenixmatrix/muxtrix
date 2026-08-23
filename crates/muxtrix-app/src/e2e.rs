@@ -1087,10 +1087,11 @@ impl Scenario {
             {
                 panel.active_tab = GitHubPanelTab::PullRequests;
                 if self.capturing("github-pull-request-search") {
-                    panel.pull_request_query = "mouse".into();
-                    // Reproduce filtering from a deep virtualized scroll. The
-                    // final matching row must remain visible, never a blank
-                    // viewport while the widget catches up to the new offset.
+                    // The harness clicks this real field and types "mouse"
+                    // before capture. Starting empty makes that frame prove
+                    // the input accepted keyboard events rather than merely
+                    // rendering a pre-seeded model value.
+                    panel.pull_request_query.clear();
                     panel.pull_request_scroll_offset = 9_999.0;
                 }
                 if self.capturing("github-merged-pr")

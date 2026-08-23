@@ -1533,6 +1533,47 @@ fn open_github_panel_does_not_steal_terminal_navigation_or_enter() {
 }
 
 #[test]
+fn focused_github_pull_request_query_keeps_owning_keyboard_input() {
+    let mut app = Muxtrix::new();
+    let mut panel = GitHubPanelState::loading(github::Repository {
+        root: std::env::temp_dir(),
+        name: "muxtrix".into(),
+        owner_and_name: Some("example/muxtrix".into()),
+        host: "github.com".into(),
+        branch: "main".into(),
+        head_oid: String::new(),
+        wsl_distribution: String::new(),
+    });
+    panel.active_tab = GitHubPanelTab::PullRequests;
+    panel.pull_requests_loading = false;
+    panel.pull_requests = Some(Vec::new());
+    app.github_panel = Some(panel);
+
+    assert_eq!(app.focus_target(), None);
+
+    let effects = app.update(Message::FocusGitHubPullRequestQuery);
+
+    assert_eq!(
+        app.focus_target(),
+        Some(FocusTarget::GitHubPullRequestQuery)
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Focus(FocusTarget::GitHubPullRequestQuery)]
+    ));
+
+    let _ = app.handle_keyboard(KeyEvent::Pressed(KeyInput {
+        key: Key::Character("x".into()),
+        modified_key: Key::Character("x".into()),
+        modifiers: Modifiers::empty(),
+        text: Some("x".into()),
+        repeat: false,
+    }));
+    assert!(app.terminal_command_buffers.is_empty());
+    assert!(app.pending_terminal_input.is_empty());
+}
+
+#[test]
 fn github_panel_tab_model_reaches_tabs_search_list_and_back() {
     let mut panel = GitHubPanelState::loading(github::Repository {
         root: std::env::temp_dir(),

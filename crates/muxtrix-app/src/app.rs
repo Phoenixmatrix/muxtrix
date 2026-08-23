@@ -1340,6 +1340,7 @@ pub(crate) enum Message {
         u64,
         Box<Result<Vec<github::PullRequestSummary>, String>>,
     ),
+    FocusGitHubPullRequestQuery,
     GitHubPullRequestQueryChanged(String),
     GitHubPullRequestScrolled(f32),
     SelectGitHubPullRequest(u64),
@@ -2091,6 +2092,13 @@ impl Muxtrix {
         }
         if self.worktree_prompt.is_some() {
             return Some(FocusTarget::Worktree);
+        }
+        if self
+            .github_panel
+            .as_ref()
+            .is_some_and(|panel| panel.keyboard_focus == Some(GitHubPanelKeyboardFocus::Search))
+        {
+            return Some(FocusTarget::GitHubPullRequestQuery);
         }
         None
     }
@@ -3044,6 +3052,19 @@ impl Muxtrix {
                 return scroll_offset.map_or_else(Vec::new, |offset| {
                     github_scroll_to(ScrollTarget::GitHubPullRequests, offset)
                 });
+            }
+            Message::FocusGitHubPullRequestQuery => {
+                let Some(panel) = self.github_panel.as_mut().filter(|panel| {
+                    panel.active_tab == GitHubPanelTab::PullRequests
+                        && panel.selected_pull_request_number.is_none()
+                        && !panel.pull_requests_loading
+                        && panel.pull_requests_error.is_none()
+                        && panel.pull_requests.is_some()
+                }) else {
+                    return Vec::new();
+                };
+                panel.keyboard_focus = Some(GitHubPanelKeyboardFocus::Search);
+                return vec![Effect::Focus(FocusTarget::GitHubPullRequestQuery)];
             }
             Message::GitHubPullRequestQueryChanged(query) => {
                 if let Some(panel) = self.github_panel.as_mut() {
@@ -5498,6 +5519,13 @@ impl Muxtrix {
                 }
                 return Vec::new();
             }
+        }
+
+        // GPUI's native field handles the same key before it bubbles to the
+        // root. Once a field owns focus, the root bridge must not duplicate
+        // that key into the terminal.
+        if self.focus_target().is_some() {
+            return Vec::new();
         }
 
         let Some(bytes) = encode_terminal_key(modified_key.as_ref(), modifiers, text.as_deref())
