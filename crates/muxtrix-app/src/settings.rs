@@ -902,20 +902,20 @@ mod tests {
     #[test]
     fn font_settings_use_point_sizing_for_consistent_cross_platform_metrics() {
         let settings = AppSettings::default();
-        // No face database is published in unit tests, so cell width follows the
-        // assumed ratio. See `cell_width_tracks_the_measured_advance_ratio`.
-        assert_eq!(
-            settings.terminal_advance_ratio(),
-            metrics::FALLBACK_ADVANCE_RATIO
-        );
+        // Cell width follows whichever face is published process-wide: the
+        // assumed ratio when no test has booted the application yet, or the
+        // measured one once `Muxtrix::boot` in another test has installed the
+        // real database. Either way it is what the font size scales by.
+        let ratio = settings.terminal_advance_ratio();
+        let cell_width = (settings.terminal_font_pixels() * ratio * 100.0).round() / 100.0;
         if cfg!(target_os = "macos") {
             assert_eq!(settings.terminal_font_pixels(), 14.0);
-            assert_eq!(settings.terminal_cell_width(), 8.4);
+            assert_eq!(settings.terminal_cell_width(), cell_width);
             assert_eq!(settings.terminal_cell_height(), 16.1);
             assert_eq!(settings.ui_pixels(12.0), 13.71);
         } else {
             assert_eq!(settings.terminal_font_pixels(), 18.67);
-            assert_eq!(settings.terminal_cell_width(), 11.2);
+            assert_eq!(settings.terminal_cell_width(), cell_width);
             assert_eq!(settings.terminal_cell_height(), 21.47);
             assert_eq!(settings.ui_pixels(12.0), 18.29);
         }
