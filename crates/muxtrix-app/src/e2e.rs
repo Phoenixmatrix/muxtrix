@@ -296,7 +296,12 @@ impl Scenario {
 
     fn tick(&mut self, app: &mut Muxtrix) -> Result<TickAction, String> {
         self.observe(app);
-        if self.started.elapsed() > Duration::from_secs(20) {
+        // Generous on purpose: the harness drives real input through a real X
+        // server at whatever pace a software renderer allows, and a two-core
+        // CI runner spends most of this budget before the scenario's own
+        // stages begin. The deadline exists to turn a hang into a report, not
+        // to hold the run to a pace.
+        if self.started.elapsed() > Duration::from_secs(60) {
             let terminal = self.third_pane.and_then(|pane_id| {
                 app.terminals.get(&pane_id).map(|runtime| {
                     format!(

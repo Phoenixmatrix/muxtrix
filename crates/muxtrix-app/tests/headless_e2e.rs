@@ -412,7 +412,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     // scenario has settled, and waits to be told to quit so the frame is
     // still on screen when it is taken.
     let captured = {
-        let ready = Instant::now() + Duration::from_secs(20);
+        let ready = Instant::now() + Duration::from_secs(60);
         loop {
             // The app closes its socket when it gives up, so a lost
             // connection means it has already written why.
@@ -446,7 +446,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         frame
     };
 
-    let deadline = Instant::now() + Duration::from_secs(25);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if app.child_mut().try_wait()?.is_some() {
             break;
