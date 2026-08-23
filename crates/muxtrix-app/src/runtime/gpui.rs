@@ -645,7 +645,12 @@ impl Render for Root {
             )))
             .child(match screen {
                 Some(screen) => div().flex_grow(1.0).overflow_hidden().child(screen),
+                // The panel docks beside the workspace when there is room
+                // and floats over its right edge when there is not; the
+                // panel positions itself for the second case, so the row
+                // only has to be relative for it to float against.
                 None => div()
+                    .relative()
                     .flex()
                     .flex_row()
                     .flex_grow(1.0)
