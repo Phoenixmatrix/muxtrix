@@ -1008,6 +1008,7 @@ impl Scenario {
                 )
                 .map_err(|error| error.to_string())?;
         } else if self.capturing("settings")
+            || self.capturing("settings-dropdown-open")
             || self.capturing("settings-scrollback")
             || self.capturing("settings-github-typing")
         {

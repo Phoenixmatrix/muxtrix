@@ -94,8 +94,8 @@ only when the user collapses it — never automatically on resize. Terminal
 panes are radius-10 cards on an 8 px gutter grid: the
 focused card carries a translucent accent border and drop shadow, a card whose
 pane needs a person carries a full amber border and glow (the whole card,
-never just an edge), and every other card a hairline. Split handles are the
-8 px gaps themselves, showing an accent rule only while dragging. Dense pane headers suppress secondary state copy when the window is
+never just an edge), and every other card a hairline. Split handles are
+16 px structural pointer targets with centered hairlines, showing an accent rule only while dragging. Dense pane headers suppress secondary state copy when the window is
 below 1080 px or more than two panes are visible, while the fleet retains the
 full state. Text that belongs on one line clips instead of reflowing controls.
 
