@@ -66,14 +66,16 @@ This document tracks the work required for the GPUI build to replace the Iced bu
   - Remove notices that no longer apply.
   - Verify the result against the resolved dependency graph for every shipped target.
 
-- [ ] **Promote the GPUI build to `main`.** The GPUI build is now the preferred implementation and should replace the Iced build on the default branch.
+- [x] **Promote the GPUI build to `main`.** The GPUI build is now the preferred implementation and should replace the Iced build on the default branch.
   - Create and push an immutable tag on the final Iced commit before changing `main`.
   - Record the tag name and commit in the release or migration notes.
   - Merge the complete GPUI build and its required CI/release configuration into `main`.
   - Verify branch protection, release, packaging, and installation paths against the new default.
   - Confirm the tagged Iced build remains retrievable and buildable from its documented instructions.
+  - Final Iced tag [`v0.1.62`](https://github.com/Phoenixmatrix/muxtrix/releases/tag/v0.1.62) is annotated at `f7f1a059ca2450fe7766ef8ed0bd92103ffc43d0`; its all-platform build [completed successfully](https://github.com/Phoenixmatrix/muxtrix/actions/runs/32616972626).
+  - GPUI merged through [PR #73](https://github.com/Phoenixmatrix/muxtrix/pull/73), with the release-blocking pointer follow-up in [PR #75](https://github.com/Phoenixmatrix/muxtrix/pull/75). Final release commit `5cba95854b79eb271529e76f66511a542965f177` passed the [main build and continuous publication](https://github.com/Phoenixmatrix/muxtrix/actions/runs/32648119130).
 
-- [ ] **Publish a tagged GPUI release through all three release channels.** Once
+- [x] **Publish a tagged GPUI release through all three release channels.** Once
   the GPUI build is fully merged into `main`, cut a tagged release and confirm
   that the new build is published everywhere.
   - Create the annotated version tag from the final release commit on `main`
@@ -82,3 +84,6 @@ This document tracks the work required for the GPUI build to replace the Iced bu
     GPUI build artifacts and checksums.
   - Confirm Scoop, Homebrew, and the apt repository all publish and install the
     same tagged GPUI version.
+  - Annotated tag [`v0.1.63`](https://github.com/Phoenixmatrix/muxtrix/releases/tag/v0.1.63) points to `5cba95854b79eb271529e76f66511a542965f177`; the [tagged workflow](https://github.com/Phoenixmatrix/muxtrix/actions/runs/32649115148) completed every build, validation, and publication job.
+  - The GitHub release contains Linux x64, Windows x64, and macOS arm64 archives, the Debian package, and `SHA256SUMS`.
+  - The public [Scoop manifest](https://github.com/Phoenixmatrix/scoop-muxtrix/blob/main/bucket/muxtrix.json), [Homebrew formula](https://github.com/Phoenixmatrix/homebrew-muxtrix/blob/main/Formula/muxtrix.rb), and [apt metadata](https://raw.githubusercontent.com/Phoenixmatrix/muxtrix/apt-repo/Packages) all resolve to `0.1.63`; the workflow also installed and tested the published Homebrew formula.
