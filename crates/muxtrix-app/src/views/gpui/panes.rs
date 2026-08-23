@@ -621,13 +621,25 @@ impl Root {
             .flex()
             .flex_col()
             .gap(px(2.))
-            .w(px(232.))
-            .p(px(4.))
-            .rounded(px(8.))
+            .w(px(236.))
+            .p(px(5.))
+            .rounded(px(10.))
             .bg(color(tokens.overlay))
             .border_1()
-            .border_color(color(tokens.line))
-            .shadow_lg();
+            .border_color(color(tokens.line_strong))
+            .shadow(vec![gpui::BoxShadow {
+                color: gpui::Rgba {
+                    r: 0.,
+                    g: 0.,
+                    b: 0.,
+                    a: 0.5,
+                }
+                .into(),
+                offset: gpui::point(px(0.), px(16.)),
+                blur_radius: px(40.),
+                spread_radius: px(0.),
+                inset: false,
+            }]);
         for (index, entry) in entries.into_iter().enumerate() {
             menu = menu.child(entry.render(index, pane_id, tokens, self.app(), cx));
         }
@@ -674,7 +686,7 @@ impl MenuEntry {
         match self {
             Self::Divider => div()
                 .h(px(1.))
-                .mx(px(6.))
+                .mx(px(4.))
                 .my(px(3.))
                 .bg(color(tokens.line))
                 .into_any_element(),
@@ -692,23 +704,35 @@ impl MenuEntry {
                 } else {
                     tokens.text
                 };
-                let mut hover = color(tokens.line_strong);
-                hover.a = 0.14;
+                // Menu rows sit on the raised panel, so the hover fill comes
+                // from a text-derived tint rather than the line token, which
+                // would vanish into the fill.
+                let mut hover = color(if danger { tokens.danger } else { tokens.text });
+                hover.a = if danger { 0.14 } else { 0.08 };
                 let mut row = div()
                     .id(("pane-menu", pane_key(pane_id).wrapping_add(index as u64)))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .justify_between()
-                    .h(px(26.))
-                    .px(px(8.))
+                    .gap(px(12.))
+                    .h(px(30.))
+                    .px(px(9.))
                     .rounded(px(4.))
-                    .text_size(px(app.settings.ui_pixels(11.0)))
-                    .text_color(color(foreground))
-                    .child(label)
                     .child(
                         div()
+                            .flex_grow(1.0)
+                            .min_w(px(0.))
+                            .text_size(px(app.settings.ui_pixels(9.0)))
+                            .text_color(color(foreground))
+                            .whitespace_nowrap()
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .font_family(terminal_family(&app.settings))
+                            .text_size(px(app.settings.ui_pixels(7.5)))
                             .text_color(color(tokens.faint))
+                            .whitespace_nowrap()
                             .child(shortcut.to_owned()),
                     );
                 if let Some(message) = message {
