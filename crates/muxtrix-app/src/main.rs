@@ -110,3 +110,4 @@ fn run_session_daemon(arguments: &[String]) {
         std::process::exit(1);
     }
 }
+

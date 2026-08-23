@@ -57,17 +57,27 @@ impl graphics::DecodePng for PngDecoder {
         match info.color_type {
             png::ColorType::Rgba => rgba.copy_from_slice(source),
             png::ColorType::Rgb => {
-                for (source, target) in source.chunks_exact(3).zip(rgba.chunks_exact_mut(4)) {
+                for (source, target) in source
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .zip(rgba.as_chunks_mut::<4>().0.iter_mut())
+                {
                     target.copy_from_slice(&[source[0], source[1], source[2], u8::MAX]);
                 }
             }
             png::ColorType::GrayscaleAlpha => {
-                for (source, target) in source.chunks_exact(2).zip(rgba.chunks_exact_mut(4)) {
+                for (source, target) in source
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(rgba.as_chunks_mut::<4>().0.iter_mut())
+                {
                     target.copy_from_slice(&[source[0], source[0], source[0], source[1]]);
                 }
             }
             png::ColorType::Grayscale => {
-                for (source, target) in source.iter().zip(rgba.chunks_exact_mut(4)) {
+                for (source, target) in source.iter().zip(rgba.as_chunks_mut::<4>().0.iter_mut()) {
                     target.copy_from_slice(&[*source, *source, *source, u8::MAX]);
                 }
             }
@@ -325,18 +335,6 @@ struct TerminalCore {
     /// everything that shifts rows underneath it — scrollback, a pager
     /// scrolling the alternate screen, reflow on resize.
     selection_anchor: Option<TrackedGridRef>,
-    /// A selection on an application-owned viewport. Grid references follow
-    /// terminal scrolls, but a repaint has no scroll operation to follow, so
-    /// keep the selected text and re-anchor it to the nearest matching content
-    /// in each complete frame, regardless of what caused the repaint.
-    selection_follow: Option<SelectionFollow>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SelectionFollow {
-    text: String,
-    last_row: u64,
-    off_screen: bool,
 }
 
 impl TerminalCore {
@@ -386,14 +384,12 @@ impl TerminalCore {
             last_snapshot: None,
             sync_output_started_at: None,
             selection_anchor: None,
-            selection_follow: None,
         })
     }
 
     /// Begins a selection at a viewport cell, anchoring it to a tracked
     /// reference. Nothing is selected until the drag extends it.
     fn selection_start(&mut self, column: u16, row: u16) -> Result<(), TerminalActorError> {
-        self.selection_follow = None;
         self.selection_anchor = Some(
             self.terminal
                 .track_grid_ref(viewport_point(column, row))
@@ -406,7 +402,6 @@ impl TerminalCore {
     /// Extends the active selection to a viewport cell and installs it. The
     /// emulator takes ownership and tracks both endpoints from here on.
     fn selection_extend(&mut self, column: u16, row: u16) -> Result<(), TerminalActorError> {
-        self.selection_follow = None;
         let Some(anchor) = self.selection_anchor.as_ref() else {
             return Ok(());
         };
@@ -427,7 +422,6 @@ impl TerminalCore {
 
     fn selection_clear(&mut self) -> Result<(), TerminalActorError> {
         self.selection_anchor = None;
-        self.selection_follow = None;
         self.terminal.set_selection(None).map_err(ghostty_error)?;
         Ok(())
     }
@@ -435,9 +429,6 @@ impl TerminalCore {
     /// The selected text, formatted the way Ghostty formats a copy: plain,
     /// unwrapped, and trimmed.
     fn selection_text(&self) -> Result<Option<String>, TerminalActorError> {
-        if let Some(follow) = &self.selection_follow {
-            return Ok(Some(follow.text.clone()));
-        }
         self.active_selection_text()
     }
 
@@ -451,30 +442,6 @@ impl TerminalCore {
             .format_selection_alloc(None, options)
             .map_err(ghostty_error)?;
         Ok(bytes.map(|bytes| String::from_utf8_lossy(bytes.as_ref()).into_owned()))
-    }
-
-    /// Preserve selected content on an application-owned viewport. Future
-    /// frames can then move the selection to wherever that content was
-    /// repainted. Repeated redraws retain an off-screen target.
-    fn begin_selection_follow(&mut self) -> Result<(), TerminalActorError> {
-        if self.selection_follow.is_some() {
-            return Ok(());
-        }
-        let Some(text) = self
-            .active_selection_text()?
-            .filter(|text| !text.is_empty())
-        else {
-            return Ok(());
-        };
-        let Some(last_row) = self.last_snapshot.as_ref().and_then(first_selected_row) else {
-            return Ok(());
-        };
-        self.selection_follow = Some(SelectionFollow {
-            text,
-            last_row,
-            off_screen: false,
-        });
-        Ok(())
     }
 
     fn feed(&mut self, bytes: &[u8]) {
@@ -862,7 +829,7 @@ impl TerminalCore {
         )?;
         let scrollbar = self.terminal.scrollbar().map_err(ghostty_error)?;
 
-        let mut result = GridSnapshot {
+        let result = GridSnapshot {
             rows,
             cells: cell_rows,
             images,
@@ -886,62 +853,8 @@ impl TerminalCore {
             mouse_reporting,
             selection,
         };
-        self.reconcile_selection_follow(&mut result)?;
         self.last_snapshot = Some(result.clone());
-        // Repaint following is a property of the terminal state, not of the
-        // input event that might cause the next redraw. Applications also move
-        // content while producing output, without receiving a wheel gesture.
-        if result.application_scroll {
-            self.begin_selection_follow()?;
-        }
         Ok(result)
-    }
-
-    fn reconcile_selection_follow(
-        &mut self,
-        snapshot: &mut GridSnapshot,
-    ) -> Result<(), TerminalActorError> {
-        let Some(mut follow) = self.selection_follow.take() else {
-            return Ok(());
-        };
-        if !snapshot.application_scroll {
-            return Ok(());
-        }
-
-        let current_text = self.active_selection_text()?;
-        if !follow.off_screen && current_text.as_deref() == Some(follow.text.as_str()) {
-            if let Some(row) = first_selected_row(snapshot) {
-                follow.last_row = row;
-            }
-            self.selection_follow = Some(follow);
-            return Ok(());
-        }
-
-        if let Some(found) = locate_selection_text(&follow.text, follow.last_row, snapshot) {
-            let start = self
-                .terminal
-                .grid_ref(viewport_point(found.start_column, found.start_row))
-                .map_err(ghostty_error)?;
-            let end = self
-                .terminal
-                .grid_ref(viewport_point(found.end_column, found.end_row))
-                .map_err(ghostty_error)?;
-            self.terminal
-                .set_selection(Some(&Selection::new(start, end, false)))
-                .map_err(ghostty_error)?;
-            paint_selection(snapshot, found);
-            follow.last_row = snapshot
-                .scrollbar
-                .offset
-                .saturating_add(u64::from(found.start_row));
-            follow.off_screen = false;
-        } else {
-            self.terminal.set_selection(None).map_err(ghostty_error)?;
-            snapshot.selection.fill(None);
-            follow.off_screen = true;
-        }
-        self.selection_follow = Some(follow);
-        Ok(())
     }
 
     fn take_pty_responses(&mut self) -> Vec<Vec<u8>> {
@@ -1055,12 +968,12 @@ fn image_rgba(width: u32, height: u32, format: ImageFormat, data: &[u8]) -> Opti
     let mut rgba = Vec::with_capacity(pixels.checked_mul(4)?);
     match format {
         ImageFormat::Rgb => {
-            for pixel in data.chunks_exact(3) {
+            for pixel in data.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], u8::MAX]);
             }
         }
         ImageFormat::GrayAlpha => {
-            for pixel in data.chunks_exact(2) {
+            for pixel in data.as_chunks::<2>().0 {
                 rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
             }
         }
@@ -1081,139 +994,6 @@ fn viewport_point(column: u16, row: u16) -> Point {
         x: column,
         y: u32::from(row),
     })
-}
-
-fn first_selected_row(snapshot: &GridSnapshot) -> Option<u64> {
-    snapshot
-        .selection
-        .iter()
-        .position(Option::is_some)
-        .map(|row| snapshot.scrollbar.offset.saturating_add(row as u64))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SelectionMatch {
-    start_column: u16,
-    start_row: u16,
-    end_column: u16,
-    end_row: u16,
-}
-
-/// Find selected text after a full-screen application repaints its viewport.
-/// Ties go to the nearest row so repeated content does not make a one-line
-/// scroll jump to an unrelated copy elsewhere on screen.
-fn locate_selection_text(
-    wanted: &str,
-    previous_row: u64,
-    snapshot: &GridSnapshot,
-) -> Option<SelectionMatch> {
-    if wanted.is_empty() {
-        return None;
-    }
-    let lines: Vec<&str> = wanted.split('\n').collect();
-    let mut best: Option<(u64, SelectionMatch)> = None;
-
-    for (row_index, row) in snapshot.rows.iter().enumerate() {
-        let candidates: Vec<usize> = if lines.len() == 1 {
-            row.match_indices(lines[0]).map(|(byte, _)| byte).collect()
-        } else if row.ends_with(lines[0]) {
-            vec![row.len().saturating_sub(lines[0].len())]
-        } else {
-            Vec::new()
-        };
-        for start_byte in candidates {
-            let Some((end_row, end_byte)) =
-                selection_match_tail(snapshot, row_index, &lines, start_byte)
-            else {
-                continue;
-            };
-            let start_column = terminal_column_at_byte(snapshot, row_index, start_byte)?;
-            let end_column =
-                terminal_column_at_byte(snapshot, end_row, end_byte)?.saturating_sub(1);
-            let found = SelectionMatch {
-                start_column,
-                start_row: u16::try_from(row_index).ok()?,
-                end_column,
-                end_row: u16::try_from(end_row).ok()?,
-            };
-            let absolute_row = snapshot.scrollbar.offset.saturating_add(row_index as u64);
-            let distance = absolute_row.abs_diff(previous_row);
-            if best
-                .as_ref()
-                .is_none_or(|(best_distance, _)| distance < *best_distance)
-            {
-                best = Some((distance, found));
-            }
-        }
-    }
-    best.map(|(_, found)| found)
-}
-
-fn selection_match_tail(
-    snapshot: &GridSnapshot,
-    row_index: usize,
-    lines: &[&str],
-    start_byte: usize,
-) -> Option<(usize, usize)> {
-    if lines.len() == 1 {
-        return Some((row_index, start_byte.saturating_add(lines[0].len())));
-    }
-    for (offset, line) in lines.iter().enumerate().skip(1) {
-        let next = snapshot.rows.get(row_index + offset)?;
-        let last = offset == lines.len() - 1;
-        if last {
-            return next
-                .starts_with(line)
-                .then_some((row_index + offset, line.len()));
-        }
-        if next.trim_end() != line.trim_end() {
-            return None;
-        }
-    }
-    None
-}
-
-/// Translate a UTF-8 byte offset in a rendered row to a terminal column.
-/// Wide glyphs advance by two columns while their spacer cell advances by zero.
-fn terminal_column_at_byte(snapshot: &GridSnapshot, row: usize, byte_offset: usize) -> Option<u16> {
-    let cells = snapshot.cells.get(row)?;
-    let mut bytes = 0;
-    let mut column = 0_u16;
-    for cell in cells.iter() {
-        if bytes >= byte_offset {
-            break;
-        }
-        bytes += cell.text.len();
-        column = column.saturating_add(u16::from(cell.columns));
-    }
-    Some(column)
-}
-
-fn paint_selection(snapshot: &mut GridSnapshot, found: SelectionMatch) {
-    snapshot.selection.fill(None);
-    for row in found.start_row..=found.end_row {
-        let row_index = usize::from(row);
-        let width = snapshot
-            .cells
-            .get(row_index)
-            .map(|cells| cells.iter().map(|cell| usize::from(cell.columns)).sum())
-            .unwrap_or(0);
-        if width == 0 {
-            continue;
-        }
-        snapshot.selection[row_index] = Some(SelectedColumns {
-            start: if row == found.start_row {
-                usize::from(found.start_column)
-            } else {
-                0
-            },
-            end: if row == found.end_row {
-                usize::from(found.end_column)
-            } else {
-                width - 1
-            },
-        });
-    }
 }
 
 fn cell_hyperlink(
@@ -2211,11 +1991,6 @@ fn run_live_session(
                 }
             }
             LiveCommand::Wheel { lines, cell } => {
-                if terminal.application_owns_wheel()
-                    && let Err(error) = terminal.begin_selection_follow()
-                {
-                    events.push(LiveSessionEvent::Error(error.to_string()));
-                }
                 if let Some(bytes) = terminal.encode_wheel(lines, cell) {
                     if let Err(error) = session.write_all(&bytes) {
                         events.push(LiveSessionEvent::Error(error.to_string()));
@@ -2594,12 +2369,14 @@ mod tests {
         Ok(())
     }
 
-    /// Full-screen applications can repaint different text into the same grid
-    /// rows as autonomous output arrives. There is no terminal scroll operation
-    /// for tracked references to follow, so the selected content is re-anchored
-    /// in each completed frame without requiring a preceding wheel gesture.
+    /// Full-screen applications repaint different text into the same grid
+    /// rows as autonomous output arrives. The selection stays anchored to the
+    /// cells the user dragged over — the universal emulator contract — so it
+    /// covers whatever the program paints there next, and a copy takes the
+    /// text those cells now hold rather than a remembered string.
     #[test]
-    fn a_selection_follows_autonomous_application_repaints() -> Result<(), TerminalActorError> {
+    fn a_selection_keeps_its_cells_through_an_application_repaint() -> Result<(), TerminalActorError>
+    {
         let mut terminal = TerminalCore::new(TerminalOptions {
             cols: 24,
             rows: 4,
@@ -2618,50 +2395,24 @@ mod tests {
         };
         assert_eq!(selected_rows(&terminal.snapshot()?), vec![(1, 0, 4)]);
 
-        // The application redraws because of new output, not user scrolling.
-        terminal.feed(b"\x1b[2J\x1b[Hbravo\r\ncharlie\r\ndelta\r\necho");
-        let moved = terminal.snapshot()?;
-        assert_eq!(selected_rows(&moved), vec![(0, 0, 4)]);
-        assert_eq!(terminal.selection_text()?.as_deref(), Some("bravo"));
-
-        // Off-screen selections stop painting but retain their copy text.
-        terminal.feed(b"\x1b[2J\x1b[Hcharlie\r\ndelta\r\necho\r\nfoxtrot");
-        let hidden = terminal.snapshot()?;
-        assert!(selected_rows(&hidden).is_empty());
-        assert_eq!(terminal.selection_text()?.as_deref(), Some("bravo"));
-
-        // Scrolling back to the content restores the highlight near its last
-        // known row without any application-specific knowledge.
-        terminal.feed(b"\x1b[2J\x1b[Halpha\r\nbravo\r\ncharlie\r\ndelta");
-        let restored = terminal.snapshot()?;
-        assert_eq!(selected_rows(&restored), vec![(1, 0, 4)]);
-
-        // Multi-row selection keeps terminal columns and line boundaries.
-        terminal.selection_start(0, 1)?;
-        terminal.selection_extend(6, 2)?;
+        // The application repaints different content into the same rows. The
+        // highlight neither jumps to a lookalike elsewhere on screen nor
+        // abandons the dragged cells.
+        terminal.feed(b"\x1b[2J\x1b[Hone\r\nbravo\r\nthree\r\nbravo");
+        let repainted = terminal.snapshot()?;
+        assert_eq!(selected_rows(&repainted), vec![(1, 0, 4)]);
         assert_eq!(
             terminal.selection_text()?.as_deref(),
-            Some("bravo\ncharlie")
-        );
-        terminal.snapshot()?;
-        terminal.feed(b"\x1b[2J\x1b[Hbravo\r\ncharlie\r\ndelta\r\necho");
-        let multi_row = terminal.snapshot()?;
-        assert_eq!(selected_rows(&multi_row), vec![(0, 0, 23), (1, 0, 6)]);
-        assert_eq!(
-            terminal.selection_text()?.as_deref(),
-            Some("bravo\ncharlie")
+            Some("bravo"),
+            "the copy describes the cells as they are now"
         );
 
-        // UTF-8 byte offsets are translated back to terminal columns, so a
-        // wide glyph retains both of the cells it occupies after moving.
-        terminal.feed(b"\x1b[2J\x1b[Hplain\r\nother\r\na\xE7\x95\x8Cb\r\nlast");
-        terminal.selection_start(1, 2)?;
-        terminal.selection_extend(2, 2)?;
-        assert_eq!(terminal.selection_text()?.as_deref(), Some("界"));
-        terminal.snapshot()?;
-        terminal.feed(b"\x1b[2J\x1b[Ha\xE7\x95\x8Cb\r\nother\r\nplain\r\nlast");
-        let wide = terminal.snapshot()?;
-        assert_eq!(selected_rows(&wide), vec![(0, 1, 2)]);
+        // A repaint that changes the covered text changes the copy with it:
+        // the selection never reports text it does not paint.
+        terminal.feed(b"\x1b[2J\x1b[Hone\r\ntwo\r\nthree\r\nbravo");
+        let changed = terminal.snapshot()?;
+        assert_eq!(selected_rows(&changed), vec![(1, 0, 4)]);
+        assert_eq!(terminal.selection_text()?.as_deref(), Some("two"));
         Ok(())
     }
 

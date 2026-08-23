@@ -188,8 +188,11 @@ integration is active, but normal uninstall never restores the whole file and
 therefore cannot clobber later edits from a person or another tool.
 For Codex and Claude Code, those hooks own session identity and coarse turn
 boundaries, not live interactive state. Fresh Ghostty frames pass through a
-conservative agent-screen classifier; only positive visible prompt evidence
-may author `Waiting`, while working/idle screen evidence resolves it. This
-prevents a pre-review permission hook or unrelated parallel tool completion
-from owning human attention. See
+conservative agent-screen classifier; only positive visible prompt evidence may
+author `Waiting`. Claude also polls its machine-readable interactive-session
+status off the UI thread and associates records to panes only by unique session
+ID, process PID, or cwd evidence. Structured `busy` corrects an idle-looking
+composer but cannot override a visible blocker. This prevents a pre-review
+permission hook or unrelated parallel tool completion from owning human
+attention without making optional TUI chrome a single point of failure. See
 [Agent state detection](AGENT_STATE_DETECTION.md) for the decision record.

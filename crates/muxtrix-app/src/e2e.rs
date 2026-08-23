@@ -66,7 +66,7 @@ const TERMINAL_PALETTE_SCRIPT: &str = concat!(
     "printf 'palette-%s\\n' ready\r"
 );
 const TERMINAL_PALETTE_MARKER: &str = "palette-ready";
-const SELECTION_FOLLOW_MARKER: &str = "selection-follow-target";
+const SELECTION_REPAINT_MARKER: &str = "selection-repaint-target";
 const TERMINAL_IMAGE_SCRIPT: &str = concat!(
     "printf '\\033[2J\\033[HKitty graphics via libghostty-vt\\n",
     "PNG decode · source crop · Ghostty z-order\\n",
@@ -125,7 +125,8 @@ pub(super) struct Scenario {
     selection_settle_ticks: u16,
     capture_selection_armed: bool,
     capture_selection_redraw_sent: bool,
-    capture_selection_follow_observed: bool,
+    capture_selection_repaint_observed: bool,
+    capture_selection_row: Option<usize>,
     palette_open_observed: bool,
     palette_navigation_observed: bool,
     settings_open_observed: bool,
@@ -256,7 +257,8 @@ impl Scenario {
             selection_settle_ticks: 0,
             capture_selection_armed: false,
             capture_selection_redraw_sent: false,
-            capture_selection_follow_observed: false,
+            capture_selection_repaint_observed: false,
+            capture_selection_row: None,
             palette_open_observed: false,
             palette_navigation_observed: false,
             settings_open_observed: false,
@@ -803,8 +805,8 @@ impl Scenario {
                     self.settle_ticks = 1;
                     return Ok(TickAction::Wait);
                 }
-                if self.capturing("selection-follow")
-                    && !self.stage_selection_follow_capture(app)?
+                if self.capturing("selection-repaint")
+                    && !self.stage_selection_repaint_capture(app)?
                 {
                     self.settle_ticks = 1;
                     return Ok(TickAction::Wait);
@@ -869,28 +871,30 @@ impl Scenario {
 
     /// Selects content in a generic alternate-screen application, then moves
     /// that content with autonomous output rather than a wheel gesture. The
-    /// final capture is admitted only after both the copied text and painted
-    /// selection have followed the content to its new row.
-    fn stage_selection_follow_capture(&mut self, app: &mut Muxtrix) -> Result<bool, String> {
+    /// capture is admitted only once the highlight has stayed on the dragged
+    /// cells while the program moved its text, with the copy describing what
+    /// those cells now hold — the contract every terminal emulator offers.
+    fn stage_selection_repaint_capture(&mut self, app: &mut Muxtrix) -> Result<bool, String> {
         let Some((row, column)) =
-            pane_text_position(app, self.initial_pane, SELECTION_FOLLOW_MARKER)
+            pane_text_position(app, self.initial_pane, SELECTION_REPAINT_MARKER)
         else {
             return Ok(false);
         };
         if !self.capture_selection_armed {
-            let last = column + SELECTION_FOLLOW_MARKER.chars().count() - 1;
+            let last = column + SELECTION_REPAINT_MARKER.chars().count() - 1;
             let runtime = app
                 .terminals
                 .get_mut(&self.initial_pane)
                 .ok_or_else(|| "selection capture pane disappeared".to_owned())?;
             runtime.selection_start((column as u16, row as u16))?;
             runtime.selection_extend((last as u16, row as u16))?;
+            self.capture_selection_row = Some(row);
             self.capture_selection_armed = true;
             return Ok(false);
         }
         if !self.capture_selection_redraw_sent {
             if app.selected_terminal_text(self.initial_pane).as_deref()
-                != Some(SELECTION_FOLLOW_MARKER)
+                != Some(SELECTION_REPAINT_MARKER)
             {
                 return Ok(false);
             }
@@ -900,7 +904,7 @@ impl Scenario {
                 .ok_or_else(|| "selection capture pane lost its live session".to_owned())?
                 .input(
                     format!(
-                        "printf '\\033[2J\\033[H{SELECTION_FOLLOW_MARKER}\\ncharlie\\ndelta\\necho\\n'\r"
+                        "printf '\\033[2J\\033[H{SELECTION_REPAINT_MARKER}\\ncharlie\\ndelta\\necho\\n'\r"
                     )
                     .into_bytes(),
                 )
@@ -908,7 +912,12 @@ impl Scenario {
             self.capture_selection_redraw_sent = true;
             return Ok(false);
         }
-        if row != 0 {
+        let Some(armed_row) = self.capture_selection_row else {
+            return Ok(false);
+        };
+        if row == armed_row {
+            // The repaint has not landed yet: the target still sits on the
+            // row the drag covered.
             return Ok(false);
         }
         let snapshot = app
@@ -916,14 +925,19 @@ impl Scenario {
             .get(&self.initial_pane)
             .and_then(|runtime| runtime.snapshot.as_ref())
             .ok_or_else(|| "selection capture pane has no frame".to_owned())?;
-        let selected_row = snapshot.selection.iter().position(Option::is_some);
+        let selected_rows: Vec<usize> = snapshot
+            .selection
+            .iter()
+            .enumerate()
+            .filter_map(|(index, range)| range.is_some().then_some(index))
+            .collect();
         let selected_text = app.selected_terminal_text(self.initial_pane);
-        if selected_row != Some(row) || selected_text.as_deref() != Some(SELECTION_FOLLOW_MARKER) {
+        if selected_rows != vec![armed_row] || selected_text.as_deref() != Some("charlie") {
             return Err(format!(
-                "autonomous output moved the target to row {row}, but selection row/text are {selected_row:?}/{selected_text:?}"
+                "autonomous output moved the target to row {row}, but selection rows/text are {selected_rows:?}/{selected_text:?}"
             ));
         }
-        self.capture_selection_follow_observed = true;
+        self.capture_selection_repaint_observed = true;
         Ok(true)
     }
 
@@ -955,7 +969,7 @@ impl Scenario {
                 .ok_or_else(|| "image capture pane lost its live session".to_owned())?
                 .input(TERMINAL_IMAGE_SCRIPT.as_bytes().to_vec())
                 .map_err(|error| error.to_string())?;
-        } else if self.capturing("selection-follow") {
+        } else if self.capturing("selection-repaint") {
             app.focus_pane(self.initial_pane)?;
             app.maximized_pane = Some(self.initial_pane);
             app.terminals
@@ -964,7 +978,7 @@ impl Scenario {
                 .ok_or_else(|| "selection capture pane lost its live session".to_owned())?
                 .input(
                     format!(
-                        "printf '\\033[?1049h\\033[2J\\033[Halpha\\n{SELECTION_FOLLOW_MARKER}\\ncharlie\\ndelta\\n'\r"
+                        "printf '\\033[?1049h\\033[2J\\033[Halpha\\n{SELECTION_REPAINT_MARKER}\\ncharlie\\ndelta\\n'\r"
                     )
                     .into_bytes(),
                 )
@@ -2060,8 +2074,11 @@ impl Scenario {
         if !self.selection_observed {
             return Err("a pointer drag did not select the text it crossed".into());
         }
-        if self.capturing("selection-follow") && !self.capture_selection_follow_observed {
-            return Err("selection did not follow autonomous alternate-screen output".into());
+        if self.capturing("selection-repaint") && !self.capture_selection_repaint_observed {
+            return Err(
+                "selection did not stay with its cells across autonomous alternate-screen output"
+                    .into(),
+            );
         }
         if !self.pane_grids_match_panes {
             return Err("split panes did not all render a grid matching their size".into());

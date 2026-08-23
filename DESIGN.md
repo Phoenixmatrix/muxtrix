@@ -244,6 +244,14 @@ a failed read keeps the previous counts rather than inventing new ones, and a
 read that has never once succeeded says `Unavailable` with the reason on the
 activity line rather than leaving a row that waits forever.
 
+The same machine-readable payload corrects ordinary interactive Claude rows.
+Records associate one-to-one by session ID, exact process PID, or unique cwd;
+ambiguous records do nothing. A visible blocker remains authoritative,
+structured `busy` outranks an idle-looking composer, and positive working
+chrome outranks a lagging structured `idle`. Poll failures may preserve the
+Agents-view aggregate, but pane-local structured state is discarded immediately
+so an old `busy` record can never pin a row green.
+
 Titles that name the harness's current view rather than its work — the roster's
 own title and the `current session` label Claude Code emits on the way back —
 are chrome, not identity. They never rename a fleet row, so toggling views

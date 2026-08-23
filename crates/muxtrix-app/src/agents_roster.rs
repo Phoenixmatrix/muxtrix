@@ -1,11 +1,11 @@
-//! The machine-wide Claude Code agent roster, read from `claude agents --json`.
+//! Claude Code's machine-wide structured session state, read from
+//! `claude agents --json`.
 //!
-//! A pane showing Claude Code's Agents view is projecting a fleet rather than
-//! its own conversation, so its fleet row rolls that fleet up. The harness's
-//! own on-screen tally cannot serve: it groups every session that is awaiting a
-//! human under one "Needs input" heading, including sessions that are merely
-//! idle with an empty composer. `--json` reports each session's own state, so
-//! human attention stays evidence-backed exactly as it is for a single pane.
+//! Background records roll up a pane showing Claude Code's Agents view.
+//! Interactive records correct the ordinary pane each session owns when
+//! optional TUI chrome is absent or still paints an idle composer. The
+//! harness's on-screen tally cannot serve either job: it groups every session
+//! awaiting a human with sessions that are merely idle.
 
 use serde::Deserialize;
 
@@ -35,6 +35,26 @@ pub(crate) struct AgentsRoster {
     /// pane's completed turn does.
     pub(crate) completed: usize,
     pub(crate) idle: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InteractiveState {
+    Idle,
+    Working,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InteractiveSession {
+    pub(crate) pid: Option<u32>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) state: InteractiveState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AgentsSnapshot {
+    pub(crate) roster: AgentsRoster,
+    pub(crate) interactive_sessions: Vec<InteractiveSession>,
 }
 
 impl AgentsRoster {
@@ -110,6 +130,12 @@ struct RosterEntry {
     /// `blocked` and `failed` from an ordinary idle wait.
     #[serde(default)]
     state: Option<String>,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default, rename = "sessionId", alias = "session_id")]
+    session_id: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 impl RosterEntry {
@@ -128,6 +154,27 @@ impl RosterEntry {
             .is_some_and(|kind| kind.eq_ignore_ascii_case("interactive"))
     }
 
+    fn interactive_session(&self) -> Option<InteractiveSession> {
+        if !self
+            .kind
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("interactive"))
+        {
+            return None;
+        }
+        let state = match self.status.as_deref() {
+            Some("busy") => InteractiveState::Working,
+            Some("idle") => InteractiveState::Idle,
+            _ => return None,
+        };
+        Some(InteractiveSession {
+            pid: self.pid,
+            session_id: self.session_id.clone(),
+            cwd: self.cwd.clone(),
+            state,
+        })
+    }
+
     fn signal(&self) -> RosterSignal {
         match self.state.as_deref() {
             Some("blocked") => return RosterSignal::Blocked,
@@ -143,20 +190,27 @@ impl RosterEntry {
     }
 }
 
-pub(crate) fn parse(json: &str) -> Result<AgentsRoster, String> {
+pub(crate) fn parse(json: &str) -> Result<AgentsSnapshot, String> {
     let entries: Vec<RosterEntry> =
         serde_json::from_str(json).map_err(|error| format!("unreadable agent roster: {error}"))?;
-    let mut roster = AgentsRoster::default();
-    for entry in entries.iter().filter(|entry| entry.is_agent()) {
+    let mut snapshot = AgentsSnapshot::default();
+    for entry in entries {
+        if let Some(session) = entry.interactive_session() {
+            snapshot.interactive_sessions.push(session);
+            continue;
+        }
+        if !entry.is_agent() {
+            continue;
+        }
         match entry.signal() {
-            RosterSignal::Failed => roster.failed += 1,
-            RosterSignal::Blocked => roster.blocked += 1,
-            RosterSignal::Working => roster.working += 1,
-            RosterSignal::Completed => roster.completed += 1,
-            RosterSignal::Idle => roster.idle += 1,
+            RosterSignal::Failed => snapshot.roster.failed += 1,
+            RosterSignal::Blocked => snapshot.roster.blocked += 1,
+            RosterSignal::Working => snapshot.roster.working += 1,
+            RosterSignal::Completed => snapshot.roster.completed += 1,
+            RosterSignal::Idle => snapshot.roster.idle += 1,
         }
     }
-    Ok(roster)
+    Ok(snapshot)
 }
 
 /// The executable from a configured launch command, keeping any directory so a
@@ -173,10 +227,30 @@ fn executable(command: &str) -> Option<&str> {
     Some(executable.trim_matches(['\'', '"'])).filter(|value| !value.is_empty())
 }
 
-/// Blocking: callers run this off the UI thread.
-pub(crate) fn load(claude_command: &str) -> Result<AgentsRoster, String> {
+/// Blocking: callers run this off the UI thread. `wsl_distribution` is `Some`
+/// when a Windows Muxtrix pane runs in WSL; an empty value selects WSL's
+/// default distribution.
+pub(crate) fn load(
+    claude_command: &str,
+    wsl_distribution: Option<&str>,
+) -> Result<AgentsSnapshot, String> {
     let program = executable(claude_command).ok_or("no Claude Code command is configured")?;
-    let mut command = console_command(program);
+    #[cfg(target_os = "windows")]
+    let mut command = if let Some(distribution) = wsl_distribution {
+        let mut command = console_command("wsl.exe");
+        if !distribution.trim().is_empty() {
+            command.args(["--distribution", distribution.trim()]);
+        }
+        command.args(["--exec", program]);
+        command
+    } else {
+        console_command(program)
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut command = {
+        let _ = wsl_distribution;
+        console_command(program)
+    };
     command
         .args(["agents", "--json"])
         .stdin(std::process::Stdio::null());
@@ -213,12 +287,22 @@ mod tests {
     fn a_real_roster_payload_counts_the_sessions_the_agents_view_lists() {
         // Interactive sessions are panes in their own right and the harness's
         // own view never lists them, so the roll-up must not either.
-        let roster = parse(SAMPLE).expect("sample parses");
+        let snapshot = parse(SAMPLE).expect("sample parses");
+        let roster = snapshot.roster;
         assert_eq!(roster.working, 1);
         assert_eq!(roster.completed, 1);
         assert_eq!(roster.idle, 0);
         assert_eq!(roster.label(), "1 working");
         assert_eq!(roster.activity(), "1 working · 1 idle");
+        assert_eq!(
+            snapshot.interactive_sessions,
+            vec![InteractiveSession {
+                pid: Some(1),
+                session_id: Some("s1".into()),
+                cwd: Some("/a".into()),
+                state: InteractiveState::Idle,
+            }]
+        );
     }
 
     /// Verbatim from this machine while the harness's own view read
@@ -236,6 +320,7 @@ mod tests {
             ]"#,
         )
         .expect("parses");
+        let roster = roster.roster;
         assert_eq!(roster.working, 1);
         assert_eq!(roster.completed, 3);
         assert_eq!(roster.activity(), "1 working · 3 idle");
@@ -272,6 +357,7 @@ mod tests {
                 {"status":"busy","state":"working"},{"status":"idle","state":"done"}]"#,
         )
         .expect("parses");
+        let roster = roster.roster;
         assert_eq!(roster.label(), "3 working");
     }
 
@@ -285,6 +371,7 @@ mod tests {
                 {"kind":"background","status":"idle","state":"done"}]"#,
         )
         .expect("parses");
+        let roster = roster.roster;
         assert_eq!(roster.signal(), Some(RosterSignal::Completed));
         assert_eq!(roster.label(), "2 idle");
     }
@@ -310,6 +397,7 @@ mod tests {
         let roster =
             parse(r#"[{"status":"idle","state":"blocked"},{"status":"idle","state":"failed"}]"#)
                 .expect("parses");
+        let roster = roster.roster;
         assert_eq!(roster.blocked, 1);
         assert_eq!(roster.failed, 1);
         assert_eq!(roster.idle, 0);
@@ -318,6 +406,7 @@ mod tests {
     #[test]
     fn an_empty_roster_reports_no_agents_rather_than_a_zero() {
         let roster = parse("[]").expect("parses");
+        let roster = roster.roster;
         assert_eq!(roster.signal(), None);
         assert_eq!(roster.label(), "No agents");
         assert_eq!(roster.activity(), "No agents running");
@@ -325,7 +414,9 @@ mod tests {
 
     #[test]
     fn an_unknown_state_falls_back_to_the_coarse_status() {
-        let roster = parse(r#"[{"status":"busy","state":"something-new"}]"#).expect("parses");
+        let roster = parse(r#"[{"status":"busy","state":"something-new"}]"#)
+            .expect("parses")
+            .roster;
         assert_eq!(roster.working, 1);
     }
 
