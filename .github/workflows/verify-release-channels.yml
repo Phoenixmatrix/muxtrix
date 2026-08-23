@@ -1,0 +1,90 @@
+name: Verify release channel installations
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Published Muxtrix version without the v prefix
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published Muxtrix version without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  scoop:
+    name: Install with Scoop
+    runs-on: windows-2025
+    timeout-minutes: 15
+
+    steps:
+      - name: Install Muxtrix from the public Scoop bucket
+        shell: powershell
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Get-Command scoop -ErrorAction SilentlyContinue)) {
+            Invoke-RestMethod -Uri https://get.scoop.sh -OutFile install-scoop.ps1
+            & .\install-scoop.ps1 -RunAsAdmin
+          }
+          $env:PATH = "$env:USERPROFILE\scoop\shims;$env:PATH"
+          scoop bucket add muxtrix https://github.com/Phoenixmatrix/scoop-muxtrix
+          scoop install muxtrix/muxtrix
+
+          $prefix = (scoop prefix muxtrix | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $prefix) {
+            throw "Scoop did not report an installed muxtrix package"
+          }
+          $manifest = Get-Content (Join-Path $prefix "manifest.json") -Raw | ConvertFrom-Json
+          if ($manifest.version -ne $env:RELEASE_VERSION) {
+            throw "Installed Scoop version $($manifest.version), expected $env:RELEASE_VERSION"
+          }
+          $reported = (& muxtrixctl --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $reported -ne "muxtrixctl $env:RELEASE_VERSION") {
+            throw "Installed muxtrixctl reported '$reported', expected 'muxtrixctl $env:RELEASE_VERSION'"
+          }
+
+  homebrew:
+    name: Install with Homebrew
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - name: Install Muxtrix from the public Homebrew tap
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          brew tap phoenixmatrix/muxtrix https://github.com/Phoenixmatrix/homebrew-muxtrix
+          brew install phoenixmatrix/muxtrix/muxtrix
+          installed="$(brew list --versions muxtrix)"
+          test "${installed}" = "muxtrix ${RELEASE_VERSION}"
+          brew test phoenixmatrix/muxtrix/muxtrix
+          test "$(muxtrixctl --version)" = "muxtrixctl ${RELEASE_VERSION}"
+
+  apt:
+    name: Install with apt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Install Muxtrix from the public apt repository
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          echo "deb [trusted=yes] https://raw.githubusercontent.com/Phoenixmatrix/muxtrix/apt-repo/ ./" \
+            | sudo tee /etc/apt/sources.list.d/muxtrix.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends "muxtrix=${RELEASE_VERSION}-1"
+          installed="$(dpkg-query --show --showformat='${Version}' muxtrix)"
+          test "${installed}" = "${RELEASE_VERSION}-1"
+          test "$(muxtrixctl --version)" = "muxtrixctl ${RELEASE_VERSION}"
