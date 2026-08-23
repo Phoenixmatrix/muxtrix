@@ -319,6 +319,8 @@ impl Root {
         let effects = self.app.update(Message::PollTerminal);
         self.run_detached_effects(effects, cx);
         self.sync_images();
+        #[cfg(feature = "e2e")]
+        self.app.observe_e2e();
     }
 
     /// Deliver a message from a context that has no `Window` — a timer or a

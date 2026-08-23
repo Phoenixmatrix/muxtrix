@@ -275,7 +275,13 @@ impl Scenario {
         self.capture == state
     }
 
-    fn tick(&mut self, app: &mut Muxtrix) -> Result<TickAction, String> {
+    /// Note anything transient the scenario has to have seen.
+    ///
+    /// Run on every frame as well as every tick: a surface that opens and
+    /// closes between two ticks — which a slow renderer can stretch well past
+    /// the tick interval — would otherwise be missed, and the run would fail
+    /// on a state that did happen.
+    fn observe(&mut self, app: &Muxtrix) {
         self.palette_open_observed |= app.palette.visible;
         self.palette_navigation_observed |= app.palette.visible && app.palette.selected > 0;
         self.settings_open_observed |= app.active_view == ActiveView::Settings;
@@ -286,6 +292,10 @@ impl Scenario {
         }
         self.terminal_mouse_reporting_observed |=
             pane_contains(app, self.initial_pane, MOUSE_REPORT_MARKER);
+    }
+
+    fn tick(&mut self, app: &mut Muxtrix) -> Result<TickAction, String> {
+        self.observe(app);
         if self.started.elapsed() > Duration::from_secs(20) {
             let terminal = self.third_pane.and_then(|pane_id| {
                 app.terminals.get(&pane_id).map(|runtime| {
@@ -2029,6 +2039,15 @@ fn next_patch_version(version: &str) -> String {
 }
 
 impl Muxtrix {
+    /// Let the scenario see the state after any message, not only on its
+    /// own clock.
+    pub(crate) fn observe_e2e(&mut self) {
+        if let Some(mut scenario) = self.e2e.take() {
+            scenario.observe(self);
+            self.e2e = Some(scenario);
+        }
+    }
+
     pub(super) fn drive_e2e(&mut self) -> Vec<Effect> {
         let Some(mut scenario) = self.e2e.take() else {
             return Vec::new();
