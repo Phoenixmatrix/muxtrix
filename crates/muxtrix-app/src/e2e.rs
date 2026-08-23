@@ -197,6 +197,7 @@ impl Scenario {
         // and the frame's dimensions.
         self.write_report(json!({
             "success": true,
+            "pointer_trace": self.pointer_trace,
             "checks": {
                 "real_window_and_wgpu_frame": true,
                 "command_palette_shortcut_and_render": true,
@@ -295,7 +296,7 @@ impl Scenario {
         }
         self.terminal_mouse_reporting_observed |=
             pane_contains(app, self.initial_pane, MOUSE_REPORT_MARKER);
-        if !self.terminal_mouse_reporting_observed {
+        {
             let (moves, reporting_moves, reporting_seen) = app.e2e_pointer_trace;
             let initial = app
                 .terminals
@@ -318,10 +319,11 @@ impl Scenario {
             self.pointer_trace = format!(
                 "pointer motions={moves}, while reporting={reporting_moves}, \
                  reporting ever seen={reporting_seen}, hovered={:?}, polls={polls}, \
-                 ticks={ticks}, window moves={window_moves}, paints={:?}, elapsed={:?}, view={:?}, \
+                 ticks={ticks}, window moves={window_moves}, paints={:?}, element listener={:?}, elapsed={:?}, view={:?}, \
                  palette={}, menu={}, prompts={}{}{}{}{}{}, maximized={:?}, initial pane: {initial:?}",
                 app.hovered_terminal,
                 app.e2e_paint_trace,
+                app.e2e_phase_trace,
                 self.started.elapsed(),
                 app.active_view,
                 app.palette.visible,

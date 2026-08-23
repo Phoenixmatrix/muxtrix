@@ -377,6 +377,9 @@ pub(crate) struct Muxtrix {
     /// Terminal element paints, and those that registered pointer handlers.
     #[cfg(feature = "e2e")]
     pub(crate) e2e_paint_trace: (u32, u32),
+    /// Element mouse-move listener calls: all phases, and bubble only.
+    #[cfg(feature = "e2e")]
+    pub(crate) e2e_phase_trace: (u32, u32),
 }
 
 pub(crate) struct TerminalRuntime {
@@ -1979,6 +1982,8 @@ impl Muxtrix {
             e2e_clock_trace: (0, 0),
             #[cfg(feature = "e2e")]
             e2e_paint_trace: (0, 0),
+            #[cfg(feature = "e2e")]
+            e2e_phase_trace: (0, 0),
         };
         let _ = app.publish_control_panes();
         app

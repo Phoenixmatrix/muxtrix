@@ -513,6 +513,13 @@ impl TerminalElement {
         {
             let root = root.clone();
             window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                #[cfg(feature = "e2e")]
+                root.update(cx, |root, _| {
+                    root.app.e2e_phase_trace.0 += 1;
+                    if phase.bubble() {
+                        root.app.e2e_phase_trace.1 += 1;
+                    }
+                });
                 if !phase.bubble() {
                     return;
                 }
