@@ -479,6 +479,37 @@ fn periodic_repository_refresh_does_not_restart_an_in_flight_probe() {
 }
 
 #[test]
+fn new_pane_probe_does_not_restart_an_in_flight_batch() {
+    let mut app = Muxtrix::new();
+    let original = active_pane_id(&app);
+    let original_directory = app
+        .pane_working_directory(original)
+        .expect("original pane should have a working directory");
+    app.split_terminal(SplitAxis::Horizontal)
+        .expect("second pane should open");
+    let added = active_pane_id(&app);
+    let added_directory = app
+        .pane_working_directory(added)
+        .expect("added pane should have a working directory");
+    app.pending_repository_directories
+        .insert(original, original_directory.clone());
+    app.pane_repository_generation = 7;
+
+    let effects = app.refresh_pane_repositories();
+
+    assert_eq!(effects.len(), 1, "only the new pane needs a probe");
+    assert_eq!(app.pane_repository_generation, 7);
+    assert_eq!(
+        app.pending_repository_directories.get(&original),
+        Some(&original_directory)
+    );
+    assert_eq!(
+        app.pending_repository_directories.get(&added),
+        Some(&added_directory)
+    );
+}
+
+#[test]
 fn stale_repository_metadata_is_reprobed_without_a_directory_or_branch_change() {
     let mut app = Muxtrix::new();
     let pane_id = active_pane_id(&app);
