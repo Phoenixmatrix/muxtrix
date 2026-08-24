@@ -11835,10 +11835,9 @@ pub(crate) fn parse_binary_version(output: &str, binary_name: &str) -> Result<St
 
 /// Run `work` off the UI thread and turn its result into a message.
 ///
-/// The runtime owns the thread, so this is now just the shape of the request:
-/// the work runs to completion somewhere else, and `map` decides what the
-/// answer means. `Result` is kept in the signature because callers already
-/// phrase failure that way, even though the effect itself cannot fail.
+/// The runtime owns scheduling. Its failure is fed through the same mapper as
+/// the work so every loading state receives a terminal message even when the
+/// operating system cannot create another background thread.
 pub(crate) fn perform_blocking<T>(
     work: impl FnOnce() -> T + Send + 'static,
     map: impl FnOnce(Result<T, String>) -> Message + Send + 'static,
@@ -11846,7 +11845,11 @@ pub(crate) fn perform_blocking<T>(
 where
     T: Send + 'static,
 {
-    vec![Effect::Perform(Box::new(move || map(Ok(work()))))]
+    let effect = effect::BlockingEffect::new(move |scheduling_failure| {
+        let result = scheduling_failure.map_or_else(|| Ok(work()), Err);
+        map(result)
+    });
+    vec![Effect::Perform(Arc::new(effect))]
 }
 
 pub(crate) fn hook_manager(settings: &AppSettings) -> Result<HookManager, String> {

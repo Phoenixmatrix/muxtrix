@@ -1008,6 +1008,46 @@ fn completed_agent_turn_queues_visible_pull_request_refresh() {
 }
 
 #[test]
+fn pull_request_refresh_ends_when_background_work_cannot_start() {
+    let mut app = Muxtrix::new();
+    app.github_auth = github::AuthStatus::Authenticated {
+        login: "octocat".into(),
+    };
+    let mut panel = GitHubPanelState::loading(github::Repository {
+        root: std::env::temp_dir(),
+        name: "muxtrix".into(),
+        owner_and_name: Some("example/muxtrix".into()),
+        host: "github.com".into(),
+        branch: "main".into(),
+        head_oid: String::new(),
+        wsl_distribution: String::new(),
+    });
+    panel.active_tab = GitHubPanelTab::PullRequests;
+    panel.loading = false;
+    app.github_panel = Some(panel);
+
+    let effects = app.refresh_github_pull_requests();
+    let [Effect::Perform(effect)] = effects.as_slice() else {
+        panic!("pull request refresh should schedule one blocking effect");
+    };
+    assert!(
+        app.github_panel
+            .as_ref()
+            .is_some_and(|panel| panel.pull_requests_loading)
+    );
+
+    let message = effect.resolve(Some("Background work could not start: thread limit".into()));
+    drop(app.update(message));
+
+    let panel = app.github_panel.as_ref().expect("panel should remain open");
+    assert!(!panel.pull_requests_loading);
+    assert_eq!(
+        panel.pull_requests_error.as_deref(),
+        Some("Background work could not start: thread limit")
+    );
+}
+
+#[test]
 fn completed_agent_turn_refreshes_the_selected_pull_request_and_list() {
     let mut app = Muxtrix::new();
     let pane_id = active_pane_id(&app);

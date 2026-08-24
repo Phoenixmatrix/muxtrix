@@ -3,7 +3,14 @@
 //! The application core remains framework-agnostic: `update` returns
 //! [`Effect`] values and this module executes them against GPUI.
 
-use std::time::Duration;
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, FocusHandle, Focusable, InteractiveElement,
@@ -13,7 +20,7 @@ use gpui::{
 };
 
 use crate::app::{Message, Muxtrix, TERMINAL_PADDING};
-use crate::effect::Effect;
+use crate::effect::{BlockingEffect, Effect};
 use crate::input::{Key, KeyEvent, Named};
 use crate::theme::DesignTokens;
 
@@ -34,6 +41,64 @@ const GITHUB_LOADING_INTERVAL: Duration = Duration::from_millis(90);
 /// The e2e harness's scenario tick.
 #[cfg(feature = "e2e")]
 const E2E_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Enough parallelism for per-pane probes without allowing a resume-time event
+/// burst to exhaust Windows' thread and handle limits.
+const MAX_BLOCKING_EFFECTS: usize = 64;
+
+#[derive(Default)]
+struct BlockingEffectLimiter {
+    active: Arc<AtomicUsize>,
+}
+
+impl BlockingEffectLimiter {
+    fn try_acquire(&self) -> Option<BlockingEffectPermit> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_BLOCKING_EFFECTS).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| BlockingEffectPermit {
+                active: Arc::clone(&self.active),
+            })
+    }
+}
+
+struct BlockingEffectPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for BlockingEffectPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Release);
+    }
+}
+
+type EffectThread = Box<dyn FnOnce() + Send + 'static>;
+
+fn schedule_blocking_effect(
+    limiter: &BlockingEffectLimiter,
+    effect: Arc<BlockingEffect>,
+    spawn: impl FnOnce(EffectThread) -> io::Result<()>,
+) -> Result<async_channel::Receiver<Message>, Message> {
+    let Some(permit) = limiter.try_acquire() else {
+        return Err(effect.resolve(Some(
+            "Too many background operations are still running. Try again shortly.".into(),
+        )));
+    };
+    let (sender, receiver) = async_channel::bounded(1);
+    let scheduled = Arc::clone(&effect);
+    let thread = Box::new(move || {
+        let _permit = permit;
+        let _ = sender.send_blocking(scheduled.resolve(None));
+    });
+    match spawn(thread) {
+        Ok(()) => Ok(receiver),
+        Err(error) => {
+            Err(effect.resolve(Some(format!("Background work could not start: {error}"))))
+        }
+    }
+}
 
 /// Start the application and run it until the window closes.
 pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -74,6 +139,8 @@ pub(crate) struct Root {
     pub(crate) settings_widgets: crate::views::settings_widgets::SettingsWidgets,
     /// A focus request waiting for a frame to apply it against.
     pending_focus: Option<crate::effect::FocusTarget>,
+    /// Caps independent blocking effects without queueing one behind another.
+    blocking_effects: BlockingEffectLimiter,
     /// The title the window already carries, so an unchanged one costs
     /// nothing.
     title: String,
@@ -244,6 +311,7 @@ impl Root {
             app,
             inputs,
             settings_widgets,
+            blocking_effects: BlockingEffectLimiter::default(),
             pending_focus: None,
             title: String::new(),
             component_theme: None,
@@ -496,31 +564,27 @@ impl Root {
     /// placeholder handle would be a lie rather than a step.
     fn run_effect(&mut self, effect: Effect, cx: &mut Context<Self>) {
         match effect {
-            Effect::Perform(work) => {
-                // A real thread, not the background executor. This work shells
-                // out to git and gh and blocks for as long as they take; on the
-                // executor it occupies a pool thread, and the timers that share
-                // that pool — cursor blink, the e2e tick — stop firing until it
-                // returns.
-                let (sender, receiver) = async_channel::bounded(1);
-                std::thread::Builder::new()
-                    .name("muxtrix-effect".into())
-                    .spawn(move || {
-                        let _ = sender.send_blocking(work());
-                    })
-                    .map_or_else(
-                        |error| eprintln!("muxtrix: could not start background work: {error}"),
-                        |_| {
-                            cx.spawn(async move |this, cx| {
-                                if let Ok(message) = receiver.recv().await {
-                                    let _ = this.update(cx, |root, cx| {
-                                        root.dispatch_detached(message, cx);
-                                    });
-                                }
-                            })
-                            .detach();
-                        },
-                    );
+            Effect::Perform(effect) => {
+                let scheduled =
+                    schedule_blocking_effect(&self.blocking_effects, effect, |thread| {
+                        std::thread::Builder::new()
+                            .name("muxtrix-effect".into())
+                            .spawn(thread)
+                            .map(drop)
+                    });
+                match scheduled {
+                    Ok(receiver) => {
+                        cx.spawn(async move |this, cx| {
+                            if let Ok(message) = receiver.recv().await {
+                                let _ = this.update(cx, |root, cx| {
+                                    root.dispatch_detached(message, cx);
+                                });
+                            }
+                        })
+                        .detach();
+                    }
+                    Err(message) => self.dispatch_detached(message, cx),
+                }
             }
             Effect::OpenUrl(url) => {
                 if let Some(url) = platform_web_url(&url) {
@@ -1064,8 +1128,56 @@ fn platform_web_url(uri: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScrollTo, platform_web_url, queue_pending_scroll};
-    use crate::effect::ScrollTarget;
+    use super::{
+        BlockingEffectLimiter, MAX_BLOCKING_EFFECTS, ScrollTo, platform_web_url,
+        queue_pending_scroll, schedule_blocking_effect,
+    };
+    use crate::{app::Message, effect::BlockingEffect, effect::ScrollTarget};
+    use std::{io, sync::Arc};
+
+    fn scheduling_failure_message(
+        spawn: impl FnOnce(super::EffectThread) -> io::Result<()>,
+    ) -> Message {
+        let effect = Arc::new(BlockingEffect::new(|failure| {
+            Message::SettingsGitHubHost(failure.unwrap_or_default())
+        }));
+        match schedule_blocking_effect(&BlockingEffectLimiter::default(), effect, spawn) {
+            Ok(_) => panic!("the synthetic scheduling failure must not return a receiver"),
+            Err(message) => message,
+        }
+    }
+
+    #[test]
+    fn thread_spawn_failure_resolves_blocking_effect() {
+        let message = scheduling_failure_message(|_| Err(io::Error::other("thread limit")));
+        let Message::SettingsGitHubHost(error) = message else {
+            panic!("scheduling failure should use the effect's mapper");
+        };
+        assert!(error.contains("thread limit"));
+    }
+
+    #[test]
+    fn blocking_effect_limit_rejects_without_queueing() {
+        let limiter = BlockingEffectLimiter::default();
+        let permits = (0..MAX_BLOCKING_EFFECTS)
+            .map(|_| limiter.try_acquire().expect("capacity should remain"))
+            .collect::<Vec<_>>();
+        let effect = Arc::new(BlockingEffect::new(|failure| {
+            Message::SettingsGitHubHost(failure.unwrap_or_default())
+        }));
+        let message = match schedule_blocking_effect(&limiter, effect, |_| {
+            panic!("a saturated limiter must not call the thread spawner")
+        }) {
+            Ok(_) => panic!("a saturated limiter must reject the effect"),
+            Err(message) => message,
+        };
+        let Message::SettingsGitHubHost(error) = message else {
+            panic!("limit failure should use the effect's mapper");
+        };
+        assert!(error.contains("Too many background operations"));
+        drop(permits);
+        assert!(limiter.try_acquire().is_some());
+    }
 
     #[test]
     fn deferred_scroll_queue_stays_bounded_by_surface() {

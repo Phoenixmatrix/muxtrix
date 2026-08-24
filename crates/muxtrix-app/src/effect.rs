@@ -6,14 +6,41 @@
 //! only a running UI framework can inspect. The runtime is the only place that
 //! knows how to carry them out.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::app::Message;
+
+type BlockingEffectResolver = Box<dyn FnOnce(Option<String>) -> Message + Send + 'static>;
+
+/// Blocking work plus the one mapper that resolves either its result or a
+/// runtime scheduling failure. The shared slot lets the runtime retain the
+/// mapper when `std::thread::spawn` consumes and then rejects its closure.
+pub(crate) struct BlockingEffect {
+    resolve: Mutex<Option<BlockingEffectResolver>>,
+}
+
+impl BlockingEffect {
+    pub(crate) fn new(resolve: impl FnOnce(Option<String>) -> Message + Send + 'static) -> Self {
+        Self {
+            resolve: Mutex::new(Some(Box::new(resolve))),
+        }
+    }
+
+    pub(crate) fn resolve(&self, scheduling_failure: Option<String>) -> Message {
+        let resolve = self
+            .resolve
+            .lock()
+            .expect("blocking effect resolver lock should not be poisoned")
+            .take()
+            .expect("blocking effect must resolve exactly once");
+        resolve(scheduling_failure)
+    }
+}
 
 /// A side effect `update` wants performed.
 pub(crate) enum Effect {
     /// Run blocking work off the UI thread; its return value becomes a message.
-    Perform(Box<dyn FnOnce() -> Message + Send + 'static>),
+    Perform(Arc<BlockingEffect>),
     /// Ask the native platform to open an HTTP(S) URL immediately.
     OpenUrl(String),
     Focus(FocusTarget),
