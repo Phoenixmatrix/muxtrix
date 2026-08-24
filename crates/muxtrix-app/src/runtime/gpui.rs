@@ -844,6 +844,7 @@ impl Render for Root {
             .flex()
             .flex_col()
             .bg(color(tokens.app))
+            .text_color(color(tokens.text))
             // Name the resolved system face explicitly; an unnamed GPUI
             // fallback has different metrics and changes chrome width.
             .font_family(ui_family(&self.app.settings))
