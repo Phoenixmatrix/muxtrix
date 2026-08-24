@@ -93,10 +93,10 @@ impl Root {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
                             root.dispatch(
                                 Message::BeginSplitDrag(drag_key.clone(), drag_axis),
                                 window,
@@ -141,8 +141,10 @@ impl Root {
                         )
                         .child(
                             handle
+                                .flex_shrink_0()
                                 .w(px(SPLIT_HANDLE_SIZE))
                                 .h_full()
+                                .cursor_col_resize()
                                 .child(div().w(thickness).h_full().bg(rule)),
                         )
                         .child(
@@ -166,8 +168,10 @@ impl Root {
                         )
                         .child(
                             handle
+                                .flex_shrink_0()
                                 .h(px(SPLIT_HANDLE_SIZE))
                                 .w_full()
+                                .cursor_row_resize()
                                 .child(div().h(thickness).w_full().bg(rule)),
                         )
                         .child(

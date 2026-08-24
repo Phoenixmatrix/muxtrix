@@ -490,6 +490,52 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             thread::sleep(Duration::from_millis(1_000));
             eprintln!("clicked and typed in the pull request filter");
         }
+        if capture == "split-handle-drag" {
+            let origin = pin_window(&connection, root, window)?;
+            let before = grab_window(&connection, window)?;
+            let before_edge = focused_pane_right_edge(&before)
+                .ok_or("focused pane edge was not visible before divider drag")?;
+            let before_edge = i16::try_from(before_edge)?;
+            // Start twelve pixels into the structural divider. The previous
+            // eight-pixel handle had already ended at this point.
+            let start_x = origin.dst_x.saturating_add(before_edge).saturating_add(12);
+            let end_x = start_x.saturating_sub(100);
+            let y = origin.dst_y.saturating_add(300);
+            connection
+                .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, start_x, y, 0)?
+                .check()?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(100));
+            connection
+                .xtest_fake_input(BUTTON_PRESS_EVENT, 1, 0, root, start_x, y, 0)?
+                .check()?;
+            connection
+                .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, end_x, y, 0)?
+                .check()?;
+            connection
+                .xtest_fake_input(BUTTON_RELEASE_EVENT, 1, 0, root, end_x, y, 0)?
+                .check()?;
+            thread::sleep(Duration::from_millis(1_000));
+            let after = grab_window(&connection, window)?;
+            let after_edge = focused_pane_right_edge(&after)
+                .ok_or("focused pane edge was not visible after divider drag")?;
+            assert!(
+                usize::from(before_edge.unsigned_abs()).abs_diff(after_edge) >= 60,
+                "drag from the widened split handle did not move the divider: {before_edge} -> {after_edge}"
+            );
+            eprintln!("dragged the pane divider from its widened structural target");
+        }
+        if capture == "settings-dropdown-open" {
+            let origin = pin_window(&connection, root, window)?;
+            let picker_x = origin
+                .dst_x
+                .saturating_add(i16::try_from(final_viewport.0.saturating_sub(335))?);
+            let picker_y = origin.dst_y.saturating_add(256);
+            click_at(&connection, root, picker_x, picker_y)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("clicked the Theme dropdown and left its option menu open");
+        }
         if capture == "settings-github-typing" {
             let origin = pin_window(&connection, root, window)?;
             let input_x = origin
@@ -805,6 +851,29 @@ fn grab_window(
         width,
         height,
     })
+}
+
+/// The focused pane owns the only two accent-blue border pixels on this row:
+/// its left and right vertical edges. Limiting the scan to the workspace's
+/// leading 80% excludes the unfocused pane's terminal content.
+fn focused_pane_right_edge(frame: &CapturedFrame) -> Option<usize> {
+    let y = 60;
+    if frame.height <= y {
+        return None;
+    }
+    let row = &frame.rgba[y * frame.width * 4..(y + 1) * frame.width * 4];
+    row.chunks_exact(4)
+        .enumerate()
+        .skip(272)
+        .take((frame.width.saturating_mul(4) / 5).saturating_sub(272))
+        .filter_map(|(x, pixel)| {
+            let [red, green, blue, _] = <[u8; 4]>::try_from(pixel).ok()?;
+            (u16::from(blue) > u16::from(red) + 20
+                && u16::from(blue) > u16::from(green) + 10
+                && blue > 60)
+                .then_some(x)
+        })
+        .max()
 }
 
 fn control_request(

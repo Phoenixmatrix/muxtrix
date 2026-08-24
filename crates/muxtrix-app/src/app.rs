@@ -147,7 +147,8 @@ pub(crate) const GITHUB_PULL_REQUEST_SUMMARY_HEIGHT: f32 = 34.0;
 /// remaining options.
 pub(crate) const FONT_FAMILY_MENU_MAX_HEIGHT: f32 = 320.0;
 
-pub(crate) const SPLIT_HANDLE_SIZE: f32 = 8.0;
+/// Structural pane-divider target; the centered rule remains one pixel wide.
+pub(crate) const SPLIT_HANDLE_SIZE: f32 = 16.0;
 
 pub(crate) const GITHUB_DIFF_LINE_HEIGHT: f32 = 24.0;
 
