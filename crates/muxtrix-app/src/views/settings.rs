@@ -265,11 +265,13 @@ impl Root {
         let widgets = &self.settings_widgets;
         let picker = |state: &Picker, width: f32| {
             div()
+                // `Select` fills its parent. Give that parent a concrete
+                // trigger-sized hit box instead of leaving its percentage
+                // height to resolve against an auto-height flex child.
                 .w(px(width))
+                .h(px(32.))
                 .child(
-                    // Keep the selector's working small interaction path and
-                    // enlarge only its trigger; switching its internal size
-                    // to Medium regressed pointer activation.
+                    // Preserve the small control path; only the trigger is taller.
                     Select::new(&state.state)
                         .small()
                         .h(px(32.))
