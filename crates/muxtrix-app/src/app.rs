@@ -6193,7 +6193,18 @@ impl Muxtrix {
             // every completed agent turn.
             repository.checked_at = std::time::Instant::now() - PANE_REPOSITORY_INTERVAL;
         }
-        self.pending_repository_directories.remove(&pane_id);
+        if self
+            .pending_repository_directories
+            .remove(&pane_id)
+            .is_some()
+        {
+            // This pane needs a result newer than the in-flight batch. Cancel
+            // the shared batch once, then let the next metadata refresh rebuild
+            // it; repeatedly replacing one request is what caused the
+            // resume-time thread storm.
+            self.pane_repository_cancellation.cancel();
+            self.pending_repository_directories.clear();
+        }
         if self.control_pane_id(None).ok() != Some(pane_id) {
             return;
         }
@@ -8033,6 +8044,7 @@ impl Muxtrix {
             .retain(|pane_id, _| live_panes.contains(pane_id));
         self.pending_repository_directories
             .retain(|pane_id, _| live_panes.contains(pane_id));
+        let batch_in_flight = !self.pending_repository_directories.is_empty();
 
         let pane_ids = self
             .fleet_entries_in_tab_order()
@@ -8101,25 +8113,16 @@ impl Muxtrix {
         if probes.is_empty() {
             return Vec::new();
         }
-        for (pane_id, directory) in self.pending_repository_directories.clone() {
-            if live_panes.contains(&pane_id)
-                && !probes.iter().any(|(candidate, _)| *candidate == pane_id)
-                && self
-                    .pane_repositories
-                    .get(&pane_id)
-                    .is_none_or(|repository| repository.directory != directory)
-            {
-                probes.push((pane_id, directory));
-            }
+        // New panes may join the current generation, but work already pending
+        // for another pane is left alone. The old restart loop re-enqueued the
+        // entire pending batch whenever one new directory appeared; terminal
+        // wakeups after resume then created and cancelled thousands of threads.
+        if !batch_in_flight {
+            self.pane_repository_generation = self.pane_repository_generation.wrapping_add(1);
+            self.pane_repository_cancellation.cancel();
+            self.pane_repository_cancellation = ProcessCancellation::default();
         }
-        self.pending_repository_directories.clear();
-        self.pending_repository_directories
-            .extend(probes.iter().cloned());
-
-        self.pane_repository_generation = self.pane_repository_generation.wrapping_add(1);
         let generation = self.pane_repository_generation;
-        self.pane_repository_cancellation.cancel();
-        self.pane_repository_cancellation = ProcessCancellation::default();
         let authenticated = matches!(self.github_auth, github::AuthStatus::Authenticated { .. });
         let wsl_distribution = self.settings.wsl_distribution.clone();
         let github_host = self.settings.github_host.clone();
