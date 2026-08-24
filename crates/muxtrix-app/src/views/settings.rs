@@ -13,6 +13,7 @@ use gpui::{
 
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputState};
+use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_component::select::Select;
 use gpui_component::slider::{Slider, SliderState};
 use gpui_component::switch::Switch;
@@ -635,6 +636,7 @@ impl Root {
             .child(
                 div()
                     .id("settings-scroll")
+                    .relative()
                     .flex_grow(1.0)
                     .min_h(px(0.))
                     .overflow_y_scroll()
@@ -648,7 +650,8 @@ impl Root {
                             .py(px(24.))
                             .px(px(SETTINGS_PAGE_PADDING_X))
                             .child(content),
-                    ),
+                    )
+                    .child(Scrollbar::vertical(&self.scrolls.settings).mode(ScrollbarMode::Always)),
             )
             .child(footer)
             .into_any_element()
@@ -1143,11 +1146,13 @@ impl Root {
             .child(
                 div()
                     .id("gallery-scroll")
+                    .relative()
                     .flex_grow(1.0)
                     .min_h(px(0.))
                     .overflow_y_scroll()
                     .track_scroll(&self.scrolls.settings)
-                    .child(grid.pt(px(4.)).pr(px(14.)).pb(px(24.))),
+                    .child(grid.pt(px(4.)).pr(px(14.)).pb(px(24.)))
+                    .child(Scrollbar::vertical(&self.scrolls.settings).mode(ScrollbarMode::Always)),
             )
             .into_any_element()
     }
@@ -1469,6 +1474,7 @@ impl Root {
             .child(
                 div()
                     .id("worktrees-scroll")
+                    .relative()
                     .flex_grow(1.0)
                     .min_h(px(0.))
                     .overflow_y_scroll()
@@ -1482,7 +1488,8 @@ impl Root {
                             .py(px(24.))
                             .px(px(SETTINGS_PAGE_PADDING_X))
                             .child(page),
-                    ),
+                    )
+                    .child(Scrollbar::vertical(&self.scrolls.settings).mode(ScrollbarMode::Always)),
             )
             .child(footer)
             .into_any_element()
