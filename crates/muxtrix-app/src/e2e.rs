@@ -18,6 +18,10 @@ use crate::settings::{FleetScope, FleetView};
 use crate::{agent_screen, agents_roster, commands, github};
 
 const REPORT_ENV: &str = "MUXTRIX_E2E_REPORT";
+const PANE_MENU_READY_ENV: &str = "MUXTRIX_E2E_PANE_MENU_READY";
+const PANE_MENU_DISMISSED_ENV: &str = "MUXTRIX_E2E_PANE_MENU_DISMISSED";
+const MOUSE_REPORTING_READY_ENV: &str = "MUXTRIX_E2E_MOUSE_REPORTING_READY";
+const MOUSE_PROBE_COMPLETED_ENV: &str = "MUXTRIX_E2E_MOUSE_PROBE_COMPLETED";
 const EXTERNAL_MARKER: &str = "alpha beta";
 const TERMINAL_URL_MARKER: &str = "https://example.com/docs";
 const PANE_MENU_CLICK_AWAY_MARKER: &str = "pane-menu-click-away-ready";
@@ -107,6 +111,10 @@ const STAGED_GITHUB_PATCH: &str = concat!(
 
 pub(super) struct Scenario {
     report_path: PathBuf,
+    pane_menu_ready_path: Option<PathBuf>,
+    pane_menu_dismissed_path: Option<PathBuf>,
+    mouse_reporting_ready_path: Option<PathBuf>,
+    mouse_probe_completed_path: Option<PathBuf>,
     started: Instant,
     stage: Stage,
     initial_pane: PaneId,
@@ -240,6 +248,12 @@ impl Scenario {
         let report_path = std::env::var_os(REPORT_ENV).map(PathBuf::from)?;
         Some(Self {
             report_path,
+            pane_menu_ready_path: std::env::var_os(PANE_MENU_READY_ENV).map(PathBuf::from),
+            pane_menu_dismissed_path: std::env::var_os(PANE_MENU_DISMISSED_ENV).map(PathBuf::from),
+            mouse_reporting_ready_path: std::env::var_os(MOUSE_REPORTING_READY_ENV)
+                .map(PathBuf::from),
+            mouse_probe_completed_path: std::env::var_os(MOUSE_PROBE_COMPLETED_ENV)
+                .map(PathBuf::from),
             started: Instant::now(),
             stage: Stage::PaneMenuClickAway,
             initial_pane,
@@ -296,8 +310,27 @@ impl Scenario {
         self.settings_open_observed |= app.active_view == ActiveView::Settings;
         if app.pane_menu.is_some() {
             self.pane_menu_click_open_observed = true;
+            if let Some(path) = self.pane_menu_ready_path.take() {
+                let _ = std::fs::File::create(path);
+            }
         } else if self.pane_menu_click_open_observed {
             self.pane_menu_click_away_observed = true;
+            if let Some(path) = self.pane_menu_dismissed_path.take() {
+                let _ = std::fs::File::create(path);
+            }
+        }
+        let initial_mouse_reporting = app
+            .terminals
+            .get(&self.initial_pane)
+            .and_then(|runtime| runtime.snapshot.as_ref())
+            .is_some_and(|snapshot| snapshot.mouse_reporting);
+        if initial_mouse_reporting
+            && self.pane_menu_click_away_observed
+            && !app.terminal_pointer_obscured()
+        {
+            if let Some(path) = self.mouse_reporting_ready_path.take() {
+                let _ = std::fs::File::create(path);
+            }
         }
         self.terminal_mouse_reporting_observed |=
             pane_contains(app, self.initial_pane, MOUSE_REPORT_MARKER);
@@ -432,6 +465,13 @@ impl Scenario {
                 self.stage = Stage::ExternalInput;
             }
             Stage::ExternalInput => {
+                if self
+                    .mouse_probe_completed_path
+                    .as_ref()
+                    .is_some_and(|path| !path.exists())
+                {
+                    return Ok(TickAction::Wait);
+                }
                 let Some(runtime) = app.terminals.get(&self.initial_pane) else {
                     return Err("initial terminal runtime disappeared".into());
                 };
@@ -1008,6 +1048,7 @@ impl Scenario {
                 )
                 .map_err(|error| error.to_string())?;
         } else if self.capturing("settings")
+            || self.capturing("settings-dropdown-open")
             || self.capturing("settings-scrollback")
             || self.capturing("settings-github-typing")
         {

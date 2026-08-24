@@ -99,6 +99,20 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     let mouse_probe_path =
         std::env::temp_dir().join(format!("muxtrix-e2e-mouse-{}-{unique}", std::process::id()));
     write_mouse_probe(&mouse_probe_path)?;
+    let pane_menu_ready_path =
+        std::path::PathBuf::from(format!("{}.pane-menu-ready", mouse_probe_path.display()));
+    let pane_menu_dismissed_path = std::path::PathBuf::from(format!(
+        "{}.pane-menu-dismissed",
+        mouse_probe_path.display()
+    ));
+    let mouse_reporting_ready_path = std::path::PathBuf::from(format!(
+        "{}.mouse-reporting-ready",
+        mouse_probe_path.display()
+    ));
+    let mouse_probe_completed_path = std::path::PathBuf::from(format!(
+        "{}.mouse-probe-completed",
+        mouse_probe_path.display()
+    ));
     let home_path =
         std::env::temp_dir().join(format!("muxtrix-e2e-home-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&home_path)?;
@@ -126,6 +140,16 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         .env("WINIT_UNIX_BACKEND", "x11")
         .env("XDG_SESSION_TYPE", "x11")
         .env("MUXTRIX_E2E_REPORT", &report_path)
+        .env("MUXTRIX_E2E_PANE_MENU_READY", &pane_menu_ready_path)
+        .env("MUXTRIX_E2E_PANE_MENU_DISMISSED", &pane_menu_dismissed_path)
+        .env(
+            "MUXTRIX_E2E_MOUSE_REPORTING_READY",
+            &mouse_reporting_ready_path,
+        )
+        .env(
+            "MUXTRIX_E2E_MOUSE_PROBE_COMPLETED",
+            &mouse_probe_completed_path,
+        )
         .env("MUXTRIX_CONFIG_PATH", &config_path)
         .env("MUXTRIX_CONTROL_ENDPOINT", &control_path)
         .env("MUXTRIX_E2E_SCREENSHOT_RGBA", &screenshot_path)
@@ -200,17 +224,25 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     type_text(&connection, "echo pane-menu-click-away-ready")?;
     tap_keysym(&connection, 0xff0d)?;
     connection.flush()?;
-    thread::sleep(Duration::from_millis(300));
+    let menu_open_deadline = Instant::now() + Duration::from_secs(10);
+    while !pane_menu_ready_path.exists() {
+        if Instant::now() >= menu_open_deadline {
+            return Err("the application never opened the pane menu".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     click_at(&connection, root, terminal_x, terminal_y)?;
     connection.flush()?;
-    thread::sleep(Duration::from_millis(200));
+    let menu_dismissed_deadline = Instant::now() + Duration::from_secs(10);
+    while !pane_menu_dismissed_path.exists() {
+        if Instant::now() >= menu_dismissed_deadline {
+            return Err("the application never dismissed the pane menu".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     eprintln!("opened the pane menu and dismissed it with an outside click");
-    // The probe has to run in the pane the pointer will sweep. The app's own
-    // scenario splits panes on its clock and focuses each new one, so focus
-    // is put back on the initial pane right before the probe is typed.
-    click_at(&connection, root, terminal_x, terminal_y)?;
-    connection.flush()?;
-    thread::sleep(Duration::from_millis(150));
+    // The initial pane is still focused after its menu closes, so the probe is
+    // typed only after the application confirms the backdrop released input.
     type_text(
         &connection,
         mouse_probe_path
@@ -232,7 +264,19 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         }
         thread::sleep(Duration::from_millis(20));
     }
-    thread::sleep(Duration::from_millis(50));
+    let reporting_deadline = Instant::now() + Duration::from_secs(10);
+    while !mouse_reporting_ready_path.exists() {
+        if !ready_marker.exists() {
+            return Err(
+                "the mouse probe stopped before the application observed mouse reporting".into(),
+            );
+        }
+        if Instant::now() >= reporting_deadline {
+            return Err("the application never observed unobscured mouse reporting".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    eprintln!("application observed unobscured terminal mouse reporting");
     // Every step lands somewhere new. A client that is busy drawing makes the
     // server compress the motion it missed into one event at the final
     // position, so a pointer that returns to where it started compresses to no
@@ -298,6 +342,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         }
         thread::sleep(Duration::from_millis(20));
     }
+    std::fs::File::create(&mouse_probe_completed_path)?;
     // The drag that follows needs scrollback to exist, so the lines have to
     // have been printed — not merely typed — before it starts. The shell
     // touches a file once `seq` has run; waiting for that is how long it
@@ -490,6 +535,52 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             thread::sleep(Duration::from_millis(1_000));
             eprintln!("clicked and typed in the pull request filter");
         }
+        if capture == "split-handle-drag" {
+            let origin = pin_window(&connection, root, window)?;
+            let before = grab_window(&connection, window)?;
+            let before_edge = focused_pane_right_edge(&before)
+                .ok_or("focused pane edge was not visible before divider drag")?;
+            let before_edge = i16::try_from(before_edge)?;
+            // Start twelve pixels into the structural divider. The previous
+            // eight-pixel handle had already ended at this point.
+            let start_x = origin.dst_x.saturating_add(before_edge).saturating_add(12);
+            let end_x = start_x.saturating_sub(100);
+            let y = origin.dst_y.saturating_add(300);
+            connection
+                .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, start_x, y, 0)?
+                .check()?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(100));
+            connection
+                .xtest_fake_input(BUTTON_PRESS_EVENT, 1, 0, root, start_x, y, 0)?
+                .check()?;
+            connection
+                .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, end_x, y, 0)?
+                .check()?;
+            connection
+                .xtest_fake_input(BUTTON_RELEASE_EVENT, 1, 0, root, end_x, y, 0)?
+                .check()?;
+            thread::sleep(Duration::from_millis(1_000));
+            let after = grab_window(&connection, window)?;
+            let after_edge = focused_pane_right_edge(&after)
+                .ok_or("focused pane edge was not visible after divider drag")?;
+            assert!(
+                usize::from(before_edge.unsigned_abs()).abs_diff(after_edge) >= 60,
+                "drag from the widened split handle did not move the divider: {before_edge} -> {after_edge}"
+            );
+            eprintln!("dragged the pane divider from its widened structural target");
+        }
+        if capture == "settings-dropdown-open" {
+            let origin = pin_window(&connection, root, window)?;
+            let picker_x = origin
+                .dst_x
+                .saturating_add(i16::try_from(final_viewport.0.saturating_sub(335))?);
+            let picker_y = origin.dst_y.saturating_add(256);
+            click_at(&connection, root, picker_x, picker_y)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("clicked the Theme dropdown and left its option menu open");
+        }
         if capture == "settings-github-typing" {
             let origin = pin_window(&connection, root, window)?;
             let input_x = origin
@@ -562,6 +653,10 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     let _ = std::fs::remove_file(&config_path);
     let _ = std::fs::remove_file(&control_path);
     let _ = std::fs::remove_file(format!("{}.ready", mouse_probe_path.display()));
+    let _ = std::fs::remove_file(&pane_menu_ready_path);
+    let _ = std::fs::remove_file(&pane_menu_dismissed_path);
+    let _ = std::fs::remove_file(&mouse_reporting_ready_path);
+    let _ = std::fs::remove_file(&mouse_probe_completed_path);
     let _ = std::fs::remove_file(&scrollback_marker);
     let _ = std::fs::remove_file(&mouse_probe_path);
     let _ = std::fs::remove_dir_all(&home_path);
@@ -805,6 +900,29 @@ fn grab_window(
         width,
         height,
     })
+}
+
+/// The focused pane owns the only two accent-blue border pixels on this row:
+/// its left and right vertical edges. Limiting the scan to the workspace's
+/// leading 80% excludes the unfocused pane's terminal content.
+fn focused_pane_right_edge(frame: &CapturedFrame) -> Option<usize> {
+    let y = 60;
+    if frame.height <= y {
+        return None;
+    }
+    let row = &frame.rgba[y * frame.width * 4..(y + 1) * frame.width * 4];
+    row.chunks_exact(4)
+        .enumerate()
+        .skip(272)
+        .take((frame.width.saturating_mul(4) / 5).saturating_sub(272))
+        .filter_map(|(x, pixel)| {
+            let [red, green, blue, _] = <[u8; 4]>::try_from(pixel).ok()?;
+            (u16::from(blue) > u16::from(red) + 20
+                && u16::from(blue) > u16::from(green) + 10
+                && blue > 60)
+                .then_some(x)
+        })
+        .max()
 }
 
 fn control_request(

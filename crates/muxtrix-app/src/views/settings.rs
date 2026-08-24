@@ -267,7 +267,12 @@ impl Root {
             div()
                 .w(px(width))
                 .child(
+                    // Keep the selector's working small interaction path and
+                    // enlarge only its trigger; switching its internal size
+                    // to Medium regressed pointer activation.
                     Select::new(&state.state)
+                        .small()
+                        .h(px(32.))
                         .menu_max_h(px(FONT_FAMILY_MENU_MAX_HEIGHT))
                         .cursor_pointer(),
                 )
