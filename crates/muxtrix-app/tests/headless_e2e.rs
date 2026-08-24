@@ -99,6 +99,20 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     let mouse_probe_path =
         std::env::temp_dir().join(format!("muxtrix-e2e-mouse-{}-{unique}", std::process::id()));
     write_mouse_probe(&mouse_probe_path)?;
+    let pane_menu_ready_path =
+        std::path::PathBuf::from(format!("{}.pane-menu-ready", mouse_probe_path.display()));
+    let pane_menu_dismissed_path = std::path::PathBuf::from(format!(
+        "{}.pane-menu-dismissed",
+        mouse_probe_path.display()
+    ));
+    let mouse_reporting_ready_path = std::path::PathBuf::from(format!(
+        "{}.mouse-reporting-ready",
+        mouse_probe_path.display()
+    ));
+    let mouse_probe_completed_path = std::path::PathBuf::from(format!(
+        "{}.mouse-probe-completed",
+        mouse_probe_path.display()
+    ));
     let home_path =
         std::env::temp_dir().join(format!("muxtrix-e2e-home-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&home_path)?;
@@ -126,6 +140,16 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         .env("WINIT_UNIX_BACKEND", "x11")
         .env("XDG_SESSION_TYPE", "x11")
         .env("MUXTRIX_E2E_REPORT", &report_path)
+        .env("MUXTRIX_E2E_PANE_MENU_READY", &pane_menu_ready_path)
+        .env("MUXTRIX_E2E_PANE_MENU_DISMISSED", &pane_menu_dismissed_path)
+        .env(
+            "MUXTRIX_E2E_MOUSE_REPORTING_READY",
+            &mouse_reporting_ready_path,
+        )
+        .env(
+            "MUXTRIX_E2E_MOUSE_PROBE_COMPLETED",
+            &mouse_probe_completed_path,
+        )
         .env("MUXTRIX_CONFIG_PATH", &config_path)
         .env("MUXTRIX_CONTROL_ENDPOINT", &control_path)
         .env("MUXTRIX_E2E_SCREENSHOT_RGBA", &screenshot_path)
@@ -200,17 +224,25 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     type_text(&connection, "echo pane-menu-click-away-ready")?;
     tap_keysym(&connection, 0xff0d)?;
     connection.flush()?;
-    thread::sleep(Duration::from_millis(300));
+    let menu_open_deadline = Instant::now() + Duration::from_secs(10);
+    while !pane_menu_ready_path.exists() {
+        if Instant::now() >= menu_open_deadline {
+            return Err("the application never opened the pane menu".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     click_at(&connection, root, terminal_x, terminal_y)?;
     connection.flush()?;
-    thread::sleep(Duration::from_millis(200));
+    let menu_dismissed_deadline = Instant::now() + Duration::from_secs(10);
+    while !pane_menu_dismissed_path.exists() {
+        if Instant::now() >= menu_dismissed_deadline {
+            return Err("the application never dismissed the pane menu".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     eprintln!("opened the pane menu and dismissed it with an outside click");
-    // The probe has to run in the pane the pointer will sweep. The app's own
-    // scenario splits panes on its clock and focuses each new one, so focus
-    // is put back on the initial pane right before the probe is typed.
-    click_at(&connection, root, terminal_x, terminal_y)?;
-    connection.flush()?;
-    thread::sleep(Duration::from_millis(150));
+    // The initial pane is still focused after its menu closes, so the probe is
+    // typed only after the application confirms the backdrop released input.
     type_text(
         &connection,
         mouse_probe_path
@@ -232,7 +264,19 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         }
         thread::sleep(Duration::from_millis(20));
     }
-    thread::sleep(Duration::from_millis(50));
+    let reporting_deadline = Instant::now() + Duration::from_secs(10);
+    while !mouse_reporting_ready_path.exists() {
+        if !ready_marker.exists() {
+            return Err(
+                "the mouse probe stopped before the application observed mouse reporting".into(),
+            );
+        }
+        if Instant::now() >= reporting_deadline {
+            return Err("the application never observed unobscured mouse reporting".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    eprintln!("application observed unobscured terminal mouse reporting");
     // Every step lands somewhere new. A client that is busy drawing makes the
     // server compress the motion it missed into one event at the final
     // position, so a pointer that returns to where it started compresses to no
@@ -298,6 +342,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         }
         thread::sleep(Duration::from_millis(20));
     }
+    std::fs::File::create(&mouse_probe_completed_path)?;
     // The drag that follows needs scrollback to exist, so the lines have to
     // have been printed — not merely typed — before it starts. The shell
     // touches a file once `seq` has run; waiting for that is how long it
@@ -608,6 +653,10 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     let _ = std::fs::remove_file(&config_path);
     let _ = std::fs::remove_file(&control_path);
     let _ = std::fs::remove_file(format!("{}.ready", mouse_probe_path.display()));
+    let _ = std::fs::remove_file(&pane_menu_ready_path);
+    let _ = std::fs::remove_file(&pane_menu_dismissed_path);
+    let _ = std::fs::remove_file(&mouse_reporting_ready_path);
+    let _ = std::fs::remove_file(&mouse_probe_completed_path);
     let _ = std::fs::remove_file(&scrollback_marker);
     let _ = std::fs::remove_file(&mouse_probe_path);
     let _ = std::fs::remove_dir_all(&home_path);
