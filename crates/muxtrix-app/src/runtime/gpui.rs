@@ -890,9 +890,11 @@ impl Render for Root {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_key_up(cx.listener(Self::on_key_up))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
-            // Window-level pointer tracking: a split handle or a tab that was
-            // grabbed keeps following the pointer wherever it goes, and a
-            // release anywhere ends whatever was in progress.
+            // Window-level pointer tracking keeps a real drag or terminal
+            // capture alive outside its original element. An ordinary control
+            // release must not enter the application reducer: that schedules a
+            // root render between GPUI's mouse-up and synthesized click, which
+            // invalidates click-based controls such as Select on Windows.
             .on_mouse_move(
                 cx.listener(|root, event: &gpui::MouseMoveEvent, window, cx| {
                     root.dispatch_pointer_move(event.position, window, cx);
@@ -901,7 +903,14 @@ impl Render for Root {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|root, _: &gpui::MouseUpEvent, window, cx| {
-                    root.dispatch(Message::EndPointerInteraction, window, cx);
+                    let interaction_active = root.app.split_drag.is_some()
+                        || root.app.tab_drag.is_some()
+                        || root.app.terminal_scroll_drag.is_some()
+                        || root.app.terminal_selection_drag.is_some()
+                        || root.app.terminal_mouse_capture.is_some();
+                    if interaction_active {
+                        root.dispatch(Message::EndPointerInteraction, window, cx);
+                    }
                 }),
             )
             .size_full()
