@@ -581,6 +581,44 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             thread::sleep(Duration::from_millis(1_000));
             eprintln!("clicked the Theme dropdown and left its option menu open");
         }
+        if capture == "settings-dropdown-select" {
+            let origin = pin_window(&connection, root, window)?;
+            let picker_x = origin
+                .dst_x
+                .saturating_add(i16::try_from(final_viewport.0.saturating_sub(300))?);
+            click_at(
+                &connection,
+                root,
+                picker_x,
+                origin.dst_y.saturating_add(338),
+            )?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(500));
+            click_at(
+                &connection,
+                root,
+                picker_x,
+                origin.dst_y.saturating_add(390),
+            )?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("clicked the Interface font trigger and selected its second option");
+            let apply_x = origin
+                .dst_x
+                .saturating_add(i16::try_from(final_viewport.0.saturating_sub(80))?);
+            let apply_y = origin
+                .dst_y
+                .saturating_add(i16::try_from(final_viewport.1.saturating_sub(25))?);
+            click_at(&connection, root, apply_x, apply_y)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&config_path)?)?;
+            assert_ne!(
+                saved["ui_font"], "system-sans",
+                "clicking a font option did not persist a non-default UI font"
+            );
+            eprintln!("applied and verified the selected Interface font");
+        }
         if capture == "settings-github-typing" {
             let origin = pin_window(&connection, root, window)?;
             let input_x = origin
