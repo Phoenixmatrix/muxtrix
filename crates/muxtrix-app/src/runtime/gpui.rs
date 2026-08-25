@@ -1028,7 +1028,7 @@ impl Root {
         let colors = &mut theme.colors;
         colors.background = hsla(tokens.app);
         colors.foreground = hsla(tokens.text);
-        colors.border = hsla(tokens.line_strong);
+        colors.border = hsla(tokens.line);
         colors.input = hsla(tokens.line_strong);
         colors.ring = faded(tokens.accent, 0.6);
         colors.caret = hsla(tokens.text);

@@ -3,6 +3,7 @@
 //! Everything to the right of the sidebar. Phase 3 adds the sidebar and status
 //! bar around this; for now it is the whole window.
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Anchor, AnyElement, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, StatefulInteractiveElement, Styled, Window, div, point, px, svg,
@@ -260,29 +261,6 @@ impl Root {
                 }));
             if drop_target {
                 tab = tab.border_l(px(2.)).border_color(color(tokens.accent));
-            } else if index == active_index {
-                // The component uses the global strong border for selected
-                // tab sides. Cover only those two pixels with the active
-                // surface so selection does not thicken nearby dividers.
-                tab = tab
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .left_0()
-                            .w(px(1.))
-                            .bg(color(tokens.app)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .right_0()
-                            .w(px(1.))
-                            .bg(color(tokens.app)),
-                    );
             }
             tabs.push(tab);
         }
@@ -352,8 +330,11 @@ impl Root {
             .flex_none()
             .items_center()
             .px(px(4.))
-            .border_r(px(1.))
-            .border_color(color(tokens.line))
+            // The selected first tab already supplies this divider. Avoid
+            // painting the same one-pixel edge twice at the prefix boundary.
+            .when(active_index != 0, |prefix| {
+                prefix.border_r(px(1.)).border_color(color(tokens.line))
+            })
             .child(previous_tab)
             .child(next_tab);
         let new_tab = icon_button(
