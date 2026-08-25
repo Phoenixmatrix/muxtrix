@@ -521,6 +521,27 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             }
             thread::sleep(Duration::from_millis(50));
         }
+        if capture == "second-tab-selected" {
+            let origin = pin_window(&connection, root, window)?;
+            let before = grab_window(&connection, window)?;
+            let before_marker = first_tab_signal_x_bounds(&before)
+                .ok_or("first tab signal was not visible before activation")?;
+            // Expanded rail (272 px) + fixed tab navigation (56 px) + the
+            // center of the second short-name tab.
+            let second_tab_x = origin.dst_x.saturating_add(464);
+            let tab_y = origin.dst_y.saturating_add(16);
+            click_at(&connection, root, second_tab_x, tab_y)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            let after = grab_window(&connection, window)?;
+            let after_marker = first_tab_signal_x_bounds(&after)
+                .ok_or("first tab signal was not visible after activation")?;
+            assert_eq!(
+                before_marker, after_marker,
+                "selecting the second tab shifted the first tab horizontally"
+            );
+            eprintln!("clicked the second workspace tab without shifting tab geometry");
+        }
         if capture == "github-pull-request-search" {
             let origin = pin_window(&connection, root, window)?;
             let search_x = origin
@@ -938,6 +959,36 @@ fn grab_window(
         width,
         height,
     })
+}
+
+/// Horizontal bounds of the first tab's six-pixel signal marker.
+///
+/// The marker is the first painted tab content after the fixed navigation
+/// prefix, so unchanged bounds prove the tab viewport did not move when the
+/// second tab became active.
+fn first_tab_signal_x_bounds(frame: &CapturedFrame) -> Option<(usize, usize)> {
+    if frame.width < 348 || frame.height < 23 {
+        return None;
+    }
+    let mut bounds: Option<(usize, usize)> = None;
+    for y in 9..23 {
+        for x in 330..348 {
+            let offset = (y * frame.width + x) * 4;
+            let pixel = &frame.rgba[offset..offset + 3];
+            if pixel
+                .iter()
+                .copied()
+                .max()
+                .is_some_and(|channel| channel >= 80)
+            {
+                bounds = Some(match bounds {
+                    Some((left, right)) => (left.min(x), right.max(x)),
+                    None => (x, x),
+                });
+            }
+        }
+    }
+    bounds
 }
 
 /// The focused pane owns the only two accent-blue border pixels on this row:

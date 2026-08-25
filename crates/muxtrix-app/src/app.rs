@@ -1453,6 +1453,7 @@ pub(crate) enum Message {
     SessionPickerKill(usize),
     SessionPickerKillAll,
     NewTab,
+    ActivateTab(TabId),
     CloseTab(WorkspaceId, TabId),
     ConfirmCloseWorkspace(WorkspaceId),
     CancelCloseWorkspace,
@@ -2780,7 +2781,26 @@ impl Muxtrix {
                 }
                 return Vec::new();
             }
-            Message::NewTab => return self.new_tab_and_open_rename(),
+            Message::NewTab => {
+                self.status = match self.new_tab() {
+                    Ok(()) => "Created a new tab".into(),
+                    Err(error) => error,
+                };
+                return Vec::new();
+            }
+            Message::ActivateTab(tab_id) => {
+                if let Some(workspace_id) = self
+                    .session
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.tabs.iter().any(|tab| tab.id == tab_id))
+                    .map(|workspace| workspace.id)
+                {
+                    let _ = self.switch_workspace(workspace_id);
+                    let _ = self.switch_tab(tab_id);
+                }
+                return Vec::new();
+            }
             Message::CloseTab(workspace_id, tab_id) => self.close_tab(workspace_id, tab_id),
             Message::ConfirmCloseWorkspace(workspace_id) => {
                 self.close_workspace_prompt = None;
@@ -4879,25 +4899,6 @@ impl Muxtrix {
         }
     }
 
-    fn new_tab_and_open_rename(&mut self) -> Vec<Effect> {
-        if let Err(error) = self.new_tab() {
-            self.status = error;
-            return Vec::new();
-        }
-        let workspace_id = self.session.active_workspace_id;
-        let Some((tab_id, name)) = self
-            .active_workspace()
-            .ok()
-            .and_then(Workspace::active_tab)
-            .map(|tab| (tab.id, tab.name.clone()))
-        else {
-            self.status = "Created a tab, but its name is unavailable".into();
-            return Vec::new();
-        };
-        self.status = "Created a new tab".into();
-        self.open_rename_prompt(RenameTarget::Tab(workspace_id, tab_id), name)
-    }
-
     pub(crate) fn new_tab(&mut self) -> Result<(), String> {
         let profile = self.regular_terminal_profile()?;
         let tab_name = format!("Tab {}", self.active_workspace()?.tabs.len() + 1);
@@ -5436,7 +5437,7 @@ impl Muxtrix {
                 return self.update(Message::ToggleMaximize(pane_id));
             }
             if character_key_is(modified_key.as_ref(), "t") {
-                return self.new_tab_and_open_rename();
+                return self.update(Message::NewTab);
             }
         }
         if self.palette.visible {
@@ -10494,6 +10495,7 @@ pub(crate) fn set_split_ratio_at(
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum IconKind {
     Back,
+    Forward,
     Add,
     Collapse,
     Expand,

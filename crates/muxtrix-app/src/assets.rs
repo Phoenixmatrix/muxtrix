@@ -17,6 +17,10 @@ use crate::app::IconKind;
 /// disagree about what exists.
 const ICONS: &[(&str, &[u8])] = &[
     ("icons/back.svg", include_bytes!("../assets/icons/back.svg")),
+    (
+        "icons/forward.svg",
+        include_bytes!("../assets/icons/forward.svg"),
+    ),
     ("icons/add.svg", include_bytes!("../assets/icons/add.svg")),
     (
         "icons/collapse.svg",
@@ -109,6 +113,7 @@ const ICONS: &[(&str, &[u8])] = &[
 pub(crate) fn icon_path(kind: IconKind) -> SharedString {
     let path = match kind {
         IconKind::Back => "icons/back.svg",
+        IconKind::Forward => "icons/forward.svg",
         IconKind::Add => "icons/add.svg",
         IconKind::Collapse => "icons/collapse.svg",
         IconKind::Expand => "icons/expand.svg",
@@ -166,6 +171,7 @@ mod tests {
     fn every_icon_kind_resolves_to_a_served_asset() {
         let kinds = [
             IconKind::Back,
+            IconKind::Forward,
             IconKind::Add,
             IconKind::Collapse,
             IconKind::Expand,

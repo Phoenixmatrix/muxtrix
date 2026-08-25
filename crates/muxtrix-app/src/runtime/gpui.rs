@@ -128,6 +128,16 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+type TabOverflowLayout = (usize, usize, gpui::Pixels, bool, bool);
+type TabOverflowReveal = (
+    muxtrix_domain::WorkspaceId,
+    muxtrix_domain::TabId,
+    usize,
+    gpui::Pixels,
+    bool,
+    bool,
+);
+
 /// The window's root view.
 ///
 /// Owns the single [`Muxtrix`] value and turns messages into state changes and
@@ -173,6 +183,21 @@ pub(crate) struct Root {
     /// One handle per scrollable surface, so an effect that names a surface by
     /// role has something to move.
     pub(crate) scrolls: Scrolls,
+    /// The active workspace tab already requested from the horizontal strip.
+    ///
+    /// Tracking this separately preserves a user's manual horizontal scroll
+    /// until selection changes, while every newly active tab is brought fully
+    /// into view.
+    pub(crate) tab_scroll_target:
+        std::cell::Cell<Option<(muxtrix_domain::WorkspaceId, muxtrix_domain::TabId)>>,
+    /// Layout inputs whose tab overflow was last measured without its menu.
+    pub(crate) tab_overflow_layout: std::cell::Cell<Option<TabOverflowLayout>>,
+    /// The layout input currently queued for a post-render overflow probe.
+    pub(crate) tab_overflow_probe: std::cell::Cell<Option<TabOverflowLayout>>,
+    /// Whether the measured tab strip needs its complete-list menu.
+    pub(crate) tab_overflow_visible: std::cell::Cell<bool>,
+    /// Active tab already revealed against the measured overflow viewport.
+    pub(crate) tab_overflow_reveal: std::cell::Cell<Option<TabOverflowReveal>>,
     /// Scroll requests waiting for their surface to have an extent.
     ///
     /// An effect can arrive before the surface it names has ever been laid
@@ -320,6 +345,11 @@ impl Root {
             github_panel_bounds: std::rc::Rc::default(),
             images: std::collections::BTreeMap::new(),
             scrolls: Scrolls::default(),
+            tab_scroll_target: std::cell::Cell::default(),
+            tab_overflow_layout: std::cell::Cell::default(),
+            tab_overflow_probe: std::cell::Cell::default(),
+            tab_overflow_visible: std::cell::Cell::default(),
+            tab_overflow_reveal: std::cell::Cell::default(),
             pending_scrolls: Vec::new(),
             focus,
         };
@@ -998,7 +1028,7 @@ impl Root {
         let colors = &mut theme.colors;
         colors.background = hsla(tokens.app);
         colors.foreground = hsla(tokens.text);
-        colors.border = hsla(tokens.line_strong);
+        colors.border = hsla(tokens.line);
         colors.input = hsla(tokens.line_strong);
         colors.ring = faded(tokens.accent, 0.6);
         colors.caret = hsla(tokens.text);
@@ -1030,6 +1060,11 @@ impl Root {
         colors.scrollbar = hsla(crate::theme::Color::TRANSPARENT);
         colors.scrollbar_thumb = faded(tokens.text, 0.25);
         colors.scrollbar_thumb_hover = faded(tokens.text, 0.4);
+        colors.tab = hsla(crate::theme::Color::TRANSPARENT);
+        colors.tab_active = hsla(tokens.app);
+        colors.tab_active_foreground = hsla(tokens.text);
+        colors.tab_bar = hsla(tokens.rail);
+        colors.tab_foreground = hsla(tokens.muted);
         colors.danger = hsla(tokens.danger);
         colors.danger_foreground = hsla(tokens.app);
         colors.success = hsla(tokens.success);
@@ -1040,6 +1075,12 @@ impl Root {
         colors.link_hover = hsla(tokens.accent);
         colors.link_active = hsla(tokens.accent);
         colors.overlay = hsla(tokens.scrim);
+        // `Tab` reads the newer semantic tokens for its surfaces while older
+        // component controls still read `ThemeColor`; keep both projections
+        // on Muxtrix's palette.
+        theme.tokens.tab = hsla(crate::theme::Color::TRANSPARENT).into();
+        theme.tokens.tab_active = hsla(tokens.app).into();
+        theme.tokens.tab_bar = hsla(tokens.rail).into();
         window.refresh();
     }
 }
@@ -1085,6 +1126,7 @@ pub(crate) struct Scrolls {
     pub(crate) palette: gpui::ScrollHandle,
     pub(crate) github_files: gpui::ScrollHandle,
     pub(crate) github_pull_requests: gpui::ScrollHandle,
+    pub(crate) tabs: gpui::ScrollHandle,
 }
 
 impl Scrolls {
