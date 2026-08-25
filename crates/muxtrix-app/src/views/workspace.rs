@@ -113,10 +113,15 @@ impl Root {
                 let scroll = self.scrolls.tabs.clone();
                 window.defer(cx, move |_, cx| {
                     let overflow = scroll.max_offset().x > px(14.);
+                    let offset = scroll.offset();
+                    let reset_scroll = !overflow && offset.x != px(0.);
+                    if reset_scroll {
+                        scroll.set_offset(point(px(0.), offset.y));
+                    }
                     root.update(cx, |root, cx| {
                         root.tab_overflow_layout.set(Some(overflow_layout));
                         root.tab_overflow_probe.set(None);
-                        if root.tab_overflow_visible.replace(overflow) != overflow {
+                        if root.tab_overflow_visible.replace(overflow) != overflow || reset_scroll {
                             cx.notify();
                         }
                     });
@@ -218,6 +223,11 @@ impl Root {
                 .prefix(
                     div()
                         .size(px(6.))
+                        // Reallocate the component's leading whitespace so the
+                        // state dot groups with its own label, not the previous
+                        // tab's close control.
+                        .ml(px(8.))
+                        .mr(px(-8.))
                         .flex_none()
                         .rounded_full()
                         .bg(color(signal)),
