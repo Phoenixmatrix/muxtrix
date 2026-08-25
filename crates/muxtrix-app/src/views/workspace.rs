@@ -186,10 +186,13 @@ impl Root {
                 PaneSignalKind::Danger => "failed",
             };
             let signal = signal_kind.color(tokens);
+            let tab_hover_group = format!("workspace-tab-{}", tab_key(tab_id));
             let close = div()
                 .id(("close-tab", tab_key(tab_id)))
                 .role(gpui::accesskit::Role::Button)
                 .aria_label(format!("Close {} tab", workspace_tab.name))
+                .invisible()
+                .group_hover(tab_hover_group.clone(), |close| close.visible())
                 .size(px(16.))
                 .flex()
                 .flex_none()
@@ -217,6 +220,7 @@ impl Root {
             let mut tab = Tab::new()
                 .label(workspace_tab.name.clone())
                 .aria_label(format!("{}, {signal_label}", workspace_tab.name))
+                .group(tab_hover_group)
                 .prefix(
                     div()
                         .size(px(6.))
@@ -256,11 +260,102 @@ impl Root {
                 }));
             if drop_target {
                 tab = tab.border_l(px(2.)).border_color(color(tokens.accent));
+            } else if index == active_index {
+                // The component uses the global strong border for selected
+                // tab sides. Cover only those two pixels with the active
+                // surface so selection does not thicken nearby dividers.
+                tab = tab
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left_0()
+                            .w(px(1.))
+                            .bg(color(tokens.app)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .right_0()
+                            .w(px(1.))
+                            .bg(color(tokens.app)),
+                    );
             }
             tabs.push(tab);
         }
 
         let tab_count = workspace.tabs.len();
+        let can_navigate_tabs = tab_count > 1;
+        let previous_tab_id = can_navigate_tabs
+            .then(|| workspace.tabs[(active_index + tab_count - 1) % tab_count].id);
+        let next_tab_id =
+            can_navigate_tabs.then(|| workspace.tabs[(active_index + 1) % tab_count].id);
+        let mut navigation_hover = color(tokens.line_strong);
+        navigation_hover.a = 0.14;
+        let tab_navigation_button =
+            |id: &'static str,
+             kind: IconKind,
+             label: &'static str,
+             target: Option<muxtrix_domain::TabId>| {
+                let navigation_root = cx.entity();
+                let mut button = div()
+                    .id(id)
+                    .role(gpui::accesskit::Role::Button)
+                    .aria_label(label)
+                    .size(px(24.))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .child(svg().path(icon_path(kind)).size(px(12.)).text_color(color(
+                        if target.is_some() {
+                            tokens.muted
+                        } else {
+                            tokens.faint
+                        },
+                    )));
+                if let Some(tab_id) = target {
+                    button = button
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(navigation_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                                root.dispatch(Message::ActivateTab(tab_id), window, cx);
+                            }),
+                        )
+                        .on_a11y_action(gpui::accesskit::Action::Click, move |_, window, cx| {
+                            navigation_root.update(cx, |root, cx| {
+                                root.dispatch(Message::ActivateTab(tab_id), window, cx);
+                            });
+                        });
+                } else {
+                    button = button.cursor_default();
+                }
+                button
+            };
+        let previous_tab = tab_navigation_button(
+            "previous-tab",
+            IconKind::Back,
+            "Previous tab",
+            previous_tab_id,
+        );
+        let next_tab =
+            tab_navigation_button("next-tab", IconKind::Forward, "Next tab", next_tab_id);
+        let tab_bar_prefix = div()
+            .h_full()
+            .flex()
+            .flex_none()
+            .items_center()
+            .px(px(4.))
+            .border_r(px(1.))
+            .border_color(color(tokens.line))
+            .child(previous_tab)
+            .child(next_tab);
         let new_tab = icon_button(
             gpui::ElementId::from("new-tab-icon"),
             IconKind::Add,
@@ -318,6 +413,7 @@ impl Root {
             .selected_index(active_index)
             .max_width(px(app.settings.ui_pixels(120.0)))
             .track_scroll(&self.scrolls.tabs)
+            .prefix(tab_bar_prefix)
             .children(tabs)
             .last_empty_space(last_empty_space)
             // The group callback keeps direct tab activation in one path.

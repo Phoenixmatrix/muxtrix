@@ -102,11 +102,15 @@ full state. Text that belongs on one line clips instead of reflowing controls.
 Global Attention contains only problems that are not owned by a pane. Omit the section when it is empty. Activity tied to a pane belongs in that pane's fleet context.
 
 Workspace tabs live in a flush 32 px top-chrome band shared with the
-WORKSPACES header: signal dot, name, and a close affordance inside one tab.
-The tab viewport begins directly at the sidebar divider. The active tab takes
-the application field surface and interrupts the band's single bottom rule so
-it connects visually to the workspace; inactive tabs recede into the app bar.
-A compact trailing toolbar continues that bottom rule and uses one leading
+WORKSPACES header. A fixed previous/next pair sits immediately to the right of
+the sidebar divider and cycles through tabs, wrapping at either end; with one
+tab, both controls remain visible but inactive. The scrolling viewport follows
+with continuous tabs: signal dot, name, and a close suffix whose space is
+reserved but whose control appears only while its tab is hovered. The active
+tab takes the application field surface and interrupts the band's single
+bottom rule so it connects visually to the workspace. Selection never changes
+the color of a tab's side edges.
+A compact trailing toolbar continues the bottom rule and uses one leading
 divider for the whole group. Its add, flat Commands, and settings actions share
 the same quiet hover treatment without persistent bubbles or internal rules.
 The add action remains fixed after the horizontally scrolling tab viewport.

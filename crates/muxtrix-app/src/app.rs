@@ -10495,6 +10495,7 @@ pub(crate) fn set_split_ratio_at(
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum IconKind {
     Back,
+    Forward,
     Add,
     Collapse,
     Expand,
