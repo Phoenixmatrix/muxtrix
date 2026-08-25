@@ -1935,6 +1935,14 @@ impl Scenario {
         } else if self.capturing("rename-pane") {
             app.rename_prompt = Some(crate::app::RenameTarget::Pane(self.initial_pane));
             app.rename_draft = "build watcher".into();
+        } else if self.capturing("second-tab-selected") {
+            let workspace = app.active_workspace()?;
+            if workspace.tabs.len() < 2 {
+                return Err("second-tab-selected needs at least two tabs".into());
+            }
+            if workspace.active_tab_id != workspace.tabs[0].id {
+                return Err("second-tab-selected must begin on the first tab".into());
+            }
         } else if self.capturing("many-tabs") {
             for _ in 0..6 {
                 app.new_tab()?;

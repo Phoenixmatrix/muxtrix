@@ -329,9 +329,11 @@ impl Root {
             .flex_none()
             .items_center()
             .px(px(4.))
-            // Always reserve the divider pixel so selecting the first tab
-            // changes only its color, never the tab strip's geometry.
+            // Collapse the prefix and first-tab border slots onto one pixel.
+            // Exactly one is visible in either selection state, so both the
+            // geometry and the painted seam stay fixed.
             .border_r(px(1.))
+            .mr(px(-1.))
             .border_color(color(if active_index == 0 {
                 Color::TRANSPARENT
             } else {
