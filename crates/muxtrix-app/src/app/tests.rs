@@ -3379,9 +3379,8 @@ fn naming_dialogs_submit_with_enter_and_cancel_from_the_button_row() {
 }
 
 #[test]
-fn new_tab_action_opens_rename_with_the_default_name() {
+fn new_tab_action_keeps_the_default_name_without_opening_rename() {
     let mut app = Muxtrix::new();
-    let workspace_id = app.session.active_workspace_id;
 
     let effects = app.update(Message::NewTab);
 
@@ -3391,15 +3390,10 @@ fn new_tab_action_opens_rename_with_the_default_name() {
         .active_tab()
         .expect("tab");
     assert_eq!(tab.name, "Tab 2");
-    assert_eq!(
-        app.rename_prompt,
-        Some(RenameTarget::Tab(workspace_id, tab.id))
-    );
-    assert_eq!(app.rename_draft, "Tab 2");
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Focus(FocusTarget::Rename)]
-    ));
+    assert!(app.rename_prompt.is_none());
+    assert!(app.rename_draft.is_empty());
+    assert!(effects.is_empty());
+    assert_eq!(app.status, "Created a new tab");
 }
 
 #[test]
@@ -7938,6 +7932,13 @@ fn tab_drag_reorders_and_moves_tabs_between_workspaces() {
     assert_eq!(app.session.workspaces[0].tabs.len(), 1);
     assert_eq!(app.session.workspaces[0].tabs[0].id, first_tab);
     assert_eq!(app.session.workspaces[1].tabs[0].id, moved_tab);
+
+    app.switch_workspace(first_workspace)
+        .expect("first workspace should switch");
+    let effects = app.update(Message::ActivateTab(moved_tab));
+    assert!(effects.is_empty());
+    assert_eq!(app.session.active_workspace_id, second_workspace);
+    assert_eq!(active_tab(&app).id, moved_tab);
 }
 
 #[test]

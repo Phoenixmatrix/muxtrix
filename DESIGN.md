@@ -47,9 +47,9 @@ Color meaning is fixed:
 ## Layout and hierarchy
 
 The fleet rail is 272 px expanded and 46 px collapsed. The app bar is 44 px
-high and carries the workspace tabs as rounded chips; pane headers are 34 px
-bands inside their cards. Expanded fleet entries are compact two-line rows on
-the rail surface; panes are rounded cards floating on the app field.
+high and carries the workspace tabs in a continuous Zed-style strip; pane
+headers are 34 px bands inside their cards. Expanded fleet entries are compact
+two-line rows on the rail surface; panes are rounded cards floating on the app field.
 
 Workspaces are enumerated above the Fleet. Each expanded workspace row shows a
 rolled-up truthful signal, name, tab/pane counts, and the first available real
@@ -101,16 +101,23 @@ full state. Text that belongs on one line clips instead of reflowing controls.
 
 Global Attention contains only problems that are not owned by a pane. Omit the section when it is empty. Activity tied to a pane belongs in that pane's fleet context.
 
-Workspace tabs live in the app bar as 29 px rounded chips: signal dot, name,
-and a close affordance inside one chip, the active chip on a stronger fill and
-border, with a quiet add action after the last chip. The bar's right side
-holds the Commands pill — icon, label, and the real palette keycap rendered in
-the terminal face — then a divider and the settings icon button. Split actions
-stay at pane level in each pane header and its overflow menu.
-Tabs scroll horizontally, reorder by drag, and can be dropped onto workspace
-rows in the expanded rail. A workspace must retain one tab. Closing the last
-pane closes its tab automatically; closing the last tab asks whether to close
-the workspace, and the sole application workspace remains protected.
+Workspace tabs live in the app bar as 32 px continuous tabs: signal dot, name,
+and a close affordance inside one tab. The active tab takes the application
+field surface and a defined border so it connects visually to the workspace;
+inactive tabs recede into the app bar. A quiet add action remains fixed after
+the horizontally scrolling tab viewport. When tabs overflow that viewport, a
+compact Tabs menu exposes the complete list beside the add action. The bar's
+Commands pill — icon, label, and the real palette keycap rendered in the
+terminal face — then a divider and the settings icon button. Split actions stay
+at pane level in each pane header and its overflow menu.
+Tabs scroll horizontally, bring a newly active tab fully into view, reorder by
+drag, can be selected from the overflow menu, and can be dropped onto workspace
+rows in the expanded rail. Middle-click
+closes a tab. Creating a tab keeps its sequential default name and never opens
+the rename dialog; explicit rename remains a command. A workspace must retain
+one tab. Closing the last pane closes its tab automatically; closing the last
+tab asks whether to close the workspace, and the sole application workspace
+remains protected.
 
 Alt+Arrow moves pane focus by real split geometry. At the layout's right edge
 focus wraps to the next tab's first pane, and at the left edge to the previous
