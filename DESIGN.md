@@ -101,16 +101,18 @@ full state. Text that belongs on one line clips instead of reflowing controls.
 
 Global Attention contains only problems that are not owned by a pane. Omit the section when it is empty. Activity tied to a pane belongs in that pane's fleet context.
 
-Workspace tabs live in the app bar as 32 px continuous tabs: signal dot, name,
-and a close affordance inside one tab. The active tab takes the application
-field surface and a defined border so it connects visually to the workspace;
-inactive tabs recede into the app bar. Tabs and right-side controls share one
-bottom-aligned 32 px action band. A quiet add action remains fixed after the
-horizontally scrolling tab viewport, isolated from both the viewport and the
-Commands control by full-height rules. When tabs overflow, a compact Tabs menu
-exposes the complete list beside the viewport. Commands retains its real
-palette keycap; settings follows behind a shorter divider. Split actions stay
-at pane level in each pane header and its overflow menu.
+Workspace tabs live in a flush 32 px top-chrome band shared with the
+WORKSPACES header: signal dot, name, and a close affordance inside one tab.
+The tab viewport begins directly at the sidebar divider. The active tab takes
+the application field surface and interrupts the band's single bottom rule so
+it connects visually to the workspace; inactive tabs recede into the app bar.
+A compact trailing toolbar continues that bottom rule and uses one leading
+divider for the whole group. Its add, flat Commands, and settings actions share
+the same quiet hover treatment without persistent bubbles or internal rules.
+The add action remains fixed after the horizontally scrolling tab viewport.
+When tabs overflow, a compact Tabs menu exposes the complete list beside the
+viewport. Commands retains its real palette keycap. Split actions stay at pane
+level in each pane header and its overflow menu.
 Tabs scroll horizontally, bring a newly active tab fully into view, reorder by
 drag, can be selected from the overflow menu, and can be dropped onto workspace
 rows in the expanded rail. Middle-click

@@ -15,10 +15,7 @@ use gpui_component::tab::{Tab, TabBar};
 use crate::app::{IconKind, Message, PaneSignalKind};
 use crate::runtime::gpui::{Root, color};
 use crate::theme::DesignTokens;
-use crate::views::{icon_button, icon_path, tab_key};
-
-/// The application bar's fixed height.
-const APP_BAR_HEIGHT: f32 = 44.0;
+use crate::views::{TOP_CHROME_HEIGHT, icon_button, icon_path, tab_key};
 
 impl Root {
     /// The active workspace: tab strip above, pane tree below.
@@ -75,7 +72,7 @@ impl Root {
         let app = self.app();
         let tokens = DesignTokens::for_appearance(app.settings.appearance);
         let Ok(workspace) = app.active_workspace() else {
-            return div().h(px(APP_BAR_HEIGHT)).into_any_element();
+            return div().h(px(TOP_CHROME_HEIGHT)).into_any_element();
         };
 
         let workspace_id = workspace.id;
@@ -337,22 +334,21 @@ impl Root {
             .min_w(px(0.))
             .bg(color(tokens.rail));
         let strip = div()
-            .h(px(32.))
+            .h_full()
             .flex()
             .flex_grow(1.0)
             .min_w(px(0.))
             .child(tab_bar);
-        // The Commands entry: icon, label, and the real keycap for the
-        // palette; then the settings control behind a rule.
+        // One quiet toolbar follows the scrolling tabs. Its single leading
+        // rule and shared bottom edge make it part of the tab strip rather
+        // than a row of boxed controls.
         let mut keycap_fill = color(tokens.text);
         keycap_fill.a = 0.05;
-        let mut pill_fill = color(tokens.text);
-        pill_fill.a = 0.04;
-        let mut pill_hover = color(tokens.text);
-        pill_hover.a = 0.07;
+        let mut action_hover = color(tokens.line_strong);
+        action_hover.a = 0.14;
         let commands_root = cx.entity();
         let commands = div()
-            .id("commands-pill")
+            .id("commands-action")
             .role(gpui::accesskit::Role::Button)
             .aria_label("Commands")
             .aria_keyshortcuts(if cfg!(target_os = "macos") {
@@ -363,15 +359,12 @@ impl Root {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(7.))
-            .h(px(29.))
-            .px(px(9.))
-            .rounded(px(7.))
-            .bg(pill_fill)
-            .border_1()
-            .border_color(color(tokens.line_strong))
+            .gap(px(6.))
+            .h(px(24.))
+            .px(px(6.))
+            .rounded(px(4.))
             .cursor_pointer()
-            .hover(move |style| style.bg(pill_hover))
+            .hover(move |style| style.bg(action_hover))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|root, _: &MouseDownEvent, window, cx| {
@@ -445,8 +438,7 @@ impl Root {
             } else {
                 "Control+T"
             })
-            .w(px(32.))
-            .h_full()
+            .size(px(24.))
             .flex()
             .flex_none()
             .items_center()
@@ -474,47 +466,24 @@ impl Root {
             })
             .child(new_tab);
         let app_actions = div()
-            .h(px(32.))
+            .h_full()
             .flex()
             .flex_none()
             .items_center()
-            .child(
-                div()
-                    .w(px(1.))
-                    .h_full()
-                    .flex_none()
-                    .bg(color(tokens.line_strong)),
-            )
+            .gap(px(4.))
+            .px(px(6.))
+            .border_l(px(1.))
+            .border_b(px(1.))
+            .border_color(color(tokens.line))
             .child(new_tab_action)
-            .child(
-                div()
-                    .w(px(1.))
-                    .h_full()
-                    .flex_none()
-                    .bg(color(tokens.line_strong)),
-            )
-            .child(
-                div()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .pl(px(8.))
-                    .child(commands)
-                    .child(div().w(px(1.)).h(px(16.)).bg(color(tokens.line_strong)))
-                    .child(settings),
-            );
+            .child(commands)
+            .child(settings);
 
         div()
             .flex()
             .flex_row()
-            .items_end()
-            .gap(px(0.))
-            .h(px(APP_BAR_HEIGHT))
-            .px(px(10.))
+            .h(px(TOP_CHROME_HEIGHT))
             .bg(color(tokens.rail))
-            .border_b(px(1.))
-            .border_color(color(tokens.line))
             .child(strip)
             .child(app_actions)
             .into_any_element()

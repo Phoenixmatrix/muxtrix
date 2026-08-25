@@ -21,6 +21,8 @@ use crate::app::IconKind;
 use crate::assets::icon_path;
 use crate::runtime::gpui::color;
 use crate::theme::DesignTokens;
+/// Shared height of the sidebar header and workspace tab bar.
+pub(crate) const TOP_CHROME_HEIGHT: f32 = 32.0;
 
 /// A 24 px square icon button, the pane header's unit of chrome.
 ///

@@ -21,7 +21,7 @@ use crate::layout::pane_ids_in_layout;
 use crate::runtime::gpui::{Root, color};
 use crate::settings::{FleetScope, FleetView};
 use crate::theme::DesignTokens;
-use crate::views::{icon_button, pane_key, rail_marker, terminal_family};
+use crate::views::{TOP_CHROME_HEIGHT, icon_button, pane_key, rail_marker, terminal_family};
 
 impl Root {
     pub(crate) fn view_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -32,15 +32,13 @@ impl Root {
         }
 
         let mut rail = div().flex().flex_col().w_full();
-        // Same height as the app bar so the two headers' text shares one
-        // baseline across the rail/content seam.
+        // The rail and tab bar share one flush top-chrome band.
         rail = rail.child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .h(px(44.))
-                .py(px(4.))
+                .h(px(TOP_CHROME_HEIGHT))
                 .px(px(8.))
                 .child(
                     div()
@@ -58,7 +56,6 @@ impl Root {
                         tokens,
                         false,
                     )
-                    .size(px(28.))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|root, _: &MouseDownEvent, window, cx| {
@@ -1188,22 +1185,28 @@ impl Root {
                     .w(px(COLLAPSED_SIDEBAR_WIDTH - 1.0))
                     .h_full()
                     .bg(color(tokens.rail))
-                    .child(centred(
-                        icon_button(
-                            gpui::ElementId::from("collapsed-new-workspace"),
-                            IconKind::Add,
-                            tokens,
-                            false,
-                        )
-                        .size(px(32.))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|root, _: &MouseDownEvent, window, cx| {
-                                root.dispatch(Message::NewWorkspace, window, cx);
-                            }),
-                        )
-                        .into_any_element(),
-                    ))
+                    .child(
+                        div()
+                            .h(px(TOP_CHROME_HEIGHT))
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                icon_button(
+                                    gpui::ElementId::from("collapsed-new-workspace"),
+                                    IconKind::Add,
+                                    tokens,
+                                    false,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|root, _: &MouseDownEvent, window, cx| {
+                                        root.dispatch(Message::NewWorkspace, window, cx);
+                                    }),
+                                ),
+                            ),
+                    )
                     .child(
                         div()
                             .id("collapsed-scroll")
