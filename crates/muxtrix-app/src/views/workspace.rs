@@ -3,7 +3,6 @@
 //! Everything to the right of the sidebar. Phase 3 adds the sidebar and status
 //! bar around this; for now it is the whole window.
 
-use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Anchor, AnyElement, ClickEvent, Context, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, StatefulInteractiveElement, Styled, Window, div, point, px, svg,
@@ -15,7 +14,7 @@ use gpui_component::tab::{Tab, TabBar};
 
 use crate::app::{IconKind, Message, PaneSignalKind};
 use crate::runtime::gpui::{Root, color};
-use crate::theme::DesignTokens;
+use crate::theme::{Color, DesignTokens};
 use crate::views::{TOP_CHROME_HEIGHT, icon_button, icon_path, tab_key};
 
 impl Root {
@@ -330,11 +329,14 @@ impl Root {
             .flex_none()
             .items_center()
             .px(px(4.))
-            // The selected first tab already supplies this divider. Avoid
-            // painting the same one-pixel edge twice at the prefix boundary.
-            .when(active_index != 0, |prefix| {
-                prefix.border_r(px(1.)).border_color(color(tokens.line))
-            })
+            // Always reserve the divider pixel so selecting the first tab
+            // changes only its color, never the tab strip's geometry.
+            .border_r(px(1.))
+            .border_color(color(if active_index == 0 {
+                Color::TRANSPARENT
+            } else {
+                tokens.line
+            }))
             .child(previous_tab)
             .child(next_tab);
         let new_tab = icon_button(
