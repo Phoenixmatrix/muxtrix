@@ -12,7 +12,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::tab::{Tab, TabBar};
 
-use crate::app::{IconKind, Message};
+use crate::app::{IconKind, Message, PaneSignalKind};
 use crate::runtime::gpui::{Root, color};
 use crate::theme::DesignTokens;
 use crate::views::{icon_button, icon_path, tab_key};
@@ -175,9 +175,19 @@ impl Root {
             let drop_target = app.tab_drag.is_some_and(|drag| {
                 drag.target_workspace_id == workspace_id && drag.target_index == index
             });
-            let signal = app.tab_signal_kind(workspace_tab).color(tokens);
+            let signal_kind = app.tab_signal_kind(workspace_tab);
+            let signal_label = match signal_kind {
+                PaneSignalKind::Subtle => "idle",
+                PaneSignalKind::Neutral => "ready",
+                PaneSignalKind::Warning => "needs input",
+                PaneSignalKind::Active => "working",
+                PaneSignalKind::Danger => "failed",
+            };
+            let signal = signal_kind.color(tokens);
             let close = div()
                 .id(("close-tab", tab_key(tab_id)))
+                .role(gpui::accesskit::Role::Button)
+                .aria_label(format!("Close {} tab", workspace_tab.name))
                 .size(px(16.))
                 .flex()
                 .flex_none()
@@ -204,7 +214,7 @@ impl Root {
                 );
             let mut tab = Tab::new()
                 .label(workspace_tab.name.clone())
-                .aria_label(format!("{} tab", workspace_tab.name))
+                .aria_label(format!("{}, {signal_label}", workspace_tab.name))
                 .prefix(
                     div()
                         .size(px(6.))
@@ -245,25 +255,10 @@ impl Root {
 
         let tab_count = workspace.tabs.len();
         let new_tab = icon_button(
-            gpui::ElementId::from("new-tab"),
+            gpui::ElementId::from("new-tab-icon"),
             IconKind::Add,
             tokens,
             false,
-        )
-        // The fixed add action doubles as an always-reachable end drop
-        // target when the scrollable last-empty-space is offscreen.
-        .on_mouse_move(
-            cx.listener(move |root, _: &gpui::MouseMoveEvent, window, cx| {
-                if root.app.tab_drag.is_some() {
-                    root.dispatch(Message::TabDragOver(workspace_id, tab_count), window, cx);
-                }
-            }),
-        )
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|root, _: &MouseDownEvent, window, cx| {
-                root.dispatch(Message::NewTab, window, cx);
-            }),
         );
         let overflow_tabs = workspace
             .tabs
@@ -297,11 +292,7 @@ impl Root {
                 })
                 .anchor(Anchor::TopRight)
         });
-        let tab_bar_suffix = div()
-            .flex()
-            .items_center()
-            .children(overflow_menu)
-            .child(new_tab);
+        let tab_bar_suffix = div().flex().items_center().children(overflow_menu);
         let last_empty_space = div()
             .min_w(px(12.))
             .h_full()
@@ -349,8 +340,16 @@ impl Root {
         pill_fill.a = 0.04;
         let mut pill_hover = color(tokens.text);
         pill_hover.a = 0.07;
+        let commands_root = cx.entity();
         let commands = div()
             .id("commands-pill")
+            .role(gpui::accesskit::Role::Button)
+            .aria_label("Commands")
+            .aria_keyshortcuts(if cfg!(target_os = "macos") {
+                "Meta+P"
+            } else {
+                "Control+P"
+            })
             .flex()
             .flex_row()
             .items_center()
@@ -369,6 +368,11 @@ impl Root {
                     root.dispatch(Message::ToggleCommandPalette, window, cx);
                 }),
             )
+            .on_a11y_action(gpui::accesskit::Action::Click, move |_, window, cx| {
+                commands_root.update(cx, |root, cx| {
+                    root.dispatch(Message::ToggleCommandPalette, window, cx);
+                });
+            })
             .child(
                 svg()
                     .path(icon_path(IconKind::Command))
@@ -401,32 +405,101 @@ impl Root {
                     }),
             );
 
+        let settings_root = cx.entity();
         let settings = icon_button(
             gpui::ElementId::from("open-settings"),
             IconKind::Settings,
             tokens,
             false,
         )
+        .role(gpui::accesskit::Role::Button)
+        .aria_label("Settings")
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|root, _: &MouseDownEvent, window, cx| {
                 root.dispatch(Message::OpenSettings, window, cx);
             }),
-        );
-        let app_actions = div()
+        )
+        .on_a11y_action(gpui::accesskit::Action::Click, move |_, window, cx| {
+            settings_root.update(cx, |root, cx| {
+                root.dispatch(Message::OpenSettings, window, cx);
+            });
+        });
+        let new_tab_root = cx.entity();
+        let new_tab_action = div()
+            .id("new-tab-action")
+            .role(gpui::accesskit::Role::Button)
+            .aria_label("New tab")
+            .aria_keyshortcuts(if cfg!(target_os = "macos") {
+                "Meta+T"
+            } else {
+                "Control+T"
+            })
+            .w(px(32.))
             .h_full()
             .flex()
+            .flex_none()
             .items_center()
-            .gap(px(8.))
-            .child(commands)
-            .child(div().w(px(1.)).h(px(16.)).bg(color(tokens.line_strong)))
-            .child(settings);
+            .justify_center()
+            .cursor_pointer()
+            // This fixed action cell remains an always-reachable end drop
+            // target when the scroller's last empty space is offscreen.
+            .on_mouse_move(
+                cx.listener(move |root, _: &gpui::MouseMoveEvent, window, cx| {
+                    if root.app.tab_drag.is_some() {
+                        root.dispatch(Message::TabDragOver(workspace_id, tab_count), window, cx);
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|root, _: &MouseDownEvent, window, cx| {
+                    root.dispatch(Message::NewTab, window, cx);
+                }),
+            )
+            .on_a11y_action(gpui::accesskit::Action::Click, move |_, window, cx| {
+                new_tab_root.update(cx, |root, cx| {
+                    root.dispatch(Message::NewTab, window, cx);
+                });
+            })
+            .child(new_tab);
+        let app_actions = div()
+            .h(px(32.))
+            .flex()
+            .flex_none()
+            .items_center()
+            .child(
+                div()
+                    .w(px(1.))
+                    .h_full()
+                    .flex_none()
+                    .bg(color(tokens.line_strong)),
+            )
+            .child(new_tab_action)
+            .child(
+                div()
+                    .w(px(1.))
+                    .h_full()
+                    .flex_none()
+                    .bg(color(tokens.line_strong)),
+            )
+            .child(
+                div()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .pl(px(8.))
+                    .child(commands)
+                    .child(div().w(px(1.)).h(px(16.)).bg(color(tokens.line_strong)))
+                    .child(settings),
+            );
 
         div()
             .flex()
             .flex_row()
             .items_end()
-            .gap(px(8.))
+            .gap(px(0.))
             .h(px(APP_BAR_HEIGHT))
             .px(px(10.))
             .bg(color(tokens.rail))

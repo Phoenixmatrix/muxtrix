@@ -104,11 +104,12 @@ Global Attention contains only problems that are not owned by a pane. Omit the s
 Workspace tabs live in the app bar as 32 px continuous tabs: signal dot, name,
 and a close affordance inside one tab. The active tab takes the application
 field surface and a defined border so it connects visually to the workspace;
-inactive tabs recede into the app bar. A quiet add action remains fixed after
-the horizontally scrolling tab viewport. When tabs overflow that viewport, a
-compact Tabs menu exposes the complete list beside the add action. The bar's
-Commands pill — icon, label, and the real palette keycap rendered in the
-terminal face — then a divider and the settings icon button. Split actions stay
+inactive tabs recede into the app bar. Tabs and right-side controls share one
+bottom-aligned 32 px action band. A quiet add action remains fixed after the
+horizontally scrolling tab viewport, isolated from both the viewport and the
+Commands control by full-height rules. When tabs overflow, a compact Tabs menu
+exposes the complete list beside the viewport. Commands retains its real
+palette keycap; settings follows behind a shorter divider. Split actions stay
 at pane level in each pane header and its overflow menu.
 Tabs scroll horizontally, bring a newly active tab fully into view, reorder by
 drag, can be selected from the overflow menu, and can be dropped onto workspace
