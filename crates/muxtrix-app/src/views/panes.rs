@@ -482,8 +482,6 @@ impl Root {
                 .child(state)
         });
 
-        let mut unfocused = color(tokens.text);
-        unfocused.a = 0.03;
         div()
             .flex()
             .flex_col()
@@ -498,11 +496,7 @@ impl Root {
                     .pl(px(12.))
                     .pr(px(6.))
                     .rounded_t(px(9.))
-                    .bg(if focused {
-                        color(tokens.panel_raised)
-                    } else {
-                        unfocused
-                    })
+                    .bg(color(tokens.rail))
                     .child(div().size(px(6.)).rounded_full().bg(color(signal)))
                     .child(
                         div()

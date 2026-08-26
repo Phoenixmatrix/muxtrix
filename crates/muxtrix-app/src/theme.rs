@@ -47,8 +47,8 @@ pub(crate) struct DesignTokens {
     pub(crate) rail: Color,
     pub(crate) panel: Color,
     pub(crate) panel_raised: Color,
-    /// Floating surfaces — menus, palette, dialogs, tooltips — sit above the
-    /// terminal, so this is the lightest step of the dark ramp.
+    /// Floating surfaces — menus, palette, dialogs, tooltips — reuse the
+    /// chrome surface and gain depth from their strong border and shadow.
     pub(crate) overlay: Color,
     pub(crate) line: Color,
     pub(crate) line_strong: Color,
@@ -88,27 +88,26 @@ impl DesignTokens {
                 github_open: Color::from_rgb8(31, 136, 61),
                 github_merged: Color::from_rgb8(130, 80, 223),
             },
-            // The "Muxtrix Polished" world: chrome sits on a slate rail,
-            // terminal panes are darker cards floating on the app field, and
-            // hairlines are translucent white so they read on any surface.
+            // Warm graphite chrome surrounds a near-black work surface, with
+            // restrained warm-neutral copy.
             Appearance::System | Appearance::Dark => Self {
-                app: Color::from_rgb8(11, 14, 20),
-                rail: Color::from_rgb8(18, 22, 31),
-                panel: Color::from_rgb8(12, 15, 21),
-                panel_raised: Color::from_rgb8(20, 26, 38),
-                overlay: Color::from_rgb8(27, 32, 41),
-                line: Color::from_rgba8(255, 255, 255, 0.06),
-                line_strong: Color::from_rgba8(255, 255, 255, 0.12),
+                app: Color::from_rgb8(13, 16, 22),
+                rail: Color::from_rgb8(31, 33, 39),
+                panel: Color::from_rgb8(13, 16, 22),
+                panel_raised: Color::from_rgb8(45, 47, 52),
+                overlay: Color::from_rgb8(31, 33, 39),
+                line: Color::from_rgb8(45, 47, 52),
+                line_strong: Color::from_rgb8(63, 64, 67),
                 scrim: Color::from_rgba8(4, 5, 10, 0.72),
-                text: Color::from_rgb8(232, 236, 244),
-                muted: Color::from_rgb8(152, 161, 184),
-                faint: Color::from_rgb8(132, 142, 164),
-                accent: Color::from_rgb8(92, 157, 255),
-                success: Color::from_rgb8(85, 199, 126),
-                warning: Color::from_rgb8(242, 177, 78),
-                danger: Color::from_rgb8(240, 122, 110),
-                github_open: Color::from_rgb8(63, 185, 80),
-                github_merged: Color::from_rgb8(163, 113, 247),
+                text: Color::from_rgb8(191, 189, 182),
+                muted: Color::from_rgb8(161, 159, 153),
+                faint: Color::from_rgb8(152, 150, 145),
+                accent: Color::from_rgb8(90, 193, 254),
+                success: Color::from_rgb8(170, 216, 76),
+                warning: Color::from_rgb8(254, 180, 84),
+                danger: Color::from_rgb8(239, 113, 119),
+                github_open: Color::from_rgb8(170, 216, 76),
+                github_merged: Color::from_rgb8(210, 166, 254),
             },
         }
     }

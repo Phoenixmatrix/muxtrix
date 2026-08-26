@@ -8,6 +8,12 @@ Use the semantic `DesignTokens` in `crates/muxtrix-app/src/theme.rs`. Do not int
 
 The appearance setting supports System, Dark, and Light. System currently resolves to dark, and only the dark appearance is polished. Treat Light as supported configuration, not as a visually complete reference.
 
+Dark appearance uses near-black workspace and pane fields, warm graphite rail
+and elevated controls, warm-neutral text, and a clear cyan-blue focus accent.
+Secondary text stays on the legible steps of that warm-neutral ramp rather than
+dropping to placeholder gray, because Muxtrix uses it for persistent small
+labels.
+
 The default UI type size is 16 pt and its default weight is Regular. Settings
 offers only the weights available for the selected interface family; interface
 family and weight changes take effect after restart. Terminal content defaults
@@ -50,6 +56,10 @@ The fleet rail is 272 px expanded and 46 px collapsed. The app bar is 44 px
 high and carries the workspace tabs in a continuous Zed-style strip; pane
 headers are 34 px bands inside their cards. Expanded fleet entries are compact
 two-line rows on the rail surface; panes are rounded cards floating on the app field.
+
+A single one-pixel `line` token spans the top of the root surface immediately
+below the operating-system window chrome. It appears above every application
+view and does not change color with workspace or pane focus.
 
 Workspaces are enumerated above the Fleet. Each expanded workspace row shows a
 rolled-up truthful signal, name, tab/pane counts, and the first available real
