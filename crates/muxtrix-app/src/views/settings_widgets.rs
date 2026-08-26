@@ -9,6 +9,9 @@
 //! are mapped to and from those by position, which keeps one state type for
 //! all seven pickers and leaves `Display` as the single source of their copy.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, Window};
 use gpui_component::IndexPath;
 use gpui_component::input::{InputEvent, InputState};
@@ -33,6 +36,7 @@ type BoundField<'a> = (&'a Entity<InputState>, fn(String) -> Message);
 pub(crate) struct Picker {
     pub(crate) state: Entity<SelectState<Vec<String>>>,
     pub(crate) trigger_focus: FocusHandle,
+    pub(crate) restore_focus_on_release: Rc<Cell<bool>>,
     items: std::cell::RefCell<Vec<String>>,
 }
 
@@ -76,6 +80,20 @@ impl SettingsWidgets {
         };
         widgets.subscribe(cx);
         widgets
+    }
+
+    pub(crate) fn picker_trigger_focused(&self, window: &Window) -> bool {
+        [
+            &self.appearance,
+            &self.ui_font,
+            &self.ui_font_weight,
+            &self.terminal_theme,
+            &self.terminal_font,
+            &self.terminal_font_weight,
+            &self.default_agent,
+        ]
+        .into_iter()
+        .any(|picker| picker.trigger_focus.is_focused(window))
     }
 
     /// Turn each control's change into the message the application already
@@ -186,6 +204,7 @@ fn picker(window: &mut Window, cx: &mut Context<Root>) -> Picker {
     Picker {
         state,
         trigger_focus,
+        restore_focus_on_release: Rc::new(Cell::new(false)),
         items: std::cell::RefCell::new(Vec::new()),
     }
 }
