@@ -1773,7 +1773,7 @@ impl Scenario {
             if self.capturing("fleet-repos-folded") {
                 app.toggle_fleet_branch(FleetBranch::Repository(
                     app.session.active_workspace_id,
-                    self.initial_pane,
+                    "muxtrix".into(),
                 ));
             }
         } else if self.capturing("fleet-tabs-duplicates") {

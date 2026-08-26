@@ -117,14 +117,14 @@ impl Root {
                             workspace.name.clone(),
                             FleetGroupLevel::Workspace,
                             0,
-                            branch,
+                            &branch,
                             app.workspace_signal_kind(workspace),
                             pane_count,
                             app.rail_nav == Some(RailTarget::FleetWorkspace(workspace.id)),
                             tokens,
                             cx,
                         ));
-                        if app.fleet_branch_collapsed(branch) {
+                        if app.fleet_branch_collapsed(&branch) {
                             continue;
                         }
                     }
@@ -135,14 +135,14 @@ impl Root {
                             tab.name.clone(),
                             FleetGroupLevel::Nested,
                             nested_depth,
-                            branch,
+                            &branch,
                             app.tab_signal_kind(tab),
                             pane_ids.len(),
                             app.rail_nav == Some(RailTarget::FleetTab(workspace.id, tab.id)),
                             tokens,
                             cx,
                         ));
-                        if app.fleet_branch_collapsed(branch) {
+                        if app.fleet_branch_collapsed(&branch) {
                             continue;
                         }
                         for pane_id in pane_ids {
@@ -196,14 +196,14 @@ impl Root {
                             workspace.name.clone(),
                             FleetGroupLevel::Workspace,
                             0,
-                            branch,
+                            &branch,
                             strongest_pane_signal(app, workspace, entries.iter().copied()),
                             entries.len(),
                             app.rail_nav == Some(RailTarget::FleetWorkspace(workspace.id)),
                             tokens,
                             cx,
                         ));
-                        if app.fleet_branch_collapsed(branch) {
+                        if app.fleet_branch_collapsed(&branch) {
                             continue;
                         }
                     }
@@ -228,14 +228,14 @@ impl Root {
                             workspace.name.clone(),
                             FleetGroupLevel::Workspace,
                             0,
-                            branch,
+                            &branch,
                             app.workspace_signal_kind(workspace),
                             pane_count,
                             app.rail_nav == Some(RailTarget::FleetWorkspace(workspace.id)),
                             tokens,
                             cx,
                         ));
-                        if app.fleet_branch_collapsed(branch) {
+                        if app.fleet_branch_collapsed(&branch) {
                             continue;
                         }
                     }
@@ -244,12 +244,12 @@ impl Root {
                         else {
                             continue;
                         };
-                        let branch = FleetBranch::Repository(workspace_id, first_pane);
+                        let branch = FleetBranch::Repository(workspace_id, group.name.clone());
                         rail = rail.child(self.fleet_group_label(
                             group.name,
                             FleetGroupLevel::Nested,
                             nested_depth,
-                            branch,
+                            &branch,
                             strongest_pane_signal(
                                 app,
                                 workspace,
@@ -260,7 +260,7 @@ impl Root {
                             tokens,
                             cx,
                         ));
-                        if app.fleet_branch_collapsed(branch) {
+                        if app.fleet_branch_collapsed(&branch) {
                             continue;
                         }
                         for (_, pane_id) in group.entries {
@@ -432,7 +432,7 @@ impl Root {
         label: String,
         level: FleetGroupLevel,
         depth: usize,
-        branch: FleetBranch,
+        branch: &FleetBranch,
         signal_kind: PaneSignalKind,
         pane_count: usize,
         targeted: bool,
@@ -447,6 +447,7 @@ impl Root {
         let mut hover = color(tokens.text);
         hover.a = 0.04;
         let id = SharedString::from(format!("fleet-branch-{branch:?}"));
+        let branch_message = branch.clone();
         let display_label = if workspace {
             label.to_uppercase()
         } else {
@@ -482,7 +483,11 @@ impl Root {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |root, _: &MouseDownEvent, window, cx| {
-                    root.dispatch(Message::ToggleFleetBranch(branch), window, cx);
+                    root.dispatch(
+                        Message::ToggleFleetBranch(branch_message.clone()),
+                        window,
+                        cx,
+                    );
                 }),
             )
             .child(

@@ -5297,7 +5297,7 @@ fn repos_view_groups_across_tabs_without_nested_tab_bands() {
 
     app.update(Message::ToggleFleetBranch(FleetBranch::Repository(
         workspace_id,
-        first_repo_pane,
+        "muxtrix".into(),
     )));
     assert_eq!(
         app.rail_targets()
@@ -5312,6 +5312,28 @@ fn repos_view_groups_across_tabs_without_nested_tab_bands() {
             RailTarget::FleetPane(workspace_id, no_repo_pane),
         ],
         "collapsing one repository does not hide sibling branches"
+    );
+
+    app.rail_nav = Some(RailTarget::FleetGroup(workspace_id, first_repo_pane));
+    app.update(Message::ClosePane(first_repo_pane));
+    assert_eq!(
+        app.rail_targets()
+            .into_iter()
+            .filter(|target| !matches!(target, RailTarget::Workspace(_)))
+            .collect::<Vec<_>>(),
+        vec![
+            RailTarget::FleetGroup(workspace_id, second_repo_pane),
+            RailTarget::FleetGroup(workspace_id, other_repo_pane),
+            RailTarget::FleetPane(workspace_id, other_repo_pane),
+            RailTarget::FleetGroup(workspace_id, no_repo_pane),
+            RailTarget::FleetPane(workspace_id, no_repo_pane),
+        ],
+        "repository collapse survives a change to the group's leading pane"
+    );
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+    assert!(
+        app.rail_nav.is_none(),
+        "activating a stale group target exits without panicking"
     );
 }
 
@@ -5519,7 +5541,7 @@ fn rail_navigation_folds_branches_with_horizontal_arrows_and_enter() {
     );
 
     let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowLeft), Modifiers::empty()));
-    assert!(app.fleet_branch_collapsed(branch));
+    assert!(app.fleet_branch_collapsed(&branch));
     assert!(
         !app.rail_targets()
             .contains(&RailTarget::FleetPane(workspace_id, pane_id))
@@ -5530,14 +5552,14 @@ fn rail_navigation_folds_branches_with_horizontal_arrows_and_enter() {
     );
 
     let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowRight), Modifiers::empty()));
-    assert!(!app.fleet_branch_collapsed(branch));
+    assert!(!app.fleet_branch_collapsed(&branch));
     assert!(
         app.rail_targets()
             .contains(&RailTarget::FleetPane(workspace_id, pane_id))
     );
 
     let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
-    assert!(app.fleet_branch_collapsed(branch));
+    assert!(app.fleet_branch_collapsed(&branch));
     assert!(app.rail_nav.is_none());
 }
 
