@@ -649,7 +649,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
                 .dst_x
                 .saturating_add(i16::try_from(final_viewport.0.saturating_sub(335))?);
             let picker_y = origin.dst_y.saturating_add(256);
-            click_at(&connection, root, picker_x, picker_y)?;
+            click_with_jitter_at(&connection, root, picker_x, picker_y)?;
             connection.flush()?;
             thread::sleep(Duration::from_millis(1_000));
             eprintln!("clicked the Theme dropdown and left its option menu open");
@@ -659,7 +659,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             let picker_x = origin
                 .dst_x
                 .saturating_add(i16::try_from(final_viewport.0.saturating_sub(300))?);
-            click_at(
+            click_with_jitter_at(
                 &connection,
                 root,
                 picker_x,
@@ -1154,6 +1154,31 @@ fn click_at(
         .check()?;
     connection
         .xtest_fake_input(BUTTON_RELEASE_EVENT, 1, 0, root, x, y, 0)?
+        .check()?;
+    Ok(())
+}
+
+/// Exercise the sub-threshold movement a physical pointer can report during
+/// an ordinary click. The control must still activate after this jitter.
+fn click_with_jitter_at(
+    connection: &RustConnection,
+    root: u32,
+    x: i16,
+    y: i16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    connection
+        .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x, y, 0)?
+        .check()?;
+    connection
+        .xtest_fake_input(BUTTON_PRESS_EVENT, 1, 0, root, x, y, 0)?
+        .check()?;
+    connection
+        .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x.saturating_add(1), y, 0)?
+        .check()?;
+    connection.flush()?;
+    thread::sleep(Duration::from_millis(100));
+    connection
+        .xtest_fake_input(BUTTON_RELEASE_EVENT, 1, 0, root, x.saturating_add(1), y, 0)?
         .check()?;
     Ok(())
 }

@@ -7,11 +7,12 @@
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    AnyElement, Context, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px, svg,
 };
 
 use gpui_component::Sizable as _;
+use gpui_component::dialog::Confirm;
 use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_component::select::Select;
@@ -265,15 +266,32 @@ impl Root {
 
         let widgets = &self.settings_widgets;
         let picker = |state: &Picker, width: f32| {
+            let state = state.state.clone();
+            let pointer_state = state.clone();
             div()
                 // `Select` fills its parent. Give that parent a concrete
                 // trigger-sized hit box instead of leaving its percentage
                 // height to resolve against an auto-height flex child.
                 .w(px(width))
                 .h(px(32.))
+                // Focus before opening so a sub-threshold pressed-pointer move
+                // cannot discard activation before mouse-up. An already-open
+                // Select keeps its native outside-click dismissal.
+                .capture_any_mouse_down(move |event, window, cx| {
+                    if event.button != MouseButton::Left {
+                        return;
+                    }
+                    pointer_state.update(cx, |state, cx| state.focus(window, cx));
+                    let was_open = !pointer_state.read(cx).focus_handle(cx).is_focused(window);
+                    if was_open {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    window.dispatch_action(Box::new(Confirm { secondary: false }), cx);
+                })
                 .child(
                     // Preserve the small control path; only the trigger is taller.
-                    Select::new(&state.state)
+                    Select::new(&state)
                         .small()
                         .h(px(32.))
                         .menu_max_h(px(FONT_FAMILY_MENU_MAX_HEIGHT))
