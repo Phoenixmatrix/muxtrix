@@ -1,6 +1,6 @@
 # Muxtrix capture gallery
 
-186 real rendered Muxtrix frames, captured headlessly through the e2e harness
+188 real rendered Muxtrix frames, captured headlessly through the e2e harness
 (Xvfb + llvmpipe, no visible window), plus a local review UI.
 
 Shots, `manifest.json` and your review notes live in
