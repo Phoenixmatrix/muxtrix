@@ -227,6 +227,20 @@ fn executable(command: &str) -> Option<&str> {
     Some(executable.trim_matches(['\'', '"'])).filter(|value| !value.is_empty())
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn wsl_login_arguments(program: &str, distribution: &str) -> Vec<String> {
+    let mut arguments = Vec::new();
+    if !distribution.trim().is_empty() {
+        arguments.extend(["--distribution".into(), distribution.trim().into()]);
+    }
+    // Claude is commonly installed in ~/.local/bin or another path exported
+    // by the user's shell. `--exec` bypasses that shell and inherits WSL's
+    // sparse Windows-launch environment, so the roster poll cannot find the
+    // same executable an interactive Muxtrix pane launched successfully.
+    arguments.extend(["--shell-type".into(), "login".into(), program.to_owned()]);
+    arguments
+}
+
 /// Blocking: callers run this off the UI thread. `wsl_distribution` is `Some`
 /// when a Windows Muxtrix pane runs in WSL; an empty value selects WSL's
 /// default distribution.
@@ -238,10 +252,7 @@ pub(crate) fn load(
     #[cfg(target_os = "windows")]
     let mut command = if let Some(distribution) = wsl_distribution {
         let mut command = console_command("wsl.exe");
-        if !distribution.trim().is_empty() {
-            command.args(["--distribution", distribution.trim()]);
-        }
-        command.args(["--exec", program]);
+        command.args(wsl_login_arguments(program, distribution));
         command
     } else {
         console_command(program)
@@ -435,5 +446,23 @@ mod tests {
         );
         assert_eq!(executable("env FOO=1 claude"), Some("claude"));
         assert_eq!(executable("   "), None);
+    }
+
+    #[test]
+    fn wsl_roster_uses_the_users_login_environment() {
+        assert_eq!(
+            wsl_login_arguments("claude", ""),
+            ["--shell-type", "login", "claude"]
+        );
+        assert_eq!(
+            wsl_login_arguments("/home/user/.local/bin/claude", "Ubuntu-24.04"),
+            [
+                "--distribution",
+                "Ubuntu-24.04",
+                "--shell-type",
+                "login",
+                "/home/user/.local/bin/claude",
+            ]
+        );
     }
 }
