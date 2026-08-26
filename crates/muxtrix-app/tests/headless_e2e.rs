@@ -649,24 +649,48 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
                 .dst_x
                 .saturating_add(i16::try_from(final_viewport.0.saturating_sub(335))?);
             let picker_y = origin.dst_y.saturating_add(256);
-            click_with_jitter_at(&connection, root, picker_x, picker_y)?;
-            connection.flush()?;
-            thread::sleep(Duration::from_millis(1_000));
-            eprintln!("clicked the Theme dropdown and left its option menu open");
+            for _ in 0..3 {
+                click_with_jitter_at(&connection, root, picker_x, picker_y)?;
+                connection.flush()?;
+                thread::sleep(Duration::from_millis(250));
+            }
+            thread::sleep(Duration::from_millis(750));
+            eprintln!("opened, closed, and reopened the Theme dropdown");
         }
         if capture == "settings-dropdown-select" {
             let origin = pin_window(&connection, root, window)?;
             let picker_x = origin
                 .dst_x
                 .saturating_add(i16::try_from(final_viewport.0.saturating_sub(300))?);
-            click_with_jitter_at(
-                &connection,
-                root,
-                picker_x,
-                origin.dst_y.saturating_add(338),
-            )?;
+            let picker_y = origin.dst_y.saturating_add(338);
+            let apply_x = origin
+                .dst_x
+                .saturating_add(i16::try_from(final_viewport.0.saturating_sub(80))?);
+            let apply_y = origin
+                .dst_y
+                .saturating_add(i16::try_from(final_viewport.1.saturating_sub(25))?);
+            click_with_jitter_at(&connection, root, picker_x, picker_y)?;
             connection.flush()?;
             thread::sleep(Duration::from_millis(500));
+            tap_keysym(&connection, 0xff54)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(250));
+            click_with_jitter_at(&connection, root, picker_x, picker_y)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(250));
+            click_at(&connection, root, apply_x, apply_y)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(500));
+            assert!(
+                !config_path.exists(),
+                "closing the dropdown committed its highlighted option"
+            );
+            click_with_jitter_at(&connection, root, picker_x, picker_y)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(500));
+            eprintln!(
+                "opened, closed without committing, and reopened the Interface font dropdown"
+            );
             click_at(
                 &connection,
                 root,
@@ -676,12 +700,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             connection.flush()?;
             thread::sleep(Duration::from_millis(1_000));
             eprintln!("clicked the Interface font trigger and selected its second option");
-            let apply_x = origin
-                .dst_x
-                .saturating_add(i16::try_from(final_viewport.0.saturating_sub(80))?);
-            let apply_y = origin
-                .dst_y
-                .saturating_add(i16::try_from(final_viewport.1.saturating_sub(25))?);
+
             click_at(&connection, root, apply_x, apply_y)?;
             connection.flush()?;
             thread::sleep(Duration::from_millis(1_000));

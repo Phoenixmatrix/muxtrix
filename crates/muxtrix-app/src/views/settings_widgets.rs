@@ -9,7 +9,7 @@
 //! are mapped to and from those by position, which keeps one state type for
 //! all seven pickers and leaves `Display` as the single source of their copy.
 
-use gpui::{AppContext, Context, Entity, Window};
+use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, Window};
 use gpui_component::IndexPath;
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::select::{SelectEvent, SelectState};
@@ -32,6 +32,7 @@ type BoundField<'a> = (&'a Entity<InputState>, fn(String) -> Message);
 /// they differ" possible.
 pub(crate) struct Picker {
     pub(crate) state: Entity<SelectState<Vec<String>>>,
+    pub(crate) trigger_focus: FocusHandle,
     items: std::cell::RefCell<Vec<String>>,
 }
 
@@ -180,8 +181,11 @@ impl SettingsWidgets {
 }
 
 fn picker(window: &mut Window, cx: &mut Context<Root>) -> Picker {
+    let state = cx.new(|cx| SelectState::new(Vec::new(), None, window, cx));
+    let trigger_focus = state.read(cx).focus_handle(cx);
     Picker {
-        state: cx.new(|cx| SelectState::new(Vec::new(), None, window, cx)),
+        state,
+        trigger_focus,
         items: std::cell::RefCell::new(Vec::new()),
     }
 }
