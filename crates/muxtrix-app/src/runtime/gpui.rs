@@ -954,6 +954,9 @@ impl Render for Root {
             .font_weight(gpui::FontWeight(f32::from(
                 self.app.settings.ui_font_weight.numeric(),
             )))
+            // A single hairline separates native window chrome from every
+            // application surface without giving the top bar a boxed edge.
+            .child(div().h(px(1.)).w_full().flex_none().bg(color(tokens.line)))
             .child(match screen {
                 Some(screen) => div().flex_grow(1.0).overflow_hidden().child(screen),
                 // The panel docks beside the workspace when there is room

@@ -155,6 +155,14 @@ add({
   check: "Default projection: tab bands with their panes nested underneath.",
 });
 add({
+  slug: "fleet-toggle-hover",
+  title: "Fleet projection hover",
+  group: "Fleet",
+  capture: "fleet-toggle-hover",
+  check:
+    "Hovered Agents must be unmistakable against the well, remain distinct from selected Tabs, and introduce no text or border shift.",
+});
+add({
   slug: "fleet-all-workspaces",
   title: "Fleet · All workspaces",
   group: "Fleet",
@@ -233,6 +241,14 @@ add({
   group: "Fleet",
   capture: "many-tabs",
   check: "Tab strip overflow: check the last tab's close affordance against the Commands button.",
+});
+add({
+  slug: "tab-close-hover",
+  title: "Tab close hover",
+  group: "Fleet",
+  capture: "tab-close-hover",
+  check:
+    "The centred close glyph must have an 18px hover target and a 2px gap before the tab's trailing edge.",
 });
 add({
   slug: "many-tabs-compact",

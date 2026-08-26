@@ -303,8 +303,7 @@ impl Root {
             .border_color(color(tokens.line));
         for view in [FleetView::Tabs, FleetView::Agents, FleetView::Repos] {
             let selected = app.settings.fleet_view == view;
-            let mut hover = color(tokens.text);
-            hover.a = 0.05;
+            let hover = color(tokens.element_hover);
             let mut segment = div()
                 .id(SharedString::from(format!("fleet-{view}")))
                 .h(px(26.))
