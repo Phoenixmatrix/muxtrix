@@ -8,7 +8,7 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, Context, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px, svg,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px, svg,
 };
 
 use gpui_component::Sizable as _;
@@ -268,7 +268,10 @@ impl Root {
         let picker = |picker: &Picker, width: f32| {
             let state = picker.state.clone();
             let pointer_state = state.clone();
-            let trigger_focus = picker.trigger_focus.clone();
+            let pointer_trigger_focus = picker.trigger_focus.clone();
+            let restore_focus_on_release = picker.restore_focus_on_release.clone();
+            let release_restore_focus = restore_focus_on_release.clone();
+            let release_trigger_focus = picker.trigger_focus.clone();
             div()
                 // `Select` fills its parent. Give that parent a concrete
                 // trigger-sized hit box instead of leaving its percentage
@@ -283,12 +286,32 @@ impl Root {
                     if event.button != MouseButton::Left {
                         return;
                     }
-                    let open = pointer_state.read(cx).focus_handle(cx) != trigger_focus;
+                    let open = pointer_state.read(cx).focus_handle(cx) != pointer_trigger_focus;
+                    restore_focus_on_release.set(open);
                     cx.stop_propagation();
                     if open {
-                        trigger_focus.dispatch_action(&Cancel, window, cx);
+                        pointer_trigger_focus.dispatch_action(&Cancel, window, cx);
                     } else {
-                        trigger_focus.dispatch_action(&Confirm { secondary: false }, window, cx);
+                        pointer_trigger_focus.dispatch_action(
+                            &Confirm { secondary: false },
+                            window,
+                            cx,
+                        );
+                    }
+                })
+                // Mouse-up is the final event in a physical click. After a
+                // close activation, suppress the child's stale click and
+                // restore the trigger after complete event dispatch.
+                .capture_any_mouse_up(move |event, window, cx| {
+                    if event.button == MouseButton::Left && release_restore_focus.replace(false) {
+                        cx.stop_propagation();
+                        let window = Window::window_handle(window);
+                        let trigger_focus = release_trigger_focus.clone();
+                        cx.defer(move |cx| {
+                            _ = window.update(cx, |_, window, cx| {
+                                trigger_focus.focus(window, cx);
+                            });
+                        });
                     }
                 })
                 .child(

@@ -842,7 +842,8 @@ impl Render for Root {
             None => {
                 let settings_control_focused = self.app.active_view
                     == crate::app::ActiveView::Settings
-                    && self.focus.contains_focused(window, cx);
+                    && (self.focus.contains_focused(window, cx)
+                        || self.settings_widgets.picker_trigger_focused(window));
                 if !settings_control_focused && !self.focus.is_focused(window) {
                     self.focus.focus(window, cx);
                 }
