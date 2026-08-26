@@ -87,8 +87,11 @@ pub mod shell_integration {
     /// bash runs `PROMPT_COMMAND` before every prompt and, crucially, reads
     /// it from the environment — no rc-file edits or `--init-file` games.
     /// A user rc that appends to it composes; one that overwrites wins.
+    /// Keep this free of `${...}`: editors such as Zed re-spawn the shell via
+    /// `fish -i -c "exec env 'PROMPT_COMMAND=...' ..."` and fish rejects `${`
+    /// inside double quotes, which killed the whole launch.
     pub const BASH_PROMPT_COMMAND: &str =
-        r#"printf '\033]7;file://%s%s\033\\' "${HOSTNAME:-}" "$PWD""#;
+        r#"printf '\033]7;file://%s%s\033\\' "$HOSTNAME" "$PWD""#;
 
     /// zsh has no environment-borne hook, but it does read
     /// `$ZDOTDIR/.zshenv` first. Pointing ZDOTDIR at a directory holding

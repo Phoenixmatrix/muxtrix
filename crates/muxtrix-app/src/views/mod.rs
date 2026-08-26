@@ -40,9 +40,7 @@ pub(crate) fn icon_button(
         hue.a = 0.14;
         hue.into()
     } else {
-        let mut hue = color(tokens.line_strong);
-        hue.a = 0.14;
-        hue.into()
+        color(tokens.element_hover).into()
     };
     div()
         .id(id.into())

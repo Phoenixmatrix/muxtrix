@@ -8,6 +8,12 @@ Use the semantic `DesignTokens` in `crates/muxtrix-app/src/theme.rs`. Do not int
 
 The appearance setting supports System, Dark, and Light. System currently resolves to dark, and only the dark appearance is polished. Treat Light as supported configuration, not as a visually complete reference.
 
+Dark appearance uses near-black workspace and pane fields, warm graphite rail
+and elevated controls, warm-neutral text, and a clear cyan-blue focus accent.
+Secondary text stays on the legible steps of that warm-neutral ramp rather than
+dropping to placeholder gray, because Muxtrix uses it for persistent small
+labels.
+
 The default UI type size is 16 pt and its default weight is Regular. Settings
 offers only the weights available for the selected interface family; interface
 family and weight changes take effect after restart. Terminal content defaults
@@ -51,6 +57,10 @@ high and carries the workspace tabs in a continuous Zed-style strip; pane
 headers are 34 px bands inside their cards. Expanded fleet entries are compact
 two-line rows on the rail surface; panes are rounded cards floating on the app field.
 
+A single one-pixel `line` token spans the top of the root surface immediately
+below the operating-system window chrome. It appears above every application
+view and does not change color with workspace or pane focus.
+
 Workspaces are enumerated above the Fleet. Each expanded workspace row shows a
 rolled-up truthful signal, name, tab/pane counts, and the first available real
 branch/current-directory context. Tabs are not repeated under workspace rows:
@@ -78,7 +88,8 @@ Panes outside Git collect in a final `No Repo` branch for that workspace. Repos
 never nests tab branches: workspace and repository are enough context. Detection
 is cached by working directory and runs away from the UI thread so WSL-aware
 Git probes cannot interrupt terminal rendering. Each selected projection
-segment owns both the raised fill and its own border. Scope and projection
+segment owns both the raised fill and its own border. Unselected segments use
+the shared opaque element-hover fill on pointer hover. Scope and projection
 persist as settings preferences.
 
 Fleet rows show only what is true for their pane. Every expanded row uses two
@@ -106,13 +117,16 @@ WORKSPACES header. A fixed previous/next pair sits immediately to the right of
 the sidebar divider and cycles through tabs, wrapping at either end; with one
 tab, both controls remain visible but inactive. The scrolling viewport follows
 with continuous tabs: signal dot, name, and a close suffix whose space is
-reserved but whose control appears only while its tab is hovered. The active
-tab takes the application field surface and interrupts the band's single
-bottom rule so it connects visually to the workspace. Selection never changes
-the color of a tab's side edges.
+reserved but whose control appears only while its tab is hovered. The close
+uses a 14 px glyph in an 18 px hover target, with 2 px between that target and
+the tab's trailing edge. The active tab takes the application field surface and
+interrupts the band's single bottom rule so it connects visually to the
+workspace.
+Selection never changes the color of a tab's side edges.
 A compact trailing toolbar continues the bottom rule and uses one leading
 divider for the whole group. Its add, flat Commands, and settings actions share
-the same quiet hover treatment without persistent bubbles or internal rules.
+the same opaque cool-graphite hover surface without persistent bubbles or
+internal rules.
 The add action remains fixed after the horizontally scrolling tab viewport.
 When tabs overflow, a compact Tabs menu exposes the complete list beside the
 viewport. Commands retains its real palette keycap. Split actions stay at pane

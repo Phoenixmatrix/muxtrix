@@ -1941,6 +1941,12 @@ impl Scenario {
         } else if self.capturing("rename-pane") {
             app.rename_prompt = Some(crate::app::RenameTarget::Pane(self.initial_pane));
             app.rename_draft = "build watcher".into();
+        } else if self.capturing("toolbar-hover")
+            || self.capturing("toolbar-add-hover")
+            || self.capturing("fleet-toggle-hover")
+            || self.capturing("tab-close-hover")
+        {
+            app.active_view = ActiveView::Workspace;
         } else if self.capturing("second-tab-selected") {
             let workspace = app.active_workspace()?;
             if workspace.tabs.len() < 2 {

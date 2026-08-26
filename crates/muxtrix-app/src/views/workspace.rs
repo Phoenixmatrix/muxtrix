@@ -169,8 +169,7 @@ impl Root {
             }
         }
 
-        let mut close_hover = color(tokens.text);
-        close_hover.a = 0.10;
+        let close_hover = color(tokens.element_hover);
         let mut tabs = Vec::with_capacity(workspace.tabs.len());
         for (index, workspace_tab) in workspace.tabs.iter().enumerate() {
             let tab_id = workspace_tab.id;
@@ -193,7 +192,8 @@ impl Root {
                 .aria_label(format!("Close {} tab", workspace_tab.name))
                 .invisible()
                 .group_hover(tab_hover_group.clone(), |close| close.visible())
-                .size(px(16.))
+                .size(px(18.))
+                .mr(px(2.))
                 .flex()
                 .flex_none()
                 .items_center()
@@ -214,7 +214,7 @@ impl Root {
                 .child(
                     svg()
                         .path(icon_path(IconKind::Close))
-                        .size(px(11.))
+                        .size(px(14.))
                         .text_color(color(tokens.muted)),
                 );
             let mut tab = Tab::new()
@@ -270,8 +270,7 @@ impl Root {
             .then(|| workspace.tabs[(active_index + tab_count - 1) % tab_count].id);
         let next_tab_id =
             can_navigate_tabs.then(|| workspace.tabs[(active_index + 1) % tab_count].id);
-        let mut navigation_hover = color(tokens.line_strong);
-        navigation_hover.a = 0.14;
+        let navigation_hover = color(tokens.element_hover);
         let tab_navigation_button =
             |id: &'static str,
              kind: IconKind,
@@ -341,12 +340,10 @@ impl Root {
             }))
             .child(previous_tab)
             .child(next_tab);
-        let new_tab = icon_button(
-            gpui::ElementId::from("new-tab-icon"),
-            IconKind::Add,
-            tokens,
-            false,
-        );
+        let new_tab = svg()
+            .path(icon_path(IconKind::Add))
+            .size(px(12.))
+            .text_color(color(tokens.muted));
         let overflow_tabs = workspace
             .tabs
             .iter()
@@ -425,8 +422,7 @@ impl Root {
         // than a row of boxed controls.
         let mut keycap_fill = color(tokens.text);
         keycap_fill.a = 0.05;
-        let mut action_hover = color(tokens.line_strong);
-        action_hover.a = 0.14;
+        let action_hover = color(tokens.element_hover);
         let commands_root = cx.entity();
         let commands = div()
             .id("commands-action")
@@ -524,6 +520,8 @@ impl Root {
             .flex_none()
             .items_center()
             .justify_center()
+            .rounded(px(4.))
+            .hover(move |style| style.bg(action_hover))
             .cursor_pointer()
             // This fixed action cell remains an always-reachable end drop
             // target when the scroller's last empty space is offscreen.

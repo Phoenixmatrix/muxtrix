@@ -30,12 +30,17 @@ const profiles = path.join(out, "profiles");
 // The harness test binary carries a content hash in its name, so it is found
 // rather than hardcoded.
 const debugDeps = path.join(repo, "target/debug/deps");
-const testBin = path.join(
-  debugDeps,
+const testBinaries = await Promise.all(
   (await readdir(debugDeps))
     .filter((name) => /^headless_e2e-[0-9a-f]+$/.test(name))
-    .sort()
-    .at(-1) ?? "headless_e2e-missing",
+    .map(async (name) => ({
+      name,
+      modified: (await stat(path.join(debugDeps, name))).mtimeMs,
+    })),
+);
+const testBin = path.join(
+  debugDeps,
+  testBinaries.sort((a, b) => a.modified - b.modified).at(-1)?.name ?? "headless_e2e-missing",
 );
 
 const args = process.argv.slice(2);
