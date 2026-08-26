@@ -12,9 +12,10 @@ use gpui::{
 use muxtrix_domain::{PaneId, Workspace, WorkspaceId};
 
 use crate::app::{
-    COLLAPSED_SIDEBAR_WIDTH, FleetGroupLevel, GITHUB_STATUS_DOT_SIZE, GITHUB_STATUS_ICON_SIZE,
-    GITHUB_STATUS_LABEL_WIDTH, GITHUB_STATUS_ROW_SPACING, IconKind, Message, PaneSignalKind,
-    RailTarget, SIDEBAR_WIDTH, ellipsize, ellipsize_start,
+    COLLAPSED_SIDEBAR_WIDTH, FleetBranch, FleetGroupLevel, GITHUB_STATUS_DOT_SIZE,
+    GITHUB_STATUS_ICON_SIZE, GITHUB_STATUS_LABEL_WIDTH, GITHUB_STATUS_ROW_SPACING, IconKind,
+    Message, Muxtrix, PaneSignalKind, RailTarget, SIDEBAR_WIDTH, ellipsize, ellipsize_start,
+    pane_signal_priority,
 };
 use crate::github;
 use crate::layout::pane_ids_in_layout;
@@ -22,6 +23,34 @@ use crate::runtime::gpui::{Root, color};
 use crate::settings::{FleetScope, FleetView};
 use crate::theme::DesignTokens;
 use crate::views::{TOP_CHROME_HEIGHT, icon_button, pane_key, rail_marker, terminal_family};
+
+fn strongest_pane_signal(
+    app: &Muxtrix,
+    workspace: &Workspace,
+    pane_ids: impl IntoIterator<Item = PaneId>,
+) -> PaneSignalKind {
+    pane_ids
+        .into_iter()
+        .filter_map(|pane_id| {
+            let pane = workspace.pane(pane_id)?;
+            Some(app.pane_signal_kind(
+                pane_id,
+                app.pane_needs_attention(pane_id, pane.attention.unread_count),
+            ))
+        })
+        .max_by_key(|kind| pane_signal_priority(*kind))
+        .unwrap_or(PaneSignalKind::Subtle)
+}
+
+const fn fleet_rollup_label(kind: PaneSignalKind) -> &'static str {
+    match kind {
+        PaneSignalKind::Danger => "failed",
+        PaneSignalKind::Warning => "needs input",
+        PaneSignalKind::Active => "working",
+        PaneSignalKind::Neutral => "ready",
+        PaneSignalKind::Subtle => "idle",
+    }
+}
 
 impl Root {
     pub(crate) fn view_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -77,48 +106,53 @@ impl Root {
         // visible order and direct-navigation targets can never disagree.
         let entry_order = app.fleet_entries();
         let show_workspace_groups = app.settings.fleet_scope == FleetScope::AllWorkspaces;
-        let warns =
-            |kind: PaneSignalKind| matches!(kind, PaneSignalKind::Warning | PaneSignalKind::Danger);
-        let pane_warns = |workspace: &Workspace, pane_id: PaneId| {
-            workspace.pane(pane_id).is_some_and(|pane| {
-                warns(app.pane_signal_kind(
-                    pane_id,
-                    app.pane_needs_attention(pane_id, pane.attention.unread_count),
-                ))
-            })
-        };
+        let nested_depth = if show_workspace_groups { 1 } else { 0 };
         match app.settings.fleet_view {
             FleetView::Tabs => {
                 for workspace in app.fleet_workspaces() {
                     if show_workspace_groups {
+                        let branch = FleetBranch::Workspace(workspace.id);
+                        let pane_count = workspace.tabs.iter().map(|tab| tab.panes.len()).sum();
                         rail = rail.child(self.fleet_group_label(
                             workspace.name.clone(),
                             FleetGroupLevel::Workspace,
-                            warns(app.workspace_signal_kind(workspace)),
+                            0,
+                            branch,
+                            app.workspace_signal_kind(workspace),
+                            pane_count,
                             app.rail_nav == Some(RailTarget::FleetWorkspace(workspace.id)),
-                            Some(Message::SwitchWorkspace(workspace.id)),
                             tokens,
                             cx,
                         ));
+                        if app.fleet_branch_collapsed(branch) {
+                            continue;
+                        }
                     }
                     for tab in &workspace.tabs {
-                        if workspace.tabs.len() > 1 {
-                            rail =
-                                rail.child(self.fleet_group_label(
-                                    tab.name.clone(),
-                                    FleetGroupLevel::Nested,
-                                    warns(app.tab_signal_kind(tab)),
-                                    app.rail_nav
-                                        == Some(RailTarget::FleetTab(workspace.id, tab.id)),
-                                    pane_ids_in_layout(&tab.root).first().map(|pane_id| {
-                                        Message::FocusFleetPane(workspace.id, *pane_id)
-                                    }),
-                                    tokens,
-                                    cx,
-                                ));
+                        let branch = FleetBranch::Tab(workspace.id, tab.id);
+                        let pane_ids = pane_ids_in_layout(&tab.root);
+                        rail = rail.child(self.fleet_group_label(
+                            tab.name.clone(),
+                            FleetGroupLevel::Nested,
+                            nested_depth,
+                            branch,
+                            app.tab_signal_kind(tab),
+                            pane_ids.len(),
+                            app.rail_nav == Some(RailTarget::FleetTab(workspace.id, tab.id)),
+                            tokens,
+                            cx,
+                        ));
+                        if app.fleet_branch_collapsed(branch) {
+                            continue;
                         }
-                        for pane_id in pane_ids_in_layout(&tab.root) {
-                            rail = rail.child(self.fleet_row(workspace.id, pane_id, tokens, cx));
+                        for pane_id in pane_ids {
+                            rail = rail.child(self.fleet_row(
+                                workspace.id,
+                                pane_id,
+                                nested_depth + 1,
+                                tokens,
+                                cx,
+                            ));
                         }
                     }
                 }
@@ -157,21 +191,30 @@ impl Root {
                         continue;
                     }
                     if show_workspace_groups {
-                        let warning = entries
-                            .iter()
-                            .any(|pane_id| pane_warns(workspace, *pane_id));
+                        let branch = FleetBranch::Workspace(workspace.id);
                         rail = rail.child(self.fleet_group_label(
                             workspace.name.clone(),
                             FleetGroupLevel::Workspace,
-                            warning,
+                            0,
+                            branch,
+                            strongest_pane_signal(app, workspace, entries.iter().copied()),
+                            entries.len(),
                             app.rail_nav == Some(RailTarget::FleetWorkspace(workspace.id)),
-                            Some(Message::SwitchWorkspace(workspace.id)),
                             tokens,
                             cx,
                         ));
+                        if app.fleet_branch_collapsed(branch) {
+                            continue;
+                        }
                     }
                     for pane_id in entries {
-                        rail = rail.child(self.fleet_row(workspace.id, pane_id, tokens, cx));
+                        rail = rail.child(self.fleet_row(
+                            workspace.id,
+                            pane_id,
+                            nested_depth,
+                            tokens,
+                            cx,
+                        ));
                     }
                 }
             }
@@ -179,36 +222,55 @@ impl Root {
                 for workspace in app.fleet_workspaces() {
                     let groups = app.fleet_repository_groups_for(workspace);
                     if show_workspace_groups && !groups.is_empty() {
+                        let branch = FleetBranch::Workspace(workspace.id);
+                        let pane_count = groups.iter().map(|group| group.entries.len()).sum();
                         rail = rail.child(self.fleet_group_label(
                             workspace.name.clone(),
                             FleetGroupLevel::Workspace,
-                            warns(app.workspace_signal_kind(workspace)),
+                            0,
+                            branch,
+                            app.workspace_signal_kind(workspace),
+                            pane_count,
                             app.rail_nav == Some(RailTarget::FleetWorkspace(workspace.id)),
-                            Some(Message::SwitchWorkspace(workspace.id)),
                             tokens,
                             cx,
                         ));
+                        if app.fleet_branch_collapsed(branch) {
+                            continue;
+                        }
                     }
                     for group in groups {
                         let Some((workspace_id, first_pane)) = group.entries.first().copied()
                         else {
                             continue;
                         };
-                        let warning = group
-                            .entries
-                            .iter()
-                            .any(|(_, pane_id)| pane_warns(workspace, *pane_id));
+                        let branch = FleetBranch::Repository(workspace_id, first_pane);
                         rail = rail.child(self.fleet_group_label(
                             group.name,
                             FleetGroupLevel::Nested,
-                            warning,
+                            nested_depth,
+                            branch,
+                            strongest_pane_signal(
+                                app,
+                                workspace,
+                                group.entries.iter().map(|(_, pane_id)| *pane_id),
+                            ),
+                            group.entries.len(),
                             app.rail_nav == Some(RailTarget::FleetGroup(workspace_id, first_pane)),
-                            Some(Message::FocusFleetPane(workspace_id, first_pane)),
                             tokens,
                             cx,
                         ));
+                        if app.fleet_branch_collapsed(branch) {
+                            continue;
+                        }
                         for (_, pane_id) in group.entries {
-                            rail = rail.child(self.fleet_row(workspace.id, pane_id, tokens, cx));
+                            rail = rail.child(self.fleet_row(
+                                workspace.id,
+                                pane_id,
+                                nested_depth + 1,
+                                tokens,
+                                cx,
+                            ));
                         }
                     }
                 }
@@ -361,40 +423,50 @@ impl Root {
             .into_any_element()
     }
 
-    /// A fleet group band with an amber rollup dot when any pane inside needs
-    /// a person. Workspace bands carry stronger type and the rail surface;
-    /// nested tab and repository bands stay smaller and recessed on the app
-    /// surface.
+    /// A collapsible fleet-tree branch. Expanded branches carry only their
+    /// child count; collapsed branches add a signal dot and textual roll-up so
+    /// state remains legible without relying on color.
     #[allow(clippy::too_many_arguments)]
     fn fleet_group_label(
         &self,
         label: String,
         level: FleetGroupLevel,
-        warning: bool,
+        depth: usize,
+        branch: FleetBranch,
+        signal_kind: PaneSignalKind,
+        pane_count: usize,
         targeted: bool,
-        on_press: Option<Message>,
         tokens: DesignTokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let app = self.app();
         let workspace = level == FleetGroupLevel::Workspace;
+        let collapsed = app.fleet_branch_collapsed(branch);
         let mut targeted_fill = color(tokens.accent);
         targeted_fill.a = 0.12;
         let mut hover = color(tokens.text);
         hover.a = 0.04;
-        let id = SharedString::from(format!(
-            "fleet-group-{}-{label}",
-            if workspace { "w" } else { "n" }
-        ));
+        let id = SharedString::from(format!("fleet-branch-{branch:?}"));
+        let display_label = if workspace {
+            label.to_uppercase()
+        } else {
+            label
+        };
+        let summary = if collapsed {
+            format!("{pane_count} {}", fleet_rollup_label(signal_kind))
+        } else {
+            pane_count.to_string()
+        };
         let mut band = div()
             .id(id)
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.))
+            .gap(px(6.))
             .w_full()
-            .h(px(if workspace { 32. } else { 30. }))
-            .px(px(if workspace { 12. } else { 16. }))
+            .h(px(28.))
+            .pl(px(6. + depth as f32 * 8.))
+            .pr(px(8.))
             .border_1()
             .border_color(color(if targeted {
                 tokens.accent
@@ -403,56 +475,73 @@ impl Root {
             }))
             .bg(if targeted {
                 targeted_fill
-            } else if workspace {
-                color(tokens.rail)
             } else {
-                color(tokens.app)
+                color(tokens.rail)
             })
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                    root.dispatch(Message::ToggleFleetBranch(branch), window, cx);
+                }),
+            )
+            .child(
+                svg()
+                    .path(crate::assets::icon_path(if collapsed {
+                        IconKind::ChevronRight
+                    } else {
+                        IconKind::ChevronDown
+                    }))
+                    .size(px(11.))
+                    .text_color(color(if targeted {
+                        tokens.accent
+                    } else {
+                        tokens.muted
+                    })),
+            )
+            .child(div().size(px(6.)).rounded_full().bg(color(if collapsed {
+                signal_kind.color(tokens)
+            } else {
+                crate::theme::Color::TRANSPARENT
+            })))
             .child(
                 div()
                     .flex_grow(1.0)
                     .min_w(px(0.))
-                    .text_size(px(app.settings.ui_pixels(if workspace {
-                        9.0
-                    } else {
-                        8.0
-                    })))
-                    .line_height(
-                        (px(app.settings.ui_pixels(if workspace { 9.0 } else { 8.0 }))) * 1.3,
-                    )
+                    .text_size(px(app.settings.ui_pixels(9.0)))
+                    .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                     .font_weight(if workspace {
                         gpui::FontWeight::BOLD
                     } else {
-                        gpui::FontWeight::SEMIBOLD
+                        gpui::FontWeight::MEDIUM
                     })
                     .text_color(color(if targeted {
                         tokens.accent
                     } else if workspace {
                         tokens.muted
                     } else {
-                        tokens.faint
+                        tokens.text
                     }))
                     .truncate()
                     .child(ellipsize(
-                        &label.to_uppercase(),
-                        app.settings.ui_char_budget(if workspace { 24 } else { 26 }),
+                        &display_label,
+                        app.settings.ui_char_budget(if workspace { 22 } else { 24 }),
                     )),
             )
-            .child(div().size(px(6.)).rounded_full().bg(color(if warning {
-                tokens.warning
-            } else {
-                crate::theme::Color::TRANSPARENT
-            })));
+            .child(
+                div()
+                    .text_size(px(app.settings.ui_pixels(8.5)))
+                    .line_height((px(app.settings.ui_pixels(8.5))) * 1.3)
+                    .text_color(color(if collapsed {
+                        signal_kind.label_color(tokens)
+                    } else {
+                        tokens.faint
+                    }))
+                    .whitespace_nowrap()
+                    .child(summary),
+            );
         if !targeted {
             band = band.hover(move |style| style.bg(hover));
-        }
-        if let Some(message) = on_press {
-            band = band.cursor_pointer().on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |root, _: &MouseDownEvent, window, cx| {
-                    root.dispatch(message.clone(), window, cx);
-                }),
-            );
         }
         band.into_any_element()
     }
@@ -752,6 +841,7 @@ impl Root {
         &self,
         workspace_id: WorkspaceId,
         pane_id: PaneId,
+        depth: usize,
         tokens: DesignTokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -854,7 +944,8 @@ impl Root {
                     .min_w(px(0.))
                     .h(px(52.))
                     .py(px(5.))
-                    .px(px(8.))
+                    .pl(px(8. + depth as f32 * 8.))
+                    .pr(px(8.))
                     .bg(fill)
                     .when(cursor, |row| {
                         row.border_1().border_color(color(tokens.accent))

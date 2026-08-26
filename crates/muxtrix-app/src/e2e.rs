@@ -7,7 +7,7 @@ use muxtrix_terminal::TerminalMouseButton;
 use serde_json::json;
 
 use crate::app::{
-    ActiveView, AgentPaneStatus, GitHubDiffSource, GitHubDiffState, GitHubPanelState,
+    ActiveView, AgentPaneStatus, FleetBranch, GitHubDiffSource, GitHubDiffState, GitHubPanelState,
     GitHubPanelTab, Message, Muxtrix, PaneRepository, TerminalLaunchState, WorktreeManagerEntry,
     WorktreeManagerMode, WorktreeManagerState, github_diff_line_starts, github_diff_wrap_columns,
 };
@@ -1696,7 +1696,7 @@ impl Scenario {
                     git_branch: None,
                 },
             );
-        } else if self.capturing("fleet-repos") {
+        } else if self.capturing("fleet-repos") || self.capturing("fleet-repos-folded") {
             // Repos groups the fleet by the checkout each pane reports over
             // OSC 7. The harness shell runs outside any repository, so the
             // mapping is staged to give the grouping something to group.
@@ -1770,6 +1770,12 @@ impl Scenario {
                 },
             );
             app.settings.fleet_view = FleetView::Repos;
+            if self.capturing("fleet-repos-folded") {
+                app.toggle_fleet_branch(FleetBranch::Repository(
+                    app.session.active_workspace_id,
+                    self.initial_pane,
+                ));
+            }
         } else if self.capturing("fleet-tabs-duplicates") {
             // Tabs view should spend the pane row on pane-specific activity
             // when the worktree/repository line already names the checkout.
