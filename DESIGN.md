@@ -88,7 +88,8 @@ outside Git collect in a final `No Repo` band for that workspace. Repos never
 nests tab bands: workspace and repository are enough context. Detection is
 cached by working directory and runs away from the UI thread so WSL-aware Git
 probes cannot interrupt terminal rendering. Each selected segment owns both
-the raised fill and its own border. Scope and projection persist as settings
+the raised fill and its own border. Unselected segments use the shared opaque
+element-hover fill on pointer hover. Scope and projection persist as settings
 preferences without visiting the settings screen.
 
 Fleet rows show only what is true for their pane. Every expanded row uses two
@@ -116,13 +117,16 @@ WORKSPACES header. A fixed previous/next pair sits immediately to the right of
 the sidebar divider and cycles through tabs, wrapping at either end; with one
 tab, both controls remain visible but inactive. The scrolling viewport follows
 with continuous tabs: signal dot, name, and a close suffix whose space is
-reserved but whose control appears only while its tab is hovered. The active
-tab takes the application field surface and interrupts the band's single
-bottom rule so it connects visually to the workspace. Selection never changes
-the color of a tab's side edges.
+reserved but whose control appears only while its tab is hovered. The close
+uses a 14 px glyph in an 18 px hover target, with 2 px between that target and
+the tab's trailing edge. The active tab takes the application field surface and
+interrupts the band's single bottom rule so it connects visually to the
+workspace.
+Selection never changes the color of a tab's side edges.
 A compact trailing toolbar continues the bottom rule and uses one leading
 divider for the whole group. Its add, flat Commands, and settings actions share
-the same quiet hover treatment without persistent bubbles or internal rules.
+the same opaque cool-graphite hover surface without persistent bubbles or
+internal rules.
 The add action remains fixed after the horizontally scrolling tab viewport.
 When tabs overflow, a compact Tabs menu exposes the complete list beside the
 viewport. Commands retains its real palette keycap. Split actions stay at pane

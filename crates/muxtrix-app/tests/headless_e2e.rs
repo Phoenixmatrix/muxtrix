@@ -521,6 +521,58 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             }
             thread::sleep(Duration::from_millis(50));
         }
+        if capture == "toolbar-hover" || capture == "toolbar-add-hover" {
+            let origin = pin_window(&connection, root, window)?;
+            let add_action = capture == "toolbar-add-hover";
+            let trailing_offset = if add_action { 209 } else { 145 };
+            let hover_x = origin.dst_x.saturating_add(i16::try_from(
+                final_viewport.0.saturating_sub(trailing_offset),
+            )?);
+            let hover_y = origin.dst_y.saturating_add(17);
+            connection
+                .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, hover_x, hover_y, 0)?
+                .check()?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!(
+                "parked the pointer over the {} toolbar action",
+                if add_action { "New tab" } else { "Commands" }
+            );
+        }
+        if capture == "fleet-toggle-hover" {
+            let origin = pin_window(&connection, root, window)?;
+            connection
+                .xtest_fake_input(
+                    MOTION_NOTIFY_EVENT,
+                    0,
+                    0,
+                    root,
+                    origin.dst_x.saturating_add(174),
+                    origin.dst_y.saturating_add(149),
+                    0,
+                )?
+                .check()?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("parked the pointer over the Agents fleet projection");
+        }
+        if capture == "tab-close-hover" {
+            let origin = pin_window(&connection, root, window)?;
+            connection
+                .xtest_fake_input(
+                    MOTION_NOTIFY_EVENT,
+                    0,
+                    0,
+                    root,
+                    origin.dst_x.saturating_add(408),
+                    origin.dst_y.saturating_add(17),
+                    0,
+                )?
+                .check()?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("parked the pointer over the first tab close action");
+        }
         if capture == "second-tab-selected" {
             let origin = pin_window(&connection, root, window)?;
             let before = grab_window(&connection, window)?;

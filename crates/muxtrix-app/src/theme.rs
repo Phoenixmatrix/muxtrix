@@ -47,6 +47,7 @@ pub(crate) struct DesignTokens {
     pub(crate) rail: Color,
     pub(crate) panel: Color,
     pub(crate) panel_raised: Color,
+    pub(crate) element_hover: Color,
     /// Floating surfaces — menus, palette, dialogs, tooltips — reuse the
     /// chrome surface and gain depth from their strong border and shadow.
     pub(crate) overlay: Color,
@@ -74,6 +75,7 @@ impl DesignTokens {
                 rail: Color::from_rgb8(249, 250, 252),
                 panel: Color::WHITE,
                 panel_raised: Color::from_rgb8(233, 236, 241),
+                element_hover: Color::from_rgb8(223, 224, 225),
                 overlay: Color::WHITE,
                 line: Color::from_rgb8(205, 210, 219),
                 line_strong: Color::from_rgb8(162, 170, 184),
@@ -95,6 +97,7 @@ impl DesignTokens {
                 rail: Color::from_rgb8(31, 33, 39),
                 panel: Color::from_rgb8(13, 16, 22),
                 panel_raised: Color::from_rgb8(45, 47, 52),
+                element_hover: Color::from_rgb8(48, 52, 60),
                 overlay: Color::from_rgb8(31, 33, 39),
                 line: Color::from_rgb8(45, 47, 52),
                 line_strong: Color::from_rgb8(63, 64, 67),
