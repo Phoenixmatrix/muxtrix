@@ -72,25 +72,25 @@ and panes runs through command-palette actions that open one shared focused
 rename dialog; workspace rows carry no inline edit affordances. A pane rename
 is an override: clearing it restores the automatic terminal/agent title.
 
-The Fleet scope is explicit. `This` follows the selected workspace without
-repeating its workspace name. `All` lists every workspace in session order and
-inserts a recessed uppercase workspace band before that workspace's visible
-rows; selecting a band switches to that workspace without changing the scope.
-The rail header carries a compact This/All scope toggle beside the
-Tabs/Agents/Repos projection toggle. Tabs lists every pane in tab order under
-its existing tab bands. Agents filters that same order to agent panes only; in
-All scope each non-empty workspace remains a separate group, and an entirely
-empty result keeps the quiet explanatory state. Repos lists every pane under
-the Git repository detected from its live working directory. It merges panes
-from different tabs only within one workspace; equal repository names in
-different workspaces remain under their respective workspace bands. Panes
-outside Git collect in a final `No Repo` band for that workspace. Repos never
-nests tab bands: workspace and repository are enough context. Detection is
-cached by working directory and runs away from the UI thread so WSL-aware Git
-probes cannot interrupt terminal rendering. Each selected segment owns both
-the raised fill and its own border. Unselected segments use the shared opaque
-element-hover fill on pointer hover. Scope and projection persist as settings
-preferences without visiting the settings screen.
+Fleet scope is configured in Settings. Current Workspace follows the selected
+workspace without repeating its workspace name. All Workspaces lists every
+workspace in session order and inserts a collapsible uppercase workspace branch
+before that workspace's visible rows. The rail header carries only the compact
+Tabs/Agents/Repos projection toggle; it never duplicates the scope setting.
+Tabs renders every tab as a branch, including a workspace's only tab, with pane
+rows beneath it. Agents filters the same tab-and-pane order to direct agent-pane
+leaves; in All Workspaces scope each non-empty workspace is their only branch,
+and an entirely empty result keeps the quiet explanatory state. Repos lists
+every pane under the Git repository detected from its live working directory.
+It merges panes from different tabs only within one workspace; equal repository
+names in different workspaces remain under their respective workspace branches.
+Panes outside Git collect in a final `No Repo` branch for that workspace. Repos
+never nests tab branches: workspace and repository are enough context. Detection
+is cached by working directory and runs away from the UI thread so WSL-aware
+Git probes cannot interrupt terminal rendering. Each selected projection
+segment owns both the raised fill and its own border. Unselected segments use
+the shared opaque element-hover fill on pointer hover. Scope and projection
+persist as settings preferences.
 
 Fleet rows show only what is true for their pane. Every expanded row uses two
 lines: state signal and pane title first; linked-worktree, repository, or live
@@ -207,10 +207,12 @@ activity or command copy instead. Both flexible text lanes are shaped in the
 configured interface face and ellipsized to the measured width left after fixed
 trailing content claims its space. Direct pane navigation remains
 keyboard-only: expanded rows never print Ctrl/Cmd+1 through 9 hints. Workspaces,
-tabs, and repositories group under recessed uppercase bands that carry an amber
-rollup dot when a visible pane inside needs a person. Repos uses workspace and
-repository bands only, with no nested tab grouping. The workspace cards above
-the fleet keep their roll-ups: name, state, counts, and the live mono path.
+tabs, and repositories form a compact tree with disclosure chevrons and 8 px
+indentation steps, without vertical guide lines. Expanded branches show their
+child count and no status dot. Collapsed branches keep one truthful roll-up dot
+plus text such as `2 working`, so color never stands alone. Repos uses workspace
+and repository branches only, with no nested tab grouping. The workspace cards
+above the fleet keep their roll-ups: name, state, counts, and the live mono path.
 
 When a pane's checked-out branch has a linked GitHub pull request, its
 state-specific mark and hash-prefixed number trail the title line, with the
@@ -544,12 +546,14 @@ New UI must:
 6. Preserve native control semantics, tooltips, keyboard operation, and full-perimeter focus treatment.
 7. Prefix navigation: Ctrl+G arms a one-shot Zellij-style layer (announced
    by persistent bottom-center guidance), then `w` starts a rail walk at the
-   workspaces and `f` at the first visible fleet entry; arrows move the cursor
-   through visible workspaces, tab bands, and pane rows in visual order, Enter
-   activates, Esc exits. Unrecognized keys are consumed but do not dismiss
-   either mode. The cursor uses an accent-tinted fill with a complete 1 px
-   accent perimeter; actual selection keeps its neutral fill and 3 px leading
-   bar, so the proposed destination is distinct from the current location.
+   workspaces and `f` at the first visible fleet entry; Up and Down move the
+   cursor through visible workspace cards, tree branches, and pane rows in
+   visual order. Left collapses a targeted branch, Right expands it, Enter
+   toggles a branch or activates a leaf, and Esc exits. Unrecognized keys are
+   consumed but do not dismiss either mode. The cursor uses an accent-tinted
+   fill with a complete 1 px accent perimeter; actual selection keeps its
+   neutral fill and 3 px leading bar, so the proposed destination is distinct
+   from the current location.
 7. Add interface icons as SVG assets under `crates/muxtrix-app/assets/icons`.
 8. Respect the default-off status bar and the established command shortcuts.
 9. Keep compact-window behavior and terminal-grid resize coalescing intact;

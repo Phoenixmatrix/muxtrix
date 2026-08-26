@@ -5153,6 +5153,9 @@ fn default_worktree_name_skips_taken_names() {
 #[test]
 fn rail_targets_walk_workspaces_then_fleet_in_visual_order() {
     let app = Muxtrix::new();
+    let workspace_id = app.session.active_workspace_id;
+    let tab_id = active_tab(&app).id;
+    let pane_id = active_pane_id(&app);
     let targets = app.rail_targets();
     let workspace_count = targets
         .iter()
@@ -5165,18 +5168,13 @@ fn rail_targets_walk_workspaces_then_fleet_in_visual_order() {
             .all(|target| !matches!(target, RailTarget::Workspace(_))),
         "fleet entries never interleave with workspaces"
     );
-    assert!(
-        matches!(
-            targets.get(workspace_count),
-            Some(RailTarget::FleetPane(..))
-        ),
-        "a one-tab workspace starts at its first visible pane row"
-    );
-    assert!(
-        targets
-            .iter()
-            .all(|target| !matches!(target, RailTarget::FleetTab(..))),
-        "navigation never lands on a hidden single-tab band"
+    assert_eq!(
+        &targets[workspace_count..],
+        &[
+            RailTarget::FleetTab(workspace_id, tab_id),
+            RailTarget::FleetPane(workspace_id, pane_id),
+        ],
+        "even a one-tab workspace exposes the tab branch rendered by the tree"
     );
 }
 
@@ -5202,6 +5200,23 @@ fn tabs_view_keeps_visible_tab_bands_in_the_active_workspace() {
             RailTarget::FleetPane(workspace_id, second_pane),
         ],
         "Tabs preserves tab bands even though workspace bands are gone"
+    );
+
+    app.update(Message::ToggleFleetBranch(FleetBranch::Tab(
+        workspace_id,
+        first_tab,
+    )));
+    assert_eq!(
+        app.rail_targets()
+            .into_iter()
+            .filter(|target| !matches!(target, RailTarget::Workspace(_)))
+            .collect::<Vec<_>>(),
+        vec![
+            RailTarget::FleetTab(workspace_id, first_tab),
+            RailTarget::FleetTab(workspace_id, second_tab),
+            RailTarget::FleetPane(workspace_id, second_pane),
+        ],
+        "a collapsed tab keeps its branch reachable and hides only its pane rows"
     );
 }
 
@@ -5279,6 +5294,52 @@ fn repos_view_groups_across_tabs_without_nested_tab_bands() {
         ],
         "Repos uses repository bands only and preserves pane order inside each group"
     );
+
+    app.update(Message::ToggleFleetBranch(FleetBranch::Repository(
+        workspace_id,
+        "muxtrix".into(),
+    )));
+    assert_eq!(
+        app.rail_targets()
+            .into_iter()
+            .filter(|target| !matches!(target, RailTarget::Workspace(_)))
+            .collect::<Vec<_>>(),
+        vec![
+            RailTarget::FleetGroup(workspace_id, first_repo_pane),
+            RailTarget::FleetGroup(workspace_id, other_repo_pane),
+            RailTarget::FleetPane(workspace_id, other_repo_pane),
+            RailTarget::FleetGroup(workspace_id, no_repo_pane),
+            RailTarget::FleetPane(workspace_id, no_repo_pane),
+        ],
+        "collapsing one repository does not hide sibling branches"
+    );
+
+    app.rail_nav = Some(RailTarget::FleetGroup(workspace_id, first_repo_pane));
+    app.update(Message::ClosePane(first_repo_pane));
+    assert_eq!(
+        app.rail_targets()
+            .into_iter()
+            .filter(|target| !matches!(target, RailTarget::Workspace(_)))
+            .collect::<Vec<_>>(),
+        vec![
+            RailTarget::FleetGroup(workspace_id, second_repo_pane),
+            RailTarget::FleetGroup(workspace_id, other_repo_pane),
+            RailTarget::FleetPane(workspace_id, other_repo_pane),
+            RailTarget::FleetGroup(workspace_id, no_repo_pane),
+            RailTarget::FleetPane(workspace_id, no_repo_pane),
+        ],
+        "repository collapse survives a change to the group's leading pane"
+    );
+    let status_after_close = app.status.clone();
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+    assert!(
+        app.rail_nav.is_none(),
+        "activating a stale group target exits without panicking"
+    );
+    assert_eq!(
+        app.status, status_after_close,
+        "a stale repository target must not report a missing-pane error"
+    );
 }
 
 #[test]
@@ -5339,6 +5400,23 @@ fn all_workspace_repos_keep_identical_repository_names_in_workspace_groups() {
             RailTarget::FleetGroup(second_workspace, second_pane),
             RailTarget::FleetPane(second_workspace, second_pane),
         ]
+    );
+
+    app.update(Message::ToggleFleetBranch(FleetBranch::Workspace(
+        first_workspace,
+    )));
+    assert_eq!(
+        app.rail_targets()
+            .into_iter()
+            .filter(|target| !matches!(target, RailTarget::Workspace(_)))
+            .collect::<Vec<_>>(),
+        vec![
+            RailTarget::FleetWorkspace(first_workspace),
+            RailTarget::FleetWorkspace(second_workspace),
+            RailTarget::FleetGroup(second_workspace, second_pane),
+            RailTarget::FleetPane(second_workspace, second_pane),
+        ],
+        "a collapsed workspace hides its nested repository tree only"
     );
 }
 
@@ -5421,7 +5499,10 @@ fn prefix_and_rail_navigation_only_exit_explicitly() {
         .expect("fleet follow-up should start navigation");
     assert_eq!(
         app.feedback_message(),
-        Some(("Navigate — ↑↓ move · Enter select · Esc exit", true)),
+        Some((
+            "Navigate — ↑↓ move · ←→ fold · Enter select · Esc exit",
+            true
+        )),
         "rail navigation is a keyboard mode, not a transient toast"
     );
 
@@ -5447,6 +5528,44 @@ fn rail_navigation_selection_exits_the_mode() {
     let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
     assert!(app.rail_nav.is_none());
     assert!(app.feedback_message().is_none());
+}
+
+#[test]
+fn rail_navigation_folds_branches_with_horizontal_arrows_and_enter() {
+    let mut app = Muxtrix::new();
+    let workspace_id = app.session.active_workspace_id;
+    let tab_id = active_tab(&app).id;
+    let pane_id = active_pane_id(&app);
+    let branch = FleetBranch::Tab(workspace_id, tab_id);
+
+    let _ = app.handle_keyboard(key_press(Key::Character("g".into()), Modifiers::CTRL));
+    let _ = app.handle_keyboard(key_press(Key::Character("f".into()), Modifiers::empty()));
+    assert_eq!(
+        app.rail_nav,
+        Some(RailTarget::FleetTab(workspace_id, tab_id))
+    );
+
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowLeft), Modifiers::empty()));
+    assert!(app.fleet_branch_collapsed(&branch));
+    assert!(
+        !app.rail_targets()
+            .contains(&RailTarget::FleetPane(workspace_id, pane_id))
+    );
+    assert_eq!(
+        app.rail_nav,
+        Some(RailTarget::FleetTab(workspace_id, tab_id))
+    );
+
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowRight), Modifiers::empty()));
+    assert!(!app.fleet_branch_collapsed(&branch));
+    assert!(
+        app.rail_targets()
+            .contains(&RailTarget::FleetPane(workspace_id, pane_id))
+    );
+
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+    assert!(app.fleet_branch_collapsed(&branch));
+    assert!(app.rail_nav.is_none());
 }
 
 #[test]

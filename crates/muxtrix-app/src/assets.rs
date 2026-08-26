@@ -31,6 +31,14 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/expand.svg"),
     ),
     (
+        "icons/chevron-right.svg",
+        include_bytes!("../assets/icons/chevron-right.svg"),
+    ),
+    (
+        "icons/chevron-down.svg",
+        include_bytes!("../assets/icons/chevron-down.svg"),
+    ),
+    (
         "icons/split-right.svg",
         include_bytes!("../assets/icons/split-right.svg"),
     ),
@@ -117,6 +125,8 @@ pub(crate) fn icon_path(kind: IconKind) -> SharedString {
         IconKind::Add => "icons/add.svg",
         IconKind::Collapse => "icons/collapse.svg",
         IconKind::Expand => "icons/expand.svg",
+        IconKind::ChevronRight => "icons/chevron-right.svg",
+        IconKind::ChevronDown => "icons/chevron-down.svg",
         IconKind::SplitRight => "icons/split-right.svg",
         IconKind::SplitDown => "icons/split-down.svg",
         IconKind::Maximize => "icons/maximize.svg",
@@ -175,6 +185,8 @@ mod tests {
             IconKind::Add,
             IconKind::Collapse,
             IconKind::Expand,
+            IconKind::ChevronRight,
+            IconKind::ChevronDown,
             IconKind::SplitRight,
             IconKind::SplitDown,
             IconKind::Maximize,

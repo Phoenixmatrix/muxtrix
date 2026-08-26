@@ -7,7 +7,7 @@
 
 #[cfg(target_os = "windows")]
 use std::collections::HashMap;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
@@ -262,6 +262,9 @@ pub(crate) struct Muxtrix {
     pub(crate) prefix_armed: bool,
     /// Keyboard cursor walking the rail (workspaces, then fleet).
     pub(crate) rail_nav: Option<RailTarget>,
+    /// Expanded fleet-tree branches are the default; this set stores only
+    /// user-collapsed branches for the lifetime of the process.
+    pub(crate) collapsed_fleet_branches: HashSet<FleetBranch>,
     pub(crate) workspace_create_visible: bool,
     pub(crate) close_workspace_prompt: Option<WorkspaceId>,
     /// Keyboard cursor for the two actions at the bottom of a dialog.
@@ -845,6 +848,17 @@ pub(crate) enum WorktreePromptTarget {
     OpenWithAgent(commands::WorktreeKind, Agent),
     RestartPane(PaneId),
     RestartPaneWithAgent(PaneId, Agent),
+}
+
+/// A collapsible branch in the expanded fleet tree.
+///
+/// Repository branches use the group identity rendered to the user rather
+/// than whichever pane happens to lead the group today.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum FleetBranch {
+    Workspace(WorkspaceId),
+    Tab(WorkspaceId, TabId),
+    Repository(WorkspaceId, String),
 }
 
 /// A rail entry the prefix-key navigation cursor can rest on.
@@ -1532,6 +1546,7 @@ pub(crate) enum Message {
     SettingsUiFontSize(f32),
     SettingsShowAllWorkspaces(bool),
     SetFleetView(FleetView),
+    ToggleFleetBranch(FleetBranch),
     SettingsDefaultAgent(DefaultAgentChoice),
     SettingsGitHubHost(String),
     SettingsCodexCommand(String),
@@ -2054,6 +2069,7 @@ impl Muxtrix {
             toast: None,
             prefix_armed: false,
             rail_nav: None,
+            collapsed_fleet_branches: HashSet::new(),
             workspace_create_visible: false,
             close_workspace_prompt: None,
             dialog_button: None,
@@ -3687,6 +3703,10 @@ impl Muxtrix {
                 self.set_fleet_view(view);
                 return self.refresh_pane_repositories();
             }
+            Message::ToggleFleetBranch(branch) => {
+                self.toggle_fleet_branch(branch);
+                return Vec::new();
+            }
             Message::SettingsGitHubHost(host) => {
                 self.settings_draft.github_host = host;
                 return Vec::new();
@@ -4482,7 +4502,10 @@ impl Muxtrix {
         if self.prefix_armed {
             Some(("Prefix — w workspaces · f fleet · Esc cancel", true))
         } else if self.rail_nav.is_some() {
-            Some(("Navigate — ↑↓ move · Enter select · Esc exit", true))
+            Some((
+                "Navigate — ↑↓ move · ←→ fold · Enter select · Esc exit",
+                true,
+            ))
         } else {
             self.toast
                 .as_ref()
@@ -4523,7 +4546,11 @@ impl Muxtrix {
                         continue;
                     }
                     if show_workspace_groups {
+                        let branch = FleetBranch::Workspace(workspace.id);
                         targets.push(RailTarget::FleetWorkspace(workspace.id));
+                        if self.fleet_branch_collapsed(&branch) {
+                            continue;
+                        }
                     }
                     targets.extend(workspace_entries.map(|(workspace_id, pane_id)| {
                         RailTarget::FleetPane(workspace_id, pane_id)
@@ -4534,11 +4561,21 @@ impl Muxtrix {
                 for workspace in self.fleet_workspaces() {
                     let groups = self.fleet_repository_groups_for(workspace);
                     if show_workspace_groups && !groups.is_empty() {
+                        let branch = FleetBranch::Workspace(workspace.id);
                         targets.push(RailTarget::FleetWorkspace(workspace.id));
+                        if self.fleet_branch_collapsed(&branch) {
+                            continue;
+                        }
                     }
                     for group in groups {
-                        if let Some((workspace_id, first_pane)) = group.entries.first().copied() {
-                            targets.push(RailTarget::FleetGroup(workspace_id, first_pane));
+                        let Some((workspace_id, first_pane)) = group.entries.first().copied()
+                        else {
+                            continue;
+                        };
+                        let branch = FleetBranch::Repository(workspace_id, group.name);
+                        targets.push(RailTarget::FleetGroup(workspace_id, first_pane));
+                        if self.fleet_branch_collapsed(&branch) {
+                            continue;
                         }
                         targets.extend(group.entries.into_iter().map(|(workspace_id, pane_id)| {
                             RailTarget::FleetPane(workspace_id, pane_id)
@@ -4549,13 +4586,17 @@ impl Muxtrix {
             FleetView::Tabs => {
                 for workspace in self.fleet_workspaces() {
                     if show_workspace_groups {
+                        let branch = FleetBranch::Workspace(workspace.id);
                         targets.push(RailTarget::FleetWorkspace(workspace.id));
+                        if self.fleet_branch_collapsed(&branch) {
+                            continue;
+                        }
                     }
                     for tab in &workspace.tabs {
-                        // Single-tab workspaces do not render a tab band in the
-                        // fleet, so keyboard navigation must not land on one.
-                        if workspace.tabs.len() > 1 {
-                            targets.push(RailTarget::FleetTab(workspace.id, tab.id));
+                        let branch = FleetBranch::Tab(workspace.id, tab.id);
+                        targets.push(RailTarget::FleetTab(workspace.id, tab.id));
+                        if self.fleet_branch_collapsed(&branch) {
+                            continue;
                         }
                         for pane_id in pane_ids_in_layout(&tab.root) {
                             targets.push(RailTarget::FleetPane(workspace.id, pane_id));
@@ -5295,45 +5336,58 @@ impl Muxtrix {
                         self.rail_nav = targets.first().copied();
                     }
                 }
+                Key::Named(Named::ArrowLeft) | Key::Named(Named::ArrowRight) => {
+                    if let Some(branch) = self.fleet_branch_for_target(current) {
+                        let collapse =
+                            matches!(modified_key.as_ref(), Key::Named(Named::ArrowLeft));
+                        if self.fleet_branch_collapsed(&branch) != collapse {
+                            self.toggle_fleet_branch(branch);
+                        }
+                    }
+                }
                 Key::Named(Named::Enter) => {
                     self.rail_nav = None;
-                    match current {
-                        RailTarget::Workspace(workspace_id) => {
-                            if let Err(error) = self.switch_workspace(workspace_id) {
-                                self.status = error;
+                    if let Some(branch) = self.fleet_branch_for_target(current) {
+                        self.toggle_fleet_branch(branch);
+                    } else {
+                        match current {
+                            RailTarget::Workspace(workspace_id)
+                            | RailTarget::FleetWorkspace(workspace_id) => {
+                                if let Err(error) = self.switch_workspace(workspace_id) {
+                                    self.status = error;
+                                }
                             }
-                        }
-                        RailTarget::FleetTab(workspace_id, tab_id) => {
-                            let first_pane = self
-                                .session
-                                .workspaces
-                                .iter()
-                                .find(|workspace| workspace.id == workspace_id)
-                                .and_then(|workspace| {
-                                    workspace.tabs.iter().find(|tab| tab.id == tab_id)
-                                })
-                                .map(|tab| tab.focused_pane_id);
-                            if let Some(pane_id) = first_pane
-                                && let Err(error) = self
+                            RailTarget::FleetTab(workspace_id, tab_id) => {
+                                let first_pane = self
+                                    .session
+                                    .workspaces
+                                    .iter()
+                                    .find(|workspace| workspace.id == workspace_id)
+                                    .and_then(|workspace| {
+                                        workspace.tabs.iter().find(|tab| tab.id == tab_id)
+                                    })
+                                    .map(|tab| tab.focused_pane_id);
+                                if let Some(pane_id) = first_pane
+                                    && let Err(error) = self
+                                        .switch_workspace(workspace_id)
+                                        .and_then(|()| self.switch_tab(tab_id))
+                                        .and_then(|()| self.focus_pane(pane_id))
+                                {
+                                    self.status = error;
+                                }
+                            }
+                            // A repository refresh can replace the visible
+                            // group's leading pane while keyboard navigation
+                            // still holds its old target. Exiting the mode is
+                            // sufficient; never focus that stale pane.
+                            RailTarget::FleetGroup(_, _) => {}
+                            RailTarget::FleetPane(workspace_id, pane_id) => {
+                                if let Err(error) = self
                                     .switch_workspace(workspace_id)
-                                    .and_then(|()| self.switch_tab(tab_id))
                                     .and_then(|()| self.focus_pane(pane_id))
-                            {
-                                self.status = error;
-                            }
-                        }
-                        RailTarget::FleetWorkspace(workspace_id) => {
-                            if let Err(error) = self.switch_workspace(workspace_id) {
-                                self.status = error;
-                            }
-                        }
-                        RailTarget::FleetGroup(workspace_id, pane_id)
-                        | RailTarget::FleetPane(workspace_id, pane_id) => {
-                            if let Err(error) = self
-                                .switch_workspace(workspace_id)
-                                .and_then(|()| self.focus_pane(pane_id))
-                            {
-                                self.status = error;
+                                {
+                                    self.status = error;
+                                }
                             }
                         }
                     }
@@ -8835,6 +8889,39 @@ impl Muxtrix {
         }
     }
 
+    pub(crate) fn fleet_branch_collapsed(&self, branch: &FleetBranch) -> bool {
+        self.collapsed_fleet_branches.contains(branch)
+    }
+
+    pub(crate) fn toggle_fleet_branch(&mut self, branch: FleetBranch) {
+        if !self.collapsed_fleet_branches.remove(&branch) {
+            self.collapsed_fleet_branches.insert(branch);
+        }
+    }
+
+    fn fleet_branch_for_target(&self, target: RailTarget) -> Option<FleetBranch> {
+        match target {
+            RailTarget::FleetWorkspace(workspace_id) => Some(FleetBranch::Workspace(workspace_id)),
+            RailTarget::FleetTab(workspace_id, tab_id) => {
+                Some(FleetBranch::Tab(workspace_id, tab_id))
+            }
+            RailTarget::FleetGroup(workspace_id, first_pane) => {
+                let workspace = self
+                    .session
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == workspace_id)?;
+                self.fleet_repository_groups_for(workspace)
+                    .into_iter()
+                    .find(|group| {
+                        group.entries.first().copied() == Some((workspace_id, first_pane))
+                    })
+                    .map(|group| FleetBranch::Repository(workspace_id, group.name))
+            }
+            RailTarget::Workspace(_) | RailTarget::FleetPane(_, _) => None,
+        }
+    }
+
     /// The fleet projection the rail actually renders. The collapsed rail is
     /// pure navigation with no reachable toggle, so it always lists every
     /// pane without projection grouping.
@@ -10499,6 +10586,8 @@ pub(crate) enum IconKind {
     Add,
     Collapse,
     Expand,
+    ChevronRight,
+    ChevronDown,
     SplitRight,
     SplitDown,
     Maximize,
