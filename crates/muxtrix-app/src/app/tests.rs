@@ -5330,10 +5330,15 @@ fn repos_view_groups_across_tabs_without_nested_tab_bands() {
         ],
         "repository collapse survives a change to the group's leading pane"
     );
+    let status_after_close = app.status.clone();
     let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
     assert!(
         app.rail_nav.is_none(),
         "activating a stale group target exits without panicking"
+    );
+    assert_eq!(
+        app.status, status_after_close,
+        "a stale repository target must not report a missing-pane error"
     );
 }
 

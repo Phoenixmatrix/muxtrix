@@ -5376,8 +5376,12 @@ impl Muxtrix {
                                     self.status = error;
                                 }
                             }
-                            RailTarget::FleetGroup(workspace_id, pane_id)
-                            | RailTarget::FleetPane(workspace_id, pane_id) => {
+                            // A repository refresh can replace the visible
+                            // group's leading pane while keyboard navigation
+                            // still holds its old target. Exiting the mode is
+                            // sufficient; never focus that stale pane.
+                            RailTarget::FleetGroup(_, _) => {}
+                            RailTarget::FleetPane(workspace_id, pane_id) => {
                                 if let Err(error) = self
                                     .switch_workspace(workspace_id)
                                     .and_then(|()| self.focus_pane(pane_id))
