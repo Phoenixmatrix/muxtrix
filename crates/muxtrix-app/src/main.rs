@@ -13,6 +13,7 @@ mod agents_roster;
 mod app;
 mod assets;
 mod box_drawing;
+mod claude_status;
 mod commands;
 mod doctor;
 mod effect;
