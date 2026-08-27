@@ -4,8 +4,8 @@ use std::process::ExitCode;
 use std::str::FromStr as _;
 
 use muxtrix_control::{
-    Agent, AgentState, ClaudeHook, ControlRequest, Endpoint, HookAction, HookManager, HookScope,
-    SplitDirection, send_request,
+    Agent, AgentState, ClaudeHook, ControlRequest, ControlResponse, Endpoint, HookAction,
+    HookManager, HookScope, SplitDirection, send_request,
 };
 use serde_json::Value;
 
@@ -223,18 +223,45 @@ fn run_hook_event(arguments: &[String]) {
             hook,
         };
         if let Ok(endpoint) = Endpoint::discover_for_pane(Some(&pane_id)) {
-            let _ = send_request(&endpoint, &request);
+            let rejected = matches!(
+                send_request(&endpoint, &request),
+                Ok(ControlResponse { ok: false, message: Some(message), .. })
+                    if message.contains("claude_hook")
+            );
+            // An app from before the payload-carrying request still
+            // understands the coarse event it was installed with.
+            if rejected && event_changes_pane_state(event) {
+                let _ = send_request(
+                    &endpoint,
+                    &legacy_agent_event(&agent, state, event, &payload, pane_id),
+                );
+            }
         }
         return;
     }
     if !event_changes_pane_state(event) {
         return;
     }
+    let request = legacy_agent_event(&agent, state, event, &payload, pane_id.clone());
+    if let Ok(endpoint) = Endpoint::discover_for_pane(Some(&pane_id)) {
+        let _ = send_request(&endpoint, &request);
+    }
+}
+
+/// The pre-payload lifecycle request: the installed command's `--state`
+/// plus what the payload says about the moment.
+fn legacy_agent_event(
+    agent: &str,
+    state: AgentState,
+    event: &str,
+    payload: &Value,
+    pane_id: String,
+) -> ControlRequest {
     let title = payload
         .get("title")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("{} · {event}", agent_display_name(&agent)));
+        .unwrap_or_else(|| format!("{} · {event}", agent_display_name(agent)));
     let body = payload
         .get("message")
         .and_then(Value::as_str)
@@ -244,10 +271,9 @@ fn run_hook_event(arguments: &[String]) {
                 .and_then(Value::as_str)
         })
         .map(short_body)
-        .unwrap_or_else(|| default_body(&agent, state).into());
-    let endpoint = Endpoint::discover_for_pane(Some(&pane_id)).ok();
-    let request = ControlRequest::AgentEvent {
-        agent,
+        .unwrap_or_else(|| default_body(agent, state).into());
+    ControlRequest::AgentEvent {
+        agent: agent.to_owned(),
         state,
         event: Some(event.to_owned()),
         title,
@@ -261,9 +287,6 @@ fn run_hook_event(arguments: &[String]) {
             .get("cwd")
             .and_then(Value::as_str)
             .map(str::to_owned),
-    };
-    if let Some(endpoint) = endpoint {
-        let _ = send_request(&endpoint, &request);
     }
 }
 

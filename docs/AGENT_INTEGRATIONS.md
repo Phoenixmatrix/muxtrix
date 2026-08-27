@@ -224,7 +224,12 @@ daemon, edit shell startup files, or create a cross-VM TCP listener.
 
 ## Failure behavior
 
-Hook callbacks have a short timeout, ignore an unavailable Muxtrix app, and do
-not block the agent. The internal `hook-event` command always emits an empty
+Hook callbacks are acknowledged the moment the app's control service has
+queued them, before the UI thread has applied them, so a busy or stalled
+window never turns a hook into a timeout the agent reports. The installed
+timeout is 10 s and is only ever spent when the app is unreachable; an
+unavailable app is ignored and the agent is never blocked. A hook client
+newer than the app it reaches falls back to the coarse lifecycle event the
+older app understands. The internal `hook-event` command always emits an empty
 JSON response required by hook consumers that inspect stdout. Lifecycle state
 is advisory; terminal operation remains independent if hooks are removed.
