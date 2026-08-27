@@ -77,10 +77,14 @@ impl Root {
         const TAB_CLOSE_GAP: f32 = 4.;
         const TAB_CLOSE_SIZE: f32 = 16.;
         const TAB_CLOSE_MARGIN: f32 = TAB_EDGE_SPACE - TAB_CLOSE_GAP - TAB_CLOSE_SIZE;
+        /// Measured equal spaces still read as right-heavy: the small round
+        /// dot carries less visual weight than the title's final upright
+        /// stroke, so the block is nudged left by this much.
+        const TAB_OPTICAL_SHIFT: f32 = 0.;
         /// The shaped label box runs about this far past its last glyph's
         /// ink (trailing advance), so the close is pulled back by it to keep
         /// the visible gap after the title at TAB_CLOSE_GAP.
-        const TAB_LABEL_TRAILING_ADVANCE: f32 = 4.;
+        const TAB_LABEL_TRAILING_ADVANCE: f32 = 1.;
         let app = self.app();
         let tokens = DesignTokens::for_appearance(app.settings.appearance);
         let Ok(workspace) = app.active_workspace() else {
@@ -248,7 +252,7 @@ impl Root {
                         // grouped TAB_DOT_GAP from its own label (the
                         // component's 4px separator plus 12px label padding,
                         // pulled back).
-                        .ml(px(TAB_EDGE_SPACE))
+                        .ml(px(TAB_EDGE_SPACE - TAB_OPTICAL_SHIFT))
                         .mr(px(TAB_DOT_GAP - 16.))
                         .flex_none()
                         .rounded_full()
