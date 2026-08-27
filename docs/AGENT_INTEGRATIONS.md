@@ -115,24 +115,28 @@ Targets are:
 
 Muxtrix subscribes to session start/end, prompt submission, permission, stop,
 and sub-agent events for Codex and Claude Code. Claude Code also contributes
-notification and teammate-idle events. Oh My Pi does not use Codex/Claude-style
+stop-failure, elicitation, and notification events, and its hook client
+forwards the whole payload rather than a pre-decided state. Oh My Pi does not use Codex/Claude-style
 JSON hook arrays; its managed module is a native `.omp` extension that listens
 to session lifecycle, agent lifecycle, approval, compaction, and handoff
 maintenance events. Hooks identify the pane, session, working directory, and
 coarse turn boundaries. Completion and failure still create attention on the
 originating fleet entry.
 
-For Codex and Claude Code, hooks are not the authority for live interactive
-state. Codex emits `PermissionRequest` before its automatic reviewer decides,
-and `PostToolUse` arrives only after a successful tool finishes. Muxtrix treats
-those callbacks as metadata. Codex derives `Running`, `Idle`, or `Needs input`
-from the current terminal screen and OSC title. Claude combines that screen
-with the exact interactive-session `busy`/`idle` status from
-`claude agents --json`. Only a recognized, visible approval or answer surface
-can create `Needs input`; structured busy state may clear stale attention but
-never override a blocker still visible on screen. `Done` preserves the previous
-completion while the composer is idle, but positive working evidence starts
-the next turn even when its prompt hook was delayed or unavailable.
+For Codex, hooks are not the authority for live interactive state: it emits
+`PermissionRequest` before its automatic reviewer decides, and `PostToolUse`
+arrives only after a successful tool finishes. Muxtrix treats those callbacks
+as metadata and derives `Running`, `Idle`, or `Needs input` from the current
+terminal screen and OSC title. Only a recognized, visible approval or answer
+surface can create `Needs input`. `Done` preserves the previous completion
+while the composer is idle, but positive working evidence starts the next turn
+even when its prompt hook was delayed or unavailable.
+
+Claude Code is read from the session record the harness itself writes
+(`~/.claude/sessions/<pid>.json`): `busy`, `idle`, `waiting` with the reason,
+or `shell`. Hooks add the exact turn edges and session identity; the screen is
+only a fallback for a pane no live record matches. See
+[Agent state detection](AGENT_STATE_DETECTION.md#claude-code-session-records).
 
 Oh My Pi keeps exact approval and active-turn lifecycle events. From
 `agent_start` through terminal `agent_end`, an idle title cannot demote the

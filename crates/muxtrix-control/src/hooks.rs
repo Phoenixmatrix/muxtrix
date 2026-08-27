@@ -727,11 +727,10 @@ fn install_entries(root: &mut Value, agent: Agent, executable: &Path) -> Result<
 
 /// Installed hook events and the pane state each one reports.
 ///
-/// TeammateIdle and SubagentStop stay installed for stability, but the
-/// `hook-event` CLI drops them before they reach the app: helper-agent
-/// lifecycle inside a running turn must not repaint the pane. Removing them
-/// here instead would change hook semantics and force a manual repair on
-/// update.
+/// Codex's SubagentStop stays installed for stability, but the `hook-event`
+/// CLI drops it before it reaches the app: helper-agent lifecycle inside a
+/// running turn must not repaint the pane. Removing it here instead would
+/// change hook semantics and force a manual repair on update.
 fn hook_events(agent: Agent) -> &'static [(&'static str, &'static str)] {
     match agent {
         Agent::Codex => &[
@@ -747,16 +746,21 @@ fn hook_events(agent: Agent) -> &'static [(&'static str, &'static str)] {
             ("SubagentStart", "running"),
             ("SubagentStop", "completed"),
         ],
+        // Claude Code's `--state` is documentary: the `hook-event` client
+        // forwards the whole payload and the app decides. The set covers
+        // exact turn edges (prompt, stop, failure), the blocking dialogs the
+        // harness raises (permission, elicitation, and the notification it
+        // sends once a dialog has waited), and session identity.
         Agent::Claude => &[
             ("SessionStart", "idle"),
             ("UserPromptSubmit", "running"),
-            ("Notification", "waiting"),
             ("PermissionRequest", "waiting"),
+            ("Elicitation", "waiting"),
+            ("Notification", "waiting"),
             ("Stop", "completed"),
+            ("StopFailure", "failed"),
             ("SessionEnd", "stopped"),
             ("SubagentStart", "running"),
-            ("SubagentStop", "completed"),
-            ("TeammateIdle", "waiting"),
         ],
         Agent::Pi => &[
             ("session_start", "idle"),

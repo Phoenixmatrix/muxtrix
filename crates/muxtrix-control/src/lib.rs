@@ -33,6 +33,14 @@ pub enum ControlRequest {
         session_id: Option<String>,
         cwd: Option<String>,
     },
+    /// A Claude Code hook callback with its payload intact. Unlike
+    /// [`ControlRequest::AgentEvent`], the state is not pre-decided by the
+    /// installed command: the app derives it from the event name and fields,
+    /// and merges it with Claude Code's own session record.
+    ClaudeHook {
+        pane_id: Option<String>,
+        hook: ClaudeHook,
+    },
     LaunchAgent {
         agent: Agent,
     },
@@ -72,6 +80,73 @@ pub enum AgentState {
     Completed,
     Failed,
     Stopped,
+}
+
+/// The fields of a Claude Code hook payload that decide pane state or
+/// identity. Everything is optional: hook payloads differ per event and the
+/// harness may add or drop fields between releases.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeHook {
+    /// `hook_event_name`, e.g. `UserPromptSubmit`, `PermissionRequest`.
+    pub event: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    /// `Notification` payloads name their kind: `permission_prompt`,
+    /// `idle_prompt`, `elicitation_dialog`, `auth_success`, ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assistant_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
+    /// The hook process's parent PID where the platform exposes it. Claude
+    /// Code spawns hook commands directly, so on Linux this is the harness
+    /// process itself — the same PID its session record carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_process_id: Option<u32>,
+    /// Wall-clock milliseconds when the hook client sent this, on the same
+    /// clock Claude Code stamps its session record with. Lets the app order a
+    /// hook edge against the record that may lag or lead it.
+    #[serde(default)]
+    pub sent_at_ms: u64,
+}
+
+impl ClaudeHook {
+    /// Builds the request from a raw hook payload as Claude Code writes it to
+    /// the hook command's stdin.
+    #[must_use]
+    pub fn from_payload(payload: &serde_json::Value, event: &str) -> Self {
+        let text = |key: &str| {
+            payload
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        Self {
+            event: event.to_owned(),
+            session_id: text("session_id"),
+            cwd: text("cwd"),
+            tool_name: text("tool_name"),
+            tool_use_id: text("tool_use_id"),
+            notification_type: text("notification_type").or_else(|| text("matcher")),
+            permission_mode: text("permission_mode"),
+            message: text("message"),
+            last_assistant_message: text("last_assistant_message"),
+            transcript_path: text("transcript_path"),
+            parent_process_id: None,
+            sent_at_ms: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

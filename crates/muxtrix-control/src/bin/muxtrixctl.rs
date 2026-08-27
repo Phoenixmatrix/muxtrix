@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::str::FromStr as _;
 
 use muxtrix_control::{
-    Agent, AgentState, ControlRequest, Endpoint, HookAction, HookManager, HookScope,
+    Agent, AgentState, ClaudeHook, ControlRequest, Endpoint, HookAction, HookManager, HookScope,
     SplitDirection, send_request,
 };
 use serde_json::Value;
@@ -212,6 +212,22 @@ fn run_hook_event(arguments: &[String]) {
         .get("hook_event_name")
         .and_then(Value::as_str)
         .unwrap_or("Lifecycle");
+    if is_claude(&agent) {
+        // Claude Code's state is decided by the app from the full payload
+        // and the harness's own session record, not by the installed
+        // command's `--state`.
+        let mut hook = ClaudeHook::from_payload(&payload, event);
+        hook.parent_process_id = parent_process_id();
+        hook.sent_at_ms = now_ms();
+        let request = ControlRequest::ClaudeHook {
+            pane_id: Some(pane_id.clone()),
+            hook,
+        };
+        if let Ok(endpoint) = Endpoint::discover_for_pane(Some(&pane_id)) {
+            let _ = send_request(&endpoint, &request);
+        }
+        return;
+    }
     if !event_changes_pane_state(event) {
         return;
     }
@@ -252,6 +268,28 @@ fn run_hook_event(arguments: &[String]) {
     }
 }
 
+fn is_claude(agent: &str) -> bool {
+    matches!(agent, "claude" | "claude-code")
+}
+
+#[cfg(unix)]
+fn parent_process_id() -> Option<u32> {
+    Some(std::os::unix::process::parent_id())
+}
+
+#[cfg(not(unix))]
+fn parent_process_id() -> Option<u32> {
+    None
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 /// Helper-agent lifecycle events describe progress inside a running turn —
 /// a teammate or subagent finishing does not mean the session needs the
 /// user's input or is done. Filtering here keeps the installed hook set
@@ -264,6 +302,7 @@ fn request_pane_id(request: &ControlRequest) -> Option<&str> {
     match request {
         ControlRequest::Notify { pane_id, .. }
         | ControlRequest::AgentEvent { pane_id, .. }
+        | ControlRequest::ClaudeHook { pane_id, .. }
         | ControlRequest::Close { pane_id }
         | ControlRequest::SendText { pane_id, .. }
         | ControlRequest::Capture { pane_id } => pane_id.as_deref(),
