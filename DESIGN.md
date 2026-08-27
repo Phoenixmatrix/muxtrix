@@ -52,7 +52,7 @@ Color meaning is fixed:
 
 ## Layout and hierarchy
 
-The fleet rail is 272 px expanded and 46 px collapsed. The app bar is 44 px
+The fleet rail is 296 px expanded and 46 px collapsed. The app bar is 44 px
 high and carries the workspace tabs in a continuous Zed-style strip; pane
 headers are 34 px bands inside their cards. Expanded fleet entries are compact
 two-line rows on the rail surface; panes are rounded cards floating on the app field.
@@ -94,7 +94,7 @@ persist as settings preferences.
 
 Fleet rows show only what is true for their pane. Every expanded row uses two
 lines: state signal and pane title first; linked-worktree, repository, or live
-directory context second. Truthful lifecycle state trails the context line.
+directory context second, aligned under the signal dot. Truthful lifecycle state trails the context line.
 Agent panes carry their reported lifecycle. Plain terminal panes use their real
 state such as Shell, Starting, Exited, or Unavailable rather than fabricating an
 agent lifecycle. Shortcut numbers follow the currently displayed order — and
@@ -195,7 +195,7 @@ factor. Fleet copy is budgeted from the rail's available width, not from a fixed
 character count: trailing state claims its natural width first, then the title
 is shaped in the configured interface face and ellipsized to the exact space
 left. Secondary budgets that are not width-bound scale inversely with the
-interface size. The rail stays 272 px at every interface size; a larger size
+interface size. The rail stays 296 px at every interface size; a larger size
 truncates sooner rather than demanding a wider rail.
 
 Expanded fleet entries are 52 px two-line rows. The first line carries the
@@ -207,9 +207,18 @@ activity or command copy instead. Both flexible text lanes are shaped in the
 configured interface face and ellipsized to the measured width left after fixed
 trailing content claims its space. Direct pane navigation remains
 keyboard-only: expanded rows never print Ctrl/Cmd+1 through 9 hints. Workspaces,
-tabs, and repositories form a compact tree with disclosure chevrons and 8 px
-indentation steps, without vertical guide lines. Expanded branches show their
-child count and no status dot. Collapsed branches keep one truthful roll-up dot
+tabs, and repositories form a compact tree led by icons rather than chevrons:
+a package (open while expanded, closed while collapsed) for a workspace, an
+app window for a tab, and a Git folder for a repository. Rows start 12 px
+from the rail edge and each level steps in 20 px, with a hairline guide
+dropped from the centre of every ancestor's icon. A workspace's only tab is
+not drawn — its panes sit directly under the workspace — while a repository
+branch is always drawn, even alone. Only workspace branches fold; tab and
+repository headings are always open and carry nothing trailing. An expanded
+workspace branch shows its pane count in a quiet pill and no status dot, and
+a folded one keeps that pill with a signal dot and roll-up word inside it; the WORKSPACES header wears the same pill
+with the workspace count, and the Tabs/Agents/Repos well spans the rail with
+three equal centred segments. Collapsed branches keep one truthful roll-up dot
 plus text such as `2 working`, so color never stands alone. Repos uses workspace
 and repository branches only, with no nested tab grouping. The workspace cards
 above the fleet keep their roll-ups: name, state, counts, and the live mono path.
@@ -539,7 +548,7 @@ merge.
 New UI must:
 
 1. Reuse semantic `DesignTokens` and preserve the established state colors.
-2. Keep the 272/46 px rail states and 44 px header rhythm unless the entire layout contract is deliberately revised.
+2. Keep the 296/46 px rail states and 44 px header rhythm unless the entire layout contract is deliberately revised.
 3. Extend continuous fleet rows instead of introducing card styling.
 4. Place alerts according to ownership: global only for non-pane problems, pane-bound otherwise.
 5. Render only truthful process, agent, cwd, and session data.

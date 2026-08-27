@@ -712,7 +712,10 @@ fn install_entries(root: &mut Value, agent: Agent, executable: &Path) -> Result<
             "hooks": [{
                 "type": "command",
                 "command": command,
-                "timeout": 3
+                // Delivery is acknowledged on queue, so this is only ever
+                // spent when the app is genuinely unreachable; generous so a
+                // slow WSL interop launch never surfaces as a hook failure.
+                "timeout": 10
             }]
         });
         hooks

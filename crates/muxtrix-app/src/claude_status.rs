@@ -161,7 +161,9 @@ pub(crate) fn live_records(records: Vec<SessionRecord>) -> Vec<SessionRecord> {
 pub(crate) enum ProbeHost {
     Local,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    Wsl { distribution: String },
+    Wsl {
+        distribution: String,
+    },
 }
 
 /// One `sh` that answers, for each PID it is sent, that process's kernel

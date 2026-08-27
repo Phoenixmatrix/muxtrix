@@ -115,6 +115,22 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/pull-request-merged.svg",
         include_bytes!("../assets/icons/pull-request-merged.svg"),
     ),
+    (
+        "icons/package.svg",
+        include_bytes!("../assets/icons/package.svg"),
+    ),
+    (
+        "icons/package-open.svg",
+        include_bytes!("../assets/icons/package-open.svg"),
+    ),
+    (
+        "icons/app-window.svg",
+        include_bytes!("../assets/icons/app-window.svg"),
+    ),
+    (
+        "icons/folder-git.svg",
+        include_bytes!("../assets/icons/folder-git.svg"),
+    ),
 ];
 
 /// The asset path for an icon, as `svg().path(..)` wants it.
@@ -125,8 +141,6 @@ pub(crate) fn icon_path(kind: IconKind) -> SharedString {
         IconKind::Add => "icons/add.svg",
         IconKind::Collapse => "icons/collapse.svg",
         IconKind::Expand => "icons/expand.svg",
-        IconKind::ChevronRight => "icons/chevron-right.svg",
-        IconKind::ChevronDown => "icons/chevron-down.svg",
         IconKind::SplitRight => "icons/split-right.svg",
         IconKind::SplitDown => "icons/split-down.svg",
         IconKind::Maximize => "icons/maximize.svg",
@@ -147,6 +161,10 @@ pub(crate) fn icon_path(kind: IconKind) -> SharedString {
         IconKind::PullRequestDraft => "icons/pull-request-draft.svg",
         IconKind::PullRequestClosed => "icons/pull-request-closed.svg",
         IconKind::PullRequestMerged => "icons/pull-request-merged.svg",
+        IconKind::Package => "icons/package.svg",
+        IconKind::PackageOpen => "icons/package-open.svg",
+        IconKind::AppWindow => "icons/app-window.svg",
+        IconKind::FolderGit => "icons/folder-git.svg",
     };
     SharedString::new_static(path)
 }
@@ -185,8 +203,6 @@ mod tests {
             IconKind::Add,
             IconKind::Collapse,
             IconKind::Expand,
-            IconKind::ChevronRight,
-            IconKind::ChevronDown,
             IconKind::SplitRight,
             IconKind::SplitDown,
             IconKind::Maximize,
@@ -207,6 +223,10 @@ mod tests {
             IconKind::PullRequestDraft,
             IconKind::PullRequestClosed,
             IconKind::PullRequestMerged,
+            IconKind::Package,
+            IconKind::PackageOpen,
+            IconKind::AppWindow,
+            IconKind::FolderGit,
         ];
         for kind in kinds {
             let path = icon_path(kind);

@@ -547,7 +547,6 @@ fn handle_connection(
     sender: mpsc::Sender<IncomingRequest>,
     notifier: Option<ControlNotifier>,
 ) {
-    #[cfg(unix)]
     let _ = stream.set_recv_timeout(Some(Duration::from_secs(3)));
     let mut line = String::new();
     let request = {
@@ -566,6 +565,15 @@ fn handle_connection(
             },
         }
     };
+    // Lifecycle callbacks are fire-and-forget: the agent's hook is blocked
+    // for as long as this reply takes, and the hook client discards the
+    // reply anyway. Acknowledge as soon as the request is queued rather
+    // than after the UI thread has drained it, so a busy or stalled window
+    // can never turn a hook into a timeout the agent reports to the user.
+    let acknowledge_on_queue = matches!(
+        request,
+        ControlRequest::AgentEvent { .. } | ControlRequest::ClaudeHook { .. }
+    );
     let (response_sender, response_receiver) = mpsc::sync_channel(1);
     if sender
         .send(IncomingRequest {
@@ -579,9 +587,13 @@ fn handle_connection(
     if let Some(notifier) = notifier {
         notifier();
     }
-    let response = response_receiver
-        .recv_timeout(Duration::from_secs(3))
-        .unwrap_or_else(|_| ControlResponse::error("Muxtrix did not answer in time"));
+    let response = if acknowledge_on_queue {
+        ControlResponse::success("lifecycle event queued")
+    } else {
+        response_receiver
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or_else(|_| ControlResponse::error("Muxtrix did not answer in time"))
+    };
     let _ = write_response(&mut stream, &response);
 }
 
@@ -597,7 +609,6 @@ pub fn send_request(
     request: &ControlRequest,
 ) -> Result<ControlResponse, ControlError> {
     let mut stream = Stream::connect(endpoint.name()?)?;
-    #[cfg(unix)]
     stream.set_recv_timeout(Some(Duration::from_secs(4)))?;
     serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
