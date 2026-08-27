@@ -88,7 +88,7 @@ pub(crate) const AGENTS_ROSTER_INTERVAL: std::time::Duration = std::time::Durati
 /// the pane stays on the same directory and branch so new commits and PRs land.
 pub(crate) const PANE_REPOSITORY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-pub(crate) const SIDEBAR_WIDTH: f32 = 272.0;
+pub(crate) const SIDEBAR_WIDTH: f32 = 296.0;
 
 /// Width available to fleet entry copy: the rail less its 1px border, the
 /// entry's own 16px horizontal padding, and a reserve so the ellipsis fires
@@ -4603,11 +4603,16 @@ impl Muxtrix {
                             continue;
                         }
                     }
+                    // A lone tab is not a branch: its panes sit directly
+                    // under the workspace, exactly as the rail draws them.
+                    let single_tab = workspace.tabs.len() == 1;
                     for tab in &workspace.tabs {
-                        let branch = FleetBranch::Tab(workspace.id, tab.id);
-                        targets.push(RailTarget::FleetTab(workspace.id, tab.id));
-                        if self.fleet_branch_collapsed(&branch) {
-                            continue;
+                        if !single_tab {
+                            let branch = FleetBranch::Tab(workspace.id, tab.id);
+                            targets.push(RailTarget::FleetTab(workspace.id, tab.id));
+                            if self.fleet_branch_collapsed(&branch) {
+                                continue;
+                            }
                         }
                         for pane_id in pane_ids_in_layout(&tab.root) {
                             targets.push(RailTarget::FleetPane(workspace.id, pane_id));
@@ -10774,8 +10779,6 @@ pub(crate) enum IconKind {
     Add,
     Collapse,
     Expand,
-    ChevronRight,
-    ChevronDown,
     SplitRight,
     SplitDown,
     Maximize,
@@ -10796,6 +10799,10 @@ pub(crate) enum IconKind {
     PullRequestDraft,
     PullRequestClosed,
     PullRequestMerged,
+    Package,
+    PackageOpen,
+    AppWindow,
+    FolderGit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

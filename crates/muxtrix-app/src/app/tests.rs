@@ -5198,11 +5198,24 @@ fn rail_targets_walk_workspaces_then_fleet_in_visual_order() {
     );
     assert_eq!(
         &targets[workspace_count..],
+        &[RailTarget::FleetPane(workspace_id, pane_id)],
+        "a one-tab workspace draws no tab branch, so the walk skips it too"
+    );
+
+    // A second tab makes both tabs branches.
+    let mut app = app;
+    app.new_tab().expect("second tab should be created");
+    let second_tab = active_tab(&app).id;
+    let second_pane = active_pane_id(&app);
+    let targets = app.rail_targets();
+    assert_eq!(
+        &targets[workspace_count..],
         &[
             RailTarget::FleetTab(workspace_id, tab_id),
             RailTarget::FleetPane(workspace_id, pane_id),
+            RailTarget::FleetTab(workspace_id, second_tab),
+            RailTarget::FleetPane(workspace_id, second_pane),
         ],
-        "even a one-tab workspace exposes the tab branch rendered by the tree"
     );
 }
 
@@ -5564,6 +5577,8 @@ fn rail_navigation_folds_branches_with_horizontal_arrows_and_enter() {
     let workspace_id = app.session.active_workspace_id;
     let tab_id = active_tab(&app).id;
     let pane_id = active_pane_id(&app);
+    // Tab branches exist only once a workspace has more than one tab.
+    app.new_tab().expect("second tab should be created");
     let branch = FleetBranch::Tab(workspace_id, tab_id);
 
     let _ = app.handle_keyboard(key_press(Key::Character("g".into()), Modifiers::CTRL));

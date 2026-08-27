@@ -1,12 +1,12 @@
 //! The sidebar rail: workspaces above, the fleet below.
 //!
-//! Two shapes of the same list. Expanded (272 px) shows names and context;
+//! Two shapes of the same list. Expanded (296 px) shows names and context;
 //! collapsed (46 px) keeps only the markers and signal dots, so the rail still
 //! carries pane state at a glance.
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    AnyElement, Context, Div, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px, svg,
 };
 use muxtrix_domain::{PaneId, Workspace, WorkspaceId};
@@ -69,15 +69,17 @@ impl Root {
                 .items_center()
                 .h(px(TOP_CHROME_HEIGHT))
                 .px(px(8.))
+                .gap(px(8.))
                 .child(
                     div()
-                        .flex_grow(1.0)
                         .text_size(px(app.settings.ui_pixels(9.0)))
                         .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                         .font_weight(gpui::FontWeight::BOLD)
                         .text_color(color(tokens.faint))
                         .child("WORKSPACES"),
                 )
+                .child(count_badge(app.session.workspaces.len(), tokens, app))
+                .child(div().flex_grow(1.0))
                 .child(
                     icon_button(
                         gpui::ElementId::from("new-workspace"),
@@ -116,6 +118,11 @@ impl Root {
                         rail = rail.child(self.fleet_group_label(
                             workspace.name.clone(),
                             FleetGroupLevel::Workspace,
+                            if app.fleet_branch_collapsed(&branch) {
+                                IconKind::Package
+                            } else {
+                                IconKind::PackageOpen
+                            },
                             0,
                             &branch,
                             app.workspace_signal_kind(workspace),
@@ -128,28 +135,37 @@ impl Root {
                             continue;
                         }
                     }
+                    // A workspace's only tab is not a branch worth a row: its
+                    // panes sit directly under the workspace.
+                    let single_tab = workspace.tabs.len() == 1;
                     for tab in &workspace.tabs {
-                        let branch = FleetBranch::Tab(workspace.id, tab.id);
                         let pane_ids = pane_ids_in_layout(&tab.root);
-                        rail = rail.child(self.fleet_group_label(
-                            tab.name.clone(),
-                            FleetGroupLevel::Nested,
-                            nested_depth,
-                            &branch,
-                            app.tab_signal_kind(tab),
-                            pane_ids.len(),
-                            app.rail_nav == Some(RailTarget::FleetTab(workspace.id, tab.id)),
-                            tokens,
-                            cx,
-                        ));
-                        if app.fleet_branch_collapsed(&branch) {
-                            continue;
-                        }
+                        let pane_depth = if single_tab {
+                            nested_depth
+                        } else {
+                            let branch = FleetBranch::Tab(workspace.id, tab.id);
+                            rail = rail.child(self.fleet_group_label(
+                                tab.name.clone(),
+                                FleetGroupLevel::Nested,
+                                IconKind::AppWindow,
+                                nested_depth,
+                                &branch,
+                                app.tab_signal_kind(tab),
+                                pane_ids.len(),
+                                app.rail_nav == Some(RailTarget::FleetTab(workspace.id, tab.id)),
+                                tokens,
+                                cx,
+                            ));
+                            if app.fleet_branch_collapsed(&branch) {
+                                continue;
+                            }
+                            nested_depth + 1
+                        };
                         for pane_id in pane_ids {
                             rail = rail.child(self.fleet_row(
                                 workspace.id,
                                 pane_id,
-                                nested_depth + 1,
+                                pane_depth,
                                 tokens,
                                 cx,
                             ));
@@ -195,6 +211,11 @@ impl Root {
                         rail = rail.child(self.fleet_group_label(
                             workspace.name.clone(),
                             FleetGroupLevel::Workspace,
+                            if app.fleet_branch_collapsed(&branch) {
+                                IconKind::Package
+                            } else {
+                                IconKind::PackageOpen
+                            },
                             0,
                             &branch,
                             strongest_pane_signal(app, workspace, entries.iter().copied()),
@@ -227,6 +248,11 @@ impl Root {
                         rail = rail.child(self.fleet_group_label(
                             workspace.name.clone(),
                             FleetGroupLevel::Workspace,
+                            if app.fleet_branch_collapsed(&branch) {
+                                IconKind::Package
+                            } else {
+                                IconKind::PackageOpen
+                            },
                             0,
                             &branch,
                             app.workspace_signal_kind(workspace),
@@ -248,6 +274,7 @@ impl Root {
                         rail = rail.child(self.fleet_group_label(
                             group.name,
                             FleetGroupLevel::Nested,
+                            IconKind::FolderGit,
                             nested_depth,
                             &branch,
                             strongest_pane_signal(
@@ -351,15 +378,17 @@ impl Root {
             .into_any_element()
     }
 
-    /// The Tabs/Agents/Repos projection control, in its recessed well.
+    /// The Tabs/Agents/Repos projection control: three equal, centred
+    /// segments filling the rail's width in one recessed well.
     fn fleet_header(&self, tokens: DesignTokens, cx: &mut Context<Self>) -> AnyElement {
         let app = self.app();
         let mut well = div()
             .flex()
             .flex_row()
+            .w_full()
             .gap(px(2.))
-            .p(px(2.))
-            .rounded(px(7.))
+            .p(px(3.))
+            .rounded(px(8.))
             .bg(color(tokens.app))
             .border_1()
             .border_color(color(tokens.line));
@@ -368,15 +397,17 @@ impl Root {
             let hover = color(tokens.element_hover);
             let mut segment = div()
                 .id(SharedString::from(format!("fleet-{view}")))
-                .h(px(26.))
-                .px(px(6.))
+                .flex_1()
+                .min_w(px(0.))
+                .h(px(30.))
                 .flex()
                 .items_center()
-                .rounded(px(5.))
+                .justify_center()
+                .rounded(px(6.))
                 .cursor_pointer()
                 .border_1()
-                .text_size(px(app.settings.ui_pixels(10.0)))
-                .line_height((px(app.settings.ui_pixels(10.0))) * 1.3)
+                .text_size(px(app.settings.ui_pixels(9.2)))
+                .line_height((px(app.settings.ui_pixels(9.2))) * 1.3)
                 .whitespace_nowrap()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -390,6 +421,7 @@ impl Root {
                     .bg(color(tokens.panel_raised))
                     .border_color(color(tokens.line_strong))
                     .text_color(color(tokens.text))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
                     .shadow(vec![gpui::BoxShadow {
                         color: gpui::Rgba {
                             r: 0.,
@@ -415,21 +447,25 @@ impl Root {
             .flex()
             .flex_row()
             .items_center()
-            .justify_end()
-            .h(px(36.))
-            .px(px(6.))
+            .w_full()
+            .pt(px(8.))
+            .pb(px(8.))
+            .px(px(10.))
             .child(well)
             .into_any_element()
     }
 
-    /// A collapsible fleet-tree branch. Expanded branches carry only their
-    /// child count; collapsed branches add a signal dot and textual roll-up so
+    /// A collapsible fleet-tree branch, led by the icon that names its kind:
+    /// a package (open or closed) for a workspace, a window for a tab, a Git
+    /// folder for a repository. Expanded branches carry only their child
+    /// count; collapsed branches add a signal dot and textual roll-up so
     /// state remains legible without relying on color.
     #[allow(clippy::too_many_arguments)]
     fn fleet_group_label(
         &self,
         label: String,
         level: FleetGroupLevel,
+        icon: IconKind,
         depth: usize,
         branch: &FleetBranch,
         signal_kind: PaneSignalKind,
@@ -444,7 +480,7 @@ impl Root {
         let mut targeted_fill = color(tokens.accent);
         targeted_fill.a = 0.12;
         let mut hover = color(tokens.text);
-        hover.a = 0.04;
+        hover.a = 0.05;
         let id = SharedString::from(format!("fleet-branch-{branch:?}"));
         let branch_message = branch.clone();
         let display_label = if workspace {
@@ -452,21 +488,17 @@ impl Root {
         } else {
             label
         };
-        let summary = if collapsed {
-            format!("{pane_count} {}", fleet_rollup_label(signal_kind))
-        } else {
-            pane_count.to_string()
-        };
         let mut band = div()
             .id(id)
+            .relative()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.))
+            .gap(px(TREE_ICON_GAP))
             .w_full()
-            .h(px(28.))
-            .pl(px(6. + depth as f32 * 8.))
-            .pr(px(8.))
+            .h(px(30.))
+            .pl(px(tree_inset(depth)))
+            .pr(px(TREE_EDGE))
             .border_1()
             .border_color(color(if targeted {
                 tokens.accent
@@ -489,61 +521,66 @@ impl Root {
                     );
                 }),
             )
+            .children(tree_guides(depth, tokens))
             .child(
                 svg()
-                    .path(crate::assets::icon_path(if collapsed {
-                        IconKind::ChevronRight
-                    } else {
-                        IconKind::ChevronDown
-                    }))
-                    .size(px(11.))
+                    .path(crate::assets::icon_path(icon))
+                    .size(px(TREE_ICON))
+                    .flex_shrink_0()
                     .text_color(color(if targeted {
                         tokens.accent
+                    } else if workspace {
+                        tokens.text
                     } else {
                         tokens.muted
                     })),
             )
-            .child(div().size(px(6.)).rounded_full().bg(color(if collapsed {
-                signal_kind.color(tokens)
-            } else {
-                crate::theme::Color::TRANSPARENT
-            })))
             .child(
                 div()
                     .flex_grow(1.0)
                     .min_w(px(0.))
-                    .text_size(px(app.settings.ui_pixels(9.0)))
-                    .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
+                    .text_size(px(app.settings.ui_pixels(if workspace {
+                        9.2
+                    } else {
+                        9.8
+                    })))
+                    .line_height(
+                        (px(app.settings.ui_pixels(if workspace { 9.2 } else { 9.8 }))) * 1.3,
+                    )
                     .font_weight(if workspace {
                         gpui::FontWeight::BOLD
                     } else {
-                        gpui::FontWeight::MEDIUM
+                        gpui::FontWeight::NORMAL
                     })
-                    .text_color(color(if targeted {
-                        tokens.accent
-                    } else if workspace {
-                        tokens.muted
-                    } else {
-                        tokens.text
-                    }))
+                    .text_color(color(if targeted { tokens.accent } else { tokens.text }))
                     .truncate()
                     .child(ellipsize(
                         &display_label,
-                        app.settings.ui_char_budget(if workspace { 22 } else { 24 }),
+                        app.settings.ui_char_budget(if workspace { 22 } else { 26 }),
                     )),
-            )
-            .child(
-                div()
-                    .text_size(px(app.settings.ui_pixels(8.5)))
-                    .line_height((px(app.settings.ui_pixels(8.5))) * 1.3)
-                    .text_color(color(if collapsed {
-                        signal_kind.label_color(tokens)
-                    } else {
-                        tokens.faint
-                    }))
-                    .whitespace_nowrap()
-                    .child(summary),
             );
+        // The trailing slot keeps one shape in both states: a pill with the
+        // count, which gains a signal dot and the roll-up word while the
+        // branch is folded and its children cannot speak for themselves.
+        band = if collapsed {
+            band.child(
+                count_badge(pane_count, tokens, app)
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(color(signal_kind.color(tokens))),
+                    )
+                    .child(
+                        div()
+                            .text_color(color(signal_kind.label_color(tokens)))
+                            .child(fleet_rollup_label(signal_kind)),
+                    ),
+            )
+        } else {
+            band.child(count_badge(pane_count, tokens, app))
+        };
         if !targeted {
             band = band.hover(move |style| style.bg(hover));
         }
@@ -871,6 +908,17 @@ impl Root {
         let signal = signal_kind.color(tokens);
         let location = app.pane_location_label(pane_id);
         let title = app.fleet_pane_identity_label(workspace, pane_id, &location);
+        // A path's informative end is its leaf: two panes in sibling
+        // directories differ only there, so paths lose their head, not their
+        // tail. The budget is the second line's width less the state lane.
+        let context_budget = ((crate::app::FLEET_ENTRY_TEXT_WIDTH - depth as f32 * TREE_STEP - 58.)
+            / (app.settings.ui_pixels(9.0) * crate::app::UI_TEXT_ADVANCE_RATIO))
+            as usize;
+        let location = if location.contains(['/', '\\']) {
+            ellipsize_start(&location, context_budget.max(8))
+        } else {
+            location
+        };
         let is_agent = app.agent_statuses.contains_key(&pane_id);
         let pane_state = app.pane_state_label(pane_id);
         // A text state accompanies every non-neutral pip so colour never
@@ -912,7 +960,7 @@ impl Root {
             let mut ring = color(signal);
             ring.a *= 0.7;
             div()
-                .size(px(7.))
+                .size(px(8.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -921,7 +969,7 @@ impl Root {
                 .border_color(ring)
                 .child(div().size(px(3.)).rounded_full().bg(color(signal)))
         } else {
-            div().size(px(7.)).rounded_full().bg(color(signal))
+            div().size(px(8.)).rounded_full().bg(color(signal))
         };
 
         div()
@@ -946,14 +994,21 @@ impl Root {
                     .gap(px(3.))
                     .flex_grow(1.0)
                     .min_w(px(0.))
+                    .relative()
                     .h(px(52.))
                     .py(px(5.))
-                    .pl(px(8. + depth as f32 * 8.))
-                    .pr(px(8.))
+                    .pl(px(tree_inset(depth)))
+                    .pr(px(TREE_EDGE))
                     .bg(fill)
-                    .when(cursor, |row| {
-                        row.border_1().border_color(color(tokens.accent))
-                    })
+                    .children(tree_guides(depth, tokens))
+                    // The border exists in every state so the cursor landing
+                    // here never shifts the row's content by a pixel.
+                    .border_1()
+                    .border_color(color(if cursor {
+                        tokens.accent
+                    } else {
+                        crate::theme::Color::TRANSPARENT
+                    }))
                     .when(!selected && !cursor, |row| {
                         row.hover(move |style| style.bg(hover))
                     })
@@ -990,7 +1045,6 @@ impl Root {
                                 div()
                                     .flex_grow(1.0)
                                     .min_w(px(0.))
-                                    .pl(px(15.))
                                     .text_size(px(app.settings.ui_pixels(9.0)))
                                     .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                                     .text_color(color(if focused || targeted {
@@ -1334,6 +1388,54 @@ impl Root {
 }
 
 /// A stable, hashable key for a workspace, for GPUI element ids.
+/// Tree geometry, after the mock: rows start 12px from the rail edge, every
+/// level steps in by 20px, and a branch's 16px icon sits 7px before its label.
+const TREE_EDGE: f32 = 12.;
+const TREE_STEP: f32 = 20.;
+const TREE_ICON: f32 = 16.;
+const TREE_ICON_GAP: f32 = 7.;
+
+fn tree_inset(depth: usize) -> f32 {
+    TREE_EDGE + depth as f32 * TREE_STEP
+}
+
+/// One hairline per ancestor level, dropped from the centre of that
+/// ancestor's icon so children read as hanging from it.
+fn tree_guides(depth: usize, tokens: DesignTokens) -> Vec<Div> {
+    let mut guide = color(tokens.text);
+    guide.a = 0.14;
+    (0..depth)
+        .map(|level| {
+            div()
+                .absolute()
+                .left(px(tree_inset(level) + TREE_ICON / 2.))
+                .top(px(0.))
+                .bottom(px(-1.))
+                .w(px(1.))
+                .bg(guide)
+        })
+        .collect()
+}
+
+/// The quiet count pill a branch and the WORKSPACES header wear.
+fn count_badge(count: usize, tokens: DesignTokens, app: &Muxtrix) -> Div {
+    let mut fill = color(tokens.text);
+    fill.a = 0.08;
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .px(px(8.))
+        .py(px(1.))
+        .rounded_full()
+        .bg(fill)
+        .text_size(px(app.settings.ui_pixels(8.5)))
+        .line_height((px(app.settings.ui_pixels(8.5))) * 1.3)
+        .text_color(color(tokens.muted))
+        .whitespace_nowrap()
+        .child(count.to_string())
+}
+
 fn workspace_key(workspace_id: WorkspaceId) -> u64 {
     workspace_id.as_uuid().as_u128() as u64
 }
