@@ -77,6 +77,10 @@ impl Root {
         const TAB_CLOSE_GAP: f32 = 4.;
         const TAB_CLOSE_SIZE: f32 = 16.;
         const TAB_CLOSE_MARGIN: f32 = TAB_EDGE_SPACE - TAB_CLOSE_GAP - TAB_CLOSE_SIZE;
+        /// The shaped label box runs about this far past its last glyph's
+        /// ink (trailing advance), so the close is pulled back by it to keep
+        /// the visible gap after the title at TAB_CLOSE_GAP.
+        const TAB_LABEL_TRAILING_ADVANCE: f32 = 4.;
         let app = self.app();
         let tokens = DesignTokens::for_appearance(app.settings.appearance);
         let Ok(workspace) = app.active_workspace() else {
@@ -208,7 +212,7 @@ impl Root {
                 // the state dot. The dot and label then sit centred in the
                 // tab with the close in a slot of the same width as the
                 // leading edge, as Zed lays out its tabs.
-                .ml(px(TAB_CLOSE_GAP - 16.))
+                .ml(px(TAB_CLOSE_GAP - 16. - TAB_LABEL_TRAILING_ADVANCE))
                 .mr(px(TAB_CLOSE_MARGIN))
                 .flex()
                 .flex_none()
