@@ -504,10 +504,11 @@ impl Root {
             } else {
                 crate::theme::Color::TRANSPARENT
             }))
+            // Transparent so the guides drawn beneath the band show through.
             .bg(if targeted {
                 targeted_fill
             } else {
-                color(tokens.rail)
+                color(crate::theme::Color::TRANSPARENT)
             })
             // Only workspaces fold. Tabs and repositories are grouping
             // headings that always show their panes.
@@ -594,7 +595,10 @@ impl Root {
         // they line up with every other row regardless of its chrome.
         div()
             .relative()
+            .flex()
+            .flex_col()
             .w_full()
+            .h(px(30.))
             .children(tree_guides(depth, tokens))
             .child(band)
             .into_any_element()
