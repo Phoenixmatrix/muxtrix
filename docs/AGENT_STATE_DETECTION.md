@@ -238,8 +238,12 @@ Precedence for a matched pane:
   until the next `busy`; `Failed` likewise persists until the next turn.
 - Hooks are exact edges applied immediately: `UserPromptSubmit` starts the
   turn, `Stop` completes it (and triggers the PR refresh), `StopFailure` fails
-  it, `PermissionRequest` and `Elicitation` block it, `SessionStart` resets it,
-  `SessionEnd` removes it. A `Notification` counts only when it names
+  it, `Elicitation` blocks it, `SessionStart` resets it, `SessionEnd` removes
+  it. `PermissionRequest` and `SubagentStart` are advisory while a record is
+  matched: the first fires before another hook or auto mode may resolve the
+  request without a dialog, and the second fires for background subagents
+  after the turn has stopped; the record already answers both. A record whose
+  `status` this build cannot read leaves the screen in charge. A `Notification` counts only when it names
   `permission_prompt` or an elicitation dialog; the harness sends those after a
   dialog has waited about six seconds, so the record has long since said so.
 - A record stamped earlier than the last hook edge cannot regress it: the

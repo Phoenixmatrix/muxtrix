@@ -3769,15 +3769,22 @@ fn a_claude_hook_edge_leads_and_a_stale_record_cannot_regress_it() {
     app.reconcile_claude_records();
     assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Completed);
 
-    let mut permission = claude_hook(pane_id, "PermissionRequest", 2_000);
-    if let ControlRequest::ClaudeHook { hook, .. } = &mut permission {
-        hook.tool_name = Some("Bash".into());
-    }
-    assert!(app.handle_control_request(permission).ok);
+    // With a live record matched, PermissionRequest is advisory — another
+    // hook or auto mode may resolve it without a dialog — and the record
+    // reports the dialog that really opened.
+    assert!(
+        app.handle_control_request(claude_hook(pane_id, "PermissionRequest", 2_000))
+            .ok
+    );
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Completed);
+    let mut waiting = claude_record("live-session", "waiting", 2_500);
+    waiting.waiting_for = Some("permission prompt".into());
+    app.claude_records = vec![waiting];
+    app.reconcile_claude_records();
     assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Waiting);
     assert_eq!(
         app.agent_statuses[&pane_id].activity.as_deref(),
-        Some("Approve Bash")
+        Some("Approval required")
     );
 
     let ended = app.handle_control_request(claude_hook(pane_id, "SessionEnd", 3_000));

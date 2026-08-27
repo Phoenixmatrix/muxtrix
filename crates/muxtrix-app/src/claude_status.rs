@@ -277,6 +277,11 @@ impl ClaudeTracker {
                 self.saw_turn = true;
                 Decision::to(AgentState::Running, "Agent is working")
             }
+            // Fires before other hooks or auto mode may resolve the request
+            // without a dialog. With a live record matched, the record says
+            // `waiting` within milliseconds if a dialog really opened; without
+            // one, this is the best evidence available.
+            "PermissionRequest" if self.record_matched => Decision::default(),
             "PermissionRequest" => Decision::to(
                 AgentState::Waiting,
                 hook.tool_name
@@ -325,7 +330,9 @@ impl ClaudeTracker {
                     .filter(|body| !body.is_empty())
                     .unwrap_or_else(|| "Turn failed".to_owned()),
             ),
-            "SubagentStart" if current != AgentState::Waiting => {
+            // Background subagents start after the main turn has stopped;
+            // the record already says whether the harness is busy.
+            "SubagentStart" if current != AgentState::Waiting && !self.record_matched => {
                 self.saw_turn = true;
                 Decision::to(AgentState::Running, "Agent is working")
             }
@@ -344,7 +351,9 @@ impl ClaudeTracker {
     /// The pane's matched record changed. Returns no state when the record
     /// predates the last hook edge or repeats the current state.
     pub(crate) fn record(&mut self, current: AgentState, record: &SessionRecord) -> Decision {
-        self.record_matched = true;
+        // A record whose status this build cannot read must not silence the
+        // screen: the schema is internal to the harness and may move.
+        self.record_matched = record.status.is_some();
         if let Some(pid) = record.pid {
             self.process_id = Some(pid);
         }
@@ -680,6 +689,40 @@ mod tests {
             tracker.hook(AgentState::Waiting, &hook("SubagentStart")),
             Decision::default()
         );
+    }
+
+    #[test]
+    fn with_a_live_record_advisory_hooks_defer_to_it() {
+        let mut tracker = ClaudeTracker::default();
+        tracker.record(AgentState::Idle, &record("busy", 1));
+        // Another hook or auto mode may resolve this without a dialog; the
+        // record flips to `waiting` if one really opens.
+        assert_eq!(
+            tracker.hook(AgentState::Running, &hook("PermissionRequest")),
+            Decision::default()
+        );
+        // A background subagent after the turn stopped is not a new turn.
+        assert_eq!(
+            tracker.hook(AgentState::Completed, &hook("SubagentStart")),
+            Decision::default()
+        );
+        // Exact edges still apply immediately.
+        assert_eq!(
+            tracker.hook(AgentState::Running, &hook("Stop")).state,
+            Some((AgentState::Completed, "Turn complete".into()))
+        );
+    }
+
+    #[test]
+    fn a_record_with_an_unknown_status_leaves_the_screen_in_charge() {
+        let mut tracker = ClaudeTracker::default();
+        let mut unknown = record("busy", 1);
+        unknown.status = None;
+        assert_eq!(
+            tracker.record(AgentState::Idle, &unknown),
+            Decision::default()
+        );
+        assert!(!tracker.record_matched);
     }
 
     #[test]
