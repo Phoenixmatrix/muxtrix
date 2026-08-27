@@ -217,7 +217,6 @@ fn run_hook_event(arguments: &[String]) {
         // and the harness's own session record, not by the installed
         // command's `--state`.
         let mut hook = ClaudeHook::from_payload(&payload, event);
-        hook.parent_process_id = parent_process_id();
         hook.sent_at_ms = now_ms();
         let request = ControlRequest::ClaudeHook {
             pane_id: Some(pane_id.clone()),
@@ -270,16 +269,6 @@ fn run_hook_event(arguments: &[String]) {
 
 fn is_claude(agent: &str) -> bool {
     matches!(agent, "claude" | "claude-code")
-}
-
-#[cfg(unix)]
-fn parent_process_id() -> Option<u32> {
-    Some(std::os::unix::process::parent_id())
-}
-
-#[cfg(not(unix))]
-fn parent_process_id() -> Option<u32> {
-    None
 }
 
 fn now_ms() -> u64 {

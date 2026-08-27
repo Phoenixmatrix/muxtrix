@@ -13,11 +13,13 @@
 //! hook edge never regresses it. The terminal screen is only consulted for a
 //! pane no record could be matched to.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use muxtrix_control::{AgentState, ClaudeHook};
+
+use crate::process::console_command;
 
 /// `status` as Claude Code writes it. `shell` is its `!` shell mode: the
 /// harness is idle while the user runs a command through it.
@@ -109,7 +111,8 @@ pub(crate) fn sessions_directory(home: &Path, config_dir: Option<&Path>) -> Path
 
 /// Reads every session record in the directory. Unreadable or unparseable
 /// files are skipped: the harness writes them atomically, but a file may
-/// still be mid-replace or belong to a newer format.
+/// still be mid-replace or belong to a newer format. Liveness is filled in
+/// by the watcher's prober.
 pub(crate) fn read_session_records(directory: &Path) -> Vec<SessionRecord> {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return Vec::new();
@@ -124,10 +127,6 @@ pub(crate) fn read_session_records(directory: &Path) -> Vec<SessionRecord> {
         })
         .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
         .filter_map(|json| SessionRecord::parse(&json))
-        .map(|mut record| {
-            record.liveness = process_liveness(record.pid, record.proc_start.as_deref());
-            record
-        })
         .collect()
 }
 
@@ -156,69 +155,137 @@ pub(crate) fn live_records(records: Vec<SessionRecord>) -> Vec<SessionRecord> {
     by_session.into_values().chain(anonymous).collect()
 }
 
-/// Linux: the process exists and `/proc/<pid>/stat` reports the start time
-/// the record was written with, so a reused PID cannot vouch for a dead
-/// session. Other platforms cannot check without a process table walk.
-#[cfg(target_os = "linux")]
-pub(crate) fn process_liveness(pid: Option<u32>, proc_start: Option<&str>) -> Liveness {
-    let Some(pid) = pid else {
+/// Where the liveness prober runs: the shell on this host, or one inside the
+/// WSL distribution whose records are being read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProbeHost {
+    Local,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    Wsl { distribution: String },
+}
+
+/// One `sh` that answers, for each PID it is sent, that process's kernel
+/// start time from `/proc/<pid>/stat` — or `-` when it is gone. The same
+/// script serves Linux and WSL, so both platforms check liveness through one
+/// code path; a host without `/proc` says so once and the prober retires.
+const PROBE_SCRIPT: &str = r#"[ -r /proc/self/stat ] || { echo NOPROC; exit 0; }
+while IFS= read -r line; do
+  for pid in $line; do
+    if s=$(cat "/proc/$pid/stat" 2>/dev/null); then
+      rest=${s##*)}; set -- $rest; printf '%s %s
+' "$pid" "${20}"
+    else
+      printf '%s -
+' "$pid"
+    fi
+  done
+  printf 'END
+'
+done"#;
+
+/// What a prober sweep learned: each PID's start time, or `None` when gone.
+pub(crate) type ProbeResult = BTreeMap<u32, Option<String>>;
+
+struct Prober {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl Prober {
+    fn spawn(host: &ProbeHost) -> Option<Self> {
+        let mut command = match host {
+            ProbeHost::Local => console_command("sh"),
+            ProbeHost::Wsl { distribution } => {
+                let mut command = console_command("wsl.exe");
+                if !distribution.trim().is_empty() {
+                    command.args(["--distribution", distribution.trim()]);
+                }
+                command.args(["--exec", "sh"]);
+                command
+            }
+        };
+        let mut child = command
+            .args(["-c", PROBE_SCRIPT])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdin = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
+        let (sender, lines) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new()
+            .name("claude-liveness".into())
+            .spawn(move || {
+                use std::io::BufRead as _;
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+        Some(Self {
+            child,
+            stdin,
+            lines,
+        })
+    }
+
+    /// `Err(true)` means the host has no `/proc`: do not respawn.
+    fn probe(&mut self, pids: &[u32], timeout: std::time::Duration) -> Result<ProbeResult, bool> {
+        use std::io::Write as _;
+        let mut line = pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        line.push('\n');
+        self.stdin.write_all(line.as_bytes()).map_err(|_| false)?;
+        self.stdin.flush().map_err(|_| false)?;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut result = ProbeResult::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let reply = self.lines.recv_timeout(remaining).map_err(|_| false)?;
+            let reply = reply.trim();
+            if reply == "END" {
+                return Ok(result);
+            }
+            if reply == "NOPROC" {
+                return Err(true);
+            }
+            if let Some((pid, start)) = reply.split_once(' ')
+                && let Ok(pid) = pid.parse::<u32>()
+            {
+                result.insert(pid, (start != "-").then(|| start.to_owned()));
+            }
+        }
+    }
+}
+
+impl Drop for Prober {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Applies a sweep to a record: alive only when the PID still carries the
+/// start time the record was written with, so a reused PID cannot vouch for
+/// a finished session. A PID the sweep did not cover stays unknown.
+pub(crate) fn liveness_from_probe(record: &SessionRecord, probe: &ProbeResult) -> Liveness {
+    let Some(pid) = record.pid else {
         return Liveness::Unknown;
     };
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return Liveness::Dead;
-    };
-    match (proc_start, process_start_time(&stat)) {
-        (Some(expected), Some(actual)) if expected == actual => Liveness::Alive,
-        (Some(_), Some(_)) => Liveness::Dead,
-        _ => Liveness::Alive,
+    match (probe.get(&pid), record.proc_start.as_deref()) {
+        (None, _) => Liveness::Unknown,
+        (Some(None), _) => Liveness::Dead,
+        (Some(Some(actual)), Some(expected)) if actual == expected => Liveness::Alive,
+        (Some(Some(_)), Some(_)) => Liveness::Dead,
+        (Some(Some(_)), None) => Liveness::Alive,
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn process_liveness(_pid: Option<u32>, _proc_start: Option<&str>) -> Liveness {
-    Liveness::Unknown
-}
-
-/// Field 22 of `/proc/<pid>/stat`, after the parenthesised command name that
-/// may itself contain spaces and parentheses.
-pub(crate) fn process_start_time(stat: &str) -> Option<&str> {
-    let after_name = &stat[stat.rfind(')')? + 1..];
-    // The fields after the name start at field 3 (`state`).
-    after_name.split_whitespace().nth(22 - 3)
-}
-
-/// Linux: the PID chain above a process, nearest first, bounded. A hook
-/// command's parent is the shell Claude Code runs it through, whose parent is
-/// the harness itself.
-#[cfg(target_os = "linux")]
-pub(crate) fn process_ancestry(pid: u32) -> Vec<u32> {
-    let mut ancestry = Vec::new();
-    let mut current = pid;
-    for _ in 0..6 {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{current}/stat")) else {
-            break;
-        };
-        let Some(parent) = process_parent(&stat) else {
-            break;
-        };
-        if parent <= 1 {
-            break;
-        }
-        ancestry.push(parent);
-        current = parent;
-    }
-    ancestry
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn process_ancestry(_pid: u32) -> Vec<u32> {
-    Vec::new()
-}
-
-/// Field 4 of `/proc/<pid>/stat`: the parent PID.
-pub(crate) fn process_parent(stat: &str) -> Option<u32> {
-    let after_name = &stat[stat.rfind(')')? + 1..];
-    after_name.split_whitespace().nth(4 - 3)?.parse().ok()
 }
 
 /// What a hook or record asks the pane to become.
@@ -245,10 +312,8 @@ impl Decision {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ClaudeTracker {
     pub(crate) session_id: Option<String>,
-    /// The harness PID, from a matched record or a hook's process ancestry.
+    /// The harness PID, from a matched record.
     pub(crate) process_id: Option<u32>,
-    /// PIDs above the last hook command: candidates for the harness PID.
-    pub(crate) hook_ancestry: Vec<u32>,
     /// Wall-clock milliseconds of the last hook that set state. A record
     /// stamped earlier than this describes the moment before the edge.
     hook_edge_ms: Option<u64>,
@@ -434,13 +499,20 @@ fn short_body(body: &str) -> String {
 /// The newest records the watcher has read and the app has not yet taken.
 pub(crate) type RecordSlot = Arc<Mutex<Option<Vec<SessionRecord>>>>;
 
+/// How often the prober sweeps every known PID.
+pub(crate) const LIVENESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Watches the sessions directory from a background thread. Each change to
 /// the set of files, their sizes, or their modification times re-reads the
-/// records into the slot and wakes the app through `notify`. Reading is a
-/// handful of small files, so polling is cheap; a filesystem watcher would
-/// not reach a WSL distribution's files from Windows anyway.
+/// records; a long-lived prober sweeps their PIDs every few seconds (and as
+/// soon as a new PID appears). Any change to the live set lands in the slot
+/// and wakes the app through `notify`. Reading is a handful of small files,
+/// so polling is cheap; a filesystem watcher would not reach a WSL
+/// distribution's files from Windows anyway.
 pub(crate) fn spawn_watcher(
     directory: PathBuf,
+    host: ProbeHost,
     slot: RecordSlot,
     notify: Arc<dyn Fn() + Send + Sync>,
     interval: std::time::Duration,
@@ -449,13 +521,58 @@ pub(crate) fn spawn_watcher(
         .name("claude-sessions".into())
         .spawn(move || {
             let mut fingerprint = None;
+            let mut records: Vec<SessionRecord> = Vec::new();
+            let mut probe = ProbeResult::new();
+            let mut prober: Option<Prober> = None;
+            let mut prober_retired = false;
+            let mut probed_at: Option<std::time::Instant> = None;
+            let mut published: Option<Vec<SessionRecord>> = None;
             loop {
                 let next = directory_fingerprint(&directory);
                 if next != fingerprint {
                     fingerprint = next;
-                    let records = live_records(read_session_records(&directory));
+                    records = read_session_records(&directory);
+                }
+                let pids = records
+                    .iter()
+                    .filter_map(|record| record.pid)
+                    .collect::<BTreeSet<_>>();
+                let unseen = pids.iter().any(|pid| !probe.contains_key(pid));
+                let due = probed_at.is_none_or(|at| at.elapsed() >= LIVENESS_INTERVAL);
+                if !prober_retired && !pids.is_empty() && (due || unseen) {
+                    if prober.is_none() {
+                        prober = Prober::spawn(&host);
+                    }
+                    let pids = pids.iter().copied().collect::<Vec<_>>();
+                    match prober
+                        .as_mut()
+                        .map(|prober| prober.probe(&pids, PROBE_TIMEOUT))
+                    {
+                        Some(Ok(result)) => probe = result,
+                        Some(Err(no_proc)) => {
+                            // A wedged or exited prober is replaced on the
+                            // next sweep; a host without /proc never is.
+                            prober = None;
+                            prober_retired = no_proc;
+                        }
+                        None => {}
+                    }
+                    probed_at = Some(std::time::Instant::now());
+                }
+                let live = live_records(
+                    records
+                        .iter()
+                        .cloned()
+                        .map(|mut record| {
+                            record.liveness = liveness_from_probe(&record, &probe);
+                            record
+                        })
+                        .collect(),
+                );
+                if published.as_ref() != Some(&live) {
+                    published = Some(live.clone());
                     if let Ok(mut slot) = slot.lock() {
-                        *slot = Some(records);
+                        *slot = Some(live);
                     }
                     notify();
                 }
@@ -542,11 +659,30 @@ mod tests {
     }
 
     #[test]
-    fn proc_stat_fields_survive_a_command_name_with_spaces_and_parentheses() {
-        let stat =
-            "42 (claude (x) y) S 41 42 42 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 8 0 8139171 1 2 3";
-        assert_eq!(process_start_time(stat), Some("8139171"));
-        assert_eq!(process_parent(stat), Some(41));
+    fn the_prober_reports_start_times_and_gone_pids_through_one_script() {
+        let Some(mut prober) = Prober::spawn(&ProbeHost::Local) else {
+            return;
+        };
+        let own = std::process::id();
+        match prober.probe(&[own, u32::MAX], PROBE_TIMEOUT) {
+            Ok(result) => {
+                let start = result[&own].clone().expect("this process is alive");
+                assert!(start.chars().all(|c| c.is_ascii_digit()));
+                assert_eq!(result[&u32::MAX], None);
+                let mut record = record("busy", 1);
+                record.pid = Some(own);
+                record.proc_start = Some(start);
+                assert_eq!(liveness_from_probe(&record, &result), Liveness::Alive);
+                record.proc_start = Some("1".into());
+                assert_eq!(liveness_from_probe(&record, &result), Liveness::Dead);
+                record.pid = Some(u32::MAX);
+                assert_eq!(liveness_from_probe(&record, &result), Liveness::Dead);
+                record.pid = Some(2);
+                assert_eq!(liveness_from_probe(&record, &result), Liveness::Unknown);
+            }
+            // A host without /proc retires the prober rather than lying.
+            Err(no_proc) => assert!(no_proc),
+        }
     }
 
     #[test]
@@ -767,6 +903,7 @@ mod tests {
         let records = read_session_records(&directory);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].pid, Some(656_783));
+        assert_eq!(records[0].liveness, Liveness::Unknown);
 
         let before = directory_fingerprint(&directory);
         std::fs::write(directory.join("3.json"), WAITING).expect("write");

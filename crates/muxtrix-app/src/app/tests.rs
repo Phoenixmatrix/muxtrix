@@ -3802,14 +3802,12 @@ fn interactive_session_matching_rejects_ambiguous_cwds_and_accepts_exact_pids() 
             pane_id: first,
             session_id: None,
             process_id: None,
-            hook_ancestry: Vec::new(),
             cwd: Some("/work/repo".into()),
         },
         ClaudePaneIdentity {
             pane_id: second,
             session_id: None,
             process_id: None,
-            hook_ancestry: Vec::new(),
             cwd: Some("/work/repo/".into()),
         },
     ];
@@ -3818,28 +3816,24 @@ fn interactive_session_matching_rejects_ambiguous_cwds_and_accepts_exact_pids() 
     sessions[0].session_id = None;
     assert!(match_claude_interactive_sessions(&ambiguous, &sessions).is_empty());
 
+    // A unique cwd is only enough for a process the prober saw alive.
+    let lone = vec![ambiguous[0].clone()];
+    assert_eq!(
+        match_claude_interactive_sessions(&lone, &sessions).get(&first),
+        Some(&0)
+    );
+    sessions[0].liveness = claude_status::Liveness::Unknown;
+    assert!(match_claude_interactive_sessions(&lone, &sessions).is_empty());
+    sessions[0].liveness = claude_status::Liveness::Alive;
+
     let exact = vec![ClaudePaneIdentity {
         pane_id: first,
         session_id: None,
         process_id: Some(42),
-        hook_ancestry: Vec::new(),
         cwd: Some("/work/repo".into()),
     }];
     assert_eq!(
         match_claude_interactive_sessions(&exact, &sessions).get(&first),
-        Some(&0)
-    );
-
-    // A hook command's ancestry names the harness PID just as exactly.
-    let via_hook = vec![ClaudePaneIdentity {
-        pane_id: second,
-        session_id: None,
-        process_id: None,
-        hook_ancestry: vec![7, 42],
-        cwd: None,
-    }];
-    assert_eq!(
-        match_claude_interactive_sessions(&via_hook, &sessions).get(&second),
         Some(&0)
     );
 }

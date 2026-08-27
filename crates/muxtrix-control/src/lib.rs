@@ -109,11 +109,6 @@ pub struct ClaudeHook {
     pub last_assistant_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_path: Option<String>,
-    /// The hook process's parent PID where the platform exposes it. Claude
-    /// Code spawns hook commands directly, so on Linux this is the harness
-    /// process itself — the same PID its session record carries.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_process_id: Option<u32>,
     /// Wall-clock milliseconds when the hook client sent this, on the same
     /// clock Claude Code stamps its session record with. Lets the app order a
     /// hook edge against the record that may lag or lead it.
@@ -143,7 +138,6 @@ impl ClaudeHook {
             message: text("message"),
             last_assistant_message: text("last_assistant_message"),
             transcript_path: text("transcript_path"),
-            parent_process_id: None,
             sent_at_ms: 0,
         }
     }

@@ -96,9 +96,8 @@ shutdown events from the managed extension.
   blocking rule so it can never clear a wait that is still painted, and it
   ignores a `❯ 1. Yes` answer line.
 - Claude's session records are associated one-to-one by hook session ID, then
-  by the exact harness PID (the pane's process tree on Linux, or the ancestry
-  of the hook command that just called in), then by a cwd that is unique on
-  both sides. Ambiguous records are ignored. While a live record is matched,
+  by the exact harness PID from the pane's process tree, then by a cwd that
+  is unique on both sides for a record the prober confirmed alive. Ambiguous records are ignored. While a live record is matched,
   the screen classifier has no authority over that pane at all.
 - Transcript viewers return no classification so historical text cannot
   repaint the pane.
@@ -224,11 +223,17 @@ carries:
 
 A background thread lists the directory every 150 ms (500 ms over a WSL UNC
 share) and re-reads the records only when a file's name, size, or mtime moved.
-Dead processes are dropped first: on Linux, `/proc/<pid>/stat` must exist and
-its start time must equal `procStart`, so a reused PID cannot vouch for a
-finished session. Elsewhere liveness is unknown and a record must be vouched
-for by hook session ID or a cwd that is unique on both sides. When a resumed
-session leaves an older file with the same `sessionId`, the newest write wins.
+Dead processes are dropped by one long-lived prober: a `sh` running a short
+script that answers each PID with its `/proc/<pid>/stat` start time or `-`.
+The same script runs on Linux (`sh`) and inside the WSL distribution
+(`wsl.exe --exec sh`), so both hosts check liveness through one code path.
+It sweeps every known PID every 3 s and immediately when a new PID appears;
+a reply that takes more than 2 s kills and respawns it, and a host without
+`/proc` retires it. A record is alive only when the start time equals its
+`procStart`, so a reused PID cannot vouch for a finished session. A record
+whose liveness is unknown can still be matched by hook session ID, never by
+cwd alone. When a resumed session leaves an older file with the same
+`sessionId`, the newest write wins.
 
 Precedence for a matched pane:
 
@@ -254,11 +259,8 @@ Precedence for a matched pane:
 
 The hook client forwards the payload intact (event name, session, cwd, tool,
 notification type, permission mode, message) as a typed `ClaudeHook` request
-instead of a pre-decided state, and adds its own parent PID: the hook process
-is still alive waiting for the reply, so the app can read the ancestry up to
-the harness and match the record by PID even when the pane's process tree is
-hidden. A hook client from before this contract is folded into the same
-pipeline from its coarse event name.
+instead of a pre-decided state. A hook client from before this contract is
+folded into the same pipeline from its coarse event name.
 
 Every prior Claude signal is now demoted: the OSC title spinner (which the
 harness makes static under a multiplexer anyway), the `esc to interrupt`
@@ -301,10 +303,12 @@ fallbacks. `Needs input` no longer depends on recognising a dialog's text.
   2.1.246, not a documented contract. An unreadable directory or a changed
   schema degrades to hooks plus the screen classifier, never to an invented
   state. Ambiguous session/PID/cwd matches are ignored rather than guessed.
-- Outside Linux the record's process liveness is unknown; a stale file for a
-  finished session can only be excluded by hook identity or cwd uniqueness.
+- A host without `/proc` (macOS, native Windows) cannot probe liveness; a
+  stale file there is excluded only by hook identity, and cwd-only matching
+  is off.
 - A Windows host reads a WSL distribution's records over `\\wsl.localhost`
-  once hook discovery has resolved that distribution's home.
+  once hook discovery has resolved that distribution's home, and keeps one
+  hidden `wsl.exe` prober alive while any record exists.
 - Rollout parsing could later add tool names, subagent activity, transcript
   recovery, and richer summaries. It should remain descriptive metadata unless
   records are request-correlated and prove that a person currently has an
@@ -330,6 +334,7 @@ Claude fixtures pin the record contract: a live `busy` record decides the pane
 over its painted idle composer and the screen stays silent while matched; a
 `waiting` record raises attention that the next `busy` clears; a lost record
 returns authority to the screen; a hook edge leads and a record stamped before
-it cannot regress it; `SessionEnd` removes the pane; and ambiguous cwd matches
-are rejected while exact PID and hook-ancestry matching succeed. Parser
-fixtures use a verbatim 2.1.246 record and a verbatim `/proc` stat line.
+it cannot regress it; `SessionEnd` removes the pane; ambiguous cwd matches are
+rejected, a unique cwd needs a prober-confirmed process, and exact PID
+matching succeeds. Parser fixtures use a verbatim 2.1.246 record, and the
+prober is exercised against the test process itself.

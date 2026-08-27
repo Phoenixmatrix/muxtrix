@@ -1073,8 +1073,6 @@ struct ClaudePaneIdentity {
     pane_id: PaneId,
     session_id: Option<String>,
     process_id: Option<u32>,
-    /// PIDs above the pane's last hook command, nearest first.
-    hook_ancestry: Vec<u32>,
     cwd: Option<String>,
 }
 
@@ -1132,9 +1130,9 @@ fn assign_unique_claude_matches(
 
 /// Associates Claude Code's live session records with panes only when the
 /// evidence is one-to-one. Session ID is portable and strongest; the exact
-/// harness PID (from the pane's process tree or a hook's ancestry) is next;
-/// a unique cwd pair is the conservative final fallback for platforms whose
-/// terminal host hides PIDs.
+/// harness PID from the pane's process tree is next; a unique cwd pair,
+/// for a record the prober confirmed alive, is the conservative final
+/// fallback for platforms whose terminal host hides PIDs.
 fn match_claude_interactive_sessions(
     panes: &[ClaudePaneIdentity],
     sessions: &[SessionRecord],
@@ -1162,13 +1160,7 @@ fn match_claude_interactive_sessions(
         sessions,
         &mut matched,
         &mut used_sessions,
-        |pane, session| {
-            session.pid.is_some()
-                && (pane.process_id == session.pid
-                    || session
-                        .pid
-                        .is_some_and(|pid| pane.hook_ancestry.contains(&pid)))
-        },
+        |pane, session| pane.process_id.is_some() && pane.process_id == session.pid,
     );
     assign_unique_claude_matches(
         panes,
@@ -1176,6 +1168,12 @@ fn match_claude_interactive_sessions(
         &mut matched,
         &mut used_sessions,
         |pane, session| {
+            // Only a process the prober vouched for may be claimed on
+            // directory alone: a stale file for a finished session shares
+            // its cwd with the pane that replaced it.
+            if session.liveness != claude_status::Liveness::Alive {
+                return false;
+            }
             let Some(pane_cwd) = pane.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) else {
                 return false;
             };
@@ -7955,8 +7953,6 @@ impl Muxtrix {
                         .get(pane_id)
                         .map(|process| process.process_id)
                         .or_else(|| tracker.and_then(|tracker| tracker.process_id)),
-                    hook_ancestry: tracker
-                        .map_or_else(Vec::new, |tracker| tracker.hook_ancestry.clone()),
                     cwd: status.cwd.clone().or_else(|| {
                         self.pane_working_directory(*pane_id)
                             .map(|directory| directory.to_string_lossy().into_owned())
@@ -7967,19 +7963,25 @@ impl Muxtrix {
     }
 
     /// Where Claude Code keeps its session records for the panes this
-    /// instance hosts. Windows panes running in WSL read the distribution's
-    /// files over its UNC share; that home is only known once hook discovery
-    /// has resolved it, so `None` means "not yet".
-    fn claude_sessions_directory(&self) -> Option<PathBuf> {
+    /// instance hosts, and where their processes can be probed. Windows
+    /// panes running in WSL read the distribution's files over its UNC share
+    /// and probe inside the distribution; that home is only known once hook
+    /// discovery has resolved it, so `None` means "not yet".
+    fn claude_sessions_source(&self) -> Option<(PathBuf, claude_status::ProbeHost)> {
         #[cfg(target_os = "windows")]
         if self.settings.windows_shell_backend == WindowsShellBackend::Wsl {
-            return cached_wsl_hook_context(&self.settings)
-                .map(|context| claude_status::sessions_directory(&context.home, None));
+            let context = cached_wsl_hook_context(&self.settings)?;
+            return Some((
+                claude_status::sessions_directory(&context.home, None),
+                claude_status::ProbeHost::Wsl {
+                    distribution: self.settings.wsl_distribution.clone(),
+                },
+            ));
         }
         let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
-        Some(claude_status::sessions_directory(
-            &home_directory()?,
-            config_dir.as_deref(),
+        Some((
+            claude_status::sessions_directory(&home_directory()?, config_dir.as_deref()),
+            claude_status::ProbeHost::Local,
         ))
     }
 
@@ -7990,7 +7992,7 @@ impl Muxtrix {
         if self.claude_watcher_started {
             return;
         }
-        let Some(directory) = self.claude_sessions_directory() else {
+        let Some((directory, host)) = self.claude_sessions_source() else {
             return;
         };
         self.claude_watcher_started = true;
@@ -8001,6 +8003,7 @@ impl Muxtrix {
         };
         claude_status::spawn_watcher(
             directory,
+            host,
             Arc::clone(&self.claude_record_slot),
             Arc::clone(&self.event_notifier),
             interval,
@@ -8188,16 +8191,11 @@ impl Muxtrix {
             }
         }
         let current = self.agent_statuses[&pane_id].state;
-        let tracker = self.claude_trackers.entry(pane_id).or_default();
-        if let Some(parent) = hook.parent_process_id {
-            // The hook process is still alive waiting for this reply, so
-            // its ancestry — the shell Claude Code ran it through, then the
-            // harness — is readable right now.
-            let mut ancestry = vec![parent];
-            ancestry.extend(claude_status::process_ancestry(parent));
-            tracker.hook_ancestry = ancestry;
-        }
-        let decision = tracker.hook(current, &hook);
+        let decision = self
+            .claude_trackers
+            .entry(pane_id)
+            .or_default()
+            .hook(current, &hook);
         self.apply_claude_decision(pane_id, decision);
         self.ensure_claude_watcher();
         // The record may already describe the moment after this edge.
