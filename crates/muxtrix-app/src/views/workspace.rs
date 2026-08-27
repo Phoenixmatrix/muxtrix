@@ -69,6 +69,14 @@ impl Root {
 
     /// The active workspace's component-backed tab bar.
     fn tab_strip(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        /// Space between the tab edge and the state dot, and the width of the
+        /// close slot on the other side, so the dot and label are centred.
+        const TAB_EDGE_SPACE: f32 = 22.;
+        const TAB_DOT_SIZE: f32 = 6.;
+        const TAB_DOT_GAP: f32 = 8.;
+        const TAB_CLOSE_GAP: f32 = 4.;
+        const TAB_CLOSE_SIZE: f32 = 16.;
+        const TAB_CLOSE_MARGIN: f32 = TAB_EDGE_SPACE - TAB_CLOSE_GAP - TAB_CLOSE_SIZE;
         let app = self.app();
         let tokens = DesignTokens::for_appearance(app.settings.appearance);
         let Ok(workspace) = app.active_workspace() else {
@@ -192,8 +200,16 @@ impl Root {
                 .aria_label(format!("Close {} tab", workspace_tab.name))
                 .invisible()
                 .group_hover(tab_hover_group.clone(), |close| close.visible())
-                .size(px(18.))
-                .mr(px(2.))
+                .size(px(TAB_CLOSE_SIZE))
+                // The component pads its label by 12px and separates the
+                // suffix by 4px; pull the close back so the label-to-close
+                // gap is TAB_CLOSE_GAP and the whole close slot — gap,
+                // button, trailing margin — equals the leading space before
+                // the state dot. The dot and label then sit centred in the
+                // tab with the close in a slot of the same width as the
+                // leading edge, as Zed lays out its tabs.
+                .ml(px(TAB_CLOSE_GAP - 16.))
+                .mr(px(TAB_CLOSE_MARGIN))
                 .flex()
                 .flex_none()
                 .items_center()
@@ -214,7 +230,7 @@ impl Root {
                 .child(
                     svg()
                         .path(icon_path(IconKind::Close))
-                        .size(px(14.))
+                        .size(px(12.))
                         .text_color(color(tokens.muted)),
                 );
             let mut tab = Tab::new()
@@ -223,12 +239,13 @@ impl Root {
                 .group(tab_hover_group)
                 .prefix(
                     div()
-                        .size(px(6.))
-                        // Reallocate the component's leading whitespace so the
-                        // state dot groups with its own label, not the previous
-                        // tab's close control.
-                        .ml(px(8.))
-                        .mr(px(-8.))
+                        .size(px(TAB_DOT_SIZE))
+                        // Leading space equal to the close slot, then the dot
+                        // grouped TAB_DOT_GAP from its own label (the
+                        // component's 4px separator plus 12px label padding,
+                        // pulled back).
+                        .ml(px(TAB_EDGE_SPACE))
+                        .mr(px(TAB_DOT_GAP - 16.))
                         .flex_none()
                         .rounded_full()
                         .bg(color(signal)),
