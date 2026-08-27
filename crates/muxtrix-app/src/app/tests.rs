@@ -5254,10 +5254,11 @@ fn tabs_view_keeps_visible_tab_bands_in_the_active_workspace() {
             .collect::<Vec<_>>(),
         vec![
             RailTarget::FleetTab(workspace_id, first_tab),
+            RailTarget::FleetPane(workspace_id, first_pane),
             RailTarget::FleetTab(workspace_id, second_tab),
             RailTarget::FleetPane(workspace_id, second_pane),
         ],
-        "a collapsed tab keeps its branch reachable and hides only its pane rows"
+        "tab headings never fold: toggling one changes nothing"
     );
 }
 
@@ -5347,12 +5348,14 @@ fn repos_view_groups_across_tabs_without_nested_tab_bands() {
             .collect::<Vec<_>>(),
         vec![
             RailTarget::FleetGroup(workspace_id, first_repo_pane),
+            RailTarget::FleetPane(workspace_id, first_repo_pane),
+            RailTarget::FleetPane(workspace_id, second_repo_pane),
             RailTarget::FleetGroup(workspace_id, other_repo_pane),
             RailTarget::FleetPane(workspace_id, other_repo_pane),
             RailTarget::FleetGroup(workspace_id, no_repo_pane),
             RailTarget::FleetPane(workspace_id, no_repo_pane),
         ],
-        "collapsing one repository does not hide sibling branches"
+        "repository headings never fold: toggling one changes nothing"
     );
 
     app.rail_nav = Some(RailTarget::FleetGroup(workspace_id, first_repo_pane));
@@ -5364,12 +5367,13 @@ fn repos_view_groups_across_tabs_without_nested_tab_bands() {
             .collect::<Vec<_>>(),
         vec![
             RailTarget::FleetGroup(workspace_id, second_repo_pane),
+            RailTarget::FleetPane(workspace_id, second_repo_pane),
             RailTarget::FleetGroup(workspace_id, other_repo_pane),
             RailTarget::FleetPane(workspace_id, other_repo_pane),
             RailTarget::FleetGroup(workspace_id, no_repo_pane),
             RailTarget::FleetPane(workspace_id, no_repo_pane),
         ],
-        "repository collapse survives a change to the group's leading pane"
+        "the group re-keys to its new leading pane and stays open"
     );
     let status_after_close = app.status.clone();
     let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
@@ -5575,18 +5579,14 @@ fn rail_navigation_selection_exits_the_mode() {
 fn rail_navigation_folds_branches_with_horizontal_arrows_and_enter() {
     let mut app = Muxtrix::new();
     let workspace_id = app.session.active_workspace_id;
-    let tab_id = active_tab(&app).id;
     let pane_id = active_pane_id(&app);
-    // Tab branches exist only once a workspace has more than one tab.
-    app.new_tab().expect("second tab should be created");
-    let branch = FleetBranch::Tab(workspace_id, tab_id);
+    // Only workspace branches fold, and they are drawn in All Workspaces scope.
+    app.settings.fleet_scope = FleetScope::AllWorkspaces;
+    let branch = FleetBranch::Workspace(workspace_id);
 
     let _ = app.handle_keyboard(key_press(Key::Character("g".into()), Modifiers::CTRL));
     let _ = app.handle_keyboard(key_press(Key::Character("f".into()), Modifiers::empty()));
-    assert_eq!(
-        app.rail_nav,
-        Some(RailTarget::FleetTab(workspace_id, tab_id))
-    );
+    assert_eq!(app.rail_nav, Some(RailTarget::FleetWorkspace(workspace_id)));
 
     let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowLeft), Modifiers::empty()));
     assert!(app.fleet_branch_collapsed(&branch));
@@ -5594,10 +5594,7 @@ fn rail_navigation_folds_branches_with_horizontal_arrows_and_enter() {
         !app.rail_targets()
             .contains(&RailTarget::FleetPane(workspace_id, pane_id))
     );
-    assert_eq!(
-        app.rail_nav,
-        Some(RailTarget::FleetTab(workspace_id, tab_id))
-    );
+    assert_eq!(app.rail_nav, Some(RailTarget::FleetWorkspace(workspace_id)));
 
     let _ = app.handle_keyboard(key_press(Key::Named(Named::ArrowRight), Modifiers::empty()));
     assert!(!app.fleet_branch_collapsed(&branch));
@@ -5609,6 +5606,12 @@ fn rail_navigation_folds_branches_with_horizontal_arrows_and_enter() {
     let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
     assert!(app.fleet_branch_collapsed(&branch));
     assert!(app.rail_nav.is_none());
+
+    // A tab heading never folds, from the keyboard or anywhere else.
+    app.new_tab().expect("second tab should be created");
+    let tab_id = app.session.workspaces[0].tabs[0].id;
+    app.toggle_fleet_branch(FleetBranch::Tab(workspace_id, tab_id));
+    assert!(!app.fleet_branch_collapsed(&FleetBranch::Tab(workspace_id, tab_id)));
 }
 
 #[test]

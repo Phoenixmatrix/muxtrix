@@ -213,8 +213,10 @@ app window for a tab, and a Git folder for a repository. Rows start 12 px
 from the rail edge and each level steps in 20 px, with a hairline guide
 dropped from the centre of every ancestor's icon. A workspace's only tab is
 not drawn — its panes sit directly under the workspace — while a repository
-branch is always drawn, even alone. Expanded branches show their child count
-in a quiet pill and no status dot; the WORKSPACES header wears the same pill
+branch is always drawn, even alone. Only workspace branches fold; tab and
+repository headings are always open and carry nothing trailing. An expanded
+workspace branch shows its pane count in a quiet pill and no status dot, and
+a folded one keeps that pill with a signal dot and roll-up word inside it; the WORKSPACES header wears the same pill
 with the workspace count, and the Tabs/Agents/Repos well spans the rail with
 three equal centred segments. Collapsed branches keep one truthful roll-up dot
 plus text such as `2 working`, so color never stands alone. Repos uses workspace

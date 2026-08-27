@@ -9082,8 +9082,11 @@ impl Muxtrix {
         }
     }
 
+    /// Only workspace branches fold; tab and repository branches are always
+    /// open, so a stale record for one of them never hides its panes.
     pub(crate) fn fleet_branch_collapsed(&self, branch: &FleetBranch) -> bool {
-        self.collapsed_fleet_branches.contains(branch)
+        matches!(branch, FleetBranch::Workspace(_))
+            && self.collapsed_fleet_branches.contains(branch)
     }
 
     pub(crate) fn toggle_fleet_branch(&mut self, branch: FleetBranch) {
@@ -9095,23 +9098,10 @@ impl Muxtrix {
     fn fleet_branch_for_target(&self, target: RailTarget) -> Option<FleetBranch> {
         match target {
             RailTarget::FleetWorkspace(workspace_id) => Some(FleetBranch::Workspace(workspace_id)),
-            RailTarget::FleetTab(workspace_id, tab_id) => {
-                Some(FleetBranch::Tab(workspace_id, tab_id))
-            }
-            RailTarget::FleetGroup(workspace_id, first_pane) => {
-                let workspace = self
-                    .session
-                    .workspaces
-                    .iter()
-                    .find(|workspace| workspace.id == workspace_id)?;
-                self.fleet_repository_groups_for(workspace)
-                    .into_iter()
-                    .find(|group| {
-                        group.entries.first().copied() == Some((workspace_id, first_pane))
-                    })
-                    .map(|group| FleetBranch::Repository(workspace_id, group.name))
-            }
-            RailTarget::Workspace(_) | RailTarget::FleetPane(_, _) => None,
+            RailTarget::FleetTab(_, _)
+            | RailTarget::FleetGroup(_, _)
+            | RailTarget::Workspace(_)
+            | RailTarget::FleetPane(_, _) => None,
         }
     }
 

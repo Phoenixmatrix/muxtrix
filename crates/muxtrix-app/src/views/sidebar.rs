@@ -490,7 +490,6 @@ impl Root {
         };
         let mut band = div()
             .id(id)
-            .relative()
             .flex()
             .flex_row()
             .items_center()
@@ -510,18 +509,20 @@ impl Root {
             } else {
                 color(tokens.rail)
             })
-            .cursor_pointer()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |root, _: &MouseDownEvent, window, cx| {
-                    root.dispatch(
-                        Message::ToggleFleetBranch(branch_message.clone()),
-                        window,
-                        cx,
-                    );
-                }),
-            )
-            .children(tree_guides(depth, tokens))
+            // Only workspaces fold. Tabs and repositories are grouping
+            // headings that always show their panes.
+            .when(workspace, |band| {
+                band.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                        root.dispatch(
+                            Message::ToggleFleetBranch(branch_message.clone()),
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+            })
             .child(
                 svg()
                     .path(crate::assets::icon_path(icon))
@@ -562,29 +563,41 @@ impl Root {
         // The trailing slot keeps one shape in both states: a pill with the
         // count, which gains a signal dot and the roll-up word while the
         // branch is folded and its children cannot speak for themselves.
-        band = if collapsed {
-            band.child(
-                count_badge(pane_count, tokens, app)
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .size(px(6.))
-                            .rounded_full()
-                            .bg(color(signal_kind.color(tokens))),
-                    )
-                    .child(
-                        div()
-                            .text_color(color(signal_kind.label_color(tokens)))
-                            .child(fleet_rollup_label(signal_kind)),
-                    ),
-            )
-        } else {
-            band.child(count_badge(pane_count, tokens, app))
-        };
-        if !targeted {
-            band = band.hover(move |style| style.bg(hover));
+        // Workspaces wear the count pill; folded, it gains the signal dot and
+        // roll-up word so the hidden panes still speak. Nested headings carry
+        // nothing trailing: their panes are right below them.
+        if workspace {
+            band = if collapsed {
+                band.child(
+                    count_badge(pane_count, tokens, app)
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(color(signal_kind.color(tokens))),
+                        )
+                        .child(
+                            div()
+                                .text_color(color(signal_kind.label_color(tokens)))
+                                .child(fleet_rollup_label(signal_kind)),
+                        ),
+                )
+            } else {
+                band.child(count_badge(pane_count, tokens, app))
+            };
+            if !targeted {
+                band = band.hover(move |style| style.bg(hover));
+            }
         }
-        band.into_any_element()
+        // Guides hang from the rail edge, outside the band's own border, so
+        // they line up with every other row regardless of its chrome.
+        div()
+            .relative()
+            .w_full()
+            .children(tree_guides(depth, tokens))
+            .child(band)
+            .into_any_element()
     }
 
     fn global_alert_row(
@@ -974,11 +987,13 @@ impl Root {
 
         div()
             .id(("fleet", pane_key(pane_id)))
+            .relative()
             .flex()
             .flex_row()
             .items_stretch()
             .w_full()
             .cursor_pointer()
+            .children(tree_guides(depth, tokens))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |root, _: &MouseDownEvent, window, cx| {
@@ -994,13 +1009,11 @@ impl Root {
                     .gap(px(3.))
                     .flex_grow(1.0)
                     .min_w(px(0.))
-                    .relative()
                     .h(px(52.))
                     .py(px(5.))
                     .pl(px(tree_inset(depth)))
                     .pr(px(TREE_EDGE))
                     .bg(fill)
-                    .children(tree_guides(depth, tokens))
                     // The border exists in every state so the cursor landing
                     // here never shifts the row's content by a pixel.
                     .border_1()
