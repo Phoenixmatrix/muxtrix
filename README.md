@@ -11,6 +11,41 @@ engine for terminal emulation.
 > don't read it as an example of how to write Rust. Expect rough edges and
 > breaking changes between releases.
 
+## Installation
+
+Every release ships through a package channel per platform. Each one installs
+the `muxtrix` app and the `muxtrixctl` command-line tool.
+
+### Windows (Scoop)
+
+```powershell
+scoop bucket add muxtrix https://github.com/Phoenixmatrix/scoop-muxtrix
+scoop install muxtrix/muxtrix
+```
+
+### Linux (apt)
+
+apt is currently the only supported Linux install channel; there are no
+packages for other distributions or package managers yet. Users on non-Debian
+systems can grab the tarball from the
+[releases page](https://github.com/Phoenixmatrix/muxtrix/releases) instead.
+
+```sh
+echo "deb [trusted=yes] https://raw.githubusercontent.com/Phoenixmatrix/muxtrix/apt-repo/ ./" \
+  | sudo tee /etc/apt/sources.list.d/muxtrix.list > /dev/null
+sudo apt-get update
+sudo apt-get install muxtrix
+```
+
+### macOS (Homebrew)
+
+Only Apple Silicon (arm64) builds are published; Intel Macs are not supported.
+
+```sh
+brew tap phoenixmatrix/muxtrix https://github.com/Phoenixmatrix/homebrew-muxtrix
+brew install phoenixmatrix/muxtrix/muxtrix
+```
+
 ## License
 
 Muxtrix is available under the [MIT License](LICENSE).
