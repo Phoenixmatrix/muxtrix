@@ -204,6 +204,8 @@ pub(crate) struct Root {
     /// out — opening a panel and scrolling it are one gesture — and a handle
     /// with no content yet reports nowhere to go. Held until it does.
     pending_scrolls: Vec<(crate::effect::ScrollTarget, ScrollTo)>,
+    /// Last visible session-list selection, revealed only when it changes.
+    session_picker_reveal: Option<(usize, usize)>,
     /// The window's keyboard focus. Held by the root rather than by any
     /// surface: Muxtrix routes every key through one handler and decides there
     /// whether it belongs to a shortcut, a dialog or the terminal, and that
@@ -351,6 +353,7 @@ impl Root {
             tab_overflow_visible: std::cell::Cell::default(),
             tab_overflow_reveal: std::cell::Cell::default(),
             pending_scrolls: Vec::new(),
+            session_picker_reveal: None,
             focus,
         };
         root.spawn_timers(cx);
@@ -805,6 +808,36 @@ impl Render for Root {
         self.terminal_regions.clear();
         self.drain_terminals(cx);
         self.sync_component_theme(window, cx);
+        let session_reveal = self
+            .app
+            .session_picker
+            .as_ref()
+            .filter(|picker| self.app.session_picker_visible() && picker.confirm_end.is_none())
+            .map(|picker| (picker.selected, picker.entries.len()));
+        if session_reveal != self.session_picker_reveal {
+            use crate::effect::ScrollTarget;
+            self.pending_scrolls
+                .retain(|(target, _)| *target != ScrollTarget::SessionPicker);
+            if self.session_picker_reveal.map(|(_, count)| count)
+                != session_reveal.map(|(_, count)| count)
+            {
+                // A fresh handle has no stale extent: its request waits for
+                // this list's layout, not the last dialog's scroll position.
+                self.scrolls.sessions = gpui::ScrollHandle::default();
+            }
+            if let Some((selected, count)) = session_reveal {
+                let ratio = selected as f32 / count.saturating_sub(1).max(1) as f32;
+                queue_pending_scroll(
+                    &mut self.pending_scrolls,
+                    ScrollTarget::SessionPicker,
+                    ScrollTo::Ratio(ratio),
+                );
+            }
+            self.session_picker_reveal = session_reveal;
+            // Reveal against the new layout even when no terminal is producing
+            // output to schedule another frame.
+            window.request_animation_frame();
+        }
         // Both of these read what the last frame laid out, so they belong at
         // the start of the next one.
         self.apply_pending_scrolls();
@@ -976,9 +1009,9 @@ impl Render for Root {
             })
             .children(status_bar)
             .children(menu)
+            .children(toast)
             .children(dialog)
             .children(palette)
-            .children(toast)
     }
 }
 
@@ -1128,6 +1161,7 @@ fn root_menu_anchor(window: &Window) -> Point<gpui::Pixels> {
 pub(crate) struct Scrolls {
     pub(crate) settings: gpui::ScrollHandle,
     pub(crate) palette: gpui::ScrollHandle,
+    pub(crate) sessions: gpui::ScrollHandle,
     pub(crate) github_files: gpui::ScrollHandle,
     pub(crate) github_pull_requests: gpui::ScrollHandle,
     pub(crate) tabs: gpui::ScrollHandle,
@@ -1139,6 +1173,7 @@ impl Scrolls {
         match target {
             ScrollTarget::Settings => &self.settings,
             ScrollTarget::CommandPalette => &self.palette,
+            ScrollTarget::SessionPicker => &self.sessions,
             ScrollTarget::GitHubFiles => &self.github_files,
             ScrollTarget::GitHubPullRequests => &self.github_pull_requests,
         }

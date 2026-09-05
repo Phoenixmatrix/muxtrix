@@ -328,6 +328,17 @@ The command palette uses a clearly bordered accent-tinted selected row. Arrow
 keys and Tab/Shift+Tab move the selection while Enter executes it; shortcut
 labels keep a dedicated right gutter from the scrollbar.
 
+The session picker is a resume-first native dialog. Names lead each selectable
+row; pane count, session age, and abbreviated identity stay secondary. Running
+and stopped states use truthful text rather than another accent. Selection
+reuses the palette's full accent border and tinted fill. Resume session is
+primary; Start fresh is secondary and explicitly preserves running sessions.
+Ending a session is a quiet row action until a separate destructive
+confirmation, which defaults to Cancel. Keyboard selection is revealed inside
+the scrollable inventory while the footer stays visible at the minimum window
+size and across the supported UI type scale. Global toasts sit below modal
+surfaces, never over their controls.
+
 Settings follows a compact native preference-table grammar: section headings
 sit outside continuous bordered row groups; each row pairs a left label and
 secondary description with a compact right-side control; dividers replace

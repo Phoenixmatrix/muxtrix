@@ -484,9 +484,12 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     connection.flush()?;
     eprintln!("injected glyph clipping repro line");
     thread::sleep(Duration::from_millis(250));
+    // Keep the URL on its own line: at the supported minimum window width,
+    // the combined markers wrap inside the URL and no longer match the
+    // row-separated snapshot the application checks before advancing.
     type_text(
         &connection,
-        "printf 'alpha beta https\\072//example.com/docs\\n'",
+        "printf 'alpha beta\\nhttps\\072//example.com/docs\\n'",
     )?;
     tap_keysym(&connection, 0xff0d)?;
     connection.flush()?;

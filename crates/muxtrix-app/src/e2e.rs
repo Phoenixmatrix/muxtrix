@@ -31,9 +31,9 @@ const MOUSE_REPORT_MARKER: &str = "mouse-report-ok";
 // marker that wraps can never be found in a single row of the snapshot.
 const SECOND_MARKER: &str = "p2-mark";
 const THIRD_MARKER: &str = "p3-mark";
-/// A bare Down press, shaped exactly as the window delivers one.
-fn arrow_down() -> crate::input::KeyEvent {
-    let key = crate::input::Key::Named(crate::input::Named::ArrowDown);
+/// A bare named-key press, shaped exactly as the window delivers one.
+fn named_key(name: crate::input::Named) -> crate::input::KeyEvent {
+    let key = crate::input::Key::Named(name);
     crate::input::KeyEvent::Pressed(crate::input::KeyInput {
         key: key.clone(),
         modified_key: key,
@@ -327,10 +327,9 @@ impl Scenario {
         if initial_mouse_reporting
             && self.pane_menu_click_away_observed
             && !app.terminal_pointer_obscured()
+            && let Some(path) = self.mouse_reporting_ready_path.take()
         {
-            if let Some(path) = self.mouse_reporting_ready_path.take() {
-                let _ = std::fs::File::create(path);
-            }
+            let _ = std::fs::File::create(path);
         }
         self.terminal_mouse_reporting_observed |=
             pane_contains(app, self.initial_pane, MOUSE_REPORT_MARKER);
@@ -823,6 +822,13 @@ impl Scenario {
                 if self.settle_ticks == 1 {
                     self.stage_capture(app)?;
                 }
+                if self.settle_ticks == 2
+                    && (self.capturing("session-picker")
+                        || self.capturing("session-picker-confirmation")
+                        || self.capturing("session-picker-many"))
+                {
+                    self.exercise_session_picker_capture(app)?;
+                }
                 if self.capturing("terminal-glyphs")
                     && !pane_contains(app, self.initial_pane, "Weekly limit")
                 {
@@ -918,6 +924,78 @@ impl Scenario {
             Stage::Screenshot => return Ok(TickAction::Wait),
         }
         Ok(TickAction::Wait)
+    }
+
+    fn exercise_session_picker_capture(&self, app: &mut Muxtrix) -> Result<(), String> {
+        use crate::app::{DialogButton, SessionEndTarget};
+        use crate::input::Named;
+
+        let entry_ids = app
+            .session_picker
+            .as_ref()
+            .ok_or("synthetic session picker disappeared before navigation")?
+            .entries
+            .iter()
+            .map(|entry| entry.record.id)
+            .collect::<Vec<_>>();
+        let initial = app
+            .session_picker
+            .as_ref()
+            .expect("capture picker")
+            .selected;
+        let next = initial.saturating_add(1).min(entry_ids.len() - 1);
+        let _ = app.handle_keyboard(named_key(Named::ArrowDown));
+        if app.session_picker.as_ref().map(|picker| picker.selected) != Some(next) {
+            return Err("session picker ignored Down or moved beyond the inventory".into());
+        }
+        // Request/cancel only: never resume or confirm ending these SYNTHETIC
+        // entries, and never discover or address a real host session.
+        let _ = app.handle_keyboard(named_key(Named::Delete));
+        if app
+            .session_picker
+            .as_ref()
+            .and_then(|picker| picker.confirm_end)
+            != Some(SessionEndTarget::One(next))
+            || app.dialog_button != Some(DialogButton::Cancel)
+        {
+            return Err("Delete did not open session confirmation with Cancel focused".into());
+        }
+        let _ = app.handle_keyboard(named_key(Named::Escape));
+        let picker = app
+            .session_picker
+            .as_ref()
+            .ok_or("Escape closed the picker instead of canceling session confirmation")?;
+        if picker.selected != next
+            || picker.confirm_end.is_some()
+            || !picker
+                .entries
+                .iter()
+                .map(|entry| entry.record.id)
+                .eq(entry_ids.iter().copied())
+        {
+            return Err("canceling session confirmation changed the selection or inventory".into());
+        }
+        let _ = app.handle_keyboard(named_key(Named::ArrowUp));
+        if app.session_picker.as_ref().map(|picker| picker.selected) != Some(next.saturating_sub(1))
+        {
+            return Err("session picker ignored Up".into());
+        }
+        let _ = app.update(Message::SessionPickerSelect(initial));
+        if self.capturing("session-picker-confirmation") {
+            let _ = app.update(Message::SessionPickerRequestEnd(SessionEndTarget::One(0)));
+            if app
+                .session_picker
+                .as_ref()
+                .and_then(|picker| picker.confirm_end)
+                != Some(SessionEndTarget::One(0))
+                || app.dialog_button != Some(DialogButton::Cancel)
+            {
+                return Err(
+                    "session end request did not leave a safely focused confirmation".into(),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Selects content in a generic alternate-screen application, then moves
@@ -1513,8 +1591,8 @@ impl Scenario {
             // Drive the advertised navigation through the real key
             // path, so the captured frame is evidence that Down
             // reaches the inventory rather than a staged selection.
-            let _ = app.handle_keyboard(arrow_down());
-            let _ = app.handle_keyboard(arrow_down());
+            let _ = app.handle_keyboard(named_key(crate::input::Named::ArrowDown));
+            let _ = app.handle_keyboard(named_key(crate::input::Named::ArrowDown));
             let selected = app
                 .worktree_manager
                 .as_ref()
@@ -1544,48 +1622,76 @@ impl Scenario {
             app.toast = Some(("Copied to clipboard".into(), std::time::Instant::now()));
         } else if self.capturing("theme-gallery") {
             app.active_view = ActiveView::ThemeGallery;
-        } else if self.capturing("session-picker") {
-            // Synthetic startup picker; exists only for the frame.
+        } else if self.capturing("session-picker")
+            || self.capturing("session-picker-confirmation")
+            || self.capturing("session-picker-empty")
+            || self.capturing("session-picker-many")
+        {
+            // SYNTHETIC capture metadata only: deterministic IDs, no registry
+            // writes, real endpoints, or host processes. Stage once; later
+            // settle ticks exercise the actual request/cancel routes.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            let mut samples = vec![
+                ("muxtrix".to_owned(), true, 4, 7_200),
+                ("API worktree".to_owned(), true, 2, 86_400),
+                ("Release experiments".to_owned(), false, 1, 259_200),
+            ];
+            if self.capturing("session-picker-empty") {
+                samples.clear();
+            } else if self.capturing("session-picker-many") {
+                samples.extend((0..15).map(|index| {
+                    (
+                        format!(
+                            "API worktree {} — investigate cross-workspace session restoration and terminal layout",
+                            index + 1
+                        ),
+                        index % 4 != 0,
+                        index % 6 + 1,
+                        345_600 + index as u64 * 86_400,
+                    )
+                }));
+                // The only running session starts below the fold. The real
+                // renderer must reveal it on opening and after confirmation.
+                let last = samples.len() - 1;
+                for (index, (_, alive, _, _)) in samples.iter_mut().enumerate() {
+                    *alive = index == last;
+                }
+            }
+            let selected = samples
+                .iter()
+                .position(|(_, alive, _, _)| *alive)
+                .unwrap_or(0);
+            app.dialog_button = None;
             app.session_picker = Some(crate::app::SessionPickerState {
-                entries: vec![
-                    crate::app::SessionPickerEntry {
-                        record: muxtrix_sessions::SessionRecord {
-                            id: uuid::Uuid::new_v4(),
-                            name: "muxtrix".into(),
-                            endpoint: String::new(),
-                            process_id: 0,
-                            created_unix: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map_or(0, |elapsed| elapsed.as_secs())
-                                .saturating_sub(7_200),
-                            layout: None,
-                            attached: false,
-                            version: "0.1.31".into(),
+                entries: samples
+                    .into_iter()
+                    .enumerate()
+                    .map(
+                        |(index, (name, alive, pane_count, age))| crate::app::SessionPickerEntry {
+                            record: muxtrix_sessions::SessionRecord {
+                                id: uuid::Uuid::from_u128(
+                                    0xa11ce000_0000_4000_8000_000000000001
+                                        + ((index as u128) << 96),
+                                ),
+                                name,
+                                endpoint: String::new(),
+                                process_id: 0,
+                                created_unix: now.saturating_sub(age),
+                                layout: None,
+                                attached: false,
+                                version: env!("CARGO_PKG_VERSION").into(),
+                            },
+                            alive,
+                            pane_count,
                         },
-                        alive: true,
-                        pane_count: 3,
-                    },
-                    crate::app::SessionPickerEntry {
-                        record: muxtrix_sessions::SessionRecord {
-                            id: uuid::Uuid::new_v4(),
-                            name: "experiments".into(),
-                            endpoint: String::new(),
-                            process_id: 0,
-                            created_unix: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map_or(0, |elapsed| elapsed.as_secs())
-                                .saturating_sub(7_200),
-                            layout: None,
-                            attached: false,
-                            version: env!("CARGO_PKG_VERSION").into(),
-                        },
-                        alive: false,
-                        pane_count: 1,
-                    },
-                ],
-                selected: 0,
+                    )
+                    .collect(),
+                selected,
                 error: None,
                 startup: true,
+                confirm_end: None,
             });
         } else if self.capturing("worktree-dialog") {
             let _ = app.run_command(CommandAction::RestartPaneInWorktree);
@@ -2013,6 +2119,7 @@ impl Scenario {
                 selected: 0,
                 error: Some("Could not read the session registry: permission denied".into()),
                 startup: false,
+                confirm_end: None,
             });
         } else if self.capturing("github-opening") {
             app.github_auth = github::AuthStatus::Authenticated {

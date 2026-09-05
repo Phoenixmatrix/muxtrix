@@ -930,9 +930,16 @@ pub(crate) struct SessionPickerState {
     pub(crate) entries: Vec<SessionPickerEntry>,
     pub(crate) selected: usize,
     pub(crate) error: Option<String>,
+    pub(crate) confirm_end: Option<SessionEndTarget>,
     /// Opened before any new daemon is created because unattached sessions
     /// exist; declining it explicitly starts a fresh session.
     pub(crate) startup: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionEndTarget {
+    One(usize),
+    All,
 }
 
 pub(crate) struct SessionPickerEntry {
@@ -1476,9 +1483,11 @@ pub(crate) enum Message {
     ConfirmWorktreeManagerRestart,
     CancelWorktreeManagerRestart,
     CloseSessionPicker,
+    SessionPickerSelect(usize),
     SessionPickerResume(usize),
-    SessionPickerKill(usize),
-    SessionPickerKillAll,
+    SessionPickerRequestEnd(SessionEndTarget),
+    SessionPickerCancelEnd,
+    SessionPickerConfirmEnd,
     NewTab,
     ActivateTab(TabId),
     CloseTab(WorkspaceId, TabId),
@@ -2244,6 +2253,11 @@ impl Muxtrix {
             .wrapping_add(self.active_view as u64)
             .wrapping_add(self.palette.selected as u64)
             .wrapping_add(self.session.workspaces.len() as u64)
+            .wrapping_add(self.session_picker.as_ref().map_or(0, |picker| {
+                picker.selected as u64
+                    + picker.entries.len() as u64
+                    + u64::from(picker.confirm_end.is_some())
+            }))
             .wrapping_add(
                 self.worktree_manager
                     .as_ref()
@@ -2267,6 +2281,17 @@ impl Muxtrix {
             || self.default_agent_prompt
     }
 
+    /// Matches the dialog/palette stacking order; startup discovery may finish
+    /// while the user is already working in another prompt.
+    pub(crate) fn session_picker_visible(&self) -> bool {
+        self.session_picker.is_some()
+            && !self.palette.visible
+            && !self.workspace_create_visible
+            && self.rename_prompt.is_none()
+            && self.worktree_prompt.is_none()
+            && !self.default_agent_prompt
+    }
+
     /// Which text field should hold focus, given what is open.
     ///
     /// Focus is derived from state rather than remembered, so closing a
@@ -2284,6 +2309,9 @@ impl Muxtrix {
         }
         if self.worktree_prompt.is_some() && self.dialog_button.is_none() {
             return Some(FocusTarget::Worktree);
+        }
+        if self.session_picker_visible() {
+            return None;
         }
         if self
             .github_panel
@@ -2847,21 +2875,56 @@ impl Muxtrix {
                 }
                 return Vec::new();
             }
+            Message::SessionPickerSelect(index) => {
+                if let Some(picker) = self.session_picker.as_mut()
+                    && picker.confirm_end.is_none()
+                {
+                    picker.selected = index.min(picker.entries.len().saturating_sub(1));
+                    self.dialog_button = None;
+                }
+                return Vec::new();
+            }
             Message::SessionPickerResume(index) => {
                 self.resume_session(index);
                 return Vec::new();
             }
-            Message::SessionPickerKill(index) => {
-                self.kill_picked_session(index);
+            Message::SessionPickerRequestEnd(target) => {
+                if let Some(picker) = self.session_picker.as_mut() {
+                    let valid = match target {
+                        SessionEndTarget::One(index) => index < picker.entries.len(),
+                        SessionEndTarget::All => !picker.entries.is_empty(),
+                    };
+                    if valid {
+                        picker.confirm_end = Some(target);
+                        self.dialog_button = Some(DialogButton::Cancel);
+                    }
+                }
                 return Vec::new();
             }
-            Message::SessionPickerKillAll => {
-                let count = self
-                    .session_picker
-                    .as_ref()
-                    .map_or(0, |picker| picker.entries.len());
-                for index in (0..count).rev() {
-                    self.kill_picked_session(index);
+            Message::SessionPickerCancelEnd => {
+                if let Some(picker) = self.session_picker.as_mut() {
+                    picker.confirm_end = None;
+                    self.dialog_button = None;
+                }
+                return Vec::new();
+            }
+            Message::SessionPickerConfirmEnd => {
+                let Some(picker) = self.session_picker.as_mut() else {
+                    return Vec::new();
+                };
+                let Some(target) = picker.confirm_end.take() else {
+                    return Vec::new();
+                };
+                picker.error = None;
+                self.dialog_button = None;
+                match target {
+                    SessionEndTarget::One(index) => self.kill_picked_session(index),
+                    SessionEndTarget::All => {
+                        let count = picker.entries.len();
+                        for index in (0..count).rev() {
+                            self.kill_picked_session(index);
+                        }
+                    }
                 }
                 return Vec::new();
             }
@@ -4703,11 +4766,13 @@ impl Muxtrix {
                 }
             })
             .collect();
+        let selected = entries.iter().position(|entry| entry.alive).unwrap_or(0);
         self.dialog_button = None;
         self.session_picker = Some(SessionPickerState {
             entries,
-            selected: 0,
+            selected,
             error: None,
+            confirm_end: None,
             startup,
         });
     }
@@ -4724,7 +4789,10 @@ impl Muxtrix {
         if entry.alive {
             match muxtrix_sessions::SessionClient::connect_endpoint(&entry.record.endpoint) {
                 Ok((client, _, _)) => {
-                    let _ = client.send(&muxtrix_sessions::Request::Shutdown);
+                    if let Err(error) = client.send(&muxtrix_sessions::Request::Shutdown) {
+                        picker.error = Some(format!("could not end the session: {error}"));
+                        return;
+                    }
                 }
                 Err(error) => {
                     picker.error = Some(format!("could not reach the session: {error}"));
@@ -4737,7 +4805,6 @@ impl Muxtrix {
         if picker.selected >= picker.entries.len() {
             picker.selected = picker.entries.len().saturating_sub(1);
         }
-        picker.error = None;
     }
 
     /// Switches this window onto a background session: its layout replaces
@@ -4748,6 +4815,9 @@ impl Muxtrix {
         let Some(picker) = self.session_picker.as_mut() else {
             return;
         };
+        if picker.confirm_end.is_some() {
+            return;
+        }
         let Some(entry) = picker.entries.get(index) else {
             return;
         };
@@ -4831,6 +4901,7 @@ impl Muxtrix {
         self.terminals = terminals;
         self.queued_terminal_restarts.clear();
         self.session_picker = None;
+        self.dialog_button = None;
         self.maximized_pane = None;
         self.pane_menu = None;
         self.hovered_terminal = None;
@@ -5298,6 +5369,113 @@ impl Muxtrix {
             return Vec::new();
         };
 
+        // The modal owns its keys before workspace shortcuts, rail navigation,
+        // and the GitHub ledger can consume them.
+        if self.session_picker_visible()
+            && let Some(picker) = self.session_picker.as_mut()
+        {
+            let entry_count = picker.entries.len();
+            picker.selected = picker.selected.min(entry_count.saturating_sub(1));
+            let selected = picker.selected;
+            let can_resume = picker
+                .entries
+                .get(selected)
+                .is_some_and(|entry| entry.alive);
+            if picker.confirm_end.is_some() {
+                match modified_key.as_ref() {
+                    Key::Named(Named::Escape) => {
+                        return self.update(Message::SessionPickerCancelEnd);
+                    }
+                    Key::Named(Named::Enter) => {
+                        let action = if self.dialog_button == Some(DialogButton::Confirm) {
+                            Message::SessionPickerConfirmEnd
+                        } else {
+                            Message::SessionPickerCancelEnd
+                        };
+                        return self.update(action);
+                    }
+                    Key::Named(Named::Tab) => {
+                        self.dialog_button =
+                            Some(if self.dialog_button == Some(DialogButton::Confirm) {
+                                DialogButton::Cancel
+                            } else {
+                                DialogButton::Confirm
+                            });
+                    }
+                    key @ Key::Named(Named::ArrowLeft | Named::ArrowRight) => {
+                        self.select_dialog_button(key);
+                    }
+                    _ => {}
+                }
+                return Vec::new();
+            }
+            match modified_key.as_ref() {
+                Key::Named(Named::Escape) => return self.update(Message::CloseSessionPicker),
+                Key::Named(Named::Enter)
+                    if entry_count == 0 || self.dialog_button == Some(DialogButton::Cancel) =>
+                {
+                    return self.update(Message::CloseSessionPicker);
+                }
+                Key::Named(Named::Enter) if can_resume => {
+                    return self.update(Message::SessionPickerResume(selected));
+                }
+                Key::Named(Named::ArrowUp | Named::ArrowDown) if entry_count > 0 => {
+                    picker.selected = if matches!(modified_key.as_ref(), Key::Named(Named::ArrowUp))
+                    {
+                        selected.saturating_sub(1)
+                    } else {
+                        selected.saturating_add(1).min(entry_count - 1)
+                    };
+                    self.dialog_button = None;
+                    return Vec::new();
+                }
+                Key::Named(Named::Tab) => {
+                    self.dialog_button = if entry_count == 0 {
+                        Some(DialogButton::Confirm)
+                    } else if modifiers.shift() {
+                        match self.dialog_button {
+                            None if can_resume => Some(DialogButton::Confirm),
+                            None | Some(DialogButton::Confirm) => Some(DialogButton::Cancel),
+                            Some(DialogButton::Cancel) => None,
+                        }
+                    } else {
+                        match self.dialog_button {
+                            None => Some(DialogButton::Cancel),
+                            Some(DialogButton::Cancel) if can_resume => Some(DialogButton::Confirm),
+                            Some(_) => None,
+                        }
+                    };
+                }
+                Key::Named(Named::ArrowLeft) => {
+                    self.dialog_button = Some(if entry_count == 0 {
+                        DialogButton::Confirm
+                    } else {
+                        DialogButton::Cancel
+                    });
+                }
+                Key::Named(Named::ArrowRight) => {
+                    self.dialog_button = Some(if can_resume || entry_count == 0 {
+                        DialogButton::Confirm
+                    } else {
+                        DialogButton::Cancel
+                    });
+                }
+                Key::Named(Named::Delete) if modifiers.control() => {
+                    if entry_count > 1 {
+                        return self
+                            .update(Message::SessionPickerRequestEnd(SessionEndTarget::All));
+                    }
+                }
+                Key::Named(Named::Delete) if entry_count > 0 => {
+                    return self.update(Message::SessionPickerRequestEnd(SessionEndTarget::One(
+                        selected,
+                    )));
+                }
+                _ => {}
+            }
+            return Vec::new();
+        }
+
         if self.pane_menu.is_some() && matches!(modified_key.as_ref(), Key::Named(Named::Escape)) {
             self.pane_menu = None;
             return Vec::new();
@@ -5660,60 +5838,6 @@ impl Muxtrix {
                 key => {
                     self.select_dialog_button(key);
                 }
-            }
-            return Vec::new();
-        }
-
-        if self.session_picker.is_some() {
-            let (entry_count, selected) = self
-                .session_picker
-                .as_ref()
-                .map(|picker| (picker.entries.len(), picker.selected))
-                .unwrap_or_default();
-            match modified_key.as_ref() {
-                Key::Named(Named::Escape) => {
-                    self.session_picker = None;
-                    self.dialog_button = None;
-                }
-                Key::Named(Named::Enter) if self.dialog_button.is_some() => {
-                    let action = self
-                        .dialog_action(Message::SessionPickerKillAll, Message::CloseSessionPicker);
-                    return self.update(action);
-                }
-                Key::Named(Named::Enter) if entry_count > 0 => {
-                    // A dead row cannot resume; Enter does the one thing it
-                    // can — clean it up — instead of printing a refusal.
-                    if self
-                        .session_picker
-                        .as_ref()
-                        .and_then(|picker| picker.entries.get(selected))
-                        .is_some_and(|entry| entry.alive)
-                    {
-                        self.resume_session(selected);
-                    } else {
-                        self.kill_picked_session(selected);
-                    }
-                }
-                Key::Named(Named::Enter) => self.session_picker = None,
-                Key::Named(Named::ArrowUp) if entry_count > 0 => {
-                    self.dialog_button = None;
-                    if let Some(picker) = self.session_picker.as_mut() {
-                        picker.selected = selected.saturating_sub(1);
-                    }
-                }
-                Key::Named(Named::ArrowDown) if entry_count > 0 => {
-                    self.dialog_button = None;
-                    if let Some(picker) = self.session_picker.as_mut() {
-                        picker.selected = (selected + 1).min(entry_count - 1);
-                    }
-                }
-                Key::Named(Named::ArrowLeft | Named::ArrowRight) => {
-                    self.select_dialog_button(modified_key.as_ref());
-                }
-                Key::Named(Named::Delete | Named::Backspace) if entry_count > 0 => {
-                    self.kill_picked_session(selected);
-                }
-                _ => {}
             }
             return Vec::new();
         }
