@@ -370,6 +370,7 @@ fn session_picker_stopped_row_enter_never_removes_or_resumes() {
     app.open_session_picker_from_records(vec![session_picker_record()], false);
 
     drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Space), Modifiers::empty())));
     drop(app.handle_keyboard(key_press(Key::Named(Named::Backspace), Modifiers::empty())));
     let picker = app
         .session_picker
@@ -382,11 +383,18 @@ fn session_picker_stopped_row_enter_never_removes_or_resumes() {
     );
     assert!(picker.confirm_end.is_none());
 
-    // Tab omits the disabled Resume action and returns from the sole footer
-    // action to the list. Enter remains harmless there.
-    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
-    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
-    assert_eq!(app.dialog_button, None);
+    // A stopped in-app singleton exposes only its removal and dismissal.
+    for expected in [
+        SessionPickerFocus::EndSelected,
+        SessionPickerFocus::Dismiss,
+        SessionPickerFocus::List,
+    ] {
+        drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+        assert_eq!(
+            app.session_picker.as_ref().expect("session picker").focus,
+            expected
+        );
+    }
     drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
     assert_eq!(
         app.session_picker
@@ -454,7 +462,7 @@ fn session_picker_defaults_to_first_live_session_and_enter_attempts_resume() {
 }
 
 #[test]
-fn session_picker_keyboard_traverses_list_and_footer_without_changing_session() {
+fn session_picker_keyboard_traverses_list_and_actions_without_changing_session() {
     let mut app = Muxtrix::new();
     app.open_session_picker_from_records(
         vec![
@@ -465,23 +473,54 @@ fn session_picker_keyboard_traverses_list_and_footer_without_changing_session() 
         true,
     );
 
-    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
-    assert_eq!(app.dialog_button, Some(DialogButton::Cancel));
-    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
-    assert_eq!(app.dialog_button, Some(DialogButton::Confirm));
-    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
-    assert_eq!(app.dialog_button, None);
-    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::SHIFT)));
-    assert_eq!(app.dialog_button, Some(DialogButton::Confirm));
-    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::SHIFT)));
-    assert_eq!(app.dialog_button, Some(DialogButton::Cancel));
-    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::SHIFT)));
-    assert_eq!(app.dialog_button, None);
+    for (modifiers, order) in [
+        (
+            Modifiers::empty(),
+            [
+                SessionPickerFocus::EndSelected,
+                SessionPickerFocus::EndAll,
+                SessionPickerFocus::Dismiss,
+                SessionPickerFocus::Resume,
+                SessionPickerFocus::List,
+            ],
+        ),
+        (
+            Modifiers::SHIFT,
+            [
+                SessionPickerFocus::Resume,
+                SessionPickerFocus::Dismiss,
+                SessionPickerFocus::EndAll,
+                SessionPickerFocus::EndSelected,
+                SessionPickerFocus::List,
+            ],
+        ),
+    ] {
+        for expected in order {
+            let before = app.chrome_revision();
+            drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), modifiers)));
+            assert_eq!(
+                app.session_picker.as_ref().expect("session picker").focus,
+                expected
+            );
+            assert_ne!(app.chrome_revision(), before, "focus must repaint chrome");
+        }
+    }
 
+    drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowRight), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::EndSelected
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowLeft), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::List
+    );
     drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowRight), Modifiers::empty())));
     drop(app.update(Message::SessionPickerSelect(usize::MAX)));
     assert_eq!(
-        app.dialog_button, None,
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::List,
         "click selection restores list keyboard focus"
     );
     assert_eq!(
@@ -491,6 +530,7 @@ fn session_picker_keyboard_traverses_list_and_footer_without_changing_session() 
             .selected,
         2
     );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
     drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowUp), Modifiers::empty())));
     assert_eq!(
         app.session_picker
@@ -499,7 +539,19 @@ fn session_picker_keyboard_traverses_list_and_footer_without_changing_session() 
             .selected,
         1
     );
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::List,
+        "arrow selection restores list keyboard focus"
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    let focused_revision = app.chrome_revision();
     drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowDown), Modifiers::empty())));
+    assert_ne!(
+        app.chrome_revision(),
+        focused_revision,
+        "moving from a row action to the next row must invalidate its highlight"
+    );
     drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowDown), Modifiers::empty())));
     assert_eq!(
         app.session_picker
@@ -515,6 +567,74 @@ fn session_picker_keyboard_traverses_list_and_footer_without_changing_session() 
             .entries
             .len(),
         3
+    );
+}
+
+#[test]
+fn session_picker_tab_cleanup_confirms_exact_target_and_restores_focus() {
+    let mut app = Muxtrix::new();
+    app.open_session_picker_from_records(
+        vec![session_picker_record(), session_picker_record()],
+        false,
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowDown), Modifiers::empty())));
+
+    for (focus, target) in [
+        (SessionPickerFocus::EndSelected, SessionEndTarget::One(1)),
+        (SessionPickerFocus::EndAll, SessionEndTarget::All),
+    ] {
+        drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+        assert_eq!(
+            app.session_picker.as_ref().expect("session picker").focus,
+            focus
+        );
+        drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+        let picker = app.session_picker.as_ref().expect("session picker");
+        assert_eq!(picker.confirm_end, Some(target));
+        assert_eq!(
+            picker.entries.len(),
+            2,
+            "requesting cleanup never executes it"
+        );
+        assert_eq!(app.dialog_button, Some(DialogButton::Cancel));
+        drop(app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::empty())));
+        let picker = app.session_picker.as_ref().expect("session picker");
+        assert_eq!(picker.focus, focus);
+        assert!(picker.confirm_end.is_none());
+    }
+
+    // Space activates the focused cleanup too; the default confirmation
+    // remains Cancel and returns to that same action.
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Space), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .confirm_end,
+        Some(SessionEndTarget::All)
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Space), Modifiers::empty())));
+    let picker = app.session_picker.as_ref().expect("session picker");
+    assert!(picker.confirm_end.is_none());
+    assert_eq!(picker.focus, SessionPickerFocus::EndAll);
+    assert_eq!(picker.entries.len(), 2);
+
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::Dismiss
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::List,
+        "stopped sessions omit Resume"
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::SHIFT)));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+    assert!(
+        app.session_picker.is_none(),
+        "dismissal closes an in-app picker"
     );
 }
 
@@ -632,7 +752,13 @@ fn session_picker_bulk_cleanup_starts_fresh_once_only_after_success() {
     for entry in &mut app.session_picker.as_mut().expect("session picker").entries {
         entry.alive = false;
     }
-    drop(app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::CTRL)));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::EndAll
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
     assert_eq!(
         app.session_picker
             .as_ref()
@@ -719,7 +845,10 @@ fn session_picker_empty_state_only_exposes_dismissal() {
     drop(app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::empty())));
     drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::SHIFT)));
     drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowRight), Modifiers::empty())));
-    assert_eq!(app.dialog_button, Some(DialogButton::Confirm));
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::Dismiss
+    );
     assert!(
         app.session_picker
             .as_ref()

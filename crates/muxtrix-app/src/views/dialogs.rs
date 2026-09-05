@@ -10,8 +10,9 @@ use gpui::{
 };
 
 use crate::app::{
-    DialogButton, Message, RenameTarget, SessionEndTarget, SettingsButtonKind, WorktreeManagerMode,
-    WorktreeManagerState, agent_display_name, ellipsize, worktree_display_name,
+    DialogButton, Message, RenameTarget, SessionEndTarget, SessionPickerFocus, SettingsButtonKind,
+    WorktreeManagerMode, WorktreeManagerState, agent_display_name, ellipsize,
+    worktree_display_name,
 };
 use crate::runtime::gpui::{Root, color, ui_family};
 use crate::theme::DesignTokens;
@@ -234,6 +235,13 @@ impl Root {
         } else {
             "Cancel"
         };
+        let button_border = |focus, primary| {
+            color(if picker.focus == focus {
+                if primary { tokens.text } else { tokens.accent }
+            } else {
+                tokens.line
+            })
+        };
         let mut card = div()
             .w(px((app.window_size.width - 48.).min(620.)))
             .max_h(px(app.window_size.height - 32.))
@@ -308,7 +316,7 @@ impl Root {
                 .map_or(0, |elapsed| elapsed.as_secs());
             // Share content-measured columns across rows. Only session names
             // may truncate; status and action widths follow the actual UI font.
-            let label_width = |label: &'static str| {
+            let label_width = |label: &'static str, points| {
                 let run = gpui::TextRun {
                     len: label.len(),
                     font: gpui::Font {
@@ -323,11 +331,12 @@ impl Root {
                 };
                 let line = window
                     .text_system()
-                    .shape_line(label.into(), ui(9.), &[run], None);
+                    .shape_line(label.into(), ui(points), &[run], None);
                 px(f32::from(line.width).ceil())
             };
-            let status_width = label_width("Running").max(label_width("Stopped"));
-            let action_width = label_width("End session").max(label_width("Remove")) + px(24.);
+            let status_width = label_width("Running", 9.).max(label_width("Stopped", 9.));
+            let action_width =
+                label_width("End session", 11.).max(label_width("Remove", 11.)) + px(30.);
             let mut rows = div()
                 .id("session-list")
                 .flex()
@@ -344,7 +353,7 @@ impl Root {
                 let mut selected_fill = color(tokens.accent);
                 selected_fill.a = 0.10;
                 let mut selected_edge = color(tokens.accent);
-                selected_edge.a = if app.dialog_button.is_none() {
+                selected_edge.a = if picker.focus == SessionPickerFocus::List {
                     0.75
                 } else {
                     0.3
@@ -455,18 +464,23 @@ impl Root {
                                 .child(if entry.alive { "Running" } else { "Stopped" }),
                         )
                         .child(
-                            div()
-                                .flex_shrink_0()
-                                .w(action_width)
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(self.settings_action_button(
-                                    "session-end",
+                            div().flex_shrink_0().w(action_width).child(
+                                self.dialog_button(
                                     if entry.alive { "End session" } else { "Remove" },
                                     Message::SessionPickerRequestEnd(SessionEndTarget::One(index)),
-                                    SettingsButtonKind::Quiet,
+                                    false,
+                                    false,
                                     tokens,
                                     cx,
+                                )
+                                .border_color(color(
+                                    if selected && picker.focus == SessionPickerFocus::EndSelected {
+                                        tokens.accent
+                                    } else {
+                                        tokens.line
+                                    },
                                 )),
+                            ),
                         ),
                 );
             }
@@ -475,59 +489,69 @@ impl Root {
         let mut actions = div().flex().items_center().justify_end().gap(px(8.));
         if picker.entries.len() > 1 || (picker.startup && !empty) {
             actions = actions.child(
-                div()
-                    .flex()
-                    .flex_grow(1.)
-                    .child(self.settings_action_button(
-                        "session-end-all",
+                div().flex().flex_grow(1.).child(
+                    self.dialog_button(
                         if picker.startup {
                             "End all & start fresh"
                         } else {
                             "End all sessions"
                         },
                         Message::SessionPickerRequestEnd(SessionEndTarget::All),
-                        SettingsButtonKind::Secondary,
+                        false,
+                        false,
                         tokens,
                         cx,
-                    )),
+                    )
+                    .border_color(button_border(SessionPickerFocus::EndAll, false)),
+                ),
             );
         } else {
             actions = actions.child(div().flex_grow(1.));
         }
         if empty {
-            actions = actions.child(self.dialog_button(
-                if picker.startup {
-                    "Start fresh"
-                } else {
-                    "Done"
-                },
-                Message::CloseSessionPicker,
-                true,
-                false,
-                tokens,
-                cx,
-            ));
-        } else {
-            actions = actions.child(self.dialog_button(
-                secondary,
-                Message::CloseSessionPicker,
-                false,
-                false,
-                tokens,
-                cx,
-            ));
-            if can_resume {
-                actions = actions.child(self.dialog_button(
-                    "Resume session",
-                    Message::SessionPickerResume(picker.selected),
+            actions = actions.child(
+                self.dialog_button(
+                    if picker.startup {
+                        "Start fresh"
+                    } else {
+                        "Done"
+                    },
+                    Message::CloseSessionPicker,
                     true,
                     false,
                     tokens,
                     cx,
-                ));
+                )
+                .border_color(button_border(SessionPickerFocus::Dismiss, true)),
+            );
+        } else {
+            actions = actions.child(
+                self.dialog_button(
+                    secondary,
+                    Message::CloseSessionPicker,
+                    false,
+                    false,
+                    tokens,
+                    cx,
+                )
+                .border_color(button_border(SessionPickerFocus::Dismiss, false)),
+            );
+            if can_resume {
+                actions = actions.child(
+                    self.dialog_button(
+                        "Resume session",
+                        Message::SessionPickerResume(picker.selected),
+                        true,
+                        false,
+                        tokens,
+                        cx,
+                    )
+                    .border_color(button_border(SessionPickerFocus::Resume, true)),
+                );
             } else {
                 actions = actions.child(
                     div()
+                        .flex_shrink_0()
                         .h(px(30.))
                         .px(px(14.))
                         .flex()
@@ -537,6 +561,8 @@ impl Root {
                         .border_color(color(tokens.line))
                         .bg(color(tokens.panel_raised))
                         .text_size(ui(11.))
+                        .whitespace_nowrap()
+                        .line_height(ui(11.) * 1.3)
                         .text_color(color(tokens.faint))
                         .child("Resume session"),
                 );
@@ -583,8 +609,8 @@ impl Root {
                             .flex()
                             .items_center()
                             .gap(px(5.))
-                            .child(key("Enter"))
-                            .child("Resume"),
+                            .child(key("Tab"))
+                            .child("Actions"),
                     )
                     .child(div().flex_grow(1.))
                     .child(div().text_size(ui(9.)).child(if picker.startup {
@@ -709,7 +735,7 @@ impl Root {
         danger: bool,
         tokens: DesignTokens,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> gpui::Stateful<gpui::Div> {
         let background = if danger {
             tokens.danger
         } else if primary {
@@ -735,29 +761,44 @@ impl Root {
         } else {
             tokens.line
         };
+        let mut hover = color(background);
+        let mut active = hover;
+        if primary || danger {
+            hover.a = 0.86;
+            active.a = 0.72;
+        } else {
+            hover = color(tokens.panel_raised);
+            active = color(tokens.element_hover);
+        }
         div()
             .id(gpui::ElementId::from(gpui::SharedString::from(
                 label.to_owned(),
             )))
             .h(px(30.))
+            .flex_shrink_0()
             .px(px(14.))
             .flex()
             .items_center()
+            .justify_center()
             .rounded(px(6.))
             .border_1()
             .border_color(color(border))
             .cursor_pointer()
             .bg(color(background))
             .text_size(px(self.app().settings.ui_pixels(11.0)))
+            .line_height(px(self.app().settings.ui_pixels(11.0)) * 1.3)
+            .whitespace_nowrap()
             .text_color(color(foreground))
+            .hover(move |style| style.bg(hover))
+            .active(move |style| style.bg(active))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
                     root.dispatch(message.clone(), window, cx);
                 }),
             )
             .child(label.to_owned())
-            .into_any_element()
     }
 }
 

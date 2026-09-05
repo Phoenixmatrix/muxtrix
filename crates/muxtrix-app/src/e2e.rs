@@ -826,6 +826,9 @@ impl Scenario {
                     && (self.capturing("session-picker")
                         || self.capturing("session-picker-confirmation")
                         || self.capturing("session-picker-bulk-confirmation")
+                        || self.capturing("session-picker-row-focus")
+                        || self.capturing("session-picker-focus-navigation")
+                        || self.capturing("session-picker-bulk-focus")
                         || self.capturing("session-picker-stopped")
                         || self.capturing("session-picker-single")
                         || self.capturing("session-picker-many"))
@@ -930,7 +933,7 @@ impl Scenario {
     }
 
     fn exercise_session_picker_capture(&self, app: &mut Muxtrix) -> Result<(), String> {
-        use crate::app::{DialogButton, SessionEndTarget};
+        use crate::app::{DialogButton, SessionEndTarget, SessionPickerFocus};
         use crate::input::Named;
 
         let entry_ids = app
@@ -946,6 +949,10 @@ impl Scenario {
             .as_ref()
             .expect("capture picker")
             .selected;
+        if app.session_picker.as_ref().map(|picker| picker.focus) != Some(SessionPickerFocus::List)
+        {
+            return Err("populated synthetic session picker did not start on the list".into());
+        }
         let next = initial.saturating_add(1).min(entry_ids.len() - 1);
         let _ = app.handle_keyboard(named_key(Named::ArrowDown));
         if app.session_picker.as_ref().map(|picker| picker.selected) != Some(next) {
@@ -970,6 +977,7 @@ impl Scenario {
             .ok_or("Escape closed the picker instead of canceling session confirmation")?;
         if picker.selected != next
             || picker.confirm_end.is_some()
+            || picker.focus != SessionPickerFocus::EndSelected
             || !picker
                 .entries
                 .iter()
@@ -984,6 +992,69 @@ impl Scenario {
             return Err("session picker ignored Up".into());
         }
         let _ = app.update(Message::SessionPickerSelect(initial));
+        if self.capturing("session-picker-row-focus")
+            || self.capturing("session-picker-bulk-focus")
+            || self.capturing("session-picker-focus-navigation")
+        {
+            if app.session_picker.as_ref().map(|picker| picker.focus)
+                != Some(SessionPickerFocus::List)
+                || app.dialog_button.is_some()
+            {
+                return Err("selecting a session did not reset focus to the list".into());
+            }
+            let _ = app.handle_keyboard(named_key(Named::Tab));
+            if app.session_picker.as_ref().map(|picker| picker.focus)
+                != Some(SessionPickerFocus::EndSelected)
+            {
+                return Err("Tab did not focus the selected session's end action".into());
+            }
+            let (focus, target) = if self.capturing("session-picker-bulk-focus") {
+                let _ = app.handle_keyboard(named_key(Named::Tab));
+                (SessionPickerFocus::EndAll, SessionEndTarget::All)
+            } else {
+                (
+                    SessionPickerFocus::EndSelected,
+                    SessionEndTarget::One(initial),
+                )
+            };
+            if app.session_picker.as_ref().map(|picker| picker.focus) != Some(focus) {
+                return Err("Tab did not reach the requested session action".into());
+            }
+            // Focus is checked before Enter so synthetic records can never be
+            // resumed by a navigation regression. Escape is the only response.
+            let _ = app.handle_keyboard(named_key(Named::Enter));
+            if app
+                .session_picker
+                .as_ref()
+                .and_then(|picker| picker.confirm_end)
+                != Some(target)
+                || app.dialog_button != Some(DialogButton::Cancel)
+            {
+                return Err(
+                    "Enter did not open the focused session action with Cancel focused".into(),
+                );
+            }
+            let _ = app.handle_keyboard(named_key(Named::Escape));
+            let picker = app
+                .session_picker
+                .as_ref()
+                .ok_or("Escape closed the picker instead of canceling the focused action")?;
+            if picker.focus != focus
+                || picker.selected != initial
+                || picker.confirm_end.is_some()
+                || app.dialog_button.is_some()
+                || !picker
+                    .entries
+                    .iter()
+                    .map(|entry| entry.record.id)
+                    .eq(entry_ids.iter().copied())
+            {
+                return Err(
+                    "canceling the focused session action changed inventory or lost its focus"
+                        .into(),
+                );
+            }
+        }
         if self.capturing("session-picker-confirmation")
             || self.capturing("session-picker-bulk-confirmation")
         {
@@ -1635,6 +1706,10 @@ impl Scenario {
         } else if self.capturing("session-picker")
             || self.capturing("session-picker-confirmation")
             || self.capturing("session-picker-bulk-confirmation")
+            || self.capturing("session-picker-row-focus")
+            || self.capturing("session-picker-focus-navigation")
+            || self.capturing("session-picker-bulk-focus")
+            || self.capturing("session-picker-hover")
             || self.capturing("session-picker-stopped")
             || self.capturing("session-picker-single")
             || self.capturing("session-picker-empty")
@@ -1685,6 +1760,11 @@ impl Scenario {
                     .position(|(_, alive, _, _)| *alive)
                     .unwrap_or(0)
             };
+            let focus = if samples.is_empty() {
+                crate::app::SessionPickerFocus::Dismiss
+            } else {
+                crate::app::SessionPickerFocus::List
+            };
             app.dialog_button = None;
             app.session_picker = Some(crate::app::SessionPickerState {
                 entries: samples
@@ -1711,6 +1791,7 @@ impl Scenario {
                     )
                     .collect(),
                 selected,
+                focus,
                 error: None,
                 startup: true,
                 confirm_end: None,
@@ -2139,6 +2220,7 @@ impl Scenario {
             app.session_picker = Some(crate::app::SessionPickerState {
                 entries: Vec::new(),
                 selected: 0,
+                focus: crate::app::SessionPickerFocus::Dismiss,
                 error: Some("Could not read the session registry: permission denied".into()),
                 startup: false,
                 confirm_end: None,

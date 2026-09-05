@@ -524,6 +524,28 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             }
             thread::sleep(Duration::from_millis(50));
         }
+        if capture == "session-picker-hover" {
+            if final_viewport != (1280, 800) {
+                return Err("session-picker-hover requires the default 1280x800 viewport".into());
+            }
+            let origin = pin_window(&connection, root, window)?;
+            // The first row's End session button in the default synthetic
+            // picker. Move only: never activate or end a synthetic session.
+            connection
+                .xtest_fake_input(
+                    MOTION_NOTIFY_EVENT,
+                    0,
+                    0,
+                    root,
+                    origin.dst_x.saturating_add(866),
+                    origin.dst_y.saturating_add(325),
+                    0,
+                )?
+                .check()?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            eprintln!("parked the pointer over the first session's End session action");
+        }
         if capture == "toolbar-hover" || capture == "toolbar-add-hover" {
             let origin = pin_window(&connection, root, window)?;
             let add_action = capture == "toolbar-add-hover";
@@ -749,7 +771,38 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             thread::sleep(Duration::from_millis(1_000));
             eprintln!("moved from the naming input to the dialog button row");
         }
+        let held_key = if capture == "session-picker-focus-navigation" {
+            if final_viewport != (1280, 800) {
+                return Err("session-picker-focus-navigation requires 1280x800".into());
+            }
+            let keycode = keycode_for_keysym(&connection, 0xff54)?;
+            connection
+                .xtest_fake_input(KEY_PRESS_EVENT, keycode, 0, 0, 0, 0, 0)?
+                .check()?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(200));
+            Some(keycode)
+        } else {
+            None
+        };
         let frame = grab_window(&connection, window)?;
+        if let Some(keycode) = held_key {
+            connection
+                .xtest_fake_input(KEY_RELEASE_EVENT, keycode, 0, 0, 0, 0, 0)?
+                .check()?;
+            connection.flush()?;
+            // The second row must repaint while Down is held, not only after
+            // release or an unrelated event dirties the window. This location
+            // is its left selection border in the default synthetic picker.
+            let pixel = (395 * frame.width + 351) * 4;
+            let [red, green, blue, _] = <[u8; 4]>::try_from(&frame.rgba[pixel..pixel + 4])?;
+            assert!(
+                u16::from(blue) > u16::from(red) + 20
+                    && u16::from(blue) > u16::from(green) + 10
+                    && blue > 60,
+                "keyboard selection did not repaint before key release"
+            );
+        }
         std::fs::write(&screenshot_path, &frame.rgba)?;
         eprintln!(
             "captured a {}x{} frame from the X server",

@@ -333,8 +333,14 @@ row; pane count, session age, and abbreviated identity stay secondary. Running
 and stopped states use truthful text rather than another accent. Selection
 reuses the palette's full accent border and tinted fill. Resume session is
 primary; Start fresh is secondary and explicitly preserves running sessions.
-Ending a session is a quiet row action until a separate destructive
-confirmation, which defaults to Cancel. Keyboard selection is revealed inside
+End session and Remove are visible neutral bordered buttons, not metadata-like
+text actions. Session actions share the dialog button's 30 px height, ui(11)
+label scale, 14 px horizontal padding, 6 px corners, and hover/focus treatment.
+Destructive confirmation remains separate and defaults to Cancel.
+Tab/Shift+Tab cycles the inventory, selected row's cleanup button, available
+bulk action, dismissal, and enabled Resume. Enter or Space activates a focused
+button; canceling confirmation restores its initiating button's focus.
+Keyboard selection is revealed inside
 the scrollable inventory while the footer stays visible at the minimum window
 size and across the supported UI type scale. Global toasts sit below modal
 surfaces, never over their controls.

@@ -926,14 +926,65 @@ pub(crate) enum WorktreeManagerMode {
     RestartPaneWithAgent(PaneId, Agent),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionPickerFocus {
+    List,
+    EndSelected,
+    EndAll,
+    Dismiss,
+    Resume,
+}
+
 pub(crate) struct SessionPickerState {
     pub(crate) entries: Vec<SessionPickerEntry>,
     pub(crate) selected: usize,
+    pub(crate) focus: SessionPickerFocus,
     pub(crate) error: Option<String>,
     pub(crate) confirm_end: Option<SessionEndTarget>,
     /// Opened before any new daemon is created because unattached sessions
     /// exist; declining it explicitly starts a fresh session.
     pub(crate) startup: bool,
+}
+
+impl SessionPickerState {
+    fn focus_available(&self, focus: SessionPickerFocus) -> bool {
+        match focus {
+            SessionPickerFocus::List | SessionPickerFocus::EndSelected => !self.entries.is_empty(),
+            SessionPickerFocus::EndAll => {
+                self.entries.len() > 1 || (self.startup && !self.entries.is_empty())
+            }
+            SessionPickerFocus::Dismiss => true,
+            SessionPickerFocus::Resume => self
+                .entries
+                .get(self.selected)
+                .is_some_and(|entry| entry.alive),
+        }
+    }
+
+    fn step_focus(&mut self, forward: bool) {
+        let order = [
+            SessionPickerFocus::List,
+            SessionPickerFocus::EndSelected,
+            SessionPickerFocus::EndAll,
+            SessionPickerFocus::Dismiss,
+            SessionPickerFocus::Resume,
+        ];
+        let mut index = order
+            .iter()
+            .position(|candidate| *candidate == self.focus)
+            .unwrap_or(0);
+        for _ in 0..order.len() {
+            index = if forward {
+                (index + 1) % order.len()
+            } else {
+                (index + order.len() - 1) % order.len()
+            };
+            if self.focus_available(order[index]) {
+                self.focus = order[index];
+                return;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2249,15 +2300,21 @@ impl Muxtrix {
         bit(!self.global_alerts.is_empty());
         let mut text = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&self.status, &mut text);
+        if let Some(picker) = &self.session_picker {
+            // These values change together: adding them lets a focus decrement
+            // cancel a selection increment and suppress the required repaint.
+            (
+                picker.selected,
+                picker.entries.len(),
+                picker.focus as u8,
+                picker.confirm_end.is_some(),
+            )
+                .hash(&mut text);
+        }
         revision
             .wrapping_add(self.active_view as u64)
             .wrapping_add(self.palette.selected as u64)
             .wrapping_add(self.session.workspaces.len() as u64)
-            .wrapping_add(self.session_picker.as_ref().map_or(0, |picker| {
-                picker.selected as u64
-                    + picker.entries.len() as u64
-                    + u64::from(picker.confirm_end.is_some())
-            }))
             .wrapping_add(
                 self.worktree_manager
                     .as_ref()
@@ -2880,6 +2937,11 @@ impl Muxtrix {
                     && picker.confirm_end.is_none()
                 {
                     picker.selected = index.min(picker.entries.len().saturating_sub(1));
+                    picker.focus = if picker.entries.is_empty() {
+                        SessionPickerFocus::Dismiss
+                    } else {
+                        SessionPickerFocus::List
+                    };
                     self.dialog_button = None;
                 }
                 return Vec::new();
@@ -2895,6 +2957,13 @@ impl Muxtrix {
                         SessionEndTarget::All => !picker.entries.is_empty(),
                     };
                     if valid {
+                        picker.focus = match target {
+                            SessionEndTarget::One(index) => {
+                                picker.selected = index;
+                                SessionPickerFocus::EndSelected
+                            }
+                            SessionEndTarget::All => SessionPickerFocus::EndAll,
+                        };
                         picker.confirm_end = Some(target);
                         self.dialog_button = Some(DialogButton::Cancel);
                     }
@@ -4775,10 +4844,16 @@ impl Muxtrix {
             })
             .collect();
         let selected = entries.iter().position(|entry| entry.alive).unwrap_or(0);
+        let focus = if entries.is_empty() {
+            SessionPickerFocus::Dismiss
+        } else {
+            SessionPickerFocus::List
+        };
         self.dialog_button = None;
         self.session_picker = Some(SessionPickerState {
             entries,
             selected,
+            focus,
             error: None,
             confirm_end: None,
             startup,
@@ -4812,6 +4887,13 @@ impl Muxtrix {
         picker.entries.remove(index);
         if picker.selected >= picker.entries.len() {
             picker.selected = picker.entries.len().saturating_sub(1);
+        }
+        if !picker.focus_available(picker.focus) {
+            picker.focus = if picker.entries.is_empty() {
+                SessionPickerFocus::Dismiss
+            } else {
+                SessionPickerFocus::List
+            };
         }
     }
 
@@ -5385,16 +5467,13 @@ impl Muxtrix {
             let entry_count = picker.entries.len();
             picker.selected = picker.selected.min(entry_count.saturating_sub(1));
             let selected = picker.selected;
-            let can_resume = picker
-                .entries
-                .get(selected)
-                .is_some_and(|entry| entry.alive);
+            let can_resume = picker.focus_available(SessionPickerFocus::Resume);
             if picker.confirm_end.is_some() {
                 match modified_key.as_ref() {
                     Key::Named(Named::Escape) => {
                         return self.update(Message::SessionPickerCancelEnd);
                     }
-                    Key::Named(Named::Enter) => {
+                    Key::Named(Named::Enter | Named::Space) => {
                         let action = if self.dialog_button == Some(DialogButton::Confirm) {
                             Message::SessionPickerConfirmEnd
                         } else {
@@ -5419,13 +5498,29 @@ impl Muxtrix {
             }
             match modified_key.as_ref() {
                 Key::Named(Named::Escape) => return self.update(Message::CloseSessionPicker),
-                Key::Named(Named::Enter)
-                    if entry_count == 0 || self.dialog_button == Some(DialogButton::Cancel) =>
-                {
-                    return self.update(Message::CloseSessionPicker);
-                }
-                Key::Named(Named::Enter) if can_resume => {
-                    return self.update(Message::SessionPickerResume(selected));
+                Key::Named(Named::Enter | Named::Space) => {
+                    let action = match picker.focus {
+                        SessionPickerFocus::List
+                            if can_resume
+                                && matches!(modified_key.as_ref(), Key::Named(Named::Enter)) =>
+                        {
+                            Some(Message::SessionPickerResume(selected))
+                        }
+                        SessionPickerFocus::EndSelected if entry_count > 0 => Some(
+                            Message::SessionPickerRequestEnd(SessionEndTarget::One(selected)),
+                        ),
+                        SessionPickerFocus::EndAll
+                            if picker.focus_available(SessionPickerFocus::EndAll) =>
+                        {
+                            Some(Message::SessionPickerRequestEnd(SessionEndTarget::All))
+                        }
+                        SessionPickerFocus::Dismiss => Some(Message::CloseSessionPicker),
+                        SessionPickerFocus::Resume if can_resume => {
+                            Some(Message::SessionPickerResume(selected))
+                        }
+                        _ => None,
+                    };
+                    return action.map_or_else(Vec::new, |action| self.update(action));
                 }
                 Key::Named(Named::ArrowUp | Named::ArrowDown) if entry_count > 0 => {
                     picker.selected = if matches!(modified_key.as_ref(), Key::Named(Named::ArrowUp))
@@ -5434,39 +5529,18 @@ impl Muxtrix {
                     } else {
                         selected.saturating_add(1).min(entry_count - 1)
                     };
+                    picker.focus = SessionPickerFocus::List;
                     self.dialog_button = None;
                     return Vec::new();
                 }
                 Key::Named(Named::Tab) => {
-                    self.dialog_button = if entry_count == 0 {
-                        Some(DialogButton::Confirm)
-                    } else if modifiers.shift() {
-                        match self.dialog_button {
-                            None if can_resume => Some(DialogButton::Confirm),
-                            None | Some(DialogButton::Confirm) => Some(DialogButton::Cancel),
-                            Some(DialogButton::Cancel) => None,
-                        }
-                    } else {
-                        match self.dialog_button {
-                            None => Some(DialogButton::Cancel),
-                            Some(DialogButton::Cancel) if can_resume => Some(DialogButton::Confirm),
-                            Some(_) => None,
-                        }
-                    };
+                    picker.step_focus(!modifiers.shift());
                 }
                 Key::Named(Named::ArrowLeft) => {
-                    self.dialog_button = Some(if entry_count == 0 {
-                        DialogButton::Confirm
-                    } else {
-                        DialogButton::Cancel
-                    });
+                    picker.step_focus(false);
                 }
                 Key::Named(Named::ArrowRight) => {
-                    self.dialog_button = Some(if can_resume || entry_count == 0 {
-                        DialogButton::Confirm
-                    } else {
-                        DialogButton::Cancel
-                    });
+                    picker.step_focus(true);
                 }
                 Key::Named(Named::Delete) if modifiers.control() => {
                     if entry_count > 1 || (picker.startup && entry_count > 0) {
