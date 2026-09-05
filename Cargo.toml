@@ -57,8 +57,8 @@ uuid = { version = "1.18.1", features = ["serde", "v4"] }
 
 [patch.crates-io]
 # The published 0.2.1 crate links the DLL import library on MSVC instead of the
-# static archive. Keep its tested Ghostty source pin and apply only the upstream
-# link correction until a fixed release is available.
+# static archive. Keep its tested Ghostty source pin, correct the static link,
+# and honor the C API scrollback line units (see the vendored README).
 libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }
 
 [workspace.lints.rust]

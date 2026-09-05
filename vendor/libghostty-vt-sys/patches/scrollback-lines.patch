@@ -1,0 +1,49 @@
+--- a/src/terminal/PageList.zig
++++ b/src/terminal/PageList.zig
+@@ -405,6 +405,10 @@
+ /// that are used ONLY for scrollback. If the active area is still partially
+ /// in a page that also includes scrollback, then that page is not included.
+ explicit_max_size: usize,
++
++/// Optional C API limit in rows. Native Ghostty callers retain byte budgets.
++/// Evict whole pages only when at least this many history rows remain.
++max_scrollback_rows: ?usize = null,
+ 
+ /// This is the minimum max size that we will respect due to the rows/cols
+ /// of the PageList. We must always be able to fit at least the active area
+@@ -1159,6 +1163,7 @@
+         .page_serial_epoch = 0,
+         .page_size = page_size,
+         .explicit_max_size = self.explicit_max_size,
++        .max_scrollback_rows = self.max_scrollback_rows,
+         .min_max_size = self.min_max_size,
+         .cols = self.cols,
+         .rows = self.rows,
+@@ -3527,7 +3532,10 @@
+     // initial allocation.
+     if (self.pages.first != null and
+         self.pages.first != self.pages.last and
+-        self.page_size + PagePool.item_size > self.maxSize())
++        (if (self.max_scrollback_rows) |limit|
++            self.total_rows - self.pages.first.?.rows() >= limit +| self.rows
++        else
++            self.page_size + PagePool.item_size > self.maxSize()))
+     prune: {
+         const first = self.pages.popFirst().?;
+         assert(first != last);
+--- a/src/terminal/c/terminal.zig
++++ b/src/terminal/c/terminal.zig
+@@ -345,6 +345,13 @@
+         .max_scrollback = opts.max_scrollback,
+     });
+     errdefer t.deinit(alloc);
++
++    // The C API documents max_scrollback in lines; Zig's initialization
++    // option is a byte budget. Use row-based page eviction for embedders,
++    // preserving zero's no-history behavior and the alternate screen.
++    if (opts.max_scrollback > 0) {
++        t.screens.active.pages.max_scrollback_rows = opts.max_scrollback;
++    }
+ 
+     // libghostty-vt embedders don't necessarily install Ghostty's shell
+     // integration, so don't assume OSC 133 prompts can be redrawn on resize.
