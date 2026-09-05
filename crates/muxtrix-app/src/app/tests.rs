@@ -3658,6 +3658,64 @@ fn agent_titles_prefer_harness_or_worktree_identity_over_the_brand() {
 }
 
 #[test]
+fn resumed_local_changes_use_the_last_shell_directory_when_replay_loses_pwd() {
+    let root = std::env::temp_dir().join(format!("muxtrix-resume-cwd-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create repository");
+    assert!(
+        git_in(&root, "", &["init"])
+            .expect("initialize repository")
+            .status
+            .success()
+    );
+    std::fs::write(root.join("unstaged.txt"), "pending work").expect("write local change");
+
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    let pane = app.session.workspaces[0].tabs[0]
+        .panes
+        .get_mut(&pane_id)
+        .expect("pane");
+    if let muxtrix_domain::SurfaceKind::Terminal(terminal) = &mut pane.surfaces[0].kind {
+        terminal.working_directory = Some(std::env::temp_dir());
+    }
+    let actor = TerminalActor::spawn(TerminalOptions {
+        cols: 80,
+        rows: 24,
+        max_scrollback: 0,
+    })
+    .expect("terminal");
+    let mut snapshot = actor.snapshot().expect("snapshot");
+    snapshot.pwd = Some(root.to_string_lossy().into_owned());
+    actor.shutdown().expect("shutdown terminal");
+    let runtime = app.terminals.get_mut(&pane_id).expect("pane runtime");
+    runtime.session.take();
+    runtime.set_snapshot(snapshot);
+
+    // A session may have launched elsewhere before the shell changed directory.
+    // Reattach replays only recent output, which need not contain the OSC report.
+    let saved = serde_json::to_string(&app.session_for_persistence()).expect("serialize session");
+    app.session = serde_json::from_str(&saved).expect("restore session");
+    app.terminals
+        .get_mut(&pane_id)
+        .expect("pane runtime")
+        .snapshot = None;
+    app.agent_statuses.clear();
+    assert_eq!(app.pane_working_directory(pane_id), Some(root.clone()));
+    let repository = github::repository_from(
+        &app.pane_working_directory(pane_id)
+            .expect("resumed directory"),
+        "",
+        "github.com",
+        &ProcessCancellation::default(),
+    )
+    .expect("resumed repository");
+    let changes =
+        github::load_local(&repository, &ProcessCancellation::default()).expect("local changes");
+    assert!(changes.files.iter().any(|file| file.path == "unstaged.txt"));
+    std::fs::remove_dir_all(root).expect("remove test repository");
+}
+
+#[test]
 fn session_layout_persists_agent_identity_for_reattach() {
     let mut app = Muxtrix::new();
     let pane_id = active_pane_id(&app);

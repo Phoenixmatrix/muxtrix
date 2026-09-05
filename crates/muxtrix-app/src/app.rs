@@ -4624,6 +4624,30 @@ impl Muxtrix {
         targets
     }
 
+    pub(crate) fn session_for_persistence(&self) -> muxtrix_domain::SessionState {
+        let mut session = session_with_agent_identities(&self.session, &self.agent_statuses);
+        for workspace in &mut session.workspaces {
+            for tab in &mut workspace.tabs {
+                for pane in tab.panes.values_mut() {
+                    let Some(directory) = self.pane_terminal_directory(pane.id) else {
+                        continue;
+                    };
+                    if let Some(surface) = pane
+                        .surfaces
+                        .iter_mut()
+                        .find(|surface| surface.id == pane.active_surface_id)
+                        && let muxtrix_domain::SurfaceKind::Terminal(terminal) = &mut surface.kind
+                    {
+                        // OSC 7 may have aged out of the daemon's replay buffer.
+                        // Resume from the last shell directory, not the launch directory.
+                        terminal.working_directory = Some(directory);
+                    }
+                }
+            }
+        }
+        session
+    }
+
     /// Pushes the current layout to this session's daemon whenever it
     /// changes, so the session is resumable exactly as last seen. Runs on
     /// the blink tick; the hash gate keeps quiet ticks free.
@@ -4631,7 +4655,7 @@ impl Muxtrix {
         let Some((_, client)) = session_host() else {
             return;
         };
-        let session = session_with_agent_identities(&self.session, &self.agent_statuses);
+        let session = self.session_for_persistence();
         let Ok(layout) = serde_json::to_string(&session) else {
             return;
         };
