@@ -77,7 +77,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TARGET");
     println!("cargo:rerun-if-env-changed=DEBUG");
     println!("cargo:rerun-if-env-changed=OPT_LEVEL");
-    println!("cargo:rerun-if-changed=crates/libghostty-vt-sys/build.rs");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=patches/scrollback-lines.patch");
 
     // An explicit source override should stay authoritative even when the
     // pkg-config feature is enabled, so local Ghostty checkouts remain easy to
@@ -96,6 +97,24 @@ fn main() {
     }
 
     build_vendored(link_mode);
+}
+
+/// Correct the pinned C API's documented line units without changing native
+/// Ghostty's byte-budget behavior. Check the reverse patch for repeat builds.
+fn apply_scrollback_patch(source: &Path) {
+    let patch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("patches/scrollback-lines.patch");
+    let already_applied = Command::new("git")
+        .args(["apply", "--reverse", "--check"])
+        .arg(&patch)
+        .current_dir(source)
+        .output()
+        .expect("failed to check Ghostty scrollback patch");
+    if already_applied.status.success() {
+        return;
+    }
+    let mut apply = Command::new("git");
+    apply.arg("apply").arg(&patch).current_dir(source);
+    run(apply, "apply Ghostty scrollback line-limit patch");
 }
 
 /// Build libghostty-vt from source via zig. The zig build itself generates
@@ -117,6 +136,8 @@ fn build_vendored(link_mode: LinkMode) {
         }
         Err(_) => fetch_ghostty(&out_dir),
     };
+
+    apply_scrollback_patch(&ghostty_dir);
 
     // Build libghostty-vt via zig.
     let install_prefix = out_dir.join("ghostty-install");

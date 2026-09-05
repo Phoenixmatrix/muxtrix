@@ -2727,6 +2727,77 @@ mod tests {
     }
 
     #[test]
+    fn configured_scrollback_retains_lines_across_widths_and_resize()
+    -> Result<(), TerminalActorError> {
+        for cols in [40, 80, 240] {
+            let mut terminal = TerminalCore::new(TerminalOptions {
+                cols,
+                rows: 24,
+                max_scrollback: 20_000,
+            })?;
+            // Use real VT output rather than merely checking the launch option.
+            for line in 0..20_000 {
+                terminal.feed(format!("line-{line:05}\r\n").as_bytes());
+            }
+            terminal.terminal.scroll_viewport(ScrollViewport::Top);
+            let top = terminal.snapshot()?;
+            assert!(
+                top.text().contains("line-00000"),
+                "cols={cols}: {:?}",
+                top.scrollbar
+            );
+            assert_eq!(
+                terminal.terminal.scrollback_rows().map_err(ghostty_error)?,
+                19_977
+            );
+
+            // Widening a pane must not turn its line limit into a smaller
+            // effective byte budget. Short lines avoid reflow in this check.
+            terminal
+                .terminal
+                .resize(300, 24, 8, 16)
+                .map_err(ghostty_error)?;
+            for line in 20_000..60_000 {
+                terminal.feed(format!("\x1b[32mline-{line:05}\x1b[0m\r\n").as_bytes());
+            }
+            let history = terminal.terminal.scrollback_rows().map_err(ghostty_error)?;
+            // Ghostty recycles whole pages, so allow a small page-sized excess.
+            assert!(
+                (20_000..20_512).contains(&history),
+                "cols={cols}: {history}"
+            );
+            terminal.terminal.scroll_viewport(ScrollViewport::Top);
+            let top = terminal.snapshot()?.text();
+            assert!(!top.contains("line-00000"));
+            terminal.terminal.scroll_viewport(ScrollViewport::Bottom);
+            assert!(terminal.snapshot()?.text().contains("line-59999"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn zero_scrollback_and_alternate_screen_keep_no_history() -> Result<(), TerminalActorError> {
+        for limit in [0, 20_000] {
+            let mut terminal = TerminalCore::new(TerminalOptions {
+                cols: 80,
+                rows: 24,
+                max_scrollback: limit,
+            })?;
+            if limit != 0 {
+                terminal.feed(b"\x1b[?1049h");
+            }
+            for _ in 0..1_000 {
+                terminal.feed(b"output\r\n");
+            }
+            assert_eq!(
+                terminal.terminal.scrollback_rows().map_err(ghostty_error)?,
+                0
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn viewport_scroll_uses_ghostty_scrollback() -> Result<(), TerminalActorError> {
         let mut terminal = TerminalCore::new(options())?;
         terminal.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");

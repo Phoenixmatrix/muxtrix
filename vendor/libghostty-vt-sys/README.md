@@ -21,14 +21,25 @@ Raw FFI bindings for libghostty-vt.
 
 ## Muxtrix vendoring note
 
-This directory is the published `libghostty-vt-sys` 0.2.1 crate with one
-intentional build-script correction. On MSVC, static builds link
-`ghostty-vt-static.lib` instead of the DLL import library `ghostty-vt.lib`.
-The correction comes from upstream commit
+This directory is based on the published `libghostty-vt-sys` 0.2.1 crate.
+On MSVC, static builds link `ghostty-vt-static.lib` instead of the DLL import
+library `ghostty-vt.lib`, following upstream commit
 `bac73b914d936e945de4a6b93bed75ae1ce8895c`.
 
-Muxtrix vendors the released crate instead of depending on that Git revision
-because the revision also advances Ghostty's source pin and Zig requirement.
-Remove this patch and the root `[patch.crates-io]` entry after a released crate
-contains the MSVC correction while remaining compatible with Muxtrix's pinned
-toolchain.
+`patches/scrollback-lines.patch` corrects the pinned Ghostty C API's
+`max_scrollback` implementation: its public header and Rust wrapper specify
+lines, but it forwards that number to a byte budget. The patch enables a
+row-based eviction threshold for C API terminals while preserving native
+Ghostty's byte budgets. It uses the existing whole-page recycling and tracked
+pin handling, retaining at least the requested number of history rows with a
+small page-granularity excess. Width changes do not reduce the row budget;
+zero and alternate-screen no-history behavior remain intact. Cloned page
+lists preserve the limit.
+
+The build applies the patch idempotently to fetched sources and explicit
+`GHOSTTY_SOURCE_DIR` checkouts. An incompatible source override fails at patch
+application. An external `pkg-config` library must provide equivalent line
+semantics; Muxtrix uses the patched vendored build.
+
+Muxtrix keeps the tested Ghostty source pin and Zig requirement. Remove the
+local corrections when a compatible released crate includes them.
