@@ -556,11 +556,20 @@ fn session_picker_all_cleanup_is_confirmed_and_preserves_partial_failure() {
             session_picker_record(),
             session_picker_record(),
         ],
-        false,
+        true,
     );
     // A daemon may disappear between discovery and confirmation. Put the
     // unreachable entry last so subsequent successful removals cannot hide it.
-    app.session_picker.as_mut().expect("session picker").entries[2].alive = true;
+    for (index, entry) in app
+        .session_picker
+        .as_mut()
+        .expect("session picker")
+        .entries
+        .iter_mut()
+        .enumerate()
+    {
+        entry.alive = index == 2;
+    }
     drop(app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::CTRL)));
     drop(app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::empty())));
     assert_eq!(
@@ -581,7 +590,11 @@ fn session_picker_all_cleanup_is_confirmed_and_preserves_partial_failure() {
 
     drop(app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::CTRL)));
     drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::SHIFT)));
-    drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+    let effects = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+    assert!(
+        effects.is_empty(),
+        "partial cleanup must not start a new host"
+    );
     let picker = app
         .session_picker
         .as_ref()
@@ -600,6 +613,64 @@ fn session_picker_all_cleanup_is_confirmed_and_preserves_partial_failure() {
     assert_eq!(picker.selected, 0);
     drop(app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::empty())));
     assert!(app.session_picker.is_none());
+}
+
+#[test]
+fn session_picker_bulk_cleanup_starts_fresh_once_only_after_success() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    app.terminals
+        .get_mut(&pane_id)
+        .expect("startup pane")
+        .launch_state = TerminalLaunchState::PreparingHost;
+    drop(app.update(Message::SessionHostInitialized(
+        pane_id,
+        Ok(vec![session_picker_record()]),
+    )));
+    // Manually stopped metadata isolates cleanup-success continuation from
+    // live daemon transport; startup itself does not refresh this flag.
+    for entry in &mut app.session_picker.as_mut().expect("session picker").entries {
+        entry.alive = false;
+    }
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::CTRL)));
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .confirm_end,
+        Some(SessionEndTarget::All),
+        "bulk confirmation must remain keyboard-accessible for one session",
+    );
+    let canceled = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+    assert!(canceled.is_empty());
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("canceled picker")
+            .entries
+            .len(),
+        1
+    );
+
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::CTRL)));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    let effects = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+    assert!(
+        app.session_picker.is_none(),
+        "successful cleanup continues startup"
+    );
+    let [Effect::Perform(effect)] = effects.as_slice() else {
+        panic!("successful bulk cleanup must schedule the new host");
+    };
+    assert!(
+        app.update(Message::SessionPickerConfirmEnd).is_empty(),
+        "confirmation is single-use"
+    );
+    drop(app.update(effect.resolve(Some("thread unavailable".into()))));
+    assert!(matches!(
+        app.terminals[&pane_id].launch_state,
+        TerminalLaunchState::Failed(_)
+    ));
 }
 
 #[test]

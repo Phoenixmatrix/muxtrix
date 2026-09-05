@@ -13,7 +13,7 @@ use crate::app::{
     DialogButton, Message, RenameTarget, SessionEndTarget, SettingsButtonKind, WorktreeManagerMode,
     WorktreeManagerState, agent_display_name, ellipsize, worktree_display_name,
 };
-use crate::runtime::gpui::{Root, color};
+use crate::runtime::gpui::{Root, color, ui_family};
 use crate::theme::DesignTokens;
 use crate::views::terminal_family;
 
@@ -21,7 +21,11 @@ impl Root {
     /// The active dialog and the message that dismisses it.
     ///
     /// One place decides precedence so two dialogs can never be open at once.
-    pub(crate) fn dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn dialog(
+        &self,
+        window: &gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let app = self.app();
         let tokens = DesignTokens::for_appearance(app.settings.appearance);
 
@@ -95,7 +99,7 @@ impl Root {
                 } else {
                     Message::CloseSessionPicker
                 },
-                self.session_picker(picker, tokens, cx),
+                self.session_picker(picker, tokens, window, cx),
             )
         } else if let Some(manager) = app
             .worktree_manager
@@ -159,6 +163,7 @@ impl Root {
         &self,
         picker: &crate::app::SessionPickerState,
         tokens: DesignTokens,
+        window: &gpui::Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let app = self.app();
@@ -183,6 +188,12 @@ impl Root {
                     format!("End {}?", entry.record.name),
                     "Its terminals and running agents will stop. This cannot be undone.",
                     "End session",
+                )
+            } else if picker.startup {
+                (
+                    "End all sessions and start fresh?".to_owned(),
+                    "All listed sessions will be removed and their terminals and agents will stop. A new session will start only if cleanup succeeds. This cannot be undone.",
+                    "End all & start fresh",
                 )
             } else {
                 (
@@ -295,6 +306,28 @@ impl Root {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_secs());
+            // Share content-measured columns across rows. Only session names
+            // may truncate; status and action widths follow the actual UI font.
+            let label_width = |label: &'static str| {
+                let run = gpui::TextRun {
+                    len: label.len(),
+                    font: gpui::Font {
+                        family: ui_family(settings),
+                        weight: gpui::FontWeight(f32::from(settings.ui_font_weight.numeric())),
+                        ..Default::default()
+                    },
+                    color: color(tokens.muted).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let line = window
+                    .text_system()
+                    .shape_line(label.into(), ui(9.), &[run], None);
+                px(f32::from(line.width).ceil())
+            };
+            let status_width = label_width("Running").max(label_width("Stopped"));
+            let action_width = label_width("End session").max(label_width("Remove")) + px(24.);
             let mut rows = div()
                 .id("session-list")
                 .flex()
@@ -370,6 +403,7 @@ impl Root {
                                 .flex_col()
                                 .gap(px(4.))
                                 .flex_grow(1.)
+                                .flex_basis(px(0.))
                                 .min_w(px(0.))
                                 .child(
                                     div()
@@ -414,6 +448,8 @@ impl Root {
                         .child(
                             div()
                                 .flex_shrink_0()
+                                .w(status_width)
+                                .whitespace_nowrap()
                                 .text_size(ui(9.))
                                 .text_color(color(tokens.muted))
                                 .child(if entry.alive { "Running" } else { "Stopped" }),
@@ -421,10 +457,11 @@ impl Root {
                         .child(
                             div()
                                 .flex_shrink_0()
+                                .w(action_width)
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(self.settings_action_button(
                                     "session-end",
-                                    if entry.alive { "End…" } else { "Remove…" },
+                                    if entry.alive { "End session" } else { "Remove" },
                                     Message::SessionPickerRequestEnd(SessionEndTarget::One(index)),
                                     SettingsButtonKind::Quiet,
                                     tokens,
@@ -436,15 +473,24 @@ impl Root {
             card = card.child(div().mx(px(16.)).mb(px(16.)).child(rows));
         }
         let mut actions = div().flex().items_center().justify_end().gap(px(8.));
-        if picker.entries.len() > 1 {
-            actions = actions.child(div().flex_grow(1.).child(self.settings_action_button(
-                "session-end-all",
-                "End all…",
-                Message::SessionPickerRequestEnd(SessionEndTarget::All),
-                SettingsButtonKind::Quiet,
-                tokens,
-                cx,
-            )));
+        if picker.entries.len() > 1 || (picker.startup && !empty) {
+            actions = actions.child(
+                div()
+                    .flex()
+                    .flex_grow(1.)
+                    .child(self.settings_action_button(
+                        "session-end-all",
+                        if picker.startup {
+                            "End all & start fresh"
+                        } else {
+                            "End all sessions"
+                        },
+                        Message::SessionPickerRequestEnd(SessionEndTarget::All),
+                        SettingsButtonKind::Secondary,
+                        tokens,
+                        cx,
+                    )),
+            );
         } else {
             actions = actions.child(div().flex_grow(1.));
         }

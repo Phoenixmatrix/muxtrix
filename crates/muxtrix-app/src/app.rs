@@ -2920,9 +2920,17 @@ impl Muxtrix {
                 match target {
                     SessionEndTarget::One(index) => self.kill_picked_session(index),
                     SessionEndTarget::All => {
+                        let start_fresh = picker.startup;
                         let count = picker.entries.len();
                         for index in (0..count).rev() {
                             self.kill_picked_session(index);
+                        }
+                        if start_fresh
+                            && self.session_picker.as_ref().is_some_and(|picker| {
+                                picker.entries.is_empty() && picker.error.is_none()
+                            })
+                        {
+                            return self.update(Message::CloseSessionPicker);
                         }
                     }
                 }
@@ -5461,7 +5469,7 @@ impl Muxtrix {
                     });
                 }
                 Key::Named(Named::Delete) if modifiers.control() => {
-                    if entry_count > 1 {
+                    if entry_count > 1 || (picker.startup && entry_count > 0) {
                         return self
                             .update(Message::SessionPickerRequestEnd(SessionEndTarget::All));
                     }

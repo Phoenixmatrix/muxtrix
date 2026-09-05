@@ -338,6 +338,12 @@ confirmation, which defaults to Cancel. Keyboard selection is revealed inside
 the scrollable inventory while the footer stays visible at the minimum window
 size and across the supported UI type scale. Global toasts sit below modal
 surfaces, never over their controls.
+Status and row actions share columns measured from the rendered UI font, not
+per-row content widths. Action labels stay complete: End session and Remove,
+without ellipses. End all & start fresh is a bordered secondary button during
+startup; confirmation ends the listed sessions and continues into a fresh
+session only when cleanup succeeds. In-app management instead offers End all
+sessions without replacing the current session.
 
 Settings follows a compact native preference-table grammar: section headings
 sit outside continuous bordered row groups; each row pairs a left label and

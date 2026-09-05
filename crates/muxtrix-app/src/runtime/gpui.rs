@@ -911,7 +911,7 @@ impl Render for Root {
         let sidebar = self.view_sidebar(cx);
         let github = self.github_panel(cx);
         let palette = self.command_palette(cx);
-        let dialog = self.dialog(cx);
+        let dialog = self.dialog(window, cx);
         let toast = self.toast();
         let status_bar = self.status_bar();
         let workspace = self.view_workspace(window, cx);

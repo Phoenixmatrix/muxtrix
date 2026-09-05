@@ -825,6 +825,9 @@ impl Scenario {
                 if self.settle_ticks == 2
                     && (self.capturing("session-picker")
                         || self.capturing("session-picker-confirmation")
+                        || self.capturing("session-picker-bulk-confirmation")
+                        || self.capturing("session-picker-stopped")
+                        || self.capturing("session-picker-single")
                         || self.capturing("session-picker-many"))
                 {
                     self.exercise_session_picker_capture(app)?;
@@ -981,13 +984,20 @@ impl Scenario {
             return Err("session picker ignored Up".into());
         }
         let _ = app.update(Message::SessionPickerSelect(initial));
-        if self.capturing("session-picker-confirmation") {
-            let _ = app.update(Message::SessionPickerRequestEnd(SessionEndTarget::One(0)));
+        if self.capturing("session-picker-confirmation")
+            || self.capturing("session-picker-bulk-confirmation")
+        {
+            let target = if self.capturing("session-picker-bulk-confirmation") {
+                SessionEndTarget::All
+            } else {
+                SessionEndTarget::One(0)
+            };
+            let _ = app.update(Message::SessionPickerRequestEnd(target));
             if app
                 .session_picker
                 .as_ref()
                 .and_then(|picker| picker.confirm_end)
-                != Some(SessionEndTarget::One(0))
+                != Some(target)
                 || app.dialog_button != Some(DialogButton::Cancel)
             {
                 return Err(
@@ -1624,6 +1634,9 @@ impl Scenario {
             app.active_view = ActiveView::ThemeGallery;
         } else if self.capturing("session-picker")
             || self.capturing("session-picker-confirmation")
+            || self.capturing("session-picker-bulk-confirmation")
+            || self.capturing("session-picker-stopped")
+            || self.capturing("session-picker-single")
             || self.capturing("session-picker-empty")
             || self.capturing("session-picker-many")
         {
@@ -1640,6 +1653,8 @@ impl Scenario {
             ];
             if self.capturing("session-picker-empty") {
                 samples.clear();
+            } else if self.capturing("session-picker-single") {
+                samples.truncate(1);
             } else if self.capturing("session-picker-many") {
                 samples.extend((0..15).map(|index| {
                     (
@@ -1659,10 +1674,17 @@ impl Scenario {
                     *alive = index == last;
                 }
             }
-            let selected = samples
-                .iter()
-                .position(|(_, alive, _, _)| *alive)
-                .unwrap_or(0);
+            let selected = if self.capturing("session-picker-stopped") {
+                samples
+                    .iter()
+                    .position(|(_, alive, _, _)| !alive)
+                    .unwrap_or(0)
+            } else {
+                samples
+                    .iter()
+                    .position(|(_, alive, _, _)| *alive)
+                    .unwrap_or(0)
+            };
             app.dialog_button = None;
             app.session_picker = Some(crate::app::SessionPickerState {
                 entries: samples
