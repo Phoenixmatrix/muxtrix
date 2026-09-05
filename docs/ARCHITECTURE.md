@@ -113,10 +113,16 @@ process host
 ```
 
 The implemented actor uses one blocking PTY reader thread and one owning
-session thread. Only byte buffers cross from the reader. The session thread
-feeds Ghostty, writes any terminal-generated replies to the PTY, creates render
-snapshots, and publishes those snapshots to the application loop. This preserves
-ordering and keeps every Ghostty handle on the thread that created it.
+session thread. Local PTY reads become live output packets. Daemon output
+retains a backlog/live tag through the client and actor queues: replay feeds
+Ghostty to reconstruct the screen, but its terminal-generated replies are
+discarded rather than typed into the current shell. Live queries still receive
+replies. Replay provenance belongs to each packet, not a shared flag or the
+arrival time of `BacklogDone`, so slow consumers and older daemons remain safe.
+The daemon serializes backlog capture and delivery with live-output buffering
+and delivery to preserve their ordering. The session thread creates render
+snapshots and publishes them to the application loop, keeping every Ghostty
+handle on the thread that created it.
 
 ## GPU strategy
 

@@ -35,6 +35,8 @@ struct Shared {
     id: Uuid,
     endpoint: String,
     panes: Mutex<HashMap<Uuid, Pane>>,
+    /// When both are needed, lock panes before client. Attaching and emitting
+    /// live output hold panes through emission to keep the replay boundary atomic.
     client: Mutex<Option<SendHalf>>,
     layout: Mutex<Option<String>>,
     name: Mutex<String>,
@@ -202,6 +204,9 @@ pub fn run(id: Uuid, name: String, endpoint: String) -> Result<(), String> {
                         .client_attached
                         .store(true, std::sync::atomic::Ordering::Release);
                     write_registry(&record());
+                    // Snapshot and deliver under the same lock used by the
+                    // PTY reader's append-and-emit, so live bytes cannot jump
+                    // ahead of their history or appear in both streams.
                     let panes_guard = shared.panes.lock().expect("panes");
                     let summaries: Vec<PaneSummary> = panes_guard
                         .iter()
@@ -210,19 +215,19 @@ pub fn run(id: Uuid, name: String, endpoint: String) -> Result<(), String> {
                             exited: state.exited,
                         })
                         .collect();
-                    let backlogs: Vec<(Uuid, String)> = panes_guard
-                        .iter()
-                        .map(|(pane, state)| (*pane, BASE64.encode(&state.backlog)))
-                        .collect();
-                    drop(panes_guard);
                     shared.emit(&Event::Attached {
                         panes: summaries,
                         layout: shared.layout.lock().expect("layout").clone(),
                     });
-                    for (pane, data) in backlogs {
-                        shared.emit(&Event::Backlog { pane, data });
+                    for (pane, state) in panes_guard.iter() {
+                        let pane = *pane;
+                        shared.emit(&Event::Backlog {
+                            pane,
+                            data: BASE64.encode(&state.backlog),
+                        });
                         shared.emit(&Event::BacklogDone { pane });
                     }
+                    drop(panes_guard);
                 }
                 Request::Spawn {
                     pane,
@@ -397,11 +402,11 @@ fn spawn_pane_reader(
                                     state.backlog.drain(..=newline);
                                 }
                             }
+                            shared.emit(&Event::Output {
+                                pane,
+                                data: BASE64.encode(bytes),
+                            });
                         }
-                        shared.emit(&Event::Output {
-                            pane,
-                            data: BASE64.encode(bytes),
-                        });
                     }
                 }
             }
@@ -506,6 +511,7 @@ pub fn wait_until_ready(endpoint: &str) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use muxtrix_platform::PtyOutput;
 
     fn start_test_daemon(prefix: &str) -> (Uuid, std::path::PathBuf, crate::SessionClient) {
         let id = Uuid::new_v4();
@@ -561,7 +567,9 @@ mod tests {
         let mut seen = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
-            if let Ok(bytes) = output.recv_timeout(std::time::Duration::from_millis(100)) {
+            if let Ok(PtyOutput::Live(bytes)) =
+                output.recv_timeout(std::time::Duration::from_millis(100))
+            {
                 seen.extend_from_slice(&bytes);
             }
             if String::from_utf8_lossy(&seen).contains("persistence-marker") {
@@ -584,7 +592,9 @@ mod tests {
         let mut replayed = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
-            if let Ok(bytes) = replay.recv_timeout(std::time::Duration::from_millis(100)) {
+            if let Ok(PtyOutput::Backlog(bytes)) =
+                replay.recv_timeout(std::time::Duration::from_millis(100))
+            {
                 replayed.extend_from_slice(&bytes);
             }
             if String::from_utf8_lossy(&replayed).contains("persistence-marker") {
@@ -620,7 +630,9 @@ mod tests {
         let mut seen = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
-            if let Ok(bytes) = output.recv_timeout(std::time::Duration::from_millis(100)) {
+            if let Ok(PtyOutput::Live(bytes)) =
+                output.recv_timeout(std::time::Duration::from_millis(100))
+            {
                 seen.extend_from_slice(&bytes);
             }
             if String::from_utf8_lossy(&seen).contains("ready") {
@@ -714,7 +726,6 @@ mod tests {
             None,
             "a replacement pane must not inherit the exit of the pane it replaced"
         );
-        assert!(!client.pane_replaying(pane));
         assert_eq!(client.pane_spawn_failure(pane), None);
         client.send(&Request::Shutdown).expect("shutdown");
         let _ = std::fs::remove_dir_all(&dir);
@@ -823,12 +834,13 @@ mod tests {
             rows: 24,
             cols: 80,
         };
-        let await_marker = |output: &std::sync::mpsc::Receiver<Vec<u8>>, marker: &str| {
+        let await_marker = |output: &std::sync::mpsc::Receiver<PtyOutput>, marker: &str| {
             let mut seen = Vec::new();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while std::time::Instant::now() < deadline {
                 match output.recv_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(bytes) => seen.extend_from_slice(&bytes),
+                    Ok(PtyOutput::Live(bytes)) => seen.extend_from_slice(&bytes),
+                    Ok(PtyOutput::Backlog(_)) => panic!("new panes must stream live output"),
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }

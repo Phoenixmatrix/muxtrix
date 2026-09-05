@@ -17,6 +17,7 @@ use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, SendHalf, Stream, ToFsName as _, ToNsName as _,
     traits::Stream as _,
 };
+use muxtrix_platform::PtyOutput;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -76,9 +77,8 @@ pub enum Event {
         pane: Uuid,
         data: String,
     },
-    /// All buffered history for the pane has been replayed; output after
-    /// this is live. Clients gate PTY query-response write-back on it —
-    /// answering a historical query types garbage into the live shell.
+    /// Legacy replay boundary retained for older clients. Output provenance is
+    /// carried by Backlog and Output themselves, not by consuming this marker.
     BacklogDone {
         pane: Uuid,
     },
@@ -206,15 +206,13 @@ pub fn session_endpoint(id: Uuid) -> String {
 }
 
 /// Client half: owns the socket, demultiplexes daemon events per pane, and
-/// hands each pane a byte stream plus control handles.
+/// hands each pane output packets with replay provenance plus control handles.
 pub struct SessionClient {
     writer: Arc<Mutex<SendHalf>>,
     events: Mutex<Receiver<Event>>,
-    pane_outputs: Arc<Mutex<HashMap<Uuid, Sender<Vec<u8>>>>>,
+    pane_outputs: Arc<Mutex<HashMap<Uuid, Sender<PtyOutput>>>>,
     pane_exits: Arc<Mutex<HashMap<Uuid, bool>>>,
     pane_pids: Arc<Mutex<HashMap<Uuid, u32>>>,
-    /// Panes currently replaying backlog; absent means live.
-    pane_replaying: Arc<Mutex<HashMap<Uuid, bool>>>,
     /// Why the host could not start a pane's process. Without this a failed
     /// spawn is indistinguishable from a pane that simply never printed:
     /// the request was written successfully, and the failure arrives later
@@ -229,7 +227,7 @@ pub struct SessionClient {
 /// therefore races the actor: it can observe EOF before `pane_exits` is filled
 /// and retain an ordinary `exit` as an unresponsive, unclean pane.
 fn finish_tracked_pane(
-    outputs: &Mutex<HashMap<Uuid, Sender<Vec<u8>>>>,
+    outputs: &Mutex<HashMap<Uuid, Sender<PtyOutput>>>,
     exits: &Mutex<HashMap<Uuid, bool>>,
     spawn_failures: &Mutex<HashMap<Uuid, String>>,
     pane: Uuid,
@@ -260,17 +258,15 @@ impl SessionClient {
         let stream = connect(endpoint)?;
         let (read_half, mut writer) = Stream::split(stream);
         let (event_tx, event_rx) = mpsc::channel();
-        let pane_outputs: Arc<Mutex<HashMap<Uuid, Sender<Vec<u8>>>>> =
+        let pane_outputs: Arc<Mutex<HashMap<Uuid, Sender<PtyOutput>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let pane_exits: Arc<Mutex<HashMap<Uuid, bool>>> = Arc::new(Mutex::new(HashMap::new()));
         let pane_pids: Arc<Mutex<HashMap<Uuid, u32>>> = Arc::new(Mutex::new(HashMap::new()));
-        let pane_replaying: Arc<Mutex<HashMap<Uuid, bool>>> = Arc::new(Mutex::new(HashMap::new()));
         let pane_spawn_failures: Arc<Mutex<HashMap<Uuid, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let outputs = Arc::clone(&pane_outputs);
         let exits = Arc::clone(&pane_exits);
         let pids = Arc::clone(&pane_pids);
-        let replaying = Arc::clone(&pane_replaying);
         let spawn_failures = Arc::clone(&pane_spawn_failures);
         let reader = BufReader::new(read_half);
         std::thread::Builder::new()
@@ -283,26 +279,21 @@ impl SessionClient {
                     };
                     match &event {
                         Event::Backlog { pane, data } => {
-                            replaying.lock().expect("replaying").insert(*pane, true);
                             if let Ok(bytes) = BASE64.decode(data)
                                 && let Some(sender) = outputs.lock().expect("outputs").get(pane)
                             {
-                                let _ = sender.send(bytes);
+                                let _ = sender.send(PtyOutput::Backlog(bytes));
                             }
                             continue;
                         }
-                        Event::BacklogDone { pane } => {
-                            replaying.lock().expect("replaying").remove(pane);
+                        Event::BacklogDone { .. } => {
                             continue;
                         }
                         Event::Output { pane, data } => {
-                            // Live output also ends replay — covers daemons
-                            // predating BacklogDone.
-                            replaying.lock().expect("replaying").remove(pane);
                             if let Ok(bytes) = BASE64.decode(data)
                                 && let Some(sender) = outputs.lock().expect("outputs").get(pane)
                             {
-                                let _ = sender.send(bytes);
+                                let _ = sender.send(PtyOutput::Live(bytes));
                             }
                             continue;
                         }
@@ -359,7 +350,6 @@ impl SessionClient {
                 pane_outputs,
                 pane_exits,
                 pane_pids,
-                pane_replaying,
                 pane_spawn_failures,
             },
             panes,
@@ -381,21 +371,20 @@ impl SessionClient {
     fn clear_pane_metadata(&self, pane: Uuid) {
         self.pane_exits.lock().expect("exits").remove(&pane);
         self.pane_pids.lock().expect("pids").remove(&pane);
-        self.pane_replaying.lock().expect("replaying").remove(&pane);
         self.pane_spawn_failures
             .lock()
             .expect("spawn failures")
             .remove(&pane);
     }
 
-    /// Registers a pane and returns the receiver its output bytes arrive on.
+    /// Registers a pane and returns its output packets. Each packet retains
+    /// whether it is historical or live, even when consumption is delayed.
     ///
     /// Pane ids are durable, so this is also how a replacement claims the id
     /// of the pane it replaces. Everything recorded about the previous
     /// incarnation is dropped here: an inherited exit makes the replacement
-    /// report itself dead the moment it is polled, and an inherited replay
-    /// flag makes it swallow the terminal's own responses.
-    pub fn register_pane(&self, pane: Uuid) -> Receiver<Vec<u8>> {
+    /// report itself dead the moment it is polled.
+    pub fn register_pane(&self, pane: Uuid) -> Receiver<PtyOutput> {
         let (sender, receiver) = mpsc::channel();
         // This lock is the pane lifecycle boundary. Holding it while stale
         // metadata is cleared prevents a concurrent exit event from leaving
@@ -418,7 +407,7 @@ impl SessionClient {
     }
 
     /// Whether the client is still streaming this pane. False once the pane
-    /// has exited or been unregistered — in both cases its byte channel is
+    /// has exited or been unregistered — in both cases its output channel is
     /// closed and its reader has ended.
     pub fn tracks_pane(&self, pane: Uuid) -> bool {
         self.pane_outputs
@@ -442,14 +431,6 @@ impl SessionClient {
             .expect("spawn failures")
             .get(&pane)
             .cloned()
-    }
-
-    /// Whether the pane is still replaying buffered history.
-    pub fn pane_replaying(&self, pane: Uuid) -> bool {
-        self.pane_replaying
-            .lock()
-            .expect("replaying")
-            .contains_key(&pane)
     }
 }
 

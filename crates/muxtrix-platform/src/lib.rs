@@ -9,6 +9,14 @@ use thiserror::Error;
 
 pub use portable_pty::PtySize;
 
+/// PTY bytes with immutable provenance, preserved until the terminal consumes
+/// them. Replaying history must rebuild the screen without answering old queries.
+#[derive(Debug)]
+pub enum PtyOutput {
+    Live(Vec<u8>),
+    Backlog(Vec<u8>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPlan {
     pub executable: String,

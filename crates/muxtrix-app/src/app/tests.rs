@@ -6,6 +6,172 @@
 
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn resumed_backlog_never_writes_query_replies_into_the_live_prompt() {
+    use muxtrix_sessions::{Event, Request, encode_bytes};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    // Surviving daemons may predate the BacklogDone protocol marker.
+    for backlog_done in [true, false] {
+        let endpoint =
+            std::env::temp_dir().join(format!("muxtrix-replay-{}.sock", uuid::Uuid::new_v4()));
+        let listener = UnixListener::bind(&endpoint).expect("session socket");
+        let pane = uuid::Uuid::new_v4();
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("bound server reads");
+            let reader = BufReader::new(stream.try_clone().expect("clone client stream"));
+            let mut attaches = 0;
+            for line in reader.lines() {
+                let request: Request = serde_json::from_str(&line.expect("read client request"))
+                    .expect("decode client request");
+                let mut emit = |event: Event| {
+                    writeln!(
+                        stream,
+                        "{}",
+                        serde_json::to_string(&event).expect("encode event")
+                    )
+                    .expect("send session event");
+                };
+                match request {
+                    Request::Attach => {
+                        attaches += 1;
+                        if attaches == 2 {
+                            emit(Event::Backlog {
+                                pane,
+                                data: encode_bytes(b""),
+                            });
+                            // Exceed the PTY reader buffer, including queries on
+                            // both sides of a read boundary.
+                            let mut backlog =
+                                b"\x1b[6n\x1b[c\x1b]10;?\x07\x1b]11;?\x07\x1b[?u".to_vec();
+                            backlog.extend(vec![b'\r'; 32 * 1024]);
+                            backlog.extend_from_slice(b"\x1b[6");
+                            emit(Event::Backlog {
+                                pane,
+                                data: encode_bytes(&backlog),
+                            });
+                            emit(Event::Backlog {
+                                pane,
+                                data: encode_bytes(b"n\r\nrestored-prompt"),
+                            });
+                            if backlog_done {
+                                emit(Event::BacklogDone { pane });
+                            }
+                        }
+                        // Barrier: the socket has consumed all replay events
+                        // before the terminal's replay consumer starts.
+                        emit(Event::Attached {
+                            panes: Vec::new(),
+                            layout: None,
+                        });
+                    }
+                    Request::Input { data, .. } => {
+                        input_tx.send(data.clone()).expect("record PTY input");
+                        if data == encode_bytes(b"typed") {
+                            emit(Event::Output {
+                                pane,
+                                data: encode_bytes(b"\x1b[3;5H\x1b[6"),
+                            });
+                            emit(Event::Output {
+                                pane,
+                                data: encode_bytes(b""),
+                            });
+                            emit(Event::Output {
+                                pane,
+                                data: encode_bytes(b"n"),
+                            });
+                        }
+                    }
+                    Request::Detach => break,
+                    _ => {}
+                }
+            }
+        });
+        let (client, _, _) = muxtrix_sessions::SessionClient::connect_endpoint(
+            endpoint.to_str().expect("UTF-8 socket path"),
+        )
+        .expect("connect session client");
+        let client = Arc::new(client);
+        let output = client.register_pane(pane);
+        client
+            .send(&Request::Attach)
+            .expect("request registered replay");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(Event::Attached { .. }) = client.try_event() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replay barrier timed out"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let session = LiveSession::spawn_remote(
+            Box::new(RemotePaneBackend {
+                pane,
+                client: Arc::clone(&client),
+                output: Some(output),
+            }),
+            initial_pty_size(),
+            TerminalOptions {
+                cols: initial_pty_size().cols,
+                rows: initial_pty_size().rows,
+                max_scrollback: 100,
+            },
+            TerminalThemeId::default().preset().terminal_theme(),
+            None,
+        )
+        .expect("start replay consumer");
+        loop {
+            let snapshot = session.snapshot().expect("read restored screen");
+            let text: String = snapshot
+                .cells
+                .iter()
+                .flat_map(|row| row.iter())
+                .map(|cell| cell.text.as_str())
+                .collect();
+            if text.contains("restored-prompt") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal replay timed out"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        session.input(b"typed".to_vec()).expect("type into prompt");
+        let first = input_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first PTY input");
+        let second = input_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("live query reply");
+        session.shutdown().expect("stop terminal actor");
+        client.unregister_pane(pane);
+        drop(client);
+        server.join().expect("join session server");
+        std::fs::remove_file(endpoint).expect("remove session socket");
+        assert_eq!(
+            first,
+            encode_bytes(b"typed"),
+            "historical queries must not type replies into the prompt"
+        );
+        assert_eq!(
+            second,
+            encode_bytes(b"\x1b[3;5R"),
+            "fresh queries must still receive replies"
+        );
+    }
+}
+
 #[test]
 fn settings_change_detection_tracks_edits_and_reverts() {
     let saved = AppSettings::default();
@@ -1733,10 +1899,10 @@ impl std::io::Read for ParkedReader {
 }
 
 impl muxtrix_terminal::SessionBackend for RecordingBackend {
-    fn take_reader(&mut self) -> Result<Box<dyn std::io::Read + Send>, String> {
+    fn take_reader(&mut self) -> Result<muxtrix_terminal::SessionReader, String> {
         self.reader
             .take()
-            .map(|reader| Box::new(reader) as Box<dyn std::io::Read + Send>)
+            .map(|reader| muxtrix_terminal::SessionReader::Pty(Box::new(reader)))
             .ok_or_else(|| "the recording reader was already taken".to_owned())
     }
     fn write_all(&mut self, _bytes: &[u8]) -> Result<(), String> {
@@ -1770,10 +1936,10 @@ struct SlowWriteBackend {
 }
 
 impl muxtrix_terminal::SessionBackend for SlowWriteBackend {
-    fn take_reader(&mut self) -> Result<Box<dyn std::io::Read + Send>, String> {
+    fn take_reader(&mut self) -> Result<muxtrix_terminal::SessionReader, String> {
         self.reader
             .take()
-            .map(|reader| Box::new(reader) as Box<dyn std::io::Read + Send>)
+            .map(|reader| muxtrix_terminal::SessionReader::Pty(Box::new(reader)))
             .ok_or_else(|| "the slow writer's reader was already taken".to_owned())
     }
     fn write_all(&mut self, _bytes: &[u8]) -> Result<(), String> {
@@ -1951,10 +2117,10 @@ struct KillTrackingBackend {
 }
 
 impl muxtrix_terminal::SessionBackend for KillTrackingBackend {
-    fn take_reader(&mut self) -> Result<Box<dyn std::io::Read + Send>, String> {
+    fn take_reader(&mut self) -> Result<muxtrix_terminal::SessionReader, String> {
         self.reader
             .take()
-            .map(|reader| Box::new(reader) as Box<dyn std::io::Read + Send>)
+            .map(|reader| muxtrix_terminal::SessionReader::Pty(Box::new(reader)))
             .ok_or_else(|| "the kill-tracking reader was already taken".to_owned())
     }
     fn write_all(&mut self, _bytes: &[u8]) -> Result<(), String> {
