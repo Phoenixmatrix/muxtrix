@@ -1,12 +1,12 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, ListenerNonblockingMode, ListenerOptions, Name, Stream,
@@ -609,13 +609,85 @@ pub fn send_request(
     request: &ControlRequest,
 ) -> Result<ControlResponse, ControlError> {
     let mut stream = Stream::connect(endpoint.name()?)?;
-    stream.set_recv_timeout(Some(Duration::from_secs(4)))?;
-    serde_json::to_writer(&mut stream, request)?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
-    Ok(serde_json::from_str(&line)?)
+    // Windows named pipes reject socket receive timeouts. Configure the pipe
+    // before sending: a fast server may close its end immediately after replying.
+    stream.set_nonblocking(true)?;
+    let mut request = serde_json::to_vec(request)?;
+    request.push(b'\n');
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut remaining = request.as_slice();
+    while !remaining.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Muxtrix control request timed out",
+            )
+            .into());
+        }
+        match stream.write(remaining) {
+            #[cfg(windows)]
+            Ok(0) => thread::sleep(Duration::from_millis(10)),
+            #[cfg(not(windows))]
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+            Ok(written) => remaining = &remaining[written..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10))
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    read_response(
+        &mut stream,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+}
+
+fn read_response(
+    reader: &mut impl Read,
+    timeout: Duration,
+) -> Result<ControlResponse, ControlError> {
+    let deadline = Instant::now() + timeout;
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Muxtrix control response timed out",
+            )
+            .into());
+        }
+        match reader.read(&mut buffer) {
+            // A PIPE_NOWAIT byte pipe can complete an empty read while its
+            // peer is still connected. The deadline also bounds a closed pipe.
+            #[cfg(windows)]
+            Ok(0) => thread::sleep(Duration::from_millis(10)),
+            #[cfg(not(windows))]
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Muxtrix closed before completing its response",
+                )
+                .into());
+            }
+            Ok(read) => {
+                if let Some(end) = buffer[..read].iter().position(|byte| *byte == b'\n') {
+                    response.extend_from_slice(&buffer[..end]);
+                    return Ok(serde_json::from_slice(&response)?);
+                }
+                response.extend_from_slice(&buffer[..read]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -661,6 +733,72 @@ mod tests {
     }
 
     #[test]
+    fn response_read_preserves_fragments_across_would_block() {
+        struct Fragmented {
+            stage: usize,
+        }
+        impl Read for Fragmented {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.stage += 1;
+                let fragment: &[u8] = match self.stage {
+                    1 => b"{\"ok\":true,",
+                    2 => return Err(io::ErrorKind::WouldBlock.into()),
+                    3 => b"\"message\":\"pong\"}\n",
+                    _ => return Ok(0),
+                };
+                buffer[..fragment.len()].copy_from_slice(fragment);
+                Ok(fragment.len())
+            }
+        }
+        let response = read_response(&mut Fragmented { stage: 0 }, Duration::from_secs(1))
+            .expect("fragmented response");
+        assert!(response.ok);
+        assert_eq!(response.message.as_deref(), Some("pong"));
+    }
+
+    #[test]
+    fn response_read_times_out_without_a_reply() {
+        struct Unresponsive;
+        impl Read for Unresponsive {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+        let error =
+            read_response(&mut Unresponsive, Duration::from_millis(20)).expect_err("must time out");
+        assert!(
+            matches!(error, ControlError::Io(error) if error.kind() == io::ErrorKind::TimedOut)
+        );
+    }
+
+    #[test]
+    fn local_transport_sends_requests_larger_than_the_pipe_buffer() {
+        let endpoint = test_endpoint("large-request");
+        let server = ControlServer::bind(endpoint.clone()).expect("server should bind");
+        let request = ControlRequest::SendText {
+            text: "x".repeat(256 * 1024),
+            pane_id: None,
+        };
+        let expected = request.clone();
+        let handler = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let incoming = loop {
+                if let Ok(incoming) = server.try_recv() {
+                    break incoming;
+                }
+                assert!(Instant::now() < deadline, "request should arrive");
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            assert_eq!(incoming.request, expected);
+            incoming.respond(ControlResponse::success("received"));
+            server
+        });
+        let response = send_request(&endpoint, &request).expect("large request should work");
+        assert!(response.ok);
+        handler.join().expect("handler should finish");
+    }
+
+    #[test]
     fn local_transport_round_trips_typed_requests() {
         let endpoint = test_endpoint("round-trip");
         let server = ControlServer::bind(endpoint.clone()).expect("server should bind");
@@ -673,6 +811,8 @@ mod tests {
             };
             assert_eq!(incoming.request, ControlRequest::Ping);
             incoming.respond(ControlResponse::success("pong"));
+            // Keep the listener alive until the client has read the reply.
+            server
         });
 
         let response = send_request(&endpoint, &ControlRequest::Ping).expect("request should work");
