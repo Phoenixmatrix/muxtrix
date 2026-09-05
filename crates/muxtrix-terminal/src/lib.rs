@@ -24,7 +24,7 @@ use libghostty_vt::selection::{FormatOptions, Selection};
 use libghostty_vt::style::{Palette, RgbColor, Underline};
 use libghostty_vt::terminal::{Mode, Point, PointCoordinate, ScrollViewport};
 use libghostty_vt::{RenderState, Terminal, TerminalOptions, paste};
-use muxtrix_platform::{LaunchPlan, PtySession, PtySize};
+use muxtrix_platform::{LaunchPlan, PtyOutput, PtySession, PtySize};
 use thiserror::Error;
 
 /// Ghostty's full terminal host resets a stuck synchronized-output frame after
@@ -1400,7 +1400,7 @@ fn notification(title: &str, body: &str) -> Option<TerminalNotification> {
 
 enum LiveCommand {
     Terminate,
-    PtyOutput(Vec<u8>),
+    PtyOutput(PtyOutput),
     PtyEof,
     PtyReadFailed(String),
     Input(Vec<u8>),
@@ -1461,11 +1461,17 @@ fn exit_was_clean(session: &mut PtySession) -> bool {
     false
 }
 
+/// An unframed local PTY or remote output retaining its replay provenance.
+pub enum SessionReader {
+    Pty(Box<dyn Read + Send>),
+    Channel(Receiver<PtyOutput>),
+}
+
 /// Where a pane's bytes come from and where its control operations go:
 /// an in-process PTY, or a session daemon owning the PTY remotely so the
 /// process survives this GUI closing.
 pub trait SessionBackend: Send + 'static {
-    fn take_reader(&mut self) -> Result<Box<dyn std::io::Read + Send>, String>;
+    fn take_reader(&mut self) -> Result<SessionReader, String>;
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), String>;
     fn resize(&self, size: PtySize) -> Result<(), String>;
     fn kill(&mut self) -> Result<(), String>;
@@ -1480,19 +1486,16 @@ pub trait SessionBackend: Send + 'static {
     fn kill_on_detach(&self) -> bool {
         true
     }
-    /// True while the bytes being fed are replayed history: the VT's
-    /// answers to queries found there must be dropped, not typed into the
-    /// live shell as input.
-    fn discard_pty_responses(&self) -> bool {
-        false
-    }
 }
 
 struct LocalBackend(PtySession);
 
 impl SessionBackend for LocalBackend {
-    fn take_reader(&mut self) -> Result<Box<dyn std::io::Read + Send>, String> {
-        self.0.take_reader().map_err(|error| error.to_string())
+    fn take_reader(&mut self) -> Result<SessionReader, String> {
+        self.0
+            .take_reader()
+            .map(SessionReader::Pty)
+            .map_err(|error| error.to_string())
     }
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.0.write_all(bytes).map_err(|error| error.to_string())
@@ -1883,22 +1886,22 @@ fn run_live_session(
             }
         };
         match command {
-            LiveCommand::PtyOutput(bytes) => {
+            LiveCommand::PtyOutput(output) => {
                 process_pty_output(
                     &mut terminal,
                     &mut notification_scanner,
                     &mut session,
                     &events,
-                    &bytes,
+                    &output,
                 );
                 loop {
                     match receiver.try_recv() {
-                        Ok(LiveCommand::PtyOutput(bytes)) => process_pty_output(
+                        Ok(LiveCommand::PtyOutput(output)) => process_pty_output(
                             &mut terminal,
                             &mut notification_scanner,
                             &mut session,
                             &events,
-                            &bytes,
+                            &output,
                         ),
                         Ok(command) => {
                             pending = Some(command);
@@ -2070,14 +2073,18 @@ fn process_pty_output(
     notification_scanner: &mut OscNotificationScanner,
     session: &mut Box<dyn SessionBackend>,
     events: &LiveEventQueue,
-    bytes: &[u8],
+    output: &PtyOutput,
 ) {
+    let (bytes, replaying) = match output {
+        PtyOutput::Live(bytes) => (bytes, false),
+        PtyOutput::Backlog(bytes) => (bytes, true),
+    };
     for notification in notification_scanner.push(bytes) {
         events.push(LiveSessionEvent::Notification(notification));
     }
     terminal.feed(bytes);
     for response in terminal.take_pty_responses() {
-        if session.discard_pty_responses() {
+        if replaying {
             continue;
         }
         if let Err(error) = session.write_all(&response) {
@@ -2087,32 +2094,50 @@ fn process_pty_output(
 }
 
 fn spawn_pty_reader(
-    mut reader: Box<dyn Read + Send>,
+    reader: SessionReader,
     sender: Sender<LiveCommand>,
 ) -> Result<(), LiveSessionError> {
     thread::Builder::new()
         .name("muxtrix-pty-reader".into())
-        .spawn(move || {
-            let mut buffer = vec![0_u8; 16 * 1_024];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => {
-                        let _ = sender.send(LiveCommand::PtyEof);
-                        break;
-                    }
-                    Ok(read) => {
-                        if sender
-                            .send(LiveCommand::PtyOutput(buffer[..read].to_vec()))
-                            .is_err()
-                        {
+        .spawn(move || match reader {
+            SessionReader::Pty(mut reader) => {
+                let mut buffer = vec![0_u8; 16 * 1_024];
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) => {
+                            let _ = sender.send(LiveCommand::PtyEof);
+                            break;
+                        }
+                        Ok(read) => {
+                            if sender
+                                .send(LiveCommand::PtyOutput(PtyOutput::Live(
+                                    buffer[..read].to_vec(),
+                                )))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = sender.send(LiveCommand::PtyReadFailed(error.to_string()));
                             break;
                         }
                     }
-                    Err(error) => {
-                        let _ = sender.send(LiveCommand::PtyReadFailed(error.to_string()));
-                        break;
+                }
+            }
+            SessionReader::Channel(receiver) => {
+                while let Ok(output) = receiver.recv() {
+                    let bytes = match &output {
+                        PtyOutput::Live(bytes) | PtyOutput::Backlog(bytes) => bytes,
+                    };
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    if sender.send(LiveCommand::PtyOutput(output)).is_err() {
+                        return;
                     }
                 }
+                let _ = sender.send(LiveCommand::PtyEof);
             }
         })
         .map(|_| ())
@@ -2850,10 +2875,10 @@ mod tests {
     }
 
     impl SessionBackend for FlagBackend {
-        fn take_reader(&mut self) -> Result<Box<dyn std::io::Read + Send>, String> {
+        fn take_reader(&mut self) -> Result<SessionReader, String> {
             self.reader
                 .take()
-                .map(|receiver| Box::new(BlockingReader(receiver)) as Box<dyn std::io::Read + Send>)
+                .map(|receiver| SessionReader::Pty(Box::new(BlockingReader(receiver))))
                 .ok_or_else(|| "reader taken twice".to_owned())
         }
         fn write_all(&mut self, _bytes: &[u8]) -> Result<(), String> {

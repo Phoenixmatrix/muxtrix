@@ -4782,8 +4782,10 @@ impl Muxtrix {
         let client = Arc::new(client);
         // Register every pane, then re-attach so the daemon replays each
         // backlog into the channels that now exist to receive it.
-        let mut receivers: std::collections::HashMap<PaneId, std::sync::mpsc::Receiver<Vec<u8>>> =
-            std::collections::HashMap::new();
+        let mut receivers: std::collections::HashMap<
+            PaneId,
+            std::sync::mpsc::Receiver<muxtrix_platform::PtyOutput>,
+        > = std::collections::HashMap::new();
         for workspace in &state.workspaces {
             for tab in &workspace.tabs {
                 for pane_id in tab.panes.keys() {
@@ -11210,7 +11212,7 @@ impl TerminalRuntime {
         theme: TerminalTheme,
         notifier: EventNotifier,
         client: Arc<muxtrix_sessions::SessionClient>,
-        output: std::sync::mpsc::Receiver<Vec<u8>>,
+        output: std::sync::mpsc::Receiver<muxtrix_platform::PtyOutput>,
     ) -> Self {
         let size = initial_pty_size();
         // Knock the PTY one row off before attaching: the first real layout
@@ -12453,38 +12455,17 @@ pub(crate) fn start_session_host() -> Option<SessionHost> {
     })
 }
 
-/// Blocking reader over a pane's daemon-fed byte channel; channel close is
-/// EOF, exactly like a PTY reader hitting the end of stream.
-pub(crate) struct ReceiverReader(std::sync::mpsc::Receiver<Vec<u8>>, Vec<u8>);
-
-impl std::io::Read for ReceiverReader {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if self.1.is_empty() {
-            match self.0.recv() {
-                Ok(bytes) => self.1 = bytes,
-                Err(_) => return Ok(0),
-            }
-        }
-        let count = self.1.len().min(buffer.len());
-        buffer[..count].copy_from_slice(&self.1[..count]);
-        self.1.drain(..count);
-        Ok(count)
-    }
-}
-
 pub(crate) struct RemotePaneBackend {
     pub(crate) pane: uuid::Uuid,
     pub(crate) client: Arc<muxtrix_sessions::SessionClient>,
-    pub(crate) output: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+    pub(crate) output: Option<std::sync::mpsc::Receiver<muxtrix_platform::PtyOutput>>,
 }
 
 impl muxtrix_terminal::SessionBackend for RemotePaneBackend {
-    fn take_reader(&mut self) -> Result<Box<dyn std::io::Read + Send>, String> {
+    fn take_reader(&mut self) -> Result<muxtrix_terminal::SessionReader, String> {
         self.output
             .take()
-            .map(|receiver| {
-                Box::new(ReceiverReader(receiver, Vec::new())) as Box<dyn std::io::Read + Send>
-            })
+            .map(muxtrix_terminal::SessionReader::Channel)
             .ok_or_else(|| "pane reader already taken".to_owned())
     }
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -12525,9 +12506,6 @@ impl muxtrix_terminal::SessionBackend for RemotePaneBackend {
     }
     fn kill_on_detach(&self) -> bool {
         false
-    }
-    fn discard_pty_responses(&self) -> bool {
-        self.client.pane_replaying(self.pane)
     }
 }
 
