@@ -296,6 +296,570 @@ fn startup_offers_resumable_sessions_before_spawning_a_daemon() {
     );
 }
 
+fn session_picker_record() -> muxtrix_sessions::SessionRecord {
+    let id = uuid::Uuid::new_v4();
+    muxtrix_sessions::SessionRecord {
+        id,
+        name: "Picker regression session".into(),
+        endpoint: muxtrix_sessions::session_endpoint(id),
+        process_id: 0,
+        created_unix: 1,
+        layout: None,
+        attached: false,
+        version: env!("CARGO_PKG_VERSION").into(),
+    }
+}
+
+#[test]
+fn session_picker_requires_confirmation_before_removing_a_record() {
+    let mut app = Muxtrix::new();
+    let record = session_picker_record();
+    let path = muxtrix_sessions::registry_path(record.id).expect("session registry");
+    std::fs::create_dir_all(path.parent().expect("registry directory")).expect("create registry");
+    std::fs::write(&path, serde_json::to_vec(&record).expect("encode record"))
+        .expect("write record");
+    app.open_session_picker_from_records(vec![record], false);
+
+    drop(app.update(Message::SessionPickerConfirmEnd));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Backspace), Modifiers::empty())));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::empty())));
+    assert!(
+        path.exists(),
+        "requesting removal must not remove the record"
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+    assert!(
+        path.exists(),
+        "Enter must activate the default Cancel action"
+    );
+    assert!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .confirm_end
+            .is_none()
+    );
+
+    drop(app.update(Message::SessionPickerRequestEnd(SessionEndTarget::One(0))));
+    drop(app.update(Message::SessionPickerCancelEnd));
+    drop(app.update(Message::SessionPickerConfirmEnd));
+    assert!(
+        path.exists(),
+        "a canceled target must not remain executable"
+    );
+
+    drop(app.update(Message::SessionPickerRequestEnd(SessionEndTarget::One(0))));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+    assert!(
+        !path.exists(),
+        "explicit confirmation must remove the record"
+    );
+    assert!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .entries
+            .is_empty()
+    );
+}
+
+#[test]
+fn session_picker_stopped_row_enter_never_removes_or_resumes() {
+    let mut app = Muxtrix::new();
+    app.open_session_picker_from_records(vec![session_picker_record()], false);
+
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Space), Modifiers::empty())));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Backspace), Modifiers::empty())));
+    let picker = app
+        .session_picker
+        .as_ref()
+        .expect("stopped session remains listed");
+    assert_eq!(picker.entries.len(), 1);
+    assert!(
+        picker.error.is_none(),
+        "a disabled resume must not attempt attachment"
+    );
+    assert!(picker.confirm_end.is_none());
+
+    // A stopped in-app singleton exposes only its removal and dismissal.
+    for expected in [
+        SessionPickerFocus::EndSelected,
+        SessionPickerFocus::Dismiss,
+        SessionPickerFocus::List,
+    ] {
+        drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+        assert_eq!(
+            app.session_picker.as_ref().expect("session picker").focus,
+            expected
+        );
+    }
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .entries
+            .len(),
+        1
+    );
+    drop(app.update(Message::SessionPickerResume(0)));
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .entries
+            .len(),
+        1
+    );
+    assert!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .error
+            .is_some()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_picker_defaults_to_first_live_session_and_enter_attempts_resume() {
+    use std::os::unix::net::UnixListener;
+
+    let mut app = Muxtrix::new();
+    let mut live = session_picker_record();
+    let endpoint =
+        std::env::temp_dir().join(format!("muxtrix-picker-{}.sock", uuid::Uuid::new_v4()));
+    live.endpoint = endpoint.to_str().expect("UTF-8 socket path").to_owned();
+    let listener = UnixListener::bind(&endpoint).expect("live session endpoint");
+    app.open_session_picker_from_records(vec![session_picker_record(), live], false);
+    drop(listener);
+    std::fs::remove_file(endpoint).expect("remove session socket");
+
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .selected,
+        1
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+    let picker = app
+        .session_picker
+        .as_ref()
+        .expect("failed attachment stays recoverable");
+    assert!(
+        picker.error.is_some(),
+        "Enter must attempt the selected live session"
+    );
+    assert_eq!(
+        picker.entries.len(),
+        2,
+        "a failed resume never removes a session"
+    );
+    assert!(picker.confirm_end.is_none());
+}
+
+#[test]
+fn session_picker_keyboard_traverses_list_and_actions_without_changing_session() {
+    let mut app = Muxtrix::new();
+    app.open_session_picker_from_records(
+        vec![
+            session_picker_record(),
+            session_picker_record(),
+            session_picker_record(),
+        ],
+        true,
+    );
+
+    for (modifiers, order) in [
+        (
+            Modifiers::empty(),
+            [
+                SessionPickerFocus::EndSelected,
+                SessionPickerFocus::EndAll,
+                SessionPickerFocus::Dismiss,
+                SessionPickerFocus::Resume,
+                SessionPickerFocus::List,
+            ],
+        ),
+        (
+            Modifiers::SHIFT,
+            [
+                SessionPickerFocus::Resume,
+                SessionPickerFocus::Dismiss,
+                SessionPickerFocus::EndAll,
+                SessionPickerFocus::EndSelected,
+                SessionPickerFocus::List,
+            ],
+        ),
+    ] {
+        for expected in order {
+            let before = app.chrome_revision();
+            drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), modifiers)));
+            assert_eq!(
+                app.session_picker.as_ref().expect("session picker").focus,
+                expected
+            );
+            assert_ne!(app.chrome_revision(), before, "focus must repaint chrome");
+        }
+    }
+
+    drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowRight), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::EndSelected
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowLeft), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::List
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowRight), Modifiers::empty())));
+    drop(app.update(Message::SessionPickerSelect(usize::MAX)));
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::List,
+        "click selection restores list keyboard focus"
+    );
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .selected,
+        2
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowUp), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .selected,
+        1
+    );
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::List,
+        "arrow selection restores list keyboard focus"
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    let focused_revision = app.chrome_revision();
+    drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowDown), Modifiers::empty())));
+    assert_ne!(
+        app.chrome_revision(),
+        focused_revision,
+        "moving from a row action to the next row must invalidate its highlight"
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowDown), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .selected,
+        2
+    );
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .entries
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn session_picker_tab_cleanup_confirms_exact_target_and_restores_focus() {
+    let mut app = Muxtrix::new();
+    app.open_session_picker_from_records(
+        vec![session_picker_record(), session_picker_record()],
+        false,
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowDown), Modifiers::empty())));
+
+    for (focus, target) in [
+        (SessionPickerFocus::EndSelected, SessionEndTarget::One(1)),
+        (SessionPickerFocus::EndAll, SessionEndTarget::All),
+    ] {
+        drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+        assert_eq!(
+            app.session_picker.as_ref().expect("session picker").focus,
+            focus
+        );
+        drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+        let picker = app.session_picker.as_ref().expect("session picker");
+        assert_eq!(picker.confirm_end, Some(target));
+        assert_eq!(
+            picker.entries.len(),
+            2,
+            "requesting cleanup never executes it"
+        );
+        assert_eq!(app.dialog_button, Some(DialogButton::Cancel));
+        drop(app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::empty())));
+        let picker = app.session_picker.as_ref().expect("session picker");
+        assert_eq!(picker.focus, focus);
+        assert!(picker.confirm_end.is_none());
+    }
+
+    // Space activates the focused cleanup too; the default confirmation
+    // remains Cancel and returns to that same action.
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Space), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .confirm_end,
+        Some(SessionEndTarget::All)
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Space), Modifiers::empty())));
+    let picker = app.session_picker.as_ref().expect("session picker");
+    assert!(picker.confirm_end.is_none());
+    assert_eq!(picker.focus, SessionPickerFocus::EndAll);
+    assert_eq!(picker.entries.len(), 2);
+
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::Dismiss
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::List,
+        "stopped sessions omit Resume"
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::SHIFT)));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+    assert!(
+        app.session_picker.is_none(),
+        "dismissal closes an in-app picker"
+    );
+}
+
+#[test]
+fn session_picker_respects_the_visible_palette_and_prompt() {
+    let mut app = Muxtrix::new();
+    app.palette.visible = true;
+    app.open_session_picker_from_records(vec![session_picker_record()], true);
+    assert_eq!(app.focus_target(), Some(FocusTarget::CommandPalette));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::empty())));
+    assert!(
+        !app.palette.visible,
+        "Escape belongs to the visible palette"
+    );
+    assert!(
+        app.session_picker.is_some(),
+        "the hidden startup picker must remain"
+    );
+
+    app.workspace_create_visible = true;
+    assert_eq!(app.focus_target(), Some(FocusTarget::WorkspaceCreate));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::empty())));
+    assert!(
+        !app.workspace_create_visible,
+        "Escape belongs to the visible prompt"
+    );
+    assert!(
+        app.session_picker.is_some(),
+        "a prompt dismissal must not start a host"
+    );
+}
+
+#[test]
+fn session_picker_all_cleanup_is_confirmed_and_preserves_partial_failure() {
+    let mut app = Muxtrix::new();
+    app.open_session_picker_from_records(
+        vec![
+            session_picker_record(),
+            session_picker_record(),
+            session_picker_record(),
+        ],
+        true,
+    );
+    // A daemon may disappear between discovery and confirmation. Put the
+    // unreachable entry last so subsequent successful removals cannot hide it.
+    for (index, entry) in app
+        .session_picker
+        .as_mut()
+        .expect("session picker")
+        .entries
+        .iter_mut()
+        .enumerate()
+    {
+        entry.alive = index == 2;
+    }
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::CTRL)));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .entries
+            .len(),
+        3
+    );
+    assert!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .confirm_end
+            .is_none()
+    );
+
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::CTRL)));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::SHIFT)));
+    let effects = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+    assert!(
+        effects.is_empty(),
+        "partial cleanup must not start a new host"
+    );
+    let picker = app
+        .session_picker
+        .as_ref()
+        .expect("failure stays dismissible");
+    assert_eq!(
+        picker.entries.len(),
+        1,
+        "other records should still be cleaned up"
+    );
+    assert!(picker.entries[0].alive);
+    assert!(
+        picker.error.is_some(),
+        "later successes must not erase the failure"
+    );
+    assert!(picker.confirm_end.is_none());
+    assert_eq!(picker.selected, 0);
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::empty())));
+    assert!(app.session_picker.is_none());
+}
+
+#[test]
+fn session_picker_bulk_cleanup_starts_fresh_once_only_after_success() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    app.terminals
+        .get_mut(&pane_id)
+        .expect("startup pane")
+        .launch_state = TerminalLaunchState::PreparingHost;
+    drop(app.update(Message::SessionHostInitialized(
+        pane_id,
+        Ok(vec![session_picker_record()]),
+    )));
+    // Manually stopped metadata isolates cleanup-success continuation from
+    // live daemon transport; startup itself does not refresh this flag.
+    for entry in &mut app.session_picker.as_mut().expect("session picker").entries {
+        entry.alive = false;
+    }
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::EndAll
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .confirm_end,
+        Some(SessionEndTarget::All),
+        "bulk confirmation must remain keyboard-accessible for one session",
+    );
+    let canceled = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+    assert!(canceled.is_empty());
+    assert_eq!(
+        app.session_picker
+            .as_ref()
+            .expect("canceled picker")
+            .entries
+            .len(),
+        1
+    );
+
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::CTRL)));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::empty())));
+    let effects = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+    assert!(
+        app.session_picker.is_none(),
+        "successful cleanup continues startup"
+    );
+    let [Effect::Perform(effect)] = effects.as_slice() else {
+        panic!("successful bulk cleanup must schedule the new host");
+    };
+    assert!(
+        app.update(Message::SessionPickerConfirmEnd).is_empty(),
+        "confirmation is single-use"
+    );
+    drop(app.update(effect.resolve(Some("thread unavailable".into()))));
+    assert!(matches!(
+        app.terminals[&pane_id].launch_state,
+        TerminalLaunchState::Failed(_)
+    ));
+}
+
+#[test]
+fn session_picker_startup_escape_starts_fresh_through_close_action() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    app.terminals
+        .get_mut(&pane_id)
+        .expect("startup pane")
+        .launch_state = TerminalLaunchState::PreparingHost;
+    drop(app.update(Message::SessionHostInitialized(
+        pane_id,
+        Ok(vec![session_picker_record()]),
+    )));
+    drop(app.update(Message::SessionPickerRequestEnd(SessionEndTarget::One(0))));
+    let canceled = app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::empty()));
+    assert!(
+        canceled.is_empty(),
+        "confirmation Escape must not start a host"
+    );
+    assert!(app.session_picker.is_some());
+
+    let effects = app.handle_keyboard(key_press(Key::Named(Named::Escape), Modifiers::empty()));
+    assert!(app.session_picker.is_none());
+    let [Effect::Perform(effect)] = effects.as_slice() else {
+        panic!("startup Escape must request a fresh host, not just hide the dialog");
+    };
+    // Resolve a real scheduling error instead of starting a daemon in a unit
+    // test. The startup pane must receive it through the normal close path.
+    drop(app.update(effect.resolve(Some("thread unavailable".into()))));
+    assert!(matches!(
+        app.terminals[&pane_id].launch_state,
+        TerminalLaunchState::Failed(_)
+    ));
+}
+
+#[test]
+fn session_picker_empty_state_only_exposes_dismissal() {
+    let mut app = Muxtrix::new();
+    app.open_session_picker_from_records(Vec::new(), false);
+    app.session_picker.as_mut().expect("session picker").error =
+        Some("registry unavailable".into());
+    drop(app.update(Message::SessionPickerSelect(usize::MAX)));
+    drop(app.update(Message::SessionPickerRequestEnd(SessionEndTarget::All)));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::CTRL)));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::empty())));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::SHIFT)));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowRight), Modifiers::empty())));
+    assert_eq!(
+        app.session_picker.as_ref().expect("session picker").focus,
+        SessionPickerFocus::Dismiss
+    );
+    assert!(
+        app.session_picker
+            .as_ref()
+            .expect("session picker")
+            .confirm_end
+            .is_none()
+    );
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+    assert!(app.session_picker.is_none());
+}
+
 #[test]
 fn installed_version_mismatch_requests_a_restart() {
     let matching = InstalledVersionsState::Ready(InstalledVersions {
