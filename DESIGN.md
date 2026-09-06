@@ -328,6 +328,29 @@ The command palette uses a clearly bordered accent-tinted selected row. Arrow
 keys and Tab/Shift+Tab move the selection while Enter executes it; shortcut
 labels keep a dedicated right gutter from the scrollbar.
 
+The session picker is a resume-first native dialog. Names lead each selectable
+row; pane count, session age, and abbreviated identity stay secondary. Running
+and stopped states use truthful text rather than another accent. Selection
+reuses the palette's full accent border and tinted fill. Resume session is
+primary; Start fresh is secondary and explicitly preserves running sessions.
+End session and Remove are visible neutral bordered buttons, not metadata-like
+text actions. Session actions share the dialog button's 30 px height, ui(11)
+label scale, 14 px horizontal padding, 6 px corners, and hover/focus treatment.
+Destructive confirmation remains separate and defaults to Cancel.
+Tab/Shift+Tab cycles the inventory, selected row's cleanup button, available
+bulk action, dismissal, and enabled Resume. Enter or Space activates a focused
+button; canceling confirmation restores its initiating button's focus.
+Keyboard selection is revealed inside
+the scrollable inventory while the footer stays visible at the minimum window
+size and across the supported UI type scale. Global toasts sit below modal
+surfaces, never over their controls.
+Status and row actions share columns measured from the rendered UI font, not
+per-row content widths. Action labels stay complete: End session and Remove,
+without ellipses. End all & start fresh is a bordered secondary button during
+startup; confirmation ends the listed sessions and continues into a fresh
+session only when cleanup succeeds. In-app management instead offers End all
+sessions without replacing the current session.
+
 Settings follows a compact native preference-table grammar: section headings
 sit outside continuous bordered row groups; each row pairs a left label and
 secondary description with a compact right-side control; dividers replace

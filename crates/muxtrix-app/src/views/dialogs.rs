@@ -6,14 +6,15 @@
 
 use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Styled, div, px,
+    ParentElement, StatefulInteractiveElement, Styled, div, px,
 };
 
 use crate::app::{
-    DialogButton, Message, RenameTarget, SettingsButtonKind, WorktreeManagerMode,
-    WorktreeManagerState, agent_display_name, ellipsize, worktree_display_name,
+    DialogButton, Message, RenameTarget, SessionEndTarget, SessionPickerFocus, SettingsButtonKind,
+    WorktreeManagerMode, WorktreeManagerState, agent_display_name, ellipsize,
+    worktree_display_name,
 };
-use crate::runtime::gpui::{Root, color};
+use crate::runtime::gpui::{Root, color, ui_family};
 use crate::theme::DesignTokens;
 use crate::views::terminal_family;
 
@@ -21,7 +22,11 @@ impl Root {
     /// The active dialog and the message that dismisses it.
     ///
     /// One place decides precedence so two dialogs can never be open at once.
-    pub(crate) fn dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn dialog(
+        &self,
+        window: &gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let app = self.app();
         let tokens = DesignTokens::for_appearance(app.settings.appearance);
 
@@ -90,8 +95,12 @@ impl Root {
             )
         } else if let Some(picker) = app.session_picker.as_ref() {
             (
-                Message::CloseSessionPicker,
-                self.session_picker(picker, tokens, cx),
+                if picker.confirm_end.is_some() {
+                    Message::SessionPickerCancelEnd
+                } else {
+                    Message::CloseSessionPicker
+                },
+                self.session_picker(picker, tokens, window, cx),
             )
         } else if let Some(manager) = app
             .worktree_manager
@@ -155,98 +164,463 @@ impl Root {
         &self,
         picker: &crate::app::SessionPickerState,
         tokens: DesignTokens,
+        window: &gpui::Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let app = self.app();
-        let mut rows = div().flex().flex_col().gap(px(2.)).max_h(px(320.));
-        for (index, entry) in picker.entries.iter().enumerate() {
-            let selected = index == picker.selected;
-            let panes = entry.pane_count;
-            rows = rows.child(
-                div()
-                    .id(("session", index as u64))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(10.))
-                    .h(px(38.))
-                    .px(px(10.))
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .bg(color(if selected {
-                        tokens.panel_raised
-                    } else {
-                        tokens.panel
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |root, _: &MouseDownEvent, window, cx| {
-                            root.dispatch(Message::SessionPickerResume(index), window, cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_grow(1.0)
-                            .min_w(px(0.))
-                            .child(
-                                div()
-                                    .text_size(px(app.settings.ui_pixels(11.0)))
-                                    .line_height((px(app.settings.ui_pixels(11.0))) * 1.3)
-                                    .text_color(color(tokens.text))
-                                    .truncate()
-                                    .child(entry.record.id.to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(app.settings.ui_pixels(9.0)))
-                                    .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
-                                    .text_color(color(tokens.faint))
-                                    .child(format!(
-                                        "{panes} pane{}{}",
-                                        if panes == 1 { "" } else { "s" },
-                                        if entry.alive { "" } else { " · not running" }
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(("session-kill", index as u64))
-                            .h(px(24.))
-                            .px(px(10.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(5.))
-                            .cursor_pointer()
-                            .bg(color(tokens.panel_raised))
-                            .text_size(px(app.settings.ui_pixels(9.0)))
-                            .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
-                            .text_color(color(tokens.danger))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |root, _: &MouseDownEvent, window, cx| {
-                                    root.dispatch(Message::SessionPickerKill(index), window, cx);
-                                }),
-                            )
-                            .child("Kill"),
-                    ),
+        let settings = &app.settings;
+        let ui = |points: f32| px(settings.ui_pixels(points));
+        // Resume owns the accent. Session identity leads a selectable inventory;
+        // lifecycle cleanup stays quiet and always opens a separate confirmation.
+        if let Some(target) = picker.confirm_end {
+            let entry = match target {
+                SessionEndTarget::One(index) => picker.entries.get(index),
+                SessionEndTarget::All => None,
+            };
+            let stopped = entry.is_some_and(|entry| !entry.alive);
+            let (title, description, action) = if stopped {
+                (
+                    "Remove stopped session?".to_owned(),
+                    "This session is no longer running. Only its saved record will be removed.",
+                    "Remove session",
+                )
+            } else if let Some(entry) = entry {
+                (
+                    format!("End {}?", entry.record.name),
+                    "Its terminals and running agents will stop. This cannot be undone.",
+                    "End session",
+                )
+            } else if picker.startup {
+                (
+                    "End all sessions and start fresh?".to_owned(),
+                    "All listed sessions will be removed and their terminals and agents will stop. A new session will start only if cleanup succeeds. This cannot be undone.",
+                    "End all & start fresh",
+                )
+            } else {
+                (
+                    "End all sessions?".to_owned(),
+                    "All listed sessions will be removed. Their running terminals and agents will stop. This cannot be undone.",
+                    "End all sessions",
+                )
+            };
+            let mut middle = Vec::new();
+            if let Some(error) = &picker.error {
+                middle.push(
+                    div()
+                        .text_size(ui(10.))
+                        .text_color(color(tokens.danger))
+                        .child(error.clone())
+                        .into_any_element(),
+                );
+            }
+            return self.card(
+                &title,
+                description,
+                middle,
+                ("Cancel", Message::SessionPickerCancelEnd),
+                (action, Message::SessionPickerConfirmEnd),
+                true,
+                tokens,
+                cx,
             );
         }
-        self.card(
-            "Resume a session",
-            picker
-                .error
-                .as_deref()
-                .unwrap_or("These sessions are still running. Resume one, or start fresh."),
-            vec![rows.into_any_element()],
-            ("Kill all", Message::SessionPickerKillAll),
-            ("Start fresh", Message::CloseSessionPicker),
-            false,
-            tokens,
-            cx,
-        )
+
+        let empty = picker.entries.is_empty();
+        let can_resume = picker
+            .entries
+            .get(picker.selected)
+            .is_some_and(|entry| entry.alive);
+        let secondary = if picker.startup {
+            "Start fresh"
+        } else {
+            "Cancel"
+        };
+        let button_border = |focus, primary| {
+            color(if picker.focus == focus {
+                if primary { tokens.text } else { tokens.accent }
+            } else {
+                tokens.line
+            })
+        };
+        let mut card = div()
+            .w(px((app.window_size.width - 48.).min(620.)))
+            .max_h(px(app.window_size.height - 32.))
+            .flex()
+            .flex_col()
+            .rounded(px(10.))
+            .bg(color(tokens.overlay))
+            .border_1()
+            .border_color(color(tokens.line_strong))
+            .shadow_lg()
+            .occlude()
+            .child(
+                div()
+                    .p(px(20.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_size(ui(18.))
+                            .line_height(ui(18.) * 1.3)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(color(tokens.text))
+                            .child("Resume a session"),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui(10.5))
+                            .line_height(ui(10.5) * 1.4)
+                            .text_color(color(tokens.muted))
+                            .child(if empty && picker.error.is_some() {
+                                "The session list could not be loaded."
+                            } else if empty && picker.startup {
+                                "Start a new session to open a fresh workspace."
+                            } else if empty {
+                                "There are no other sessions available on this machine."
+                            } else {
+                                "Pick up where you left off. Choose a session to reconnect."
+                            }),
+                    ),
+            );
+        if let Some(error) = &picker.error {
+            card = card.child(
+                div()
+                    .mx(px(20.))
+                    .mb(px(12.))
+                    .text_size(ui(10.))
+                    .line_height(ui(10.) * 1.4)
+                    .text_color(color(tokens.danger))
+                    .child(error.clone()),
+            );
+        }
+        if empty {
+            card = card.child(
+                div()
+                    .mx(px(20.))
+                    .py(px(24.))
+                    .border_t_1()
+                    .border_color(color(tokens.line))
+                    .text_size(ui(11.))
+                    .line_height(ui(11.) * 1.4)
+                    .text_color(color(tokens.muted))
+                    .child(if picker.error.is_some() {
+                        "Your running sessions have not been changed."
+                    } else {
+                        "No background sessions to resume."
+                    }),
+            );
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            // Share content-measured columns across rows. Only session names
+            // may truncate; status and action widths follow the actual UI font.
+            let label_width = |label: &'static str, points| {
+                let run = gpui::TextRun {
+                    len: label.len(),
+                    font: gpui::Font {
+                        family: ui_family(settings),
+                        weight: gpui::FontWeight(f32::from(settings.ui_font_weight.numeric())),
+                        ..Default::default()
+                    },
+                    color: color(tokens.muted).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let line = window
+                    .text_system()
+                    .shape_line(label.into(), ui(points), &[run], None);
+                px(f32::from(line.width).ceil())
+            };
+            let status_width = label_width("Running", 9.).max(label_width("Stopped", 9.));
+            let action_width =
+                label_width("End session", 11.).max(label_width("Remove", 11.)) + px(30.);
+            let mut rows = div()
+                .id("session-list")
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .p(px(4.))
+                .max_h(px((app.window_size.height - 280.).clamp(80., 320.)))
+                .overflow_y_scroll()
+                .track_scroll(&self.scrolls.sessions)
+                .bg(color(tokens.panel))
+                .rounded(px(7.));
+            for (index, entry) in picker.entries.iter().enumerate() {
+                let selected = index == picker.selected;
+                let mut selected_fill = color(tokens.accent);
+                selected_fill.a = 0.10;
+                let mut selected_edge = color(tokens.accent);
+                selected_edge.a = if picker.focus == SessionPickerFocus::List {
+                    0.75
+                } else {
+                    0.3
+                };
+                let age = now.saturating_sub(entry.record.created_unix);
+                let started = if age < 60 {
+                    "Started just now".to_owned()
+                } else if age < 3_600 {
+                    format!("Started {}m ago", age / 60)
+                } else if age < 86_400 {
+                    format!("Started {}h ago", age / 3_600)
+                } else {
+                    format!("Started {}d ago", age / 86_400)
+                };
+                let short_id = format!("{:08x}", entry.record.id.as_fields().0);
+                rows = rows.child(
+                    div()
+                        .id(("session", index as u64))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .w_full()
+                        .flex_shrink_0()
+                        .px(px(12.))
+                        .py(px(10.))
+                        .rounded(px(5.))
+                        .border_1()
+                        .border_color(if selected {
+                            selected_edge
+                        } else {
+                            color(crate::theme::Color::TRANSPARENT)
+                        })
+                        .bg(if selected {
+                            selected_fill
+                        } else {
+                            color(crate::theme::Color::TRANSPARENT)
+                        })
+                        .cursor_pointer()
+                        .hover(move |style| {
+                            style.bg(if selected {
+                                selected_fill
+                            } else {
+                                color(tokens.element_hover)
+                            })
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                root.dispatch(Message::SessionPickerSelect(index), window, cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.))
+                                .flex_grow(1.)
+                                .flex_basis(px(0.))
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .text_size(ui(12.))
+                                        .line_height(ui(12.) * 1.3)
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(color(if selected {
+                                            tokens.accent
+                                        } else {
+                                            tokens.text
+                                        }))
+                                        .truncate()
+                                        .child(if entry.record.name.trim().is_empty() {
+                                            "Untitled session".to_owned()
+                                        } else {
+                                            entry.record.name.clone()
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .text_size(ui(9.))
+                                        .line_height(ui(9.) * 1.3)
+                                        .text_color(color(tokens.muted))
+                                        .child(div().min_w(px(0.)).truncate().child(format!(
+                                            "{} pane{} · {started}",
+                                            entry.pane_count,
+                                            if entry.pane_count == 1 { "" } else { "s" },
+                                        )))
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .font_family(terminal_family(settings))
+                                                .text_size(ui(8.))
+                                                .text_color(color(tokens.faint))
+                                                .child(short_id),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .w(status_width)
+                                .whitespace_nowrap()
+                                .text_size(ui(9.))
+                                .text_color(color(tokens.muted))
+                                .child(if entry.alive { "Running" } else { "Stopped" }),
+                        )
+                        .child(
+                            div().flex_shrink_0().w(action_width).child(
+                                self.dialog_button(
+                                    if entry.alive { "End session" } else { "Remove" },
+                                    Message::SessionPickerRequestEnd(SessionEndTarget::One(index)),
+                                    false,
+                                    false,
+                                    tokens,
+                                    cx,
+                                )
+                                .border_color(color(
+                                    if selected && picker.focus == SessionPickerFocus::EndSelected {
+                                        tokens.accent
+                                    } else {
+                                        tokens.line
+                                    },
+                                )),
+                            ),
+                        ),
+                );
+            }
+            card = card.child(div().mx(px(16.)).mb(px(16.)).child(rows));
+        }
+        let mut actions = div().flex().items_center().justify_end().gap(px(8.));
+        if picker.entries.len() > 1 || (picker.startup && !empty) {
+            actions = actions.child(
+                div().flex().flex_grow(1.).child(
+                    self.dialog_button(
+                        if picker.startup {
+                            "End all & start fresh"
+                        } else {
+                            "End all sessions"
+                        },
+                        Message::SessionPickerRequestEnd(SessionEndTarget::All),
+                        false,
+                        false,
+                        tokens,
+                        cx,
+                    )
+                    .border_color(button_border(SessionPickerFocus::EndAll, false)),
+                ),
+            );
+        } else {
+            actions = actions.child(div().flex_grow(1.));
+        }
+        if empty {
+            actions = actions.child(
+                self.dialog_button(
+                    if picker.startup {
+                        "Start fresh"
+                    } else {
+                        "Done"
+                    },
+                    Message::CloseSessionPicker,
+                    true,
+                    false,
+                    tokens,
+                    cx,
+                )
+                .border_color(button_border(SessionPickerFocus::Dismiss, true)),
+            );
+        } else {
+            actions = actions.child(
+                self.dialog_button(
+                    secondary,
+                    Message::CloseSessionPicker,
+                    false,
+                    false,
+                    tokens,
+                    cx,
+                )
+                .border_color(button_border(SessionPickerFocus::Dismiss, false)),
+            );
+            if can_resume {
+                actions = actions.child(
+                    self.dialog_button(
+                        "Resume session",
+                        Message::SessionPickerResume(picker.selected),
+                        true,
+                        false,
+                        tokens,
+                        cx,
+                    )
+                    .border_color(button_border(SessionPickerFocus::Resume, true)),
+                );
+            } else {
+                actions = actions.child(
+                    div()
+                        .flex_shrink_0()
+                        .h(px(30.))
+                        .px(px(14.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(color(tokens.line))
+                        .bg(color(tokens.panel_raised))
+                        .text_size(ui(11.))
+                        .whitespace_nowrap()
+                        .line_height(ui(11.) * 1.3)
+                        .text_color(color(tokens.faint))
+                        .child("Resume session"),
+                );
+            }
+        }
+        let mut footer = div()
+            .p(px(16.))
+            .border_t_1()
+            .border_color(color(tokens.line))
+            .flex()
+            .flex_col()
+            .gap(px(12.));
+        if !empty {
+            let key = |label: &'static str| {
+                div()
+                    .px(px(5.))
+                    .py(px(1.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(color(tokens.line_strong))
+                    .font_family(terminal_family(settings))
+                    .text_size(ui(8.))
+                    .line_height(ui(8.) * 1.3)
+                    .text_color(color(tokens.muted))
+                    .child(label)
+            };
+            footer = footer.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(14.))
+                    .text_size(ui(9.))
+                    .text_color(color(tokens.muted))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.))
+                            .child(key("↑ ↓"))
+                            .child("Select"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.))
+                            .child(key("Tab"))
+                            .child("Actions"),
+                    )
+                    .child(div().flex_grow(1.))
+                    .child(div().text_size(ui(9.)).child(if picker.startup {
+                        "Start fresh keeps sessions running"
+                    } else {
+                        "Other sessions keep running"
+                    })),
+            );
+        }
+        card.child(footer.child(actions)).into_any_element()
     }
 
     /// A dialog with a single text field.
@@ -361,7 +735,7 @@ impl Root {
         danger: bool,
         tokens: DesignTokens,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> gpui::Stateful<gpui::Div> {
         let background = if danger {
             tokens.danger
         } else if primary {
@@ -387,29 +761,44 @@ impl Root {
         } else {
             tokens.line
         };
+        let mut hover = color(background);
+        let mut active = hover;
+        if primary || danger {
+            hover.a = 0.86;
+            active.a = 0.72;
+        } else {
+            hover = color(tokens.panel_raised);
+            active = color(tokens.element_hover);
+        }
         div()
             .id(gpui::ElementId::from(gpui::SharedString::from(
                 label.to_owned(),
             )))
             .h(px(30.))
+            .flex_shrink_0()
             .px(px(14.))
             .flex()
             .items_center()
+            .justify_center()
             .rounded(px(6.))
             .border_1()
             .border_color(color(border))
             .cursor_pointer()
             .bg(color(background))
             .text_size(px(self.app().settings.ui_pixels(11.0)))
+            .line_height(px(self.app().settings.ui_pixels(11.0)) * 1.3)
+            .whitespace_nowrap()
             .text_color(color(foreground))
+            .hover(move |style| style.bg(hover))
+            .active(move |style| style.bg(active))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |root, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
                     root.dispatch(message.clone(), window, cx);
                 }),
             )
             .child(label.to_owned())
-            .into_any_element()
     }
 }
 

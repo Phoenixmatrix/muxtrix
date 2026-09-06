@@ -85,6 +85,7 @@ pub(crate) enum FocusTarget {
 pub(crate) enum ScrollTarget {
     Settings,
     CommandPalette,
+    SessionPicker,
     GitHubFiles,
     GitHubPullRequests,
 }

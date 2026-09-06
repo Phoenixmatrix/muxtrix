@@ -22,6 +22,7 @@ The Linux all-target suite covers:
 | Native PTY | spawn, resize, immediate post-resize input, input containing spaces, output streaming, exit, and cleanup |
 | Ghostty VT | ANSI colors and attributes, theme defaults, direct-RGB preservation, OSC palette precedence across theme changes, cursor metadata, terminal query replies, split UTF-8 output, wide-cell ownership, latest-frame coalescing, dirty-row snapshot reuse, sanitized OSC window titles, native viewport scrollback and exact scrollbar metrics, immediate resized frames, stale-grid rejection, OSC 9/99/777 parsing across read boundaries, and error-free shutdown |
 | Session isolation | two simultaneous live PTY/Ghostty actors receive and publish distinct markers; resumable startup never spawns a throwaway daemon; delayed backlog replay restores the screen without writing historical query replies into the live prompt, including older daemons without `BacklogDone`, empty packets, and split queries, while fresh queries still receive replies |
+| Session picker | first-running selection, stopped-session resume rejection, forward/reverse control focus, Enter/Space activation, canceled confirmation focus restoration, startup dismissal, visible prompt ownership, cancel-default end/remove confirmation, partial cleanup failures preserving surviving records and blocking fresh startup, and successful bulk cleanup starting a new host once |
 | Local control | typed socket round-trip, concurrent-window pane routing and ambiguous global-command rejection, pane split/close routing, dangling-option rejection, exact native/WSL endpoint propagation, WSL environment bridge, and real-app ping |
 | Hook lifecycle | idempotent add, selective remove, re-add, executable and lifecycle-semantic drift repair, custom WSL bridge command, shared Codex worktree-parent trust (including WSL-visible paths), malformed-file safety, permission preservation, concurrent third-party edits, and solely-created-file cleanup |
 | Application state | key encoding, Space/Ctrl+Space, navigation/control/Meta keys, pane-to-runtime ownership, focused routing, independent workspace lifecycle, rename-input keyboard ownership, active-workspace fleet projection, preserved tab-band ordering, flat agent filtering, fixed two-line fleet activity, local Git branch/directory context, semantic pane-signal colors, Native/WSL profile selection, registry-backed WSL filtering, distro-default shell launch, dynamic installed UI/monospace family and terminal-weight discovery, 16 persisted Ghostty-compatible theme presets, embedded icon validity, legacy font compatibility, point-based font metrics, fixed-column Unicode and wide-glyph projection, exhaustive U+2500..=U+257F semantic box-drawing coverage, grid resize coalescing with retained-frame continuity, style-run coalescing, scrollback-anchored cell selection, interactive scrollbar geometry, OSC pane/native-window titles, WSL Wayland resize-increment isolation, bounded split dragging, Zellij-style resize undo and neighbor stacking, Base/Vertical/Horizontal/Stacked/Half-stacked layout cycling, stacked-pane keyboard navigation, wheel-delta conversion, shell-exit detach/restart, close cleanup, command search and keyboard selection, pane-local Idle-to-Running agent recognition, screen-authoritative Codex/Claude attention, automatic-review suppression, visible-prompt ownership across late tool output, agent launches, settings persistence/validation, platform shortcut labels, sidebar collapse, dense pane-header consolidation, pane maximize/restore, pane context overflow, pane attention read state, state-aware agent activity, and rejection of unowned agent lifecycle events |
@@ -131,6 +132,21 @@ file-scrolling, and auth states. `github-loading`, `github-refreshing`, and
 The full-screen file review flow adds `github-diff`,
 `github-diff-binary`, `github-diff-loading`, and `github-diff-error` for its
 normal and hardened fallback states.
+The session flow adds `session-picker`, `session-picker-confirmation`,
+`session-picker-bulk-confirmation`, `session-picker-stopped`,
+`session-picker-single`, `session-picker-empty`, `session-picker-error`,
+`session-picker-many`, `session-picker-row-focus`, `session-picker-bulk-focus`,
+`session-picker-focus-navigation`, and `session-picker-hover`.
+These use synthetic records with no real endpoints or process IDs. The
+populated captures exercise selection and request/cancel confirmation without
+resuming or ending a real session. The many-session fixture places its only
+running session below the fold to verify initial selection reveal. Check these
+at 1280x800 and 720x480, including light appearance and the 20-point UI maximum.
+The row/bulk focus captures exercise Tab, Enter, and Escape against the real
+picker state machine and preserve the synthetic inventory. The hover capture
+uses actual XTest pointer motion and requires the default 1280x800 viewport.
+The focus-navigation capture also requires 1280x800 with default UI sizing; it
+asserts that the next row's selection border repaints while Down is still held.
 Combine any capture with
 `MUXTRIX_E2E_SCREENSHOT_RGBA=/tmp/muxtrix-settings.rgba` when inspecting the GPU
 output without exposing a host window.
