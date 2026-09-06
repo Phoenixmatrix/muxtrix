@@ -18,7 +18,7 @@ The Linux all-target suite covers:
 | --- | --- |
 | GPU bootstrap | WSL defaults, NVIDIA preference, EGL logging, preservation of the native window-system environment, and preservation of explicit overrides |
 | Domain model | horizontal/vertical nested splits, focus, close invariants, last-pane protection, ratios, and JSON restoration |
-| Launch planning | native profiles and explicit Windows-to-WSL command construction |
+| Launch planning | native profiles and explicit Windows-to-WSL command construction; real shell directories after remote OSC 7 reports, restored local reports with encoded spaces, and unavailable hostless directories |
 | Native PTY | spawn, resize, immediate post-resize input, input containing spaces, output streaming, exit, and cleanup |
 | Ghostty VT | ANSI colors and attributes, theme defaults, direct-RGB preservation, OSC palette precedence across theme changes, cursor metadata, terminal query replies, split UTF-8 output, wide-cell ownership, latest-frame coalescing, dirty-row snapshot reuse, sanitized OSC window titles, native viewport scrollback and exact scrollbar metrics, immediate resized frames, stale-grid rejection, OSC 9/99/777 parsing across read boundaries, and error-free shutdown |
 | Session isolation | two simultaneous live PTY/Ghostty actors receive and publish distinct markers; resumable startup never spawns a throwaway daemon; delayed backlog replay restores the screen without writing historical query replies into the live prompt, including older daemons without `BacklogDone`, empty packets, and split queries, while fresh queries still receive replies |
