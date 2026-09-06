@@ -2867,18 +2867,14 @@ fn every_terminal_creation_handler_returns_while_the_launcher_is_hung() {
     fn restart(app: &mut Muxtrix) -> Result<(), String> {
         app.restart_pane(active_pane_id(app))
     }
-    let actions: [(&str, TerminalCreationAction, CreationDirectoryPolicy); 4] = [
-        ("split", split, CreationDirectoryPolicy::Regular),
-        ("new tab", new_tab, CreationDirectoryPolicy::Regular),
-        (
-            "new workspace",
-            new_workspace,
-            CreationDirectoryPolicy::Regular,
-        ),
-        ("restart", restart, CreationDirectoryPolicy::Exact),
+    let actions: [(&str, TerminalCreationAction); 4] = [
+        ("split", split),
+        ("new tab", new_tab),
+        ("new workspace", new_workspace),
+        ("restart", restart),
     ];
 
-    for (name, action, expected_policy) in actions {
+    for (name, action) in actions {
         let mut app = Muxtrix::new();
         let (entered, finished, gate) = install_blocking_launcher(&mut app);
         let previous_sidebar = app.sidebar_collapsed;
@@ -2891,13 +2887,9 @@ fn every_terminal_creation_handler_returns_while_the_launcher_is_hung() {
             started.elapsed() < std::time::Duration::from_secs(1),
             "{name} waited for the terminal launcher"
         );
-        let policy = entered
+        entered
             .recv_timeout(std::time::Duration::from_secs(1))
             .unwrap_or_else(|_| panic!("{name} launch did not enter the injected stall"));
-        assert_eq!(
-            policy, expected_policy,
-            "{name} used the wrong working-directory policy"
-        );
         assert!(matches!(
             app.terminals[&pane_id].launch_state,
             TerminalLaunchState::Starting { .. }
@@ -2935,10 +2927,9 @@ fn restarting_a_fresh_tab_waits_for_its_in_flight_launch() {
     app.new_tab().expect("fresh tab should be created");
     let pane_id = active_pane_id(&app);
     let first_attempt = app.next_terminal_launch_attempt;
-    let first_policy = entered
+    entered
         .recv_timeout(std::time::Duration::from_secs(1))
         .expect("the fresh tab launch should enter the worker");
-    assert_eq!(first_policy, CreationDirectoryPolicy::Regular);
 
     let target = std::env::temp_dir().join("muxtrix-queued-restart-target");
     app.restart_pane_in_directory(pane_id, target.clone())
@@ -6669,6 +6660,86 @@ fn github_default_branch_comes_from_the_github_remote_head() {
     assert_eq!(github_default_branch(&repo, "").as_deref(), Some("trunk"));
 
     std::fs::remove_dir_all(repo).expect("temporary repo should be removable");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ordinary_creation_never_inherits_a_remote_shell_directory() {
+    let scratch = std::env::temp_dir().join(format!("muxtrix-ssh-{}", uuid::Uuid::new_v4()));
+    let default = scratch.join("default");
+    let local = scratch.join("local folder");
+    std::fs::create_dir_all(&default).expect("default directory");
+    std::fs::create_dir_all(&local).expect("local directory");
+    let hostname = console_command("hostname")
+        .output()
+        .expect("local hostname");
+    assert!(hostname.status.success());
+    let hostname = String::from_utf8(hostname.stdout).expect("UTF-8 hostname");
+    let mut app = Muxtrix::new();
+    app.session.profiles[0].program = "/bin/sh".into();
+    app.session.profiles[0].arguments.clear();
+    app.session.profiles[0].working_directory = Some(default.clone());
+    app.terminal_launcher = Arc::new(SystemTerminalLauncher::default());
+    app.launch_in_background = false;
+    let source = active_pane_id(&app);
+    app.terminals
+        .get_mut(&source)
+        .expect("source pane")
+        .session
+        .take();
+
+    // A remote path must not be inherited even when it also exists locally.
+    // Returning to a local prompt must restore inheritance, including spaces.
+    let reports = [
+        (
+            format!("file://remote.invalid{}/missing", scratch.display()),
+            &default,
+        ),
+        (
+            format!("file://remote.invalid{}", local.display()),
+            &default,
+        ),
+        (
+            format!("file://{}{}", hostname.trim(), local.display()).replace(' ', "%20"),
+            &local,
+        ),
+        (scratch.join("missing").display().to_string(), &default),
+    ];
+    for (index, (report, expected)) in reports.into_iter().enumerate() {
+        app.focus_pane(source).expect("return to source pane");
+        let sequence = if report.starts_with("file://") {
+            format!("\x1b]7;{report}\x07")
+        } else {
+            format!("\x1b]9;9;{report}\x07")
+        };
+        app.terminals
+            .get_mut(&source)
+            .expect("source pane")
+            .snapshot = Some(snapshot_in_mode(sequence.as_bytes()));
+        match index {
+            0 | 2 => app
+                .split_terminal(SplitAxis::Horizontal)
+                .expect("split should launch"),
+            1 => app.new_tab().expect("new tab should launch"),
+            _ => {
+                app.workspace_name_draft = "SSH fallback".into();
+                app.create_workspace().expect("new workspace should launch");
+            }
+        }
+        let pane = active_pane_id(&app);
+        let session = app.terminals[&pane]
+            .session
+            .as_ref()
+            .expect("running shell");
+        let pid = session.process_id().expect("native shell PID");
+        assert_eq!(
+            std::fs::read_link(format!("/proc/{pid}/cwd")).expect("actual shell directory"),
+            *expected,
+            "wrong launch directory after {report}"
+        );
+    }
+    drop(app);
+    std::fs::remove_dir_all(scratch).expect("remove temporary directories");
 }
 
 #[test]

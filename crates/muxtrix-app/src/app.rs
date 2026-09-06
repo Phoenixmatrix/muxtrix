@@ -461,14 +461,17 @@ pub(crate) struct TerminalLaunchRequest {
     pub(crate) previous_session: Option<LiveSession>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CreationDirectoryPolicy {
     /// Use the profile directory exactly. Explicit worktree creation and pane
     /// restarts must never be redirected away from their requested target.
     Exact,
-    /// Keep an ordinary directory, but leave a linked worktree for the
-    /// repository's GitHub-default checkout before starting the shell.
-    Regular,
+    /// Inherit only a directory belonging to the launch backend, then route
+    /// linked worktrees to the repository's GitHub-default checkout.
+    Regular {
+        reported_hostname: Option<String>,
+        default_directory: Option<std::path::PathBuf>,
+    },
 }
 
 pub(crate) trait TerminalLauncher: Send + Sync {
@@ -524,13 +527,24 @@ impl SystemTerminalLauncher {
         request: TerminalLaunchRequest,
     ) -> Result<LaunchedTerminal, String> {
         let mut profile = request.profile.clone();
-        if request.directory_policy == CreationDirectoryPolicy::Regular
+        if let CreationDirectoryPolicy::Regular {
+            reported_hostname,
+            default_directory,
+        } = &request.directory_policy
             && let Some(directory) = profile.working_directory.as_deref()
         {
-            profile.working_directory = Some(resolve_regular_creation_directory(
+            profile.working_directory = if inherited_directory_is_local(
                 directory,
-                &request.wsl_distribution,
-            ));
+                reported_hostname.as_deref(),
+                &profile.backend,
+            ) {
+                Some(resolve_regular_creation_directory(
+                    directory,
+                    &request.wsl_distribution,
+                ))
+            } else {
+                default_directory.clone()
+            };
         }
         if let Some(previous_session) = request.previous_session {
             previous_session.terminate();
@@ -1752,20 +1766,6 @@ impl Muxtrix {
             pane_id,
             fallback_title,
             CreationDirectoryPolicy::Exact,
-        )
-    }
-
-    pub(crate) fn request_regular_terminal_launch(
-        &mut self,
-        profile: LaunchProfile,
-        pane_id: PaneId,
-        fallback_title: String,
-    ) -> Result<(), String> {
-        self.request_terminal_launch_with_policy(
-            profile,
-            pane_id,
-            fallback_title,
-            CreationDirectoryPolicy::Regular,
         )
     }
 
@@ -3955,19 +3955,39 @@ impl Muxtrix {
             .ok_or_else(|| "terminal launch profile is missing".to_owned())
     }
 
-    pub(crate) fn regular_terminal_profile(&self) -> Result<LaunchProfile, String> {
+    pub(crate) fn regular_terminal_profile(
+        &self,
+    ) -> Result<(LaunchProfile, CreationDirectoryPolicy), String> {
         let mut profile = self.default_terminal_profile()?;
+        let default_directory = profile.working_directory.clone();
+        let reported_hostname = self
+            .active_workspace()?
+            .active_tab()
+            .and_then(|tab| self.terminals.get(&tab.focused_pane_id))
+            .and_then(|runtime| runtime.snapshot.as_ref())
+            .and_then(|snapshot| snapshot.pwd.as_deref())
+            .and_then(|pwd| pwd.trim().strip_prefix("file://"))
+            .and_then(|uri| uri.split_once('/'))
+            .map(|(hostname, _)| hostname)
+            .filter(|hostname| !hostname.is_empty())
+            .map(str::to_owned);
         if let Some(directory) = self.regular_creation_directory() {
             profile.working_directory = Some(directory);
         }
-        Ok(profile)
+        Ok((
+            profile,
+            CreationDirectoryPolicy::Regular {
+                reported_hostname,
+                default_directory,
+            },
+        ))
     }
 
     pub(crate) fn split_terminal(&mut self, axis: SplitAxis) -> Result<(), String> {
         if self.maximized_pane.is_some() {
             return Err("Restore panes before splitting the focused pane".into());
         }
-        let profile = self.regular_terminal_profile()?;
+        let (profile, directory_policy) = self.regular_terminal_profile()?;
         let pane_count = self
             .active_workspace()?
             .active_tab()
@@ -3992,7 +4012,7 @@ impl Muxtrix {
             .active_workspace_mut()?
             .split_focused(axis, SplitRatio::EQUAL, surface)
             .map_err(|error| error.to_string())?;
-        self.request_regular_terminal_launch(profile, pane_id, title)
+        self.request_terminal_launch_with_policy(profile, pane_id, title, directory_policy)
     }
 
     pub(crate) fn clear_manual_layout_history(&mut self, tab_id: TabId) {
@@ -4173,7 +4193,7 @@ impl Muxtrix {
     }
 
     pub(crate) fn create_workspace(&mut self) -> Result<(), String> {
-        let profile = self.regular_terminal_profile()?;
+        let (profile, directory_policy) = self.regular_terminal_profile()?;
         let workspace_name = self.workspace_name_draft.trim().to_owned();
         if workspace_name.is_empty() {
             return Err("Workspace names cannot be empty".into());
@@ -4196,7 +4216,7 @@ impl Muxtrix {
         self.session
             .add_workspace(workspace)
             .map_err(|error| error.to_string())?;
-        self.request_regular_terminal_launch(profile, pane_id, title.into())?;
+        self.request_terminal_launch_with_policy(profile, pane_id, title.into(), directory_policy)?;
         self.workspace_name_draft = workspace_name;
         self.rename_prompt = None;
         self.workspace_create_visible = false;
@@ -5144,7 +5164,7 @@ impl Muxtrix {
     }
 
     pub(crate) fn new_tab(&mut self) -> Result<(), String> {
-        let profile = self.regular_terminal_profile()?;
+        let (profile, directory_policy) = self.regular_terminal_profile()?;
         let tab_name = format!("Tab {}", self.active_workspace()?.tabs.len() + 1);
         let title = "shell 1";
         let tab = WorkspaceTab::new(
@@ -5161,7 +5181,7 @@ impl Muxtrix {
         self.active_workspace_mut()?
             .add_tab(tab)
             .map_err(|error| error.to_string())?;
-        self.request_regular_terminal_launch(profile, pane_id, title.into())?;
+        self.request_terminal_launch_with_policy(profile, pane_id, title.into(), directory_policy)?;
         self.maximized_pane = None;
         self.pane_menu = None;
         Ok(())
@@ -10251,7 +10271,6 @@ pub(crate) fn worktree_failure_message(
 
 /// A hidden wsl.exe invocation targeting the configured distribution, or
 /// the default distribution when the setting is empty.
-#[cfg(target_os = "windows")]
 pub(crate) fn wsl_command(wsl_distribution: &str) -> std::process::Command {
     let mut command = console_command("wsl.exe");
     let distribution = wsl_distribution.trim();
@@ -10782,6 +10801,52 @@ pub(crate) fn regular_creation_directory_from_worktrees(
         return focused_directory.to_path_buf();
     }
     preferred_default_worktree(worktrees, github_default_branch)
+}
+
+/// OSC 7 can report a remote SSH host. Check against the launch backend,
+/// not the GUI host: Windows-hosted WSL panes have their own filesystem and
+/// hostname. This runs on the launch worker, never the UI thread.
+fn inherited_directory_is_local(
+    directory: &std::path::Path,
+    reported_hostname: Option<&str>,
+    backend: &ProcessBackend,
+) -> bool {
+    let reported_hostname = reported_hostname
+        .map(|hostname| hostname.trim_end_matches('.'))
+        .filter(|hostname| !hostname.is_empty() && !hostname.eq_ignore_ascii_case("localhost"));
+    let mut command = match backend {
+        ProcessBackend::Local => {
+            if !directory.is_dir() {
+                return false;
+            }
+            if reported_hostname.is_none() {
+                return true;
+            }
+            console_command("hostname")
+        }
+        ProcessBackend::Wsl { distribution } => {
+            let mut command = wsl_command(distribution.as_deref().unwrap_or_default());
+            command
+                .args(["--exec", "sh", "-c", "test -d \"$1\" && uname -n", "sh"])
+                .arg(directory);
+            command
+        }
+    };
+    let Ok(output) = command_output(
+        &mut command,
+        HELPER_COMMAND_TIMEOUT,
+        &ProcessCancellation::default(),
+    ) else {
+        return false;
+    };
+    output.status.success()
+        && reported_hostname.is_none_or(|hostname| {
+            hostname.eq_ignore_ascii_case(
+                String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .trim_end_matches('.'),
+            )
+        })
 }
 
 /// Resolves the launch directory for an ordinary pane, tab, or workspace.

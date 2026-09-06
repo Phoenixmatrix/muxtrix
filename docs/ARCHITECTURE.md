@@ -155,6 +155,15 @@ A process-host trait separates terminal state from where commands execute:
   itself stays a native Windows GUI.
 - `Ssh`: later milestone; transport remains outside Ghostty VT.
 
+New panes, tabs, and workspaces inherit the focused directory only when it
+exists in the destination backend and any OSC 7 hostname belongs to that
+backend. An SSH session's remote directory falls back to the terminal profile's
+default directory, even if the same path exists locally. Hostless directory
+reports also fall back when the directory is unavailable. WSL checks run inside
+the selected distribution, not against the Windows filesystem or hostname.
+Directory validation and Git worktree routing run on the terminal-launch
+worker; explicit worktree targets and pane restarts retain their exact policy.
+
 The WSL host must translate Windows/UNC paths explicitly and must not pretend a
 native Windows process is a Linux process. Profiles persist the backend choice.
 The Windows host shares pane identity and an optional control endpoint with WSL
