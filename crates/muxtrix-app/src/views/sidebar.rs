@@ -575,6 +575,7 @@ impl Root {
                         .child(
                             div()
                                 .size(px(6.))
+                                .flex_none()
                                 .rounded_full()
                                 .bg(color(signal_kind.color(tokens))),
                         )
@@ -831,6 +832,7 @@ impl Root {
                             .child(
                                 div()
                                     .size(px(9.))
+                                    .flex_none()
                                     .mt(px(2.))
                                     .rounded_full()
                                     .bg(color(signal_kind.color(tokens))),
@@ -1035,7 +1037,7 @@ impl Root {
                             .flex_row()
                             .items_center()
                             .gap(px(8.))
-                            .child(pip)
+                            .child(pip.flex_none())
                             .child(
                                 div()
                                     .flex_grow(1.0)
@@ -1228,7 +1230,13 @@ impl Root {
                                 }))
                                 .child((index + 1).to_string()),
                         )
-                        .child(div().size(px(7.)).rounded_full().bg(color(signal))),
+                        .child(
+                            div()
+                                .size(px(7.))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(color(signal)),
+                        ),
                 )
                 .child(div().h(px(1.)).w_full().bg(color(tokens.line)));
         }
@@ -1326,7 +1334,7 @@ impl Root {
                                 .text_color(color(identity_color))
                                 .child((index + 1).to_string()),
                         )
-                        .child(pip),
+                        .child(pip.flex_none()),
                 )
                 .child(div().h(px(1.)).w_full().bg(color(tokens.line)));
         }

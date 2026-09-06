@@ -95,6 +95,9 @@ persist as settings preferences.
 Fleet rows show only what is true for their pane. Every expanded row uses two
 lines: state signal and pane title first; linked-worktree, repository, or live
 directory context second, aligned under the signal dot. Truthful lifecycle state trails the context line.
+Fleet and workspace signal dots, including roster rings, keep a fixed circular
+footprint. Long titles and PR badges must not squeeze them; adjacent text
+truncates instead.
 Agent panes carry their reported lifecycle. Plain terminal panes use their real
 state such as Shell, Starting, Exited, or Unavailable rather than fabricating an
 agent lifecycle. Shortcut numbers follow the currently displayed order — and
