@@ -164,6 +164,11 @@ the selected distribution, not against the Windows filesystem or hostname.
 Directory validation and Git worktree routing run on the terminal-launch
 worker; explicit worktree targets and pane restarts retain their exact policy.
 
+Fish reports its directory via OSC 7 both when `$PWD` changes and before each
+prompt. Returning from SSH must replace a remote directory report even when
+the local shell never changed directories, so repository and worktree actions
+can rediscover the local checkout on Windows/WSL.
+
 The WSL host must translate Windows/UNC paths explicitly and must not pretend a
 native Windows process is a Linux process. Profiles persist the backend choice.
 The Windows host shares pane identity and an optional control endpoint with WSL

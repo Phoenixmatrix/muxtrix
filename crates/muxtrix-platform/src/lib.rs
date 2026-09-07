@@ -108,11 +108,12 @@ pub mod shell_integration {
     /// kitty, VTE, Apple Terminal, WezTerm, iTerm) — under a plain
     /// xterm-256color it stays silent. This conf.d snippet reports
     /// unconditionally, but only inside Muxtrix panes (MUXTRIX_PANE_ID)
-    /// so the file is inert for every other fish session.
+    /// so the file is inert for every other fish session. Report at every
+    /// prompt too: SSH may replace OSC 7 without changing the local PWD.
     pub const FISH_CONF_D: &str = r#"# Muxtrix shell integration: report the working directory via OSC 7.
 # Inert outside Muxtrix panes; safe to delete — Muxtrix recreates it.
 if status is-interactive; and set -q MUXTRIX_PANE_ID
-    function __muxtrix_report_pwd --on-variable PWD --description 'Report $PWD to Muxtrix via OSC 7'
+    function __muxtrix_report_pwd --on-variable PWD --on-event fish_prompt --description 'Report $PWD to Muxtrix via OSC 7'
         if status is-command-substitution; or set -q INSIDE_EMACS
             return
         end

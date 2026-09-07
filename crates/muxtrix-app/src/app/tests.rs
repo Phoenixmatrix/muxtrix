@@ -5858,6 +5858,70 @@ fn staged_fish_integration_reports_pwd_through_osc7() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn fish_prompt_restores_worktree_detection_after_remote_directory_report() {
+    if crate::process::console_command("fish")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("muxtrix-fish-cwd-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create repository");
+    assert!(
+        git_in(&root, "", &["init"])
+            .expect("initialize repository")
+            .status
+            .success()
+    );
+    // SSH can report a remote directory without changing the local shell's
+    // PWD. Exercise fish's prompt event, not a cd that would hide the bug.
+    let output = crate::process::console_command("fish")
+        .args(["--no-config", "--interactive", "--command"])
+        .arg(format!(
+            "{}\nprintf '\\e]7;file://remote.invalid/srv/remote-repo\\e\\\\'; emit fish_prompt",
+            muxtrix_platform::shell_integration::FISH_CONF_D
+        ))
+        .current_dir(&root)
+        .env("MUXTRIX_PANE_ID", "directory-regression")
+        .env_remove("INSIDE_EMACS")
+        .output()
+        .expect("run fish");
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let actor = TerminalActor::spawn(TerminalOptions {
+        cols: 80,
+        rows: 24,
+        max_scrollback: 0,
+    })
+    .expect("terminal");
+    actor.feed(output.stdout).expect("consume shell reports");
+    let snapshot = actor.snapshot().expect("snapshot");
+    actor.shutdown().expect("shutdown terminal");
+
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    let runtime = app.terminals.get_mut(&pane_id).expect("pane runtime");
+    // Windows/WSL has no /proc fallback: use only the terminal report.
+    runtime.session.take();
+    runtime.set_snapshot(snapshot);
+    for target in [
+        WorktreePromptTarget::Open(commands::WorktreeKind::Pane(SplitAxis::Horizontal)),
+        WorktreePromptTarget::RestartPane(pane_id),
+    ] {
+        let _ = app.open_worktree_prompt(target);
+        let prompt = app.worktree_prompt.as_ref().expect("worktree prompt");
+        assert_eq!(
+            prompt.repo_root.as_deref(),
+            Some(root.as_path()),
+            "local prompt must restore worktree detection: {:?}",
+            prompt.failure
+        );
+    }
+    std::fs::remove_dir_all(root).expect("remove test repository");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn staged_zsh_bridge_reports_pwd_through_osc7() {
     if std::process::Command::new("zsh")
         .arg("--version")
