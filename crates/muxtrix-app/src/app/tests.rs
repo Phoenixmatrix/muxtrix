@@ -7847,32 +7847,42 @@ fn pi_session_start_cannot_relabel_a_launched_agent_idle() {
 }
 
 #[test]
-fn pane_dimensions_map_to_terminal_rows_and_columns() {
+fn pane_dimensions_count_complete_cells_without_resizing_within_a_cell() {
     let settings = AppSettings::default();
-    assert_eq!(
-        pty_size_for_pane(Size::new(856.0, 400.0), &settings),
-        if cfg!(target_os = "macos") {
-            PtySize {
-                rows: 23,
-                cols: 100,
-                pixel_width: 840,
-                pixel_height: 384,
-            }
-        } else {
-            PtySize {
-                rows: 17,
-                cols: 75,
-                pixel_width: 840,
-                pixel_height: 384,
-            }
-        }
-    );
-    let minimum = pty_size_for_pane(Size::new(0.0, 0.0), &settings);
-    assert_eq!((minimum.cols, minimum.rows), (2, 2));
+    let cell_width = settings.terminal_cell_width();
+    let cell_height = settings.terminal_cell_height();
+    let size_for_cells = |cols, rows| {
+        pty_size_for_pane(
+            Size::new(
+                TERMINAL_PADDING + cell_width * cols,
+                TERMINAL_PADDING + cell_height * rows,
+            ),
+            &settings,
+        )
+    };
 
-    let one_pixel_wider = pty_size_for_pane(Size::new(857.0, 401.0), &settings);
-    let baseline = pty_size_for_pane(Size::new(856.0, 400.0), &settings);
-    assert!(!terminal_grid_changed(baseline, one_pixel_wider));
+    // The selected system face varies by machine. Use its measured cells and
+    // stay away from exact floating-point boundaries, not fixed pixel sizes.
+    let baseline = size_for_cells(10.25, 5.25);
+    assert_eq!((baseline.cols, baseline.rows), (10, 5));
+
+    let within_cell = size_for_cells(10.75, 5.75);
+    assert_eq!((within_cell.cols, within_cell.rows), (10, 5));
+    assert!(!terminal_grid_changed(baseline, within_cell));
+
+    let wider = size_for_cells(11.25, 5.75);
+    assert_eq!((wider.cols, wider.rows), (11, 5));
+    assert!(terminal_grid_changed(baseline, wider));
+
+    let taller = size_for_cells(10.75, 6.25);
+    assert_eq!((taller.cols, taller.rows), (10, 6));
+    assert!(terminal_grid_changed(baseline, taller));
+}
+
+#[test]
+fn zero_sized_panes_keep_a_usable_terminal_grid() {
+    let minimum = pty_size_for_pane(Size::new(0.0, 0.0), &AppSettings::default());
+    assert_eq!((minimum.cols, minimum.rows), (2, 2));
 }
 
 #[test]

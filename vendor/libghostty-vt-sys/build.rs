@@ -101,8 +101,20 @@ fn main() {
 
 /// Correct the pinned C API's documented line units without changing native
 /// Ghostty's byte-budget behavior. Check the reverse patch for repeat builds.
-fn apply_scrollback_patch(source: &Path) {
+fn apply_scrollback_patch(source: &Path, out_dir: &Path) {
     let patch = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("patches/scrollback-lines.patch");
+    // Ghostty forces Zig sources to LF, but this crate's patch can be checked
+    // out as CRLF on Windows. Normalize only the patch, never a source override
+    // or cached checkout, and use the same bytes for both apply directions.
+    let contents = include_str!("patches/scrollback-lines.patch");
+    let patch = if contents.contains("\r\n") {
+        let normalized = out_dir.join("scrollback-lines.patch");
+        std::fs::write(&normalized, contents.replace("\r\n", "\n"))
+            .expect("failed to normalize Ghostty scrollback patch");
+        normalized
+    } else {
+        patch
+    };
     let already_applied = Command::new("git")
         .args(["apply", "--reverse", "--check"])
         .arg(&patch)
@@ -137,7 +149,7 @@ fn build_vendored(link_mode: LinkMode) {
         Err(_) => fetch_ghostty(&out_dir),
     };
 
-    apply_scrollback_patch(&ghostty_dir);
+    apply_scrollback_patch(&ghostty_dir, &out_dir);
 
     // Build libghostty-vt via zig.
     let install_prefix = out_dir.join("ghostty-install");
