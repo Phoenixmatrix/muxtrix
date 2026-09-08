@@ -40,6 +40,9 @@ The build applies the patch idempotently to fetched sources and explicit
 `GHOSTTY_SOURCE_DIR` checkouts. An incompatible source override fails at patch
 application. An external `pkg-config` library must provide equivalent line
 semantics; Muxtrix uses the patched vendored build.
+On Windows, Git can check out this patch as CRLF while Ghostty forces its Zig
+sources to LF. The build normalizes only the patch input in `OUT_DIR` before
+forward/reverse application; it never resets source overrides or cached edits.
 
 Muxtrix keeps the tested Ghostty source pin and Zig requirement. Remove the
 local corrections when a compatible released crate includes them.

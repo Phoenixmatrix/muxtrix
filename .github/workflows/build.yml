@@ -166,9 +166,12 @@ jobs:
 
       - name: Build native Windows release binaries
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           cargo build --release --locked -p muxtrix --bin muxtrix
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --release --locked -p muxtrix-control --bin muxtrixctl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build native macOS release binaries
         if: runner.os == 'macOS'
