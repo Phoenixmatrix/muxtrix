@@ -64,6 +64,9 @@ use crate::terminal::runs::{
 use crate::theme::{Color, DesignTokens};
 use crate::themes::{TerminalThemeId, TerminalThemePreset};
 
+mod task_panes;
+pub(crate) use task_panes::{CompleteTaskPrompt, TaskCompletion, TaskPaneCreation};
+
 pub(crate) static NO_TERMINAL_STARTUP: AtomicBool = AtomicBool::new(false);
 
 /// What draws the window, for the diagnostics that report it.
@@ -247,6 +250,12 @@ pub(crate) struct Muxtrix {
     pub(crate) default_agent_prompt: bool,
     pub(crate) pending_default_agent_command: Option<CommandAction>,
     pub(crate) worktree_prompt: Option<WorktreePrompt>,
+    pub(crate) complete_task_prompt: Option<CompleteTaskPrompt>,
+    pub(crate) pending_task_creation: Option<TaskPaneCreation>,
+    pub(crate) task_completion: Option<TaskCompletion>,
+    pub(crate) task_session_epoch: u64,
+    pub(crate) task_deferred_messages: Vec<Message>,
+    pub(crate) task_terminal_stops: BTreeMap<PaneId, Arc<task_panes::TaskTerminalStop>>,
     pub(crate) worktree_name_draft: String,
     pub(crate) worktree_manager: Option<WorktreeManagerState>,
     pub(crate) worktree_manager_generation: u64,
@@ -1490,6 +1499,17 @@ pub(crate) enum Message {
     Focus(PaneId),
     FocusFleetPane(WorkspaceId, PaneId),
     ClosePane(PaneId),
+    CompleteTask(PaneId),
+    ConfirmCompleteTask,
+    CancelCompleteTask,
+    TaskPaneCreated(
+        Box<(
+            TaskPaneCreation,
+            Result<muxtrix_domain::TaskWorktree, String>,
+        )>,
+    ),
+    TaskInspected(Box<(TaskCompletion, Result<Option<String>, String>)>),
+    TaskRemoved(Box<(TaskCompletion, Result<(), String>)>),
     RestartPane(PaneId),
     StartTerminal(PaneId),
     CancelTerminalLaunch(PaneId),
@@ -1776,6 +1796,13 @@ impl Muxtrix {
         fallback_title: String,
         directory_policy: CreationDirectoryPolicy,
     ) -> Result<(), String> {
+        if self
+            .task_terminal_stops
+            .get(&pane_id)
+            .is_some_and(|stop| stop.pending.load(Ordering::Acquire))
+        {
+            return Err("The previous task process has not confirmed stopping. Retry Complete Task before restarting this pane.".into());
+        }
         self.next_terminal_launch_attempt = self.next_terminal_launch_attempt.wrapping_add(1);
         let attempt_id = self.next_terminal_launch_attempt;
         let viewport = self
@@ -2135,6 +2162,12 @@ impl Muxtrix {
             default_agent_prompt: false,
             pending_default_agent_command: None,
             worktree_prompt: None,
+            complete_task_prompt: None,
+            pending_task_creation: None,
+            task_completion: None,
+            task_session_epoch: 0,
+            task_deferred_messages: Vec::new(),
+            task_terminal_stops: BTreeMap::new(),
             worktree_name_draft: String::new(),
             worktree_manager: None,
             worktree_manager_generation: 0,
@@ -2283,6 +2316,19 @@ impl Muxtrix {
         bit(self.workspace_create_visible);
         bit(self.rename_prompt.is_some());
         bit(self.worktree_prompt.is_some());
+        bit(self.complete_task_prompt.is_some());
+        bit(self
+            .complete_task_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.busy));
+        bit(self
+            .complete_task_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.warning.is_some()));
+        bit(self
+            .complete_task_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.error.is_some()));
         bit(self.session_picker.is_some());
         bit(self.close_workspace_prompt.is_some());
         bit(self.default_agent_prompt);
@@ -2300,6 +2346,11 @@ impl Muxtrix {
         bit(!self.global_alerts.is_empty());
         let mut text = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&self.status, &mut text);
+        if let Some(prompt) = &self.complete_task_prompt {
+            prompt.pane_id.hash(&mut text);
+            prompt.warning.hash(&mut text);
+            prompt.error.hash(&mut text);
+        }
         if let Some(picker) = &self.session_picker {
             // These values change together: adding them lets a focus decrement
             // cancel a selection increment and suppress the required repaint.
@@ -2333,6 +2384,7 @@ impl Muxtrix {
             || self.workspace_create_visible
             || self.rename_prompt.is_some()
             || self.worktree_prompt.is_some()
+            || self.complete_task_prompt.is_some()
             || self.session_picker.is_some()
             || self.close_workspace_prompt.is_some()
             || self.default_agent_prompt
@@ -2346,6 +2398,7 @@ impl Muxtrix {
             && !self.workspace_create_visible
             && self.rename_prompt.is_none()
             && self.worktree_prompt.is_none()
+            && self.complete_task_prompt.is_none()
             && !self.default_agent_prompt
     }
 
@@ -2355,6 +2408,9 @@ impl Muxtrix {
     /// surface cannot leave its field holding keys the terminal needs.
     pub(crate) fn focus_target(&self) -> Option<crate::effect::FocusTarget> {
         use crate::effect::FocusTarget;
+        if self.complete_task_prompt.is_some() {
+            return None;
+        }
         if self.palette.visible {
             return Some(FocusTarget::CommandPalette);
         }
@@ -2402,6 +2458,47 @@ impl Muxtrix {
     }
 
     pub(crate) fn update(&mut self, message: Message) -> Vec<Effect> {
+        if self.task_removal_busy()
+            && !matches!(
+                &message,
+                Message::TaskRemoved(..)
+                    | Message::PollTerminal
+                    | Message::BlinkCursor
+                    | Message::WindowFocusChanged(_)
+                    | Message::WindowResized(_)
+                    | Message::ResizePane(..)
+                    | Message::ResizeSplit(..)
+            )
+        {
+            // A checkout deletion is a short transaction: no pane may start,
+            // move into, or lose its identity beneath the worker's safety check.
+            // Preserve asynchronous results, but do not replay modal user input.
+            if matches!(
+                &message,
+                Message::TaskPaneCreated(..)
+                    | Message::TaskInspected(..)
+                    | Message::SessionHostInitialized(..)
+                    | Message::AgentsRosterLoaded(..)
+                    | Message::PaneRepositoriesLoaded(..)
+                    | Message::WorktreeCreated(..)
+                    | Message::WorktreeManagerLoaded(..)
+                    | Message::WorktreeManagerDeleted(..)
+                    | Message::InstalledVersionsLoaded(..)
+                    | Message::GitHubAuthChecked(..)
+                    | Message::GitHubAuthFinished(..)
+                    | Message::GitHubFocusedPaneLoaded(..)
+                    | Message::GitHubPullRequestsLoaded(..)
+                    | Message::GitHubPullRequestLoaded(..)
+                    | Message::GitHubDiffLoaded(..)
+                    | Message::GitHubPullRequestDraftChanged(..)
+                    | Message::GitHubMergeFinished(..)
+                    | Message::IntegrationDiscoveryFinished(..)
+                    | Message::HookOperationFinished(..)
+            ) {
+                self.task_deferred_messages.push(message);
+            }
+            return Vec::new();
+        }
         let result = match message {
             #[cfg(test)]
             Message::Split(axis) => self.split_terminal(axis),
@@ -2417,6 +2514,27 @@ impl Muxtrix {
                 .switch_workspace(workspace_id)
                 .and_then(|()| self.focus_pane(pane_id)),
             Message::ClosePane(pane_id) => self.close_pane(pane_id),
+            Message::CompleteTask(pane_id) => return self.begin_complete_task(pane_id),
+            Message::ConfirmCompleteTask => return self.confirm_complete_task(),
+            Message::CancelCompleteTask => {
+                self.cancel_complete_task();
+                return Vec::new();
+            }
+            Message::TaskPaneCreated(outcome) => {
+                let (request, result) = *outcome;
+                self.finish_task_creation(request, result);
+                return Vec::new();
+            }
+            Message::TaskInspected(outcome) => {
+                let (operation, result) = *outcome;
+                return self.finish_task_inspection(operation, result);
+            }
+            Message::TaskRemoved(outcome) => {
+                let (operation, result) = *outcome;
+                self.finish_task_removal(operation, result);
+                let deferred = std::mem::take(&mut self.task_deferred_messages);
+                return effect::batch(deferred.into_iter().map(|message| self.update(message)));
+            }
             Message::RestartPane(pane_id) if session_host().is_none() && !local_pty_allowed() => {
                 return self.prepare_session_host(pane_id);
             }
@@ -4946,6 +5064,10 @@ impl Muxtrix {
     /// (backlog replays into a fresh VT). The session this window was on
     /// stays alive in the background — that is the multiplexer contract.
     pub(crate) fn resume_session(&mut self, index: usize) {
+        if self.task_removal_busy() {
+            self.status = "Wait for task completion before changing sessions".into();
+            return;
+        }
         let Some(picker) = self.session_picker.as_mut() else {
             return;
         };
@@ -5032,6 +5154,12 @@ impl Muxtrix {
         }
         let restored_agent_statuses = agent_statuses_from_session(&state);
         self.session = state;
+        self.task_session_epoch = self.task_session_epoch.wrapping_add(1);
+        self.pending_task_creation = None;
+        self.task_completion = None;
+        self.complete_task_prompt = None;
+        self.task_deferred_messages.clear();
+        self.task_terminal_stops.clear();
         self.terminals = terminals;
         self.queued_terminal_restarts.clear();
         self.session_picker = None;
@@ -5263,6 +5391,9 @@ impl Muxtrix {
     }
 
     pub(crate) fn close_pane(&mut self, pane_id: PaneId) -> Result<(), String> {
+        if self.task_removal_busy() {
+            return Err("Wait for task completion before closing panes".into());
+        }
         let (workspace_id, tab_id, pane_count, tab_count) = self
             .session
             .workspaces
@@ -5325,6 +5456,12 @@ impl Muxtrix {
     }
 
     pub(crate) fn cleanup_pane_state(&mut self, pane_id: PaneId) {
+        if let Some(stop) = self.task_terminal_stops.remove(&pane_id)
+            && let Ok(session) = stop.session.lock()
+            && let Some(session) = session.as_ref()
+        {
+            session.terminate();
+        }
         // Closing a pane is a decision to end its process — unlike app
         // exit, where daemon-owned panes must keep running.
         if let Some(runtime) = self.terminals.remove(&pane_id)
@@ -5503,6 +5640,37 @@ impl Muxtrix {
             return Vec::new();
         };
 
+        if self.complete_task_prompt.is_some() {
+            match modified_key.as_ref() {
+                Key::Named(Named::Escape) => return self.update(Message::CancelCompleteTask),
+                Key::Named(Named::Home | Named::PageUp) => {
+                    return vec![Effect::ScrollToRatio(ScrollTarget::Dialog, 0.0)];
+                }
+                Key::Named(Named::End | Named::PageDown) => {
+                    return vec![Effect::ScrollToRatio(ScrollTarget::Dialog, 1.0)];
+                }
+                Key::Named(Named::Enter | Named::Space) => {
+                    return self.update(
+                        self.dialog_action(
+                            Message::CancelCompleteTask,
+                            Message::ConfirmCompleteTask,
+                        ),
+                    );
+                }
+                Key::Named(Named::Tab) => {
+                    self.dialog_button =
+                        Some(if self.dialog_button == Some(DialogButton::Cancel) {
+                            DialogButton::Confirm
+                        } else {
+                            DialogButton::Cancel
+                        });
+                }
+                Key::Named(Named::ArrowLeft) => self.dialog_button = Some(DialogButton::Cancel),
+                Key::Named(Named::ArrowRight) => self.dialog_button = Some(DialogButton::Confirm),
+                _ => {}
+            }
+            return Vec::new();
+        }
         // The modal owns its keys before workspace shortcuts, rail navigation,
         // and the GitHub ledger can consume them.
         if self.session_picker_visible()
@@ -6166,6 +6334,7 @@ impl Muxtrix {
             || self.rename_prompt.is_some()
             || self.default_agent_prompt
             || self.worktree_prompt.is_some()
+            || self.complete_task_prompt.is_some()
         {
             return None;
         }
@@ -6396,7 +6565,11 @@ impl Muxtrix {
     }
 
     pub(crate) fn command_enabled(&self, action: CommandAction) -> bool {
-        self.maximized_pane.is_none() || !action.requires_tiled_panes()
+        (action != CommandAction::CompleteTask
+            || self
+                .focused_pane_id()
+                .is_some_and(|pane_id| self.task_worktree(pane_id).is_some()))
+            && (self.maximized_pane.is_none() || !action.requires_tiled_panes())
     }
 
     pub(crate) fn close_command_palette(&mut self) {
@@ -6915,11 +7088,22 @@ impl Muxtrix {
 
     pub(crate) fn run_command(&mut self, action: CommandAction) -> Vec<Effect> {
         if !self.command_enabled(action) {
-            self.status = "Restore panes before changing their layout".into();
+            self.status = if action == CommandAction::CompleteTask {
+                "Focus a task pane to complete its task"
+            } else {
+                "Restore panes before changing their layout"
+            }
+            .into();
             return Vec::new();
         }
         self.close_command_palette();
         match action {
+            CommandAction::CreateTaskPane => return self.create_task_pane(),
+            CommandAction::CompleteTask => {
+                if let Some(pane_id) = self.focused_pane_id() {
+                    return self.begin_complete_task(pane_id);
+                }
+            }
             CommandAction::Split(axis) => {
                 self.active_view = ActiveView::Workspace;
                 self.status = match self.split_terminal(axis) {
@@ -8006,7 +8190,13 @@ impl Muxtrix {
         let mut exited = Vec::new();
         let mut titles = Vec::new();
         for (pane_id, runtime) in &mut self.terminals {
-            let poll = runtime.poll();
+            let task_owned = self
+                .session
+                .workspaces
+                .iter()
+                .find_map(|workspace| workspace.pane(*pane_id))
+                .is_some_and(|pane| pane.task_worktree.is_some());
+            let poll = runtime.poll(task_owned);
             if let Some(status) = poll.status {
                 self.status = status;
             }
@@ -8187,7 +8377,7 @@ impl Muxtrix {
             // raises the close-workspace confirmation instead of vanishing.
             // Unclean or unknown exits keep the pane so its output — likely
             // an error — stays readable, with Restart available.
-            if clean {
+            if clean && self.task_worktree(pane_id).is_none() {
                 let _ = self.close_pane(pane_id);
             }
         }
@@ -8754,6 +8944,13 @@ impl Muxtrix {
     }
 
     pub(crate) fn handle_control_request(&mut self, request: ControlRequest) -> ControlResponse {
+        if self.task_removal_busy()
+            && !matches!(&request, ControlRequest::Ping | ControlRequest::E2eStatus)
+        {
+            return ControlResponse::error(
+                "Task completion is in progress; retry after it finishes",
+            );
+        }
         match request {
             ControlRequest::Ping => ControlResponse::success("pong"),
             // GPUI renders to an image only on its test platform, so a
@@ -11548,7 +11745,7 @@ impl TerminalRuntime {
         self.snapshot = Some(snapshot);
     }
 
-    pub(crate) fn poll(&mut self) -> RuntimePoll {
+    pub(crate) fn poll(&mut self, retain_session_on_exit: bool) -> RuntimePoll {
         let mut poll = RuntimePoll::default();
         loop {
             let event = self
@@ -11585,7 +11782,11 @@ impl TerminalRuntime {
                     poll.status = Some("Terminal process exited".into());
                     poll.exited = true;
                     poll.exited_clean = clean;
-                    self.session.take();
+                    // EOF is not proof that every process has stopped. Task
+                    // completion still needs this actor's positive barrier.
+                    if !retain_session_on_exit && let Some(session) = self.session.take() {
+                        dispose_live_session(session);
+                    }
                     self.launch_state = TerminalLaunchState::Exited;
                     break;
                 }
@@ -12789,6 +12990,9 @@ impl muxtrix_terminal::SessionBackend for RemotePaneBackend {
         // byte channel — and its reader thread blocks until something does.
         self.client.unregister_pane(self.pane);
         result
+    }
+    fn kill_and_wait(&mut self) -> Result<(), String> {
+        self.client.kill_and_wait(self.pane)
     }
     fn process_id(&self) -> Option<u32> {
         self.client.pane_process_id(self.pane)

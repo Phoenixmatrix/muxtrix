@@ -1400,6 +1400,7 @@ fn notification(title: &str, body: &str) -> Option<TerminalNotification> {
 
 enum LiveCommand {
     Terminate,
+    TerminateAndWait(Sender<Result<(), String>>),
     PtyOutput(PtyOutput),
     PtyEof,
     PtyReadFailed(String),
@@ -1475,6 +1476,11 @@ pub trait SessionBackend: Send + 'static {
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), String>;
     fn resize(&self, size: PtySize) -> Result<(), String>;
     fn kill(&mut self) -> Result<(), String>;
+    /// A task-only exit barrier. Remote backends must use an acknowledged
+    /// protocol, never the ordinary fire-and-forget kill.
+    fn kill_and_wait(&mut self) -> Result<(), String> {
+        Err("backend does not support acknowledged termination".into())
+    }
     fn process_id(&self) -> Option<u32>;
     /// Exit status polled without blocking; `Some(clean)` once known.
     fn poll_exit(&mut self) -> Result<Option<bool>, String>;
@@ -1505,6 +1511,9 @@ impl SessionBackend for LocalBackend {
     }
     fn kill(&mut self) -> Result<(), String> {
         self.0.kill().map_err(|error| error.to_string())
+    }
+    fn kill_and_wait(&mut self) -> Result<(), String> {
+        self.0.kill_and_wait().map_err(|error| error.to_string())
     }
     fn process_id(&self) -> Option<u32> {
         self.0.process_id()
@@ -1747,9 +1756,20 @@ impl LiveSession {
         let _ = self.sender.send(LiveCommand::Terminate);
     }
 
+    /// Waits for actual child exit. Call from a cleanup worker, not the UI.
+    pub fn terminate_and_wait(&self) -> Result<(), String> {
+        let (sender, receiver) = mpsc::channel();
+        self.sender
+            .send(LiveCommand::TerminateAndWait(sender))
+            .map_err(|error| format!("session cannot confirm termination: {error}"))?;
+        receiver
+            .recv_timeout(Duration::from_secs(8))
+            .map_err(|error| format!("session did not confirm termination: {error}"))?
+    }
+
     fn stop(&mut self) -> Result<(), LiveSessionError> {
-        // A short-lived child may have already closed the command channel after
-        // reporting Exited. Joining its owner thread is still a clean shutdown.
+        // Explicit terminate or an actor failure may have closed the command
+        // channel. Joining its owner thread is still a clean shutdown.
         let _ = self.sender.send(LiveCommand::Shutdown);
         if let Some(thread) = self.thread.take() {
             thread
@@ -1830,6 +1850,7 @@ fn run_live_session(
     }
 
     let mut pending = None;
+    let mut output_ended = false;
     loop {
         let command = match pending.take() {
             Some(command) => command,
@@ -1864,19 +1885,23 @@ fn run_live_session(
                             }
                         }
                         #[cfg(windows)]
-                        match session.poll_exit() {
+                        match if output_ended {
+                            Ok(None)
+                        } else {
+                            session.poll_exit()
+                        } {
                             Ok(Some(clean)) => {
                                 if let Ok(snapshot) = terminal.snapshot() {
                                     events.push(LiveSessionEvent::Frame(snapshot));
                                 }
                                 events.push(LiveSessionEvent::Exited { clean });
-                                break;
+                                output_ended = true;
                             }
                             Ok(None) => {}
                             Err(error) => {
                                 events.push(LiveSessionEvent::Error(error));
                                 events.push(LiveSessionEvent::Exited { clean: false });
-                                break;
+                                output_ended = true;
                             }
                         }
                         continue;
@@ -1924,15 +1949,19 @@ fn run_live_session(
                 if let Ok(snapshot) = terminal.snapshot() {
                     events.push(LiveSessionEvent::Frame(snapshot));
                 }
-                events.push(LiveSessionEvent::Exited {
-                    clean: session.exit_clean(),
-                });
-                break;
+                if !output_ended {
+                    events.push(LiveSessionEvent::Exited {
+                        clean: session.exit_clean(),
+                    });
+                    output_ended = true;
+                }
             }
             LiveCommand::PtyReadFailed(error) => {
-                events.push(LiveSessionEvent::Error(error));
-                events.push(LiveSessionEvent::Exited { clean: false });
-                break;
+                if !output_ended {
+                    events.push(LiveSessionEvent::Error(error));
+                    events.push(LiveSessionEvent::Exited { clean: false });
+                    output_ended = true;
+                }
             }
             LiveCommand::Input(bytes) => {
                 if let Err(error) = session.write_all(&bytes) {
@@ -2055,7 +2084,7 @@ fn run_live_session(
             }
             LiveCommand::Shutdown => {
                 // Drop-driven: a detach, not a verdict on the process.
-                if session.kill_on_detach() {
+                if !output_ended && session.kill_on_detach() {
                     let _ = session.kill();
                 }
                 break;
@@ -2063,6 +2092,15 @@ fn run_live_session(
             LiveCommand::Terminate => {
                 let _ = session.kill();
                 break;
+            }
+            LiveCommand::TerminateAndWait(response) => {
+                // Retain the backend even after EOF: a byte-channel closure
+                // alone never proves the process is gone.
+                let result = session.kill_and_wait();
+                if result.is_ok() {
+                    output_ended = true;
+                }
+                let _ = response.send(result);
             }
         }
     }
@@ -2926,9 +2964,7 @@ mod tests {
         );
     }
 
-    /// Blocks until its sender half drops — an instantly-EOF reader would
-    /// let the session loop exit before commands arrive, making the tests
-    /// race their own setup.
+    /// Keeps the remote byte stream open until its backend is dropped.
     struct BlockingReader(mpsc::Receiver<Vec<u8>>);
 
     impl std::io::Read for BlockingReader {
@@ -3021,6 +3057,14 @@ mod tests {
             None,
         )
         .expect("remote session should spawn")
+    }
+
+    #[test]
+    fn termination_barrier_rejects_backend_without_exit_acknowledgment() {
+        let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let session = spawn_flag_session(&killed);
+        assert!(session.terminate_and_wait().is_err());
+        assert!(!killed.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

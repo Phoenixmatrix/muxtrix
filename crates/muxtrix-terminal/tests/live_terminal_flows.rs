@@ -34,6 +34,85 @@ fn interactive_session() -> Result<LiveSession, Box<dyn std::error::Error>> {
     Ok(LiveSession::spawn(plan, size, options(size))?)
 }
 
+#[test]
+#[cfg(target_os = "linux")]
+fn termination_barrier_reaps_child_even_after_pty_eof() -> Result<(), Box<dyn std::error::Error>> {
+    let size = PtySize {
+        rows: 6,
+        cols: 40,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let session = LiveSession::spawn(
+        LaunchPlan {
+            executable: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "exec 0<&- 1>&- 2>&-; sleep 300; :".into()],
+            working_directory: None,
+            environment: vec![],
+        },
+        size,
+        options(size),
+    )?;
+    let pid = session.process_id().expect("shell pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "PTY should close before child exits"
+        );
+        if matches!(
+            session.recv_timeout(Duration::from_millis(100)),
+            Ok(LiveSessionEvent::Exited { .. })
+        ) {
+            break;
+        }
+    }
+    assert!(
+        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "EOF is not child exit"
+    );
+    session.terminate_and_wait()?;
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "child must be reaped"
+    );
+    session.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn termination_barrier_accepts_already_exited_child() -> Result<(), Box<dyn std::error::Error>> {
+    let size = PtySize {
+        rows: 6,
+        cols: 40,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let session = LiveSession::spawn(
+        LaunchPlan {
+            executable: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "exit 0".into()],
+            working_directory: None,
+            environment: vec![],
+        },
+        size,
+        options(size),
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < deadline, "child should exit");
+        if matches!(
+            session.recv_timeout(Duration::from_millis(100)),
+            Ok(LiveSessionEvent::Exited { clean: true })
+        ) {
+            break;
+        }
+    }
+    session.terminate_and_wait()?;
+    session.shutdown()?;
+    Ok(())
+}
+
 fn wait_for_text(
     session: &LiveSession,
     needle: &str,

@@ -9,6 +9,71 @@ use std::collections::BTreeSet;
 use muxtrix_domain::{PaneId, PaneTree, SplitAxis, SplitRatio, WorkspaceTab};
 
 use crate::app::{NavDirection, PaneLayout, PaneRect};
+use crate::geom::Size;
+use crate::settings::AppSettings;
+
+/// Keep agent panes readable rather than repeatedly halving the focused pane.
+/// Four panes matches the tiled layout's grouping; smaller windows spill sooner.
+/// A missing viewport is not evidence that another split will fit.
+pub(crate) fn task_pane_placement(
+    tab: &WorkspaceTab,
+    source: PaneId,
+    viewport: impl Fn(PaneId) -> Option<Size>,
+    settings: &AppSettings,
+) -> Option<(PaneId, SplitAxis)> {
+    if tab.panes.len() >= 4 {
+        return None;
+    }
+    let mut best: Option<(PaneId, SplitAxis, f32)> = None;
+    let mut consider = |pane_id| {
+        let Some(size) = viewport(pane_id) else {
+            return;
+        };
+        if !size.width.is_finite() || !size.height.is_finite() {
+            return;
+        }
+        for axis in [SplitAxis::Horizontal, SplitAxis::Vertical] {
+            // Viewports exclude pane chrome. A vertical split introduces a
+            // second 35px header; both axes add a divider and card borders.
+            let child = match axis {
+                SplitAxis::Horizontal => Size::new(
+                    (size.width - crate::app::SPLIT_HANDLE_SIZE - 4.0) / 2.0,
+                    size.height,
+                ),
+                SplitAxis::Vertical => Size::new(
+                    size.width,
+                    (size.height - crate::app::SPLIT_HANDLE_SIZE - 35.0 - 4.0) / 2.0,
+                ),
+            };
+            let grid = crate::app::pty_size_for_pane(child, settings);
+            if grid.cols < 60 || grid.rows < 16 {
+                continue;
+            }
+            // The limiting dimension of an 80x24 terminal is a better
+            // reading-space measure than pixel area or aspect ratio alone.
+            let score = (f32::from(grid.cols) / 80.0).min(f32::from(grid.rows) / 24.0);
+            if best.is_none_or(|(previous, _, previous_score)| {
+                score > previous_score
+                    || (score == previous_score && pane_id == source && previous != source)
+            }) {
+                best = Some((pane_id, axis, score));
+            }
+        }
+    };
+    fn visit(tree: &PaneTree, consider: &mut impl FnMut(PaneId)) {
+        match tree {
+            PaneTree::Leaf { pane_id } => consider(*pane_id),
+            PaneTree::Split { first, second, .. } => {
+                visit(first, consider);
+                visit(second, consider);
+            }
+            // A collapsed sheet's cached terminal viewport is not free space.
+            PaneTree::Stack { .. } => {}
+        }
+    }
+    visit(&tab.root, &mut consider);
+    best.map(|(pane_id, axis, _)| (pane_id, axis))
+}
 
 pub(crate) fn pane_ids_in_layout(tree: &PaneTree) -> Vec<PaneId> {
     tree.pane_ids()
@@ -453,4 +518,121 @@ pub(crate) fn neighbor_pane(
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|rect| rect.pane_id)
+}
+#[cfg(test)]
+mod task_placement_tests {
+    use super::*;
+    use muxtrix_domain::{ProfileId, Surface, TerminalSurface};
+
+    fn tab(count: usize) -> WorkspaceTab {
+        let surface = || {
+            Surface::terminal(
+                "shell",
+                TerminalSurface {
+                    profile_id: ProfileId::new(),
+                    working_directory: None,
+                },
+            )
+        };
+        let mut tab = WorkspaceTab::new("tasks", surface());
+        for _ in 1..count {
+            tab.split_focused(SplitAxis::Horizontal, SplitRatio::EQUAL, surface())
+                .expect("fixture split");
+        }
+        tab
+    }
+
+    #[test]
+    fn task_placement_uses_readable_width_or_height_instead_of_fixed_direction() {
+        let tab = tab(1);
+        let pane = tab.focused_pane_id;
+        let settings = AppSettings::default();
+        assert_eq!(
+            task_pane_placement(&tab, pane, |_| Some(Size::new(3000.0, 650.0)), &settings),
+            Some((pane, SplitAxis::Horizontal)),
+        );
+        assert_eq!(
+            task_pane_placement(&tab, pane, |_| Some(Size::new(900.0, 1600.0)), &settings),
+            Some((pane, SplitAxis::Vertical)),
+        );
+    }
+
+    #[test]
+    fn task_placement_spills_crowded_or_unmeasured_tabs_without_cramping_terminals() {
+        let settings = AppSettings::default();
+        let crowded = tab(4);
+        assert_eq!(
+            task_pane_placement(
+                &crowded,
+                crowded.focused_pane_id,
+                |_| Some(Size::new(4000.0, 2000.0)),
+                &settings,
+            ),
+            None
+        );
+        let small = tab(1);
+        assert_eq!(
+            task_pane_placement(
+                &small,
+                small.focused_pane_id,
+                |_| Some(Size::new(500.0, 300.0)),
+                &settings,
+            ),
+            None
+        );
+        assert_eq!(
+            task_pane_placement(&small, small.focused_pane_id, |_| None, &settings),
+            None
+        );
+    }
+
+    #[test]
+    fn task_placement_uses_roomier_neighbor_and_prefers_source_on_ties() {
+        let tab = tab(2);
+        let panes = tab.root.pane_ids();
+        let source = panes[0];
+        let neighbor = panes[1];
+        let settings = AppSettings::default();
+        assert_eq!(
+            task_pane_placement(
+                &tab,
+                source,
+                |pane| {
+                    Some(if pane == source {
+                        Size::new(500.0, 300.0)
+                    } else {
+                        Size::new(3000.0, 650.0)
+                    })
+                },
+                &settings
+            ),
+            Some((neighbor, SplitAxis::Horizontal))
+        );
+        assert_eq!(
+            task_pane_placement(
+                &tab,
+                neighbor,
+                |_| Some(Size::new(3000.0, 650.0)),
+                &settings
+            ),
+            Some((neighbor, SplitAxis::Horizontal))
+        );
+    }
+
+    #[test]
+    fn task_placement_does_not_mistake_stacked_terminal_caches_for_free_space() {
+        let mut tab = tab(2);
+        tab.root = PaneTree::Stack {
+            pane_ids: tab.root.pane_ids(),
+        };
+        assert_eq!(
+            task_pane_placement(
+                &tab,
+                tab.focused_pane_id,
+                |_| Some(Size::new(4000.0, 2000.0)),
+                &AppSettings::default(),
+            ),
+            None
+        );
+    }
 }

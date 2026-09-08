@@ -9,6 +9,8 @@ use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Styled, Window, div, px,
 };
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{Disableable as _, Sizable as _};
 use muxtrix_domain::{PaneId, PaneTree, SplitAxis, Workspace, WorkspaceTab};
 
 use crate::app::{
@@ -339,6 +341,7 @@ impl Root {
         let signal = signal_kind.color(tokens);
         let state = app.pane_state_label(pane_id);
         let compact = crate::app::pane_header_is_compact(app.window_size.width, tab.panes.len());
+        let task_pane = app.task_worktree(pane_id).is_some();
         let runtime = app.terminals.get(&pane_id);
         let process_exited = runtime.is_some_and(|runtime| {
             matches!(
@@ -367,7 +370,30 @@ impl Root {
         });
         let ui_size = px(app.settings.ui_pixels(9.0));
 
-        let mut controls = div().flex().flex_row().items_center().gap(px(2.));
+        let mut controls = div()
+            .flex()
+            .flex_row()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(2.));
+        if task_pane {
+            let busy = app
+                .complete_task_prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.pane_id == pane_id && prompt.busy);
+            controls = controls.child(
+                Button::new(("complete-task", pane_key(pane_id)))
+                    .xsmall()
+                    .ghost()
+                    .label("Complete Task")
+                    .tooltip("Remove this task's worktree and close its pane")
+                    .disabled(busy)
+                    .on_click(cx.listener(move |root, _, window, cx| {
+                        cx.stop_propagation();
+                        root.dispatch(Message::CompleteTask(pane_id), window, cx);
+                    })),
+            );
+        }
         if !compact {
             if app.maximized_pane.is_none() {
                 controls = controls
@@ -436,16 +462,18 @@ impl Root {
         if !compact {
             controls = controls.child(div().w(px(1.)).h(px(14.)).bg(color(tokens.line_strong)));
         }
-        controls = controls
-            .child(self.header_button(
-                ("overflow", pane_key(pane_id)),
-                IconKind::Overflow,
-                Message::TogglePaneMenu(pane_id),
-                false,
-                tokens,
-                cx,
-            ))
-            .child(self.header_button(
+        controls = controls.child(self.header_button(
+            ("overflow", pane_key(pane_id)),
+            IconKind::Overflow,
+            Message::TogglePaneMenu(pane_id),
+            false,
+            tokens,
+            cx,
+        ));
+        // The task action stays visible in dense headers; ordinary close is
+        // still available in the overflow menu without crowding the title.
+        if !task_pane || !compact {
+            controls = controls.child(self.header_button(
                 ("close", pane_key(pane_id)),
                 IconKind::Close,
                 Message::ClosePane(pane_id),
@@ -453,6 +481,7 @@ impl Root {
                 tokens,
                 cx,
             ));
+        }
 
         // What is actually running, when there is room to say so: the
         // program's name in the terminal face, on a faint chip.
@@ -633,6 +662,14 @@ impl Root {
             false,
         ));
         entries.push(MenuEntry::Divider);
+        if app.task_worktree(pane_id).is_some() {
+            entries.push(MenuEntry::action(
+                "Complete Task",
+                "",
+                Some(Message::CompleteTask(pane_id)),
+                false,
+            ));
+        }
         entries.push(MenuEntry::action(
             "Restart in worktree…",
             "",

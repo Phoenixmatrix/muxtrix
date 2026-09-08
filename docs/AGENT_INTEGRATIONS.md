@@ -82,6 +82,40 @@ Settings is open; choosing **Apply and continue** resumes it after setup.
 The launch and worktree-agent actions are available from Ctrl+P on Windows/Linux
 and Cmd+P on macOS.
 
+### Task panes
+
+**Create Task Pane** creates a Git worktree and branch with an automatic
+adjective/name pair such as `clever_hopper`, opens a terminal there, and starts
+the configured default agent. There is no naming dialog. The same integration
+setup gate and **Apply and continue** flow described above apply.
+
+Placement is automatic: Muxtrix considers the tab's visible panes and chooses
+a horizontal or vertical split that leaves both terminals at least 60 columns
+by 16 rows. A roomier neighbor can be selected; the source pane wins ties.
+It creates a new tab instead when no split fits, geometry is unavailable,
+the tab already has four panes, or a pane is maximized. Existing panes are
+not rearranged.
+
+Use **Complete Task** in the task pane's header or command palette to remove
+its worktree and close its pane. Task ownership persists across saved-session
+restoration and process exit. Closing a pane normally does not delete its
+worktree. Completing the last pane opens a safe replacement shell first.
+
+Completion checks local files (including ignored files), initialized
+submodules, hidden index flags, and commits not reachable from the branch
+the task started on. This is a local ancestry check, not a fetch or a
+patch-equivalence check. Risk requires explicit **Discard & Complete**;
+Cancel is the default keyboard action. The task branch is always kept,
+but discarded uncommitted files are not recoverable from that branch.
+
+Before deletion, Muxtrix requires acknowledged process termination and checks
+that no other pane references the checkout. A failed check keeps the worktree
+and presents a retryable error; it does not silently force removal.
+An older running session host must be restarted before it can acknowledge
+task termination. Linux and Windows have termination barriers; other Unix
+platforms currently refuse completion when a live session's termination
+cannot be verified.
+
 Adding or re-adding user-level Codex hooks also marks the shared
 `~/.muxtrix/worktrees` parent as trusted in `~/.codex/config.toml`. Codex can
 then trust every linked checkout Muxtrix creates without accumulating a

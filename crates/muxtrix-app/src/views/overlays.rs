@@ -61,6 +61,8 @@ impl Root {
                 } else {
                     command.subtitle.to_owned()
                 }
+            } else if command.action == crate::commands::CommandAction::CompleteTask {
+                "Focus a task pane to complete its task".to_owned()
             } else {
                 "Restore panes to use this command".to_owned()
             };

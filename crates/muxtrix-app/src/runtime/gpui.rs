@@ -1162,6 +1162,7 @@ pub(crate) struct Scrolls {
     pub(crate) settings: gpui::ScrollHandle,
     pub(crate) palette: gpui::ScrollHandle,
     pub(crate) sessions: gpui::ScrollHandle,
+    pub(crate) dialog: gpui::ScrollHandle,
     pub(crate) github_files: gpui::ScrollHandle,
     pub(crate) github_pull_requests: gpui::ScrollHandle,
     pub(crate) tabs: gpui::ScrollHandle,
@@ -1174,6 +1175,7 @@ impl Scrolls {
             ScrollTarget::Settings => &self.settings,
             ScrollTarget::CommandPalette => &self.palette,
             ScrollTarget::SessionPicker => &self.sessions,
+            ScrollTarget::Dialog => &self.dialog,
             ScrollTarget::GitHubFiles => &self.github_files,
             ScrollTarget::GitHubPullRequests => &self.github_pull_requests,
         }

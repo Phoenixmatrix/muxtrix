@@ -181,6 +181,15 @@ whole band. Focus and attention live on the card border, never on a separate
 top rail. Preserve native button semantics, tooltips, keyboard operation, and
 visible keyboard focus for every action.
 
+Task panes retain a quiet **Complete Task** text button before their layout
+controls. At compact widths, keep that action and overflow visible; ordinary
+close remains in overflow. Completion is also a contextual palette command,
+so the destructive flow has a keyboard entry path. Its confirmation defaults
+to Cancel and explains file deletion, unmerged commits, and branch retention.
+Bound long dialog content to the viewport with a visible scrollbar; keep the
+title and footer stationary. Task warnings support Home/Page Up and End/Page
+Down without forwarding those keys to the terminal.
+
 Terminal-emitted window titles replace the pane's fallback shell label and feed
 the native window title. Treat this as live terminal metadata: sanitize it,
 keep it pane-local, and never let another process rename an unrelated pane.

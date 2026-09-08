@@ -32,6 +32,8 @@ pub(crate) enum CommandAction {
     RenamePane,
     NewWorktree(WorktreeKind),
     NewWorktreeWithAgent(WorktreeKind),
+    CreateTaskPane,
+    CompleteTask,
     RestartPaneInWorktree,
     RestartPaneInExistingWorktree,
     RestartPaneInWorktreeWithAgent,
@@ -70,6 +72,7 @@ impl CommandAction {
         matches!(
             self,
             Self::NewWorktreeWithAgent(_)
+                | Self::CreateTaskPane
                 | Self::RestartPaneInWorktreeWithAgent
                 | Self::RestartPaneInExistingWorktreeWithAgent
         )
@@ -91,7 +94,7 @@ pub(crate) struct Command {
     pub(crate) action: CommandAction,
 }
 
-const COMMANDS: [Command; 37] = [
+const COMMANDS: [Command; 39] = [
     Command {
         title: "Split pane right",
         subtitle: "Open an independent terminal beside the focused pane",
@@ -203,6 +206,20 @@ const COMMANDS: [Command; 37] = [
         keywords: "pane edit title change name terminal",
         shortcut: "",
         action: CommandAction::RenamePane,
+    },
+    Command {
+        title: "Create Task Pane",
+        subtitle: "Create an auto-named worktree, place its pane automatically, and start the default agent",
+        keywords: "task git branch worktree agent automatic name create pane tab smart placement",
+        shortcut: "",
+        action: CommandAction::CreateTaskPane,
+    },
+    Command {
+        title: "Complete Task",
+        subtitle: "Remove the focused task's worktree and close its pane; keep its branch",
+        keywords: "task git worktree finish cleanup discard remove complete",
+        shortcut: "",
+        action: CommandAction::CompleteTask,
     },
     Command {
         title: "New worktree pane right",

@@ -86,6 +86,7 @@ pub(crate) enum ScrollTarget {
     Settings,
     CommandPalette,
     SessionPicker,
+    Dialog,
     GitHubFiles,
     GitHubPullRequests,
 }

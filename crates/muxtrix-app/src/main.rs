@@ -25,6 +25,7 @@ mod metrics;
 mod process;
 mod runtime;
 mod settings;
+mod task_worktree;
 mod terminal;
 mod terminal_image;
 mod theme;
