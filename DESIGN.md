@@ -72,6 +72,18 @@ and panes runs through command-palette actions that open one shared focused
 rename dialog; workspace rows carry no inline edit affordances. A pane rename
 is an override: clearing it restores the automatic terminal/agent title.
 
+Workspace tiles reserve a 24 px close target at the trailing edge of the
+tab/pane-count line, 13 px inside the rail. Its quiet × appears on tile hover
+or workspace keyboard targeting, with the shared danger hover and a tooltip.
+The slot remains stable and hit-testable through hover repaint and dialog
+dismissal; neither the workspace title nor its live status gives up space.
+Closing does not activate an inactive workspace. Tile close, Delete while
+targeting a workspace in prefix navigation, and the Close workspace palette
+command all open the same confirmation with the full workspace name and an
+explicit warning that running processes stop. Cancel is initially selected;
+Enter cancels until the user chooses Close workspace. The last workspace
+remains protected by the session model.
+
 Fleet scope is configured in Settings. Current Workspace follows the selected
 workspace without repeating its workspace name. All Workspaces lists every
 workspace in session order and inserts a collapsible uppercase workspace branch

@@ -1556,6 +1556,7 @@ pub(crate) enum Message {
     NewTab,
     ActivateTab(TabId),
     CloseTab(WorkspaceId, TabId),
+    RequestCloseWorkspace(WorkspaceId),
     ConfirmCloseWorkspace(WorkspaceId),
     CancelCloseWorkspace,
     BeginTabDrag(WorkspaceId, TabId, usize),
@@ -2914,6 +2915,9 @@ impl Muxtrix {
                 return Vec::new();
             }
             Message::CloseTab(workspace_id, tab_id) => self.close_tab(workspace_id, tab_id),
+            Message::RequestCloseWorkspace(workspace_id) => {
+                self.request_close_workspace(workspace_id)
+            }
             Message::ConfirmCloseWorkspace(workspace_id) => {
                 self.close_workspace_prompt = None;
                 self.dialog_button = None;
@@ -5205,7 +5209,22 @@ impl Muxtrix {
     }
 
     pub(crate) fn close_workspace(&mut self) -> Result<(), String> {
-        self.close_workspace_by_id(self.session.active_workspace_id)
+        self.request_close_workspace(self.session.active_workspace_id)
+    }
+
+    fn request_close_workspace(&mut self, workspace_id: WorkspaceId) -> Result<(), String> {
+        if !self
+            .session
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id)
+        {
+            return Err("workspace is missing".to_owned());
+        }
+        self.rail_nav = None;
+        self.close_workspace_prompt = Some(workspace_id);
+        self.dialog_button = Some(DialogButton::Cancel);
+        Ok(())
     }
 
     pub(crate) fn close_workspace_by_id(
@@ -5275,9 +5294,7 @@ impl Muxtrix {
             .ok_or_else(|| format!("pane {pane_id:?} is missing"))?;
         if pane_count == 1 {
             if tab_count == 1 {
-                self.close_workspace_prompt = Some(workspace_id);
-                self.dialog_button = Some(DialogButton::Confirm);
-                return Ok(());
+                return self.request_close_workspace(workspace_id);
             }
             return self.close_tab(workspace_id, tab_id);
         }
@@ -5305,9 +5322,7 @@ impl Muxtrix {
             .find(|workspace| workspace.id == workspace_id)
             .ok_or_else(|| "workspace is missing".to_owned())?;
         if workspace.tabs.len() == 1 {
-            self.close_workspace_prompt = Some(workspace_id);
-            self.dialog_button = Some(DialogButton::Confirm);
-            return Ok(());
+            return self.request_close_workspace(workspace_id);
         }
         let removed = workspace
             .close_tab(tab_id)
@@ -5657,6 +5672,11 @@ impl Muxtrix {
                         self.rail_nav = targets.get(next).copied();
                     } else {
                         self.rail_nav = targets.first().copied();
+                    }
+                }
+                Key::Named(Named::Delete) => {
+                    if let RailTarget::Workspace(workspace_id) = current {
+                        return self.update(Message::RequestCloseWorkspace(workspace_id));
                     }
                 }
                 Key::Named(Named::ArrowLeft) | Key::Named(Named::ArrowRight) => {
@@ -6990,7 +7010,7 @@ impl Muxtrix {
             }
             CommandAction::CloseWorkspace => {
                 self.status = match self.close_workspace() {
-                    Ok(()) => "Closed the workspace".into(),
+                    Ok(()) => "Confirm closing the workspace".into(),
                     Err(error) => error,
                 };
             }

@@ -113,6 +113,10 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         "{}.mouse-probe-completed",
         mouse_probe_path.display()
     ));
+    let workspace_close_state_path = std::path::PathBuf::from(format!(
+        "{}.workspace-close-state",
+        mouse_probe_path.display()
+    ));
     let home_path =
         std::env::temp_dir().join(format!("muxtrix-e2e-home-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&home_path)?;
@@ -142,6 +146,10 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         .env("MUXTRIX_E2E_REPORT", &report_path)
         .env("MUXTRIX_E2E_PANE_MENU_READY", &pane_menu_ready_path)
         .env("MUXTRIX_E2E_PANE_MENU_DISMISSED", &pane_menu_dismissed_path)
+        .env(
+            "MUXTRIX_E2E_WORKSPACE_CLOSE_STATE",
+            &workspace_close_state_path,
+        )
         .env(
             "MUXTRIX_E2E_MOUSE_REPORTING_READY",
             &mouse_reporting_ready_path,
@@ -524,6 +532,38 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             }
             thread::sleep(Duration::from_millis(50));
         }
+        if matches!(
+            capture.as_str(),
+            "workspace-close-hover" | "workspace-close-confirm" | "close-workspace"
+        ) {
+            wait_workspace_close_state(&workspace_close_state_path, false, 2)?;
+            let origin = pin_window(&connection, root, window)?;
+            // The 296px expanded rail keeps the close slot at its trailing
+            // 13px inset. Its 24px target is on the first tile's second line.
+            let close_x = origin.dst_x.saturating_add(270);
+            let close_y = origin.dst_y.saturating_add(79);
+            connection
+                .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, close_x, close_y, 0)?
+                .check()?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(1_000));
+            if capture != "workspace-close-hover" {
+                click_at(&connection, root, close_x, close_y)?;
+                connection.flush()?;
+                wait_workspace_close_state(&workspace_close_state_path, true, 2)?;
+                // Enter on the initial selection must cancel, never destroy.
+                tap_keysym(&connection, 0xff0d)?;
+                connection.flush()?;
+                wait_workspace_close_state(&workspace_close_state_path, false, 2)?;
+                click_at(&connection, root, close_x, close_y)?;
+                connection.flush()?;
+                wait_workspace_close_state(&workspace_close_state_path, true, 2)?;
+                thread::sleep(Duration::from_millis(750));
+                eprintln!("clicked inactive workspace close, canceled with Enter, and reopened");
+            } else {
+                eprintln!("hovered the inactive workspace close control");
+            }
+        }
         if capture == "session-picker-hover" {
             if final_viewport != (1280, 800) {
                 return Err("session-picker-hover requires the default 1280x800 viewport".into());
@@ -808,6 +848,15 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             "captured a {}x{} frame from the X server",
             frame.width, frame.height
         );
+        if capture == "workspace-close-confirm" || capture == "close-workspace" {
+            // Preserve the confirmation frame, then exercise its destructive
+            // action through keyboard navigation before the app quits.
+            tap_keysym(&connection, 0xff53)?;
+            tap_keysym(&connection, 0xff0d)?;
+            connection.flush()?;
+            wait_workspace_close_state(&workspace_close_state_path, false, 1)?;
+            eprintln!("confirmed closing only the inactive target workspace");
+        }
         let _ = control_request(&control_path, r#"{"method":"quit"}"#);
         frame
     };
@@ -847,6 +896,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     let _ = std::fs::remove_file(format!("{}.ready", mouse_probe_path.display()));
     let _ = std::fs::remove_file(&pane_menu_ready_path);
     let _ = std::fs::remove_file(&pane_menu_dismissed_path);
+    let _ = std::fs::remove_file(&workspace_close_state_path);
     let _ = std::fs::remove_file(&mouse_reporting_ready_path);
     let _ = std::fs::remove_file(&mouse_probe_completed_path);
     let _ = std::fs::remove_file(&scrollback_marker);
@@ -939,6 +989,43 @@ print("mouse-report-ok" if data.startswith(b"\x1b[<35;") else "mouse-report-fail
     permissions.set_mode(0o700);
     std::fs::set_permissions(path, permissions)?;
     Ok(())
+}
+
+fn wait_workspace_close_state(
+    path: &std::path::Path,
+    prompt_open: bool,
+    workspace_count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(bytes) = std::fs::read(path) {
+            let state: serde_json::Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(
+                state["active"], "release-audit-with-a-long-workspace-name",
+                "closing the inactive workspace activated its parent row"
+            );
+            let expected_prompt = if prompt_open {
+                serde_json::json!("muxtrix-platform-long-running-workspace")
+            } else {
+                serde_json::Value::Null
+            };
+            if state["prompt"] == expected_prompt && state["workspaces"] == workspace_count {
+                if prompt_open {
+                    assert_eq!(
+                        state["cancel_selected"], true,
+                        "close must default to Cancel"
+                    );
+                }
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("workspace close state did not settle: {state}").into());
+            }
+        } else if Instant::now() >= deadline {
+            return Err("workspace close state was never published".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Put the window at the screen's corner and report where it actually is.

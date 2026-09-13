@@ -6,8 +6,8 @@
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, Context, Div, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px, svg,
+    AnyElement, ClickEvent, Context, Div, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px, svg,
 };
 use muxtrix_domain::{PaneId, Workspace, WorkspaceId};
 
@@ -764,6 +764,33 @@ impl Root {
         let tabs = workspace.tabs.len();
         let panes = workspace.pane_count();
         let tab_count = workspace.tabs.len();
+        let hover_group = format!("workspace-row-{}", workspace_key(workspace_id));
+        let close = icon_button(
+            ("close-workspace", workspace_key(workspace_id)),
+            IconKind::Close,
+            tokens,
+            true,
+        )
+        .role(gpui::accesskit::Role::Button)
+        .aria_label(format!("Close {} workspace", workspace.name))
+        .flex_none()
+        // Keep the reserved target hit-testable when a fast click follows
+        // hover or dialog dismissal before the reveal frame has painted.
+        .when(!targeted, |button| button.opacity(0.))
+        .when(app.close_workspace_prompt.is_none(), |button| {
+            button.tooltip(|window, cx| {
+                gpui_component::tooltip::Tooltip::new("Close workspace…").build(window, cx)
+            })
+        })
+        .group_hover(hover_group.clone(), |button| button.opacity(1.))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+        )
+        .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
+            root.dispatch(Message::RequestCloseWorkspace(workspace_id), window, cx);
+            cx.stop_propagation();
+        }));
 
         // Text-derived translucent fills read correctly on every surface in
         // both appearances, which is why the iced rail uses them too.
@@ -785,17 +812,15 @@ impl Root {
 
         div()
             .id(("workspace", workspace_key(workspace_id)))
+            .group(hover_group)
             .flex()
             .flex_row()
             .items_stretch()
             .w_full()
             .cursor_pointer()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |root, _: &MouseDownEvent, window, cx| {
-                    root.dispatch(Message::SwitchWorkspace(workspace_id), window, cx);
-                }),
-            )
+            .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
+                root.dispatch(Message::SwitchWorkspace(workspace_id), window, cx);
+            }))
             .on_mouse_move(
                 cx.listener(move |root, _: &gpui::MouseMoveEvent, window, cx| {
                     if root.app.tab_drag.is_some() {
@@ -870,13 +895,19 @@ impl Root {
                     .child(
                         div()
                             .text_size(px(app.settings.ui_pixels(9.0)))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .min_h(px(24.))
                             .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                             .text_color(color(tokens.muted))
-                            .child(format!(
+                            .child(div().min_w(px(0.)).truncate().child(format!(
                                 "{tabs} tab{} · {panes} pane{}",
                                 if tabs == 1 { "" } else { "s" },
                                 if panes == 1 { "" } else { "s" }
-                            )),
+                            )))
+                            .child(close),
                     )
                     .child(
                         div()

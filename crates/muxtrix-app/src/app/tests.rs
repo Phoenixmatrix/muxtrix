@@ -8958,10 +8958,161 @@ fn app_workspaces_keep_independent_terminal_fleets() {
     app.switch_workspace(first_workspace)
         .expect("first workspace should switch");
     assert_eq!(active_pane_id(&app), first_pane);
-    app.close_workspace().expect("first workspace should close");
+    drop(app.update(Message::RequestCloseWorkspace(first_workspace)));
+    drop(app.update(Message::ConfirmCloseWorkspace(first_workspace)));
     assert_eq!(app.session.active_workspace_id, second_workspace);
     assert!(!app.terminals.contains_key(&first_pane));
     assert!(app.terminals.contains_key(&second_pane));
+}
+
+#[test]
+fn inactive_workspace_close_preserves_live_fleets_until_confirmed() {
+    let mut app = Muxtrix::new();
+    let target_workspace = app.session.active_workspace_id;
+    let first_pane = active_pane_id(&app);
+    app.split_terminal(SplitAxis::Horizontal)
+        .expect("split should be created");
+    let split_pane = active_pane_id(&app);
+    app.new_tab().expect("second tab should be created");
+    let second_tab_pane = active_pane_id(&app);
+    let target_panes = [first_pane, split_pane, second_tab_pane];
+    create_test_workspace(&mut app);
+    let active_workspace = app.session.active_workspace_id;
+    let active_tab_id = active_tab(&app).id;
+    let active_pane = active_pane_id(&app);
+
+    let mut sessions = Vec::new();
+    for pane_id in target_panes.into_iter().chain([active_pane]) {
+        let killed = Arc::new(AtomicBool::new(false));
+        let (launched, reader) = late_launched_terminal(&app, &killed);
+        app.terminals.get_mut(&pane_id).expect("terminal").session = Some(launched.session);
+        sessions.push((pane_id, killed, reader));
+    }
+
+    app.rail_nav = Some(RailTarget::Workspace(target_workspace));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Delete), Modifiers::empty())));
+    assert_eq!(app.close_workspace_prompt, Some(target_workspace));
+    assert_eq!(app.session.active_workspace_id, active_workspace);
+    assert_eq!(active_tab(&app).id, active_tab_id);
+    assert_eq!(active_pane_id(&app), active_pane);
+    assert_eq!(app.session.workspaces.len(), 2);
+    for (pane_id, killed, _) in &sessions {
+        app.terminals[pane_id]
+            .session
+            .as_ref()
+            .expect("request must retain the live session")
+            .snapshot()
+            .expect("session must remain responsive");
+        assert!(!killed.load(Ordering::Acquire));
+    }
+
+    drop(app.update(Message::CancelCloseWorkspace));
+    assert!(app.close_workspace_prompt.is_none());
+    assert_eq!(app.session.workspaces.len(), 2);
+    assert_eq!(app.session.active_workspace_id, active_workspace);
+    assert_eq!(active_tab(&app).id, active_tab_id);
+    assert_eq!(active_pane_id(&app), active_pane);
+    for (pane_id, killed, _) in &sessions {
+        app.terminals[pane_id]
+            .session
+            .as_ref()
+            .expect("cancellation must retain the live session")
+            .snapshot()
+            .expect("session must remain responsive");
+        assert!(!killed.load(Ordering::Acquire));
+    }
+
+    drop(app.update(Message::RequestCloseWorkspace(target_workspace)));
+    drop(app.update(Message::ConfirmCloseWorkspace(target_workspace)));
+    assert!(app.close_workspace_prompt.is_none());
+    assert_eq!(app.session.workspaces.len(), 1);
+    assert_eq!(app.session.workspaces[0].id, active_workspace);
+    assert_eq!(app.session.active_workspace_id, active_workspace);
+    assert_eq!(active_tab(&app).id, active_tab_id);
+    assert_eq!(active_pane_id(&app), active_pane);
+    assert_eq!(app.terminals.len(), 1);
+    for (pane_id, killed, _) in &sessions {
+        if *pane_id == active_pane {
+            app.terminals[pane_id]
+                .session
+                .as_ref()
+                .expect("other workspace session must survive")
+                .snapshot()
+                .expect("other workspace session must remain responsive");
+            assert!(!killed.load(Ordering::Acquire));
+        } else {
+            assert!(!app.terminals.contains_key(pane_id));
+            assert!(
+                wait_for_kill(killed, std::time::Duration::from_secs(5)),
+                "confirmation must end target sessions in every tab"
+            );
+        }
+    }
+}
+
+#[test]
+fn palette_workspace_close_requires_explicit_keyboard_confirmation() {
+    let mut app = Muxtrix::new();
+    let other_workspace = app.session.active_workspace_id;
+    let other_pane = active_pane_id(&app);
+    create_test_workspace(&mut app);
+    let target_workspace = app.session.active_workspace_id;
+    let target_pane = active_pane_id(&app);
+
+    app.palette.visible = true;
+    app.palette.query.clear();
+    let close_command = commands::filtered("")
+        .iter()
+        .position(|command| matches!(command.action, CommandAction::CloseWorkspace))
+        .expect("close workspace command");
+    drop(app.update(Message::CommandSelected(close_command)));
+    assert!(!app.palette.visible);
+    assert_eq!(app.close_workspace_prompt, Some(target_workspace));
+    assert_eq!(app.session.workspaces.len(), 2);
+    assert!(app.terminals.contains_key(&target_pane));
+    assert!(app.terminals.contains_key(&other_pane));
+
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+    assert!(app.close_workspace_prompt.is_none());
+    assert_eq!(app.session.workspaces.len(), 2);
+    assert_eq!(app.session.active_workspace_id, target_workspace);
+    assert_eq!(active_pane_id(&app), target_pane);
+    assert!(app.terminals.contains_key(&target_pane));
+    assert!(app.terminals.contains_key(&other_pane));
+
+    drop(app.update(Message::RequestCloseWorkspace(target_workspace)));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::ArrowRight), Modifiers::empty())));
+    drop(app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty())));
+    assert!(app.close_workspace_prompt.is_none());
+    assert_eq!(app.session.workspaces.len(), 1);
+    assert_eq!(app.session.active_workspace_id, other_workspace);
+    assert!(!app.terminals.contains_key(&target_pane));
+    assert!(app.terminals.contains_key(&other_pane));
+}
+
+#[test]
+fn confirming_close_cannot_remove_the_only_workspace() {
+    let mut app = Muxtrix::new();
+    let workspace_id = app.session.active_workspace_id;
+    let pane_id = active_pane_id(&app);
+    let killed = Arc::new(AtomicBool::new(false));
+    let (launched, reader) = late_launched_terminal(&app, &killed);
+    app.terminals.get_mut(&pane_id).expect("terminal").session = Some(launched.session);
+
+    drop(app.update(Message::RequestCloseWorkspace(workspace_id)));
+    drop(app.update(Message::ConfirmCloseWorkspace(workspace_id)));
+
+    assert_eq!(app.session.workspaces.len(), 1);
+    assert_eq!(app.session.active_workspace_id, workspace_id);
+    assert_eq!(active_pane_id(&app), pane_id);
+    app.terminals[&pane_id]
+        .session
+        .as_ref()
+        .expect("last workspace must retain its session")
+        .snapshot()
+        .expect("last workspace session must remain responsive");
+    assert!(!killed.load(Ordering::Acquire));
+    drop(reader);
 }
 
 #[test]
