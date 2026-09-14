@@ -182,14 +182,14 @@ impl Root {
                 .workspaces
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
-                .map_or_else(|| "this workspace".to_owned(), |w| ellipsize(&w.name, 32));
+                .map_or("this workspace", |workspace| workspace.name.as_str());
             (
                 Message::CancelCloseWorkspace,
                 self.confirm(
                     "Close workspace",
-                    &format!("{name} and every terminal in it will be closed."),
+                    &format!("Close “{name}” and every terminal in it? Running processes will be stopped."),
                     ("Cancel", Message::CancelCloseWorkspace),
-                    ("Close", Message::ConfirmCloseWorkspace(workspace_id)),
+                    ("Close workspace", Message::ConfirmCloseWorkspace(workspace_id)),
                     true,
                     tokens,
                     cx,

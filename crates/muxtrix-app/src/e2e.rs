@@ -160,6 +160,7 @@ pub(super) struct Scenario {
     /// workspace frame. One name per staged surface; `capturing` is the only
     /// reader, so a new state costs one match arm rather than a new field.
     capture: String,
+    workspace_close_state: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +293,7 @@ impl Scenario {
             tab_lifecycle_observed: false,
             capture: std::env::var_os("MUXTRIX_E2E_CAPTURE")
                 .map_or_else(String::new, |value| value.to_string_lossy().into_owned()),
+            workspace_close_state: String::new(),
         })
     }
 
@@ -931,7 +933,33 @@ impl Scenario {
                     return Ok(TickAction::Capture);
                 }
             }
-            Stage::Screenshot => return Ok(TickAction::Wait),
+            Stage::Screenshot => {
+                if self.capturing("workspace-close-hover")
+                    || self.capturing("workspace-close-confirm")
+                    || self.capturing("close-workspace")
+                {
+                    let state = json!({
+                        "active": app.active_workspace()?.name,
+                        "prompt": app.close_workspace_prompt.and_then(|id| {
+                            app.session.workspaces.iter().find(|workspace| workspace.id == id)
+                                .map(|workspace| workspace.name.clone())
+                        }),
+                        "workspaces": app.session.workspaces.len(),
+                        "cancel_selected": app.dialog_button == Some(crate::app::DialogButton::Cancel),
+                    })
+                    .to_string();
+                    if state != self.workspace_close_state {
+                        if let Some(path) = std::env::var_os("MUXTRIX_E2E_WORKSPACE_CLOSE_STATE") {
+                            let path = PathBuf::from(path);
+                            let pending = path.with_extension("pending");
+                            std::fs::write(&pending, &state).map_err(|error| error.to_string())?;
+                            std::fs::rename(pending, path).map_err(|error| error.to_string())?;
+                        }
+                        self.workspace_close_state = state;
+                    }
+                }
+                return Ok(TickAction::Wait);
+            }
         }
         Ok(TickAction::Wait)
     }
@@ -1878,8 +1906,61 @@ impl Scenario {
                 prompt.base_directory =
                     Some("/home/user/an-extraordinarily-long-home-directory-name/.muxtrix/worktrees/muxtrix".into());
             }
-        } else if self.capturing("close-workspace") {
-            app.close_workspace_prompt = Some(app.session.active_workspace_id);
+        } else if self.capturing("workspace-close-hover")
+            || self.capturing("workspace-close-confirm")
+            || self.capturing("close-workspace")
+        {
+            // Keep the second workspace active so clicking the first tile's
+            // close action must not accidentally activate its parent row.
+            app.active_workspace_mut()?.name = "muxtrix-platform-long-running-workspace".into();
+            for (pane_id, state, activity) in [
+                (
+                    self.initial_pane,
+                    AgentState::Running,
+                    "Building workspace close controls",
+                ),
+                (
+                    self.second_pane()?,
+                    AgentState::Waiting,
+                    "Needs approval for release checks",
+                ),
+            ] {
+                app.agent_statuses.insert(
+                    pane_id,
+                    AgentPaneStatus {
+                        agent: "codex".into(),
+                        display_name: Some("workspace-close-review".into()),
+                        state,
+                        activity: Some(activity.into()),
+                        session_id: None,
+                        cwd: Some("/home/user/dev/muxtrix".into()),
+                        git_branch: Some("workspace-close-confirmation".into()),
+                    },
+                );
+            }
+            app.workspace_name_draft = "release-audit-with-a-long-workspace-name".into();
+            app.create_workspace()?;
+            let active_pane = app
+                .active_workspace()?
+                .active_tab()
+                .ok_or_else(|| "capture workspace has no active tab".to_owned())?
+                .focused_pane_id;
+            app.agent_statuses.insert(
+                active_pane,
+                AgentPaneStatus {
+                    agent: "claude".into(),
+                    display_name: Some("release-audit".into()),
+                    state: AgentState::Running,
+                    activity: Some("Running release checks".into()),
+                    session_id: None,
+                    cwd: Some("/home/user/dev/muxtrix".into()),
+                    git_branch: Some("release".into()),
+                },
+            );
+            app.sidebar_collapsed = false;
+            app.active_view = ActiveView::Workspace;
+            app.settings.fleet_scope = FleetScope::AllWorkspaces;
+            app.settings.fleet_view = FleetView::Tabs;
         } else if self.capturing("rail-nav") || self.capturing("rail-nav-collapsed") {
             // Park the prefix-navigation cursor on the second fleet pane so the
             // frame carries the cursor and the really focused pane at once —
