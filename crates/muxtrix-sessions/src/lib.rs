@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -225,6 +226,8 @@ pub struct SessionClient {
     writer: Arc<Mutex<SendHalf>>,
     events: Mutex<Receiver<Event>>,
     pane_outputs: Arc<Mutex<HashMap<Uuid, Sender<PtyOutput>>>>,
+    /// Updated under `pane_outputs` so registration cannot outlive disconnect.
+    connected: Arc<AtomicBool>,
     pane_exits: Arc<Mutex<HashMap<Uuid, bool>>>,
     pane_pids: Arc<Mutex<HashMap<Uuid, u32>>>,
     /// Why the host could not start a pane's process. Without this a failed
@@ -278,6 +281,8 @@ impl SessionClient {
         let (event_tx, event_rx) = mpsc::channel();
         let pane_outputs: Arc<Mutex<HashMap<Uuid, Sender<PtyOutput>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let connected = Arc::new(AtomicBool::new(true));
+        let reader_connected = Arc::clone(&connected);
         let pane_exits: Arc<Mutex<HashMap<Uuid, bool>>> = Arc::new(Mutex::new(HashMap::new()));
         let pane_pids: Arc<Mutex<HashMap<Uuid, u32>>> = Arc::new(Mutex::new(HashMap::new()));
         let pane_spawn_failures: Arc<Mutex<HashMap<Uuid, String>>> =
@@ -383,6 +388,12 @@ impl SessionClient {
                     }
                 }
                 // Losing the connection is not confirmation of process exit.
+                // Wake existing readers without inventing an exit verdict.
+                // Serialize with registration so late readers close too.
+                let mut outputs = outputs.lock().expect("outputs");
+                reader_connected.store(false, Ordering::Release);
+                outputs.clear();
+                drop(outputs);
                 waiters.lock().expect("kill waiters").clear();
             })
             .map_err(std::io::Error::other)?;
@@ -396,6 +407,7 @@ impl SessionClient {
                 writer: Arc::new(Mutex::new(writer)),
                 events: Mutex::new(event_rx),
                 pane_outputs,
+                connected,
                 pane_exits,
                 pane_pids,
                 pane_spawn_failures,
@@ -486,7 +498,9 @@ impl SessionClient {
         // the replacement with its predecessor's status.
         let mut outputs = self.pane_outputs.lock().expect("outputs");
         self.clear_pane_metadata(pane);
-        outputs.insert(pane, sender);
+        if self.connected.load(Ordering::Acquire) {
+            outputs.insert(pane, sender);
+        }
         receiver
     }
 
@@ -671,6 +685,27 @@ mod tests {
     fn acknowledged_kill_rejects_connection_closure() {
         with_shutdown_peer(Some(1), "disconnect", |client, pane| {
             assert!(client.kill_and_wait(pane).is_err());
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn connection_loss_closes_existing_and_late_pane_readers_without_claiming_exit() {
+        with_shutdown_peer(Some(1), "disconnect", |client, pane| {
+            let output = client.register_pane(pane);
+            assert!(client.kill_and_wait(pane).is_err());
+            assert!(matches!(
+                output.recv_timeout(Duration::from_secs(1)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ));
+            // A lost transport does not prove the child died, and must never
+            // authorize worktree deletion or mark a pane as a clean exit.
+            assert_eq!(client.pane_exit(pane), None);
+            let late = client.register_pane(Uuid::new_v4());
+            assert!(matches!(
+                late.recv_timeout(Duration::from_secs(1)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ));
         });
     }
 

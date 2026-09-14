@@ -171,6 +171,15 @@ can rediscover the local checkout on Windows/WSL.
 
 The WSL host must translate Windows/UNC paths explicitly and must not pretend a
 native Windows process is a Linux process. Profiles persist the backend choice.
+
+Terminal actors publish frames after bounded output batches, even when PTY
+output never goes idle. Synchronized-output deadlines are checked between
+batches and commands, not only on an idle receive. Losing the daemon connection
+closes existing and subsequently registered pane output streams without
+claiming that their processes have exited. Daemon PTY removal and destruction
+happen outside the pane-map lock so ConPTY shutdown can drain output through
+its reader without a lock cycle.
+
 The Windows host shares pane identity and an optional control endpoint with WSL
 through `WSLENV`. Linux-side hooks can invoke `muxtrixctl.exe` via standard WSL
 interop, keeping control on the Windows named pipe without opening TCP access.

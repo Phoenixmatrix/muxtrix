@@ -30,6 +30,8 @@ use thiserror::Error;
 /// Ghostty's full terminal host resets a stuck synchronized-output frame after
 /// one second. libghostty-vt deliberately leaves that host policy to embedders.
 const SYNC_OUTPUT_RESET_AFTER: Duration = Duration::from_secs(1);
+/// Publish frames even when the PTY command queue never becomes empty.
+const PTY_OUTPUT_BATCH_TIME: Duration = Duration::from_millis(8);
 const KITTY_IMAGE_STORAGE_LIMIT: u64 = 64 * 1024 * 1024;
 
 #[derive(Default)]
@@ -1852,6 +1854,15 @@ fn run_live_session(
     let mut pending = None;
     let mut output_ended = false;
     loop {
+        // A ready command must not postpone the synchronized-output deadline.
+        match terminal.expire_synchronized_output() {
+            Ok(true) => match terminal.snapshot() {
+                Ok(snapshot) => events.push(LiveSessionEvent::Frame(snapshot)),
+                Err(error) => events.push(LiveSessionEvent::Error(error.to_string())),
+            },
+            Ok(false) => {}
+            Err(error) => events.push(LiveSessionEvent::Error(error.to_string())),
+        }
         let command = match pending.take() {
             Some(command) => command,
             None => {
@@ -1872,18 +1883,6 @@ fn run_live_session(
                 match received {
                     Ok(command) => command,
                     Err(RecvTimeoutError::Timeout) => {
-                        match terminal.expire_synchronized_output() {
-                            Ok(true) => match terminal.snapshot() {
-                                Ok(snapshot) => events.push(LiveSessionEvent::Frame(snapshot)),
-                                Err(error) => {
-                                    events.push(LiveSessionEvent::Error(error.to_string()));
-                                }
-                            },
-                            Ok(false) => {}
-                            Err(error) => {
-                                events.push(LiveSessionEvent::Error(error.to_string()));
-                            }
-                        }
                         #[cfg(windows)]
                         match if output_ended {
                             Ok(None)
@@ -1912,6 +1911,7 @@ fn run_live_session(
         };
         match command {
             LiveCommand::PtyOutput(output) => {
+                let batch_started = Instant::now();
                 process_pty_output(
                     &mut terminal,
                     &mut notification_scanner,
@@ -1919,7 +1919,7 @@ fn run_live_session(
                     &events,
                     &output,
                 );
-                loop {
+                while batch_started.elapsed() < PTY_OUTPUT_BATCH_TIME {
                     match receiver.try_recv() {
                         Ok(LiveCommand::PtyOutput(output)) => process_pty_output(
                             &mut terminal,
@@ -2964,6 +2964,93 @@ mod tests {
         );
     }
 
+    fn assert_frames_progress_with_busy_output(
+        synchronized: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (keep_reader_open, reader) = mpsc::channel();
+        let output_sender = Arc::new(std::sync::OnceLock::<Sender<LiveCommand>>::new());
+        let refill_sender = Arc::clone(&output_sender);
+        let mut sequence = 0_u64;
+        let session = LiveSession::spawn_source(
+            SessionSource::Remote(Box::new(FlagBackend {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                _keep_reader_open: keep_reader_open,
+                reader: Some(reader),
+                on_write: Some(Box::new(move || {
+                    sequence += 1;
+                    // Every status reply queues another output chunk before
+                    // try_recv: the actor cannot rely on an idle queue.
+                    refill_sender
+                        .get()
+                        .expect("output sender initialized before the first query")
+                        .send(LiveCommand::PtyOutput(PtyOutput::Live(
+                            format!("\rprogress:{sequence}\x1b[5n").into_bytes(),
+                        )))
+                        .expect("actor still receives output");
+                })),
+            })),
+            PtySize {
+                rows: 4,
+                cols: 24,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            options(),
+            None,
+            None,
+        )?;
+        output_sender
+            .set(session.sender.clone())
+            .expect("output sender initialized once");
+        session.send(LiveCommand::PtyOutput(PtyOutput::Live(
+            b"complete frame".to_vec(),
+        )))?;
+        assert!(session.snapshot()?.text().contains("complete frame"));
+        let start = if synchronized {
+            b"\x1b[?2026h\x1b[2J\x1b[Hprogress:0\x1b[5n".as_slice()
+        } else {
+            b"\x1b[2J\x1b[Hprogress:0\x1b[5n".as_slice()
+        };
+        session.send(LiveCommand::PtyOutput(PtyOutput::Live(start.to_vec())))?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut first_progress = None;
+        loop {
+            match session.recv_timeout(deadline.saturating_duration_since(Instant::now()))? {
+                LiveSessionEvent::Frame(snapshot) => {
+                    let text = snapshot.text();
+                    if text.contains("progress:") {
+                        if let Some(first) = &first_progress {
+                            if first != &text {
+                                break;
+                            }
+                        } else {
+                            first_progress = Some(text);
+                        }
+                    }
+                }
+                event => return Err(format!("unexpected output event: {event:?}").into()),
+            }
+            if Instant::now() >= deadline {
+                return Err("frames stopped progressing while output remained queued".into());
+            }
+        }
+        session.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn live_session_publishes_frames_while_output_stays_queued()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_frames_progress_with_busy_output(false)
+    }
+
+    #[test]
+    fn live_session_expires_synchronized_output_while_output_stays_queued()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_frames_progress_with_busy_output(true)
+    }
+
     /// Keeps the remote byte stream open until its backend is dropped.
     struct BlockingReader(mpsc::Receiver<Vec<u8>>);
 
@@ -2979,6 +3066,7 @@ mod tests {
         // Held so the paired reader blocks for the backend's lifetime.
         _keep_reader_open: mpsc::Sender<Vec<u8>>,
         reader: Option<mpsc::Receiver<Vec<u8>>>,
+        on_write: Option<Box<dyn FnMut() + Send>>,
     }
 
     impl SessionBackend for FlagBackend {
@@ -2989,6 +3077,9 @@ mod tests {
                 .ok_or_else(|| "reader taken twice".to_owned())
         }
         fn write_all(&mut self, _bytes: &[u8]) -> Result<(), String> {
+            if let Some(on_write) = &mut self.on_write {
+                on_write();
+            }
             Ok(())
         }
         fn resize(&self, _size: PtySize) -> Result<(), String> {
@@ -3020,6 +3111,7 @@ mod tests {
                 killed: Arc::clone(killed),
                 _keep_reader_open: sender,
                 reader: Some(receiver),
+                on_write: None,
             }),
             PtySize {
                 rows: 24,
