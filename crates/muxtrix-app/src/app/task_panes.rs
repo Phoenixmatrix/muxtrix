@@ -644,7 +644,8 @@ fn task_resolve_directory(path: &std::path::Path, distribution: &str) -> Result<
             &mut command,
             HELPER_COMMAND_TIMEOUT,
             &ProcessCancellation::default(),
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         if !output.status.success() {
             return Err(format!(
                 "Cannot verify another pane's directory {}. Restart that pane in an existing directory and retry.",
