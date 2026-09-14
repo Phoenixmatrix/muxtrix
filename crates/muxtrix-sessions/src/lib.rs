@@ -53,6 +53,12 @@ pub enum Request {
     Kill {
         pane: Uuid,
     },
+    /// Unlike Kill, this requires a correlated confirmation of child exit.
+    KillAndWait {
+        pane: Uuid,
+        request: Uuid,
+        generation: u64,
+    },
     Layout {
         data: String,
     },
@@ -93,10 +99,16 @@ pub enum Event {
     Spawned {
         pane: Uuid,
         process_id: Option<u32>,
+        #[serde(default)]
+        generation: Option<u64>,
     },
     SpawnFailed {
         pane: Uuid,
         error: String,
+    },
+    KillCompleted {
+        request: Uuid,
+        error: Option<String>,
     },
 }
 
@@ -104,6 +116,8 @@ pub enum Event {
 pub struct PaneSummary {
     pub pane: Uuid,
     pub exited: Option<bool>,
+    #[serde(default)]
+    pub generation: Option<u64>,
 }
 
 /// One line in the on-disk registry: everything a client needs to list,
@@ -218,7 +232,11 @@ pub struct SessionClient {
     /// the request was written successfully, and the failure arrives later
     /// as an event nobody reads.
     pane_spawn_failures: Arc<Mutex<HashMap<Uuid, String>>>,
+    kill_waiters: KillWaiters,
+    pane_generations: Arc<Mutex<HashMap<Uuid, u64>>>,
 }
+
+type KillWaiters = Arc<Mutex<HashMap<Uuid, Sender<Result<(), String>>>>>;
 
 /// Publishes a pane's terminal state before closing its output stream.
 ///
@@ -264,6 +282,10 @@ impl SessionClient {
         let pane_pids: Arc<Mutex<HashMap<Uuid, u32>>> = Arc::new(Mutex::new(HashMap::new()));
         let pane_spawn_failures: Arc<Mutex<HashMap<Uuid, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let kill_waiters: KillWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let waiters = Arc::clone(&kill_waiters);
+        let pane_generations = Arc::new(Mutex::new(HashMap::new()));
+        let generations = Arc::clone(&pane_generations);
         let outputs = Arc::clone(&pane_outputs);
         let exits = Arc::clone(&pane_exits);
         let pids = Arc::clone(&pane_pids);
@@ -278,6 +300,22 @@ impl SessionClient {
                         continue;
                     };
                     match &event {
+                        Event::Attached { panes, .. } => {
+                            let mut generations = generations.lock().expect("generations");
+                            for pane in panes {
+                                if let Some(generation) = pane.generation {
+                                    generations.insert(pane.pane, generation);
+                                }
+                            }
+                        }
+                        Event::KillCompleted { request, error } => {
+                            if let Some(waiter) =
+                                waiters.lock().expect("kill waiters").remove(request)
+                            {
+                                let _ = waiter.send(error.clone().map_or(Ok(()), Err));
+                            }
+                            continue;
+                        }
                         Event::Backlog { pane, data } => {
                             if let Ok(bytes) = BASE64.decode(data)
                                 && let Some(sender) = outputs.lock().expect("outputs").get(pane)
@@ -310,9 +348,18 @@ impl SessionClient {
                         }
                         Event::Spawned {
                             pane,
-                            process_id: Some(process_id),
+                            process_id,
+                            generation,
                         } => {
-                            pids.lock().expect("pids").insert(*pane, *process_id);
+                            if let Some(generation) = generation {
+                                generations
+                                    .lock()
+                                    .expect("generations")
+                                    .insert(*pane, *generation);
+                            }
+                            if let Some(process_id) = process_id {
+                                pids.lock().expect("pids").insert(*pane, *process_id);
+                            }
                             continue;
                         }
                         Event::SpawnFailed { pane, error } => {
@@ -330,12 +377,13 @@ impl SessionClient {
                             );
                             continue;
                         }
-                        _ => {}
                     }
                     if event_tx.send(event).is_err() {
                         break;
                     }
                 }
+                // Losing the connection is not confirmation of process exit.
+                waiters.lock().expect("kill waiters").clear();
             })
             .map_err(std::io::Error::other)?;
         send_line(&mut writer, &Request::Attach)?;
@@ -351,6 +399,8 @@ impl SessionClient {
                 pane_exits,
                 pane_pids,
                 pane_spawn_failures,
+                kill_waiters,
+                pane_generations,
             },
             panes,
             layout,
@@ -359,6 +409,51 @@ impl SessionClient {
 
     pub fn send(&self, request: &Request) -> std::io::Result<()> {
         send_line(&mut self.writer.lock().expect("session writer"), request)
+    }
+
+    /// Blocks for a correlated daemon acknowledgment, never for a generic
+    /// pane exit (which may belong to a previous incarnation). Worker-only.
+    pub fn kill_and_wait(&self, pane: Uuid) -> Result<(), String> {
+        self.kill_and_wait_timeout(pane, Duration::from_secs(7))
+    }
+
+    fn kill_and_wait_timeout(&self, pane: Uuid, timeout: Duration) -> Result<(), String> {
+        let generation = self.pane_generations.lock().expect("generations").get(&pane).copied()
+            .ok_or_else(|| "daemon cannot identify this pane incarnation; restart the session host to enable safe task cleanup (or wait for pane startup)".to_owned())?;
+        let request = Uuid::new_v4();
+        let (sender, receiver) = mpsc::channel();
+        self.kill_waiters
+            .lock()
+            .expect("kill waiters")
+            .insert(request, sender.clone());
+        let writer = Arc::clone(&self.writer);
+        // A blocked socket write or contended writer must not defeat the
+        // acknowledgment deadline. Ordinary sends keep their existing path.
+        let sent = std::thread::Builder::new()
+            .name("muxtrix-kill-request".into())
+            .spawn(move || {
+                if let Err(error) = send_line(
+                    &mut writer.lock().expect("session writer"),
+                    &Request::KillAndWait {
+                        pane,
+                        request,
+                        generation,
+                    },
+                ) {
+                    let _ = sender.send(Err(error.to_string()));
+                }
+            });
+        let result = match sent {
+            Ok(_) => receiver.recv_timeout(timeout).map_err(|error| {
+                format!("daemon did not confirm process termination (unsupported or disconnected host): {error}")
+            }).and_then(|result| result),
+            Err(error) => Err(error.to_string()),
+        };
+        self.kill_waiters
+            .lock()
+            .expect("kill waiters")
+            .remove(&request);
+        result
     }
 
     pub fn try_event(&self) -> Result<Event, TryRecvError> {
@@ -403,6 +498,10 @@ impl SessionClient {
         // still clearing state, it must never find stale exit metadata.
         let mut outputs = self.pane_outputs.lock().expect("outputs");
         self.clear_pane_metadata(pane);
+        self.pane_generations
+            .lock()
+            .expect("generations")
+            .remove(&pane);
         outputs.remove(&pane);
     }
 
@@ -453,6 +552,127 @@ pub fn encode_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn with_shutdown_peer(
+        generation: Option<u64>,
+        reply: &str,
+        check: impl FnOnce(&SessionClient, Uuid),
+    ) {
+        use interprocess::local_socket::{ListenerOptions, traits::Listener as _};
+        let pane = Uuid::new_v4();
+        let dir = std::env::temp_dir().join(format!("muxtrix-kill-peer-{pane}"));
+        std::fs::create_dir_all(&dir).expect("directory");
+        let endpoint = dir.join("peer.sock").to_string_lossy().into_owned();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&endpoint).expect("name"))
+            .create_sync()
+            .expect("listener");
+        let reply = reply.to_owned();
+        let peer = std::thread::spawn(move || {
+            let (reader, mut writer) = Stream::split(listener.accept().expect("connection"));
+            for line in BufReader::new(reader).lines() {
+                let request: Request =
+                    serde_json::from_str(&line.expect("request line")).expect("request");
+                let event = match request {
+                    Request::Attach => Event::Attached {
+                        panes: vec![PaneSummary {
+                            pane,
+                            exited: None,
+                            generation,
+                        }],
+                        layout: None,
+                    },
+                    Request::KillAndWait { request, .. } => {
+                        assert!(
+                            generation.is_some(),
+                            "legacy host must never receive an unsupported request"
+                        );
+                        match reply.as_str() {
+                            "disconnect" => break,
+                            "error" => Event::KillCompleted {
+                                request,
+                                error: Some("permission denied".into()),
+                            },
+                            _ => {
+                                // Neither a stale pane exit nor someone else's
+                                // successful request may unlock cleanup.
+                                writeln!(
+                                    writer,
+                                    "{}",
+                                    serde_json::to_string(&Event::Exited { pane, clean: true })
+                                        .expect("exit")
+                                )
+                                .expect("exit write");
+                                Event::KillCompleted {
+                                    request: Uuid::new_v4(),
+                                    error: None,
+                                }
+                            }
+                        }
+                    }
+                    Request::Detach => break,
+                    _ => continue,
+                };
+                writeln!(writer, "{}", serde_json::to_string(&event).expect("event"))
+                    .expect("reply");
+            }
+        });
+        let (client, _, _) = SessionClient::connect_endpoint(&endpoint).expect("client");
+        check(&client, pane);
+        drop(client);
+        peer.join().expect("peer");
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acknowledged_kill_rejects_legacy_daemon_without_incarnation_support() {
+        with_shutdown_peer(None, "ignore", |client, pane| {
+            assert!(client.kill_and_wait(pane).is_err());
+            client
+                .send(&Request::Attach)
+                .expect("legacy connection stays open");
+            assert!(matches!(
+                client
+                    .events
+                    .lock()
+                    .expect("events")
+                    .recv_timeout(Duration::from_secs(1)),
+                Ok(Event::Attached { .. })
+            ));
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acknowledged_kill_times_out_on_unrelated_exit_and_acknowledgment() {
+        with_shutdown_peer(Some(1), "ignore", |client, pane| {
+            let start = std::time::Instant::now();
+            assert!(
+                client
+                    .kill_and_wait_timeout(pane, Duration::from_millis(100))
+                    .is_err()
+            );
+            assert!(start.elapsed() < Duration::from_secs(2));
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acknowledged_kill_propagates_daemon_error() {
+        with_shutdown_peer(Some(1), "error", |client, pane| {
+            assert_eq!(client.kill_and_wait(pane), Err("permission denied".into()));
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn acknowledged_kill_rejects_connection_closure() {
+        with_shutdown_peer(Some(1), "disconnect", |client, pane| {
+            assert!(client.kill_and_wait(pane).is_err());
+        });
+    }
 
     #[test]
     fn requests_and_events_round_trip_as_json_lines() {

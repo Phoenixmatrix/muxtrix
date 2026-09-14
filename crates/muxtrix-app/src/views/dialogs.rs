@@ -61,6 +61,66 @@ impl Root {
                     cx,
                 ),
             )
+        } else if let Some(prompt) = app.complete_task_prompt.as_ref() {
+            let task = app.task_worktree(prompt.pane_id);
+            let body = if app.task_removal_busy() {
+                "Stopping this pane's process and removing its worktree…".to_owned()
+            } else if prompt.busy {
+                "Checking this worktree for local file changes and unmerged commits…".to_owned()
+            } else if prompt.error.is_some() {
+                "The task could not be completed. Its worktree and branch have been kept. Resolve the problem below, then retry.".to_owned()
+            } else {
+                let warning = prompt
+                    .warning
+                    .as_deref()
+                    .unwrap_or("The worktree can be removed.");
+                format!(
+                    "{warning}\n\nCompleting stops this pane's process, removes its worktree, and closes the pane. The branch is kept."
+                )
+            };
+            let mut details = Vec::new();
+            if let Some(task) = task {
+                details.push(
+                    div()
+                        .text_size(px(app.settings.ui_pixels(10.0)))
+                        .text_color(color(tokens.text))
+                        .child(task.branch.clone())
+                        .into_any_element(),
+                );
+            }
+            if let Some(error) = &prompt.error {
+                details.push(
+                    div()
+                        .text_size(px(app.settings.ui_pixels(10.0)))
+                        .text_color(color(tokens.danger))
+                        .child(error.clone())
+                        .into_any_element(),
+                );
+            }
+            (
+                Message::CancelCompleteTask,
+                self.card(
+                    "Complete task?",
+                    &body,
+                    details,
+                    ("Cancel", Message::CancelCompleteTask),
+                    (
+                        if prompt.busy {
+                            "Working…"
+                        } else if prompt.error.is_some() {
+                            "Retry"
+                        } else if prompt.warning.is_some() {
+                            "Discard & Complete"
+                        } else {
+                            "Complete Task"
+                        },
+                        Message::ConfirmCompleteTask,
+                    ),
+                    prompt.warning.is_some(),
+                    tokens,
+                    cx,
+                ),
+            )
         } else if let Some(prompt) = app.worktree_prompt.as_ref() {
             let body = prompt.failure.clone().unwrap_or_else(|| {
                 prompt.base_directory.as_ref().map_or_else(
@@ -709,12 +769,34 @@ impl Root {
             )
             .child(
                 div()
-                    .text_size(px(app.settings.ui_pixels(10.0)))
-                    .line_height((px(app.settings.ui_pixels(10.0))) * 1.3)
-                    .text_color(color(tokens.muted))
-                    .child(body.to_owned()),
+                    .relative()
+                    .child(
+                        div()
+                            .id("dialog-body")
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.))
+                            .pr(px(12.))
+                            .max_h(px((app.window_size.height
+                                - app.settings.ui_pixels(15.0) * 1.3
+                                - 128.)
+                                .max(80.)))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scrolls.dialog)
+                            .child(
+                                div()
+                                    .text_size(px(app.settings.ui_pixels(10.0)))
+                                    .line_height((px(app.settings.ui_pixels(10.0))) * 1.3)
+                                    .text_color(color(tokens.muted))
+                                    .child(body.to_owned()),
+                            )
+                            .children(middle),
+                    )
+                    .child(
+                        gpui_component::scroll::Scrollbar::vertical(&self.scrolls.dialog)
+                            .mode(gpui_component::scroll::ScrollbarMode::Always),
+                    ),
             )
-            .children(middle)
             .child(
                 div()
                     .flex()
@@ -736,6 +818,15 @@ impl Root {
         tokens: DesignTokens,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let enabled = match message {
+            Message::CancelCompleteTask => !self.app().task_removal_busy(),
+            Message::ConfirmCompleteTask => self
+                .app()
+                .complete_task_prompt
+                .as_ref()
+                .is_some_and(|prompt| !prompt.busy),
+            _ => true,
+        };
         let background = if danger {
             tokens.danger
         } else if primary {
@@ -770,7 +861,7 @@ impl Root {
             hover = color(tokens.panel_raised);
             active = color(tokens.element_hover);
         }
-        div()
+        let control = div()
             .id(gpui::ElementId::from(gpui::SharedString::from(
                 label.to_owned(),
             )))
@@ -783,7 +874,6 @@ impl Root {
             .rounded(px(6.))
             .border_1()
             .border_color(color(border))
-            .cursor_pointer()
             .bg(color(background))
             .text_size(px(self.app().settings.ui_pixels(11.0)))
             .line_height(px(self.app().settings.ui_pixels(11.0)) * 1.3)
@@ -791,14 +881,18 @@ impl Root {
             .text_color(color(foreground))
             .hover(move |style| style.bg(hover))
             .active(move |style| style.bg(active))
-            .on_mouse_down(
+            .child(label.to_owned());
+        if enabled {
+            control.cursor_pointer().on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |root, _: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
                     root.dispatch(message.clone(), window, cx);
                 }),
             )
-            .child(label.to_owned())
+        } else {
+            control.opacity(0.45)
+        }
     }
 }
 

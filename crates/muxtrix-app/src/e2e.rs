@@ -186,6 +186,7 @@ enum TickAction {
     ScrollSettingsToGitHub,
     ScrollGitHubToEnd,
     ScrollGitHubPullRequestsToEnd,
+    ScrollTaskWarning,
     SeedClipboard,
     Capture,
 }
@@ -870,6 +871,9 @@ impl Scenario {
                     self.settle_ticks = 1;
                     return Ok(TickAction::Wait);
                 }
+                if self.capturing("task-complete-scrolled") && self.settle_ticks == 2 {
+                    return Ok(TickAction::ScrollTaskWarning);
+                }
                 if self.capturing("github-scrolled") && self.settle_ticks == 2 {
                     return Ok(TickAction::ScrollGitHubToEnd);
                 }
@@ -1247,6 +1251,75 @@ impl Scenario {
                     unreachable_entries: 0,
                 })
                 .collect();
+        } else if self.capturing("task-pane")
+            || self.capturing("task-tab")
+            || self.capturing("task-complete-confirm")
+            || self.capturing("task-complete-error")
+            || self.capturing("task-complete-scrolled")
+            || self.capturing("task-complete-palette")
+        {
+            let pane_id = if self.capturing("task-tab") {
+                self.tab_pane.ok_or("Task tab capture pane is missing")?
+            } else {
+                self.initial_pane
+            };
+            app.focus_pane(pane_id)?;
+            if self.capturing("task-tab") {
+                app.active_workspace_mut()?
+                    .active_tab_mut()
+                    .ok_or("Task tab is missing")?
+                    .name = "clever_hopper".into();
+            }
+            let pane = app
+                .active_workspace_mut()?
+                .pane_mut(pane_id)
+                .ok_or_else(|| "task capture pane is missing".to_owned())?;
+            // Capture-only metadata: no Git operation is dispatched against
+            // this illustrative checkout.
+            pane.task_worktree = Some(muxtrix_domain::TaskWorktree {
+                repo_root: "/home/user/dev/muxtrix".into(),
+                path: "/home/user/.muxtrix/worktrees/muxtrix/clever_hopper".into(),
+                branch: "clever_hopper".into(),
+                base_ref: "refs/heads/main".into(),
+                wsl_distribution: String::new(),
+            });
+            pane.custom_name = Some("clever_hopper".into());
+            if self.capturing("task-complete-confirm")
+                || self.capturing("task-complete-scrolled")
+                || self.capturing("task-complete-error")
+            {
+                let failed = self.capturing("task-complete-error");
+                app.complete_task_prompt = Some(crate::app::CompleteTaskPrompt {
+                    pane_id,
+                    warning: (!failed).then(|| {
+                        "This checkout contains staged, unstaged, untracked, or ignored files that will be deleted.\n\nSome tracked files use assume-unchanged or skip-worktree flags, so Git may hide local changes. Completing will delete these files.\n\nThis checkout contains initialized submodules. Completing removes their checkout files and local worktree state as well.\n\n3 task commit(s) are not merged into main. The task branch will be kept.".into()
+                    }),
+                    error: failed.then(|| {
+                        "Another pane references this task worktree. Close it or restart it outside the worktree, then retry.".into()
+                    }),
+                    busy: false,
+                });
+                app.dialog_button = Some(crate::app::DialogButton::Cancel);
+            }
+            if self.capturing("task-complete-palette") {
+                app.palette.visible = true;
+                app.palette.query = "Complete Task".into();
+                app.palette.selected = 0;
+            }
+        } else if self.capturing("task-palette") {
+            app.settings.default_agent = Some(Agent::Codex);
+            app.hook_statuses = vec![HookStatus {
+                agent: Agent::Codex,
+                scope: HookScope::User,
+                target: "/home/user/.codex/config.toml".into(),
+                installed: true,
+                managed_entries: 8,
+                backup_available: true,
+                unreachable_entries: 0,
+            }];
+            app.palette.visible = true;
+            app.palette.query = "Create Task Pane".into();
+            app.palette.selected = 0;
         } else if self.capturing("worktree-agent-setup") {
             app.default_agent_prompt = true;
             app.pending_default_agent_command = Some(CommandAction::NewWorktreeWithAgent(
@@ -2455,6 +2528,9 @@ impl Muxtrix {
         self.e2e = Some(scenario);
         match action {
             Ok(TickAction::Wait) => Vec::new(),
+            Ok(TickAction::ScrollTaskWarning) => {
+                self.handle_keyboard(named_key(crate::input::Named::PageDown))
+            }
             Ok(TickAction::ScrollSettingsToEnd) => {
                 vec![Effect::ScrollToEnd(ScrollTarget::Settings)]
             }

@@ -213,6 +213,7 @@ pub fn run(id: Uuid, name: String, endpoint: String) -> Result<(), String> {
                         .map(|(pane, state)| PaneSummary {
                             pane: *pane,
                             exited: state.exited,
+                            generation: Some(state.generation),
                         })
                         .collect();
                     shared.emit(&Event::Attached {
@@ -278,7 +279,11 @@ pub fn run(id: Uuid, name: String, endpoint: String) -> Result<(), String> {
                                         reader,
                                         Arc::clone(&shared),
                                     );
-                                    shared.emit(&Event::Spawned { pane, process_id });
+                                    shared.emit(&Event::Spawned {
+                                        pane,
+                                        process_id,
+                                        generation: Some(generation),
+                                    });
                                 }
                                 Err(error) => shared.emit(&Event::SpawnFailed {
                                     pane,
@@ -320,6 +325,44 @@ pub fn run(id: Uuid, name: String, endpoint: String) -> Result<(), String> {
                         let _ = state.session.kill();
                     }
                     panes.remove(&pane);
+                }
+                Request::KillAndWait {
+                    pane,
+                    request,
+                    generation,
+                } => {
+                    // Requests remain serialized, but output readers must be
+                    // free to drain while ConPTY closes and the child exits.
+                    let state = {
+                        let mut panes = shared.panes.lock().expect("panes");
+                        if panes
+                            .get(&pane)
+                            .is_some_and(|state| state.generation == generation)
+                        {
+                            panes.remove(&pane)
+                        } else {
+                            None
+                        }
+                    };
+                    let result = match state {
+                        Some(mut state) => {
+                            let result = state
+                                .session
+                                .kill_and_wait()
+                                .map_err(|error| error.to_string());
+                            if result.is_err() {
+                                shared.panes.lock().expect("panes").insert(pane, state);
+                            }
+                            result
+                        }
+                        None => {
+                            Err("pane incarnation is no longer owned by this daemon".to_owned())
+                        }
+                    };
+                    shared.emit(&Event::KillCompleted {
+                        request,
+                        error: result.err(),
+                    });
                 }
                 Request::Layout { data } => {
                     *shared.layout.lock().expect("layout") = Some(data);
@@ -379,12 +422,14 @@ fn spawn_pane_reader(
                             // A replacement pane already owns this id: these
                             // bytes belong to the incarnation being replaced,
                             // and nothing may attribute them to the new one.
-                            let Some(state) = panes
-                                .get_mut(&pane)
-                                .filter(|state| state.generation == generation)
-                            else {
-                                return;
+                            let Some(state) = panes.get_mut(&pane) else {
+                                // Task shutdown temporarily owns the session;
+                                // keep draining so ConPTY can close.
+                                continue;
                             };
+                            if state.generation != generation {
+                                return;
+                            }
                             state.backlog.extend_from_slice(bytes);
                             if state.backlog.len() > BACKLOG_LIMIT {
                                 let excess = state.backlog.len() - BACKLOG_LIMIT;
@@ -525,6 +570,219 @@ mod tests {
         assert!(wait_until_ready(&endpoint));
         let (client, _, _) = crate::SessionClient::connect_endpoint(&endpoint).expect("attach");
         (id, dir, client)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn acknowledged_kill_stops_orphan_job_after_shell_exit_and_pty_eof() {
+        let (_, dir, client) = start_test_daemon("kill-wait-orphan");
+        let pane = Uuid::new_v4();
+        let child_file = dir.join("child.pid");
+        let writes = dir.join("writes");
+        let _output = client.register_pane(pane);
+        client.send(&Request::Spawn {
+            pane, executable: "sh".into(),
+            arguments: vec!["-i".into(), "-c".into(),
+                "sh -c 'trap \"\" HUP; exec </dev/null >/dev/null 2>&1; echo $$ > \"$TASK_CHILD_PID\"; kill -KILL \"$PPID\"; while :; do printf x >> \"$TASK_WRITES\"; sleep 0.05; done'; :".into()],
+            working_directory: Some(dir.clone()),
+            environment: vec![
+                ("TASK_CHILD_PID".into(), child_file.to_string_lossy().into_owned()),
+                ("TASK_WRITES".into(), writes.to_string_lossy().into_owned()),
+            ],
+            rows: 24, cols: 80,
+        }).expect("spawn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (client.pane_exit(pane).is_none() || !writes.exists())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            client.pane_exit(pane).is_some(),
+            "root must already be reaped"
+        );
+        let child: u32 = std::fs::read_to_string(child_file)
+            .expect("child pid")
+            .trim()
+            .parse()
+            .expect("pid");
+        let stat =
+            std::fs::read_to_string(format!("/proc/{child}/stat")).expect("orphan still alive");
+        assert!(
+            !stat
+                .rsplit_once(')')
+                .expect("stat")
+                .1
+                .trim_start()
+                .starts_with('Z')
+        );
+        assert!(std::fs::metadata(&writes).expect("worktree writes").len() > 0);
+        client
+            .kill_and_wait(pane)
+            .expect("orphan session members terminated");
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{child}/stat")) {
+            assert!(
+                stat.rsplit_once(')')
+                    .expect("stat")
+                    .1
+                    .trim_start()
+                    .starts_with('Z'),
+                "orphan still running after acknowledgment: {stat}"
+            );
+        }
+        let stopped_at = std::fs::metadata(&writes).expect("writes").len();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            std::fs::metadata(&writes).expect("writes").len(),
+            stopped_at,
+            "no owned process may keep writing after acknowledgment"
+        );
+        client.send(&Request::Shutdown).expect("shutdown");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn acknowledged_kill_waits_for_shell_and_foreground_child() {
+        let (_, dir, client) = start_test_daemon("kill-wait-tree");
+        let pane = Uuid::new_v4();
+        let child_file = dir.join("child.pid");
+        let _output = client.register_pane(pane);
+        client
+            .send(&Request::Spawn {
+                pane,
+                executable: "sh".into(),
+                arguments: vec![
+                    "-i".into(),
+                    "-c".into(),
+                    "sh -c 'echo $$ > \"$TASK_CHILD_PID\"; exec sleep 300'; :".into(),
+                ],
+                working_directory: Some(dir.clone()),
+                environment: vec![(
+                    "TASK_CHILD_PID".into(),
+                    child_file.to_string_lossy().into_owned(),
+                )],
+                rows: 24,
+                cols: 80,
+            })
+            .expect("spawn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while (!child_file.exists() || client.pane_process_id(pane).is_none())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let child: u32 = std::fs::read_to_string(&child_file)
+            .expect("foreground child pid")
+            .trim()
+            .parse()
+            .expect("pid");
+        let shell = client.pane_process_id(pane).expect("shell pid");
+        assert!(std::path::Path::new(&format!("/proc/{child}")).exists());
+        client.kill_and_wait(pane).expect("confirmed termination");
+        for pid in [shell, child] {
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                // An orphaned zombie is already dead and cannot touch Git.
+                assert!(
+                    stat.rsplit_once(')')
+                        .expect("stat")
+                        .1
+                        .trim_start()
+                        .starts_with('Z'),
+                    "process {pid} still running after acknowledgment: {stat}"
+                );
+            }
+        }
+        client.send(&Request::Shutdown).expect("shutdown");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn acknowledged_kill_accepts_previously_exited_child() {
+        let (_, dir, client) = start_test_daemon("kill-wait-exited");
+        let pane = Uuid::new_v4();
+        let output = client.register_pane(pane);
+        client
+            .send(&Request::Spawn {
+                pane,
+                executable: "sh".into(),
+                arguments: vec!["-c".into(), "exit 0".into()],
+                working_directory: None,
+                environment: vec![],
+                rows: 24,
+                cols: 80,
+            })
+            .expect("spawn");
+        while output
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok()
+        {}
+        assert_eq!(client.pane_exit(pane), Some(true));
+        client.kill_and_wait(pane).expect("already exited");
+        client.send(&Request::Shutdown).expect("shutdown");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn acknowledged_kill_rejects_a_stale_pane_incarnation() {
+        let (_, dir, client) = start_test_daemon("kill-wait-stale");
+        let pane = Uuid::new_v4();
+        let output = client.register_pane(pane);
+        client.send(&Request::Spawn {
+            pane, executable: "sh".into(), arguments: vec!["-c".into(),
+                "stty -echo; IFS= read -r line; printf 'still-alive:%s\\n' \"$line\"; sleep 300".into()],
+            working_directory: None, environment: vec![], rows: 24, cols: 80,
+        }).expect("spawn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while client.pane_process_id(pane).is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let request = Uuid::new_v4();
+        let (sender, response) = std::sync::mpsc::channel();
+        client
+            .kill_waiters
+            .lock()
+            .expect("waiters")
+            .insert(request, sender);
+        client
+            .send(&Request::KillAndWait {
+                pane,
+                request,
+                generation: u64::MAX,
+            })
+            .expect("stale request");
+        assert!(
+            response
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("ack")
+                .is_err()
+        );
+        client
+            .send(&Request::Input {
+                pane,
+                data: crate::encode_bytes(b"probe\n"),
+            })
+            .expect("probe");
+        let mut bytes = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(PtyOutput::Live(chunk)) =
+                output.recv_timeout(std::time::Duration::from_millis(100))
+            {
+                bytes.extend_from_slice(&chunk);
+            }
+            if String::from_utf8_lossy(&bytes).contains("still-alive:probe") {
+                break;
+            }
+        }
+        assert!(String::from_utf8_lossy(&bytes).contains("still-alive:probe"));
+        // The stale request must not remove the live incarnation: a barrier
+        // using its real token still finds and terminates the owned child.
+        client
+            .kill_and_wait(pane)
+            .expect("current incarnation still owned");
+        client.send(&Request::Shutdown).expect("shutdown");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

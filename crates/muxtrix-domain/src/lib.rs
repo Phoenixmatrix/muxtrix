@@ -272,6 +272,9 @@ pub struct Pane {
     /// without waiting for a lifecycle hook from the already-running process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<PaneAgent>,
+    /// The dedicated Git checkout owned by this task pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_worktree: Option<TaskWorktree>,
 }
 
 impl Pane {
@@ -284,6 +287,7 @@ impl Pane {
             attention: AttentionState::default(),
             custom_name: None,
             agent: None,
+            task_worktree: None,
         }
     }
 
@@ -293,6 +297,16 @@ impl Pane {
             .iter()
             .find(|surface| surface.id == self.active_surface_id)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskWorktree {
+    pub repo_root: PathBuf,
+    pub path: PathBuf,
+    pub branch: String,
+    /// Fully qualified starting branch, checked live when completing the task.
+    pub base_ref: String,
+    pub wsl_distribution: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1101,7 +1115,17 @@ mod tests {
             arguments: vec!["-l".into()],
             working_directory: Some(PathBuf::from("/home/user/project")),
         };
-        let workspace = Workspace::new("project", terminal(profile.id, "shell"));
+        let mut workspace = Workspace::new("project", terminal(profile.id, "shell"));
+        workspace
+            .pane_mut(workspace.tabs[0].focused_pane_id)
+            .expect("initial pane")
+            .task_worktree = Some(TaskWorktree {
+            repo_root: PathBuf::from("/home/user/project"),
+            path: PathBuf::from("/home/user/.muxtrix/worktrees/project/calm_hopper"),
+            branch: "calm_hopper".into(),
+            base_ref: "refs/heads/main".into(),
+            wsl_distribution: "Ubuntu-22.04".into(),
+        });
         let state = SessionState::new(workspace, vec![profile]);
 
         let encoded = serde_json::to_string_pretty(&state)?;

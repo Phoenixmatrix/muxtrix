@@ -2,6 +2,8 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use muxtrix_domain::{LaunchProfile, ProcessBackend};
 use portable_pty::{Child, CommandBuilder, MasterPty, native_pty_system};
@@ -147,10 +149,106 @@ fi
 /// The reader and writer are separate so the session actor can dedicate one
 /// blocking thread to PTY output while retaining input and resize control.
 pub struct PtySession {
-    master: Box<dyn MasterPty + Send>,
+    master: Option<Box<dyn MasterPty + Send>>,
     child: Box<dyn Child + Send + Sync>,
     reader: Option<Box<dyn Read + Send>>,
     writer: Box<dyn Write + Send>,
+    output_ended: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
+    linux_session: Option<(u32, u64)>,
+    termination_confirmed: bool,
+}
+
+struct ExitTrackingReader {
+    reader: Box<dyn Read + Send>,
+    ended: Arc<AtomicBool>,
+}
+
+impl Read for ExitTrackingReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let result = self.reader.read(buffer);
+        let eof = matches!(result, Ok(0)) && !buffer.is_empty();
+        // Linux PTY masters report EIO, rather than a zero read, when the
+        // last slave closes. Other read errors are not exit evidence.
+        #[cfg(unix)]
+        let eof = eof
+            || result.as_ref().is_err_and(|error| {
+                error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
+            });
+        if eof {
+            self.ended.store(true, Ordering::Release);
+        }
+        result
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxProcess {
+    pid: u32,
+    session: u32,
+    started: u64,
+    state: char,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process(pid: u32) -> Result<Option<LinuxProcess>, PlatformError> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(PlatformError::Io(error.to_string())),
+    };
+    let invalid = || PlatformError::Pty(format!("cannot verify process {pid} ownership"));
+    let (_, fields) = stat.rsplit_once(')').ok_or_else(invalid)?;
+    let mut fields = fields.split_whitespace();
+    let state = fields
+        .next()
+        .and_then(|state| state.chars().next())
+        .ok_or_else(invalid)?;
+    let session = fields
+        .nth(2)
+        .ok_or_else(invalid)?
+        .parse()
+        .map_err(|_| invalid())?;
+    let started = fields
+        .nth(15)
+        .ok_or_else(invalid)?
+        .parse()
+        .map_err(|_| invalid())?;
+    Ok(Some(LinuxProcess {
+        pid,
+        session,
+        started,
+        state,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_session_members(session: u32, started: u64) -> Result<Vec<LinuxProcess>, PlatformError> {
+    // The retained leader's birth time prevents a recycled PID from making
+    // an unrelated, newer session look like this PTY's original owner.
+    if linux_process(session)?.is_some_and(|leader| leader.started != started) {
+        return Err(PlatformError::Pty(
+            "PTY session leader identity has been reused".into(),
+        ));
+    }
+    let mut members = Vec::new();
+    for entry in std::fs::read_dir("/proc").map_err(|error| PlatformError::Io(error.to_string()))? {
+        let entry = entry.map_err(|error| PlatformError::Io(error.to_string()))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if let Some(process) = linux_process(pid)?
+            && process.session == session
+            && !matches!(process.state, 'Z' | 'X')
+        {
+            members.push(process);
+        }
+    }
+    Ok(members)
 }
 
 impl PtySession {
@@ -172,12 +270,28 @@ impl PtySession {
             .master
             .take_writer()
             .map_err(|error| PlatformError::Pty(error.to_string()))?;
+        let output_ended = Arc::new(AtomicBool::new(false));
+        #[cfg(target_os = "linux")]
+        let linux_session = child.process_id().and_then(|pid| {
+            linux_process(pid)
+                .ok()
+                .flatten()
+                .filter(|process| process.session == pid)
+                .map(|process| (pid, process.started))
+        });
 
         Ok(Self {
-            master: pair.master,
+            master: Some(pair.master),
             child,
-            reader: Some(reader),
+            reader: Some(Box::new(ExitTrackingReader {
+                reader,
+                ended: Arc::clone(&output_ended),
+            })),
             writer,
+            output_ended,
+            #[cfg(target_os = "linux")]
+            linux_session,
+            termination_confirmed: false,
         })
     }
 
@@ -202,6 +316,8 @@ impl PtySession {
 
     pub fn resize(&self, size: PtySize) -> Result<(), PlatformError> {
         self.master
+            .as_ref()
+            .ok_or_else(|| PlatformError::Pty("PTY has been closed".into()))?
             .resize(size)
             .map_err(|error| PlatformError::Pty(error.to_string()))
     }
@@ -216,6 +332,92 @@ impl PtySession {
         self.child
             .kill()
             .map_err(|error| PlatformError::Pty(error.to_string()))
+    }
+
+    /// Task cleanup barrier: signaling alone is not evidence that the child
+    /// has stopped using its working directory.
+    pub fn kill_and_wait(&mut self) -> Result<(), PlatformError> {
+        if self.termination_confirmed {
+            return Ok(());
+        }
+        if cfg!(all(unix, not(target_os = "linux"))) {
+            return Err(PlatformError::Pty(
+                "cannot verify all PTY-owned process groups on this platform; keeping the task worktree (foreground-group exit alone is insufficient)".into(),
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        let (session_id, session_started) = self.linux_session.ok_or_else(|| {
+            PlatformError::Pty(
+                "cannot establish the PTY's original process-session identity".into(),
+            )
+        })?;
+        #[cfg(windows)]
+        {
+            // Closing ConPTY shuts down attached console clients, not just
+            // its initial shell. Modern Windows returns before they exit;
+            // the output EOF below is the documented completion barrier.
+            if let Some(master) = self.master.take() {
+                // Older Windows may block inside ClosePseudoConsole. Keep
+                // that destructor off the bounded session-control path.
+                std::thread::Builder::new()
+                    .name("muxtrix-close-conpty".into())
+                    .spawn(move || drop(master))
+                    .map_err(|error| PlatformError::Pty(error.to_string()))?;
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        if self.try_wait()?.is_none() {
+            self.kill()?;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            #[cfg(target_os = "linux")]
+            let members_gone = {
+                use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+                let members = linux_session_members(session_id, session_started)?;
+                let gone = members.is_empty();
+                for member in members {
+                    let pid = Pid::from_raw(member.pid as i32).ok_or_else(|| {
+                        PlatformError::Pty("invalid PTY session member PID".into())
+                    })?;
+                    // Pin the kernel process before revalidating ownership.
+                    // A later exit/PID reuse cannot redirect this signal.
+                    let handle = match pidfd_open(pid, PidfdFlags::empty()) {
+                        Ok(handle) => handle,
+                        Err(rustix::io::Errno::SRCH) => continue,
+                        Err(error) => {
+                            return Err(PlatformError::Pty(format!(
+                                "cannot safely identify PTY session member (pidfd required): {error}"
+                            )));
+                        }
+                    };
+                    if linux_process(member.pid)?.is_some_and(|current| {
+                        current.session == session_id && current.started == member.started
+                    }) {
+                        match pidfd_send_signal(&handle, Signal::KILL) {
+                            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+                            Err(error) => return Err(PlatformError::Pty(error.to_string())),
+                        }
+                    }
+                }
+                gone
+            };
+            #[cfg(not(target_os = "linux"))]
+            let members_gone = true;
+            if self.try_wait()?.is_some()
+                && self.output_ended.load(Ordering::Acquire)
+                && members_gone
+            {
+                self.termination_confirmed = true;
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(PlatformError::Pty(
+                    "timed out waiting for child exit and PTY closure".into(),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 

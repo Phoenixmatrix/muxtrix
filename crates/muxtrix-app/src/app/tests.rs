@@ -9499,3 +9499,531 @@ fn native_sessions_receive_the_exact_control_endpoint_too() {
     )));
     assert!(!plan.environment.iter().any(|(name, _)| name == "WSLENV"));
 }
+
+struct TaskPaneFixture {
+    root: PathBuf,
+    task: muxtrix_domain::TaskWorktree,
+}
+
+impl TaskPaneFixture {
+    fn new() -> Self {
+        let root =
+            std::env::temp_dir().join(format!("muxtrix-task-lifecycle-{}", uuid::Uuid::new_v4()));
+        let repo = root.join("repo");
+        let checkout = root.join("task");
+        std::fs::create_dir_all(&repo).expect("task fixture repository");
+        let git = |args: &[&str]| {
+            let output = console_command("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .expect("git fixture command");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "task-test@example.invalid"]);
+        git(&["config", "user.name", "Task lifecycle test"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "task-regression",
+            checkout.to_str().expect("checkout path"),
+        ]);
+        Self {
+            root,
+            task: muxtrix_domain::TaskWorktree {
+                repo_root: std::fs::canonicalize(repo).expect("canonical repo"),
+                path: std::fs::canonicalize(checkout).expect("canonical checkout"),
+                branch: "task-regression".into(),
+                base_ref: "refs/heads/main".into(),
+                wsl_distribution: String::new(),
+            },
+        }
+    }
+
+    fn app(&self) -> (Muxtrix, PaneId) {
+        let mut app = Muxtrix::new();
+        let pane_id = active_pane_id(&app);
+        app.terminals
+            .insert(pane_id, TerminalRuntime::suppressed("task"));
+        app.terminals
+            .get_mut(&pane_id)
+            .expect("fixture terminal")
+            .viewport = Some(Size::new(1600.0, 1000.0));
+        for profile in &mut app.session.profiles {
+            profile.backend = ProcessBackend::Local;
+            profile.working_directory = Some(self.task.repo_root.clone());
+        }
+        let pane = app
+            .session
+            .workspaces
+            .iter_mut()
+            .find_map(|workspace| workspace.pane_mut(pane_id))
+            .expect("fixture pane");
+        let muxtrix_domain::SurfaceKind::Terminal(terminal) = &mut pane.surfaces[0].kind else {
+            panic!("terminal surface")
+        };
+        terminal.working_directory = Some(self.task.path.clone());
+        pane.task_worktree = Some(self.task.clone());
+        (app, pane_id)
+    }
+}
+
+impl Drop for TaskPaneFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn resolve_task_effects(app: &mut Muxtrix, effects: Vec<Effect>) {
+    for effect in effects {
+        if let Effect::Perform(effect) = effect {
+            let next = app.update(effect.resolve(None));
+            resolve_task_effects(app, next);
+        }
+    }
+}
+
+#[test]
+fn completing_the_only_task_pane_removes_checkout_and_leaves_a_safe_shell() {
+    let fixture = TaskPaneFixture::new();
+    let (mut app, pane_id) = fixture.app();
+    let effects = app.update(Message::CompleteTask(pane_id));
+    resolve_task_effects(&mut app, effects);
+    assert!(!fixture.task.path.exists());
+    assert!(app.task_worktree(pane_id).is_none());
+    assert!(!app.terminals.contains_key(&pane_id));
+    assert!(app.session.validate().is_ok());
+    let replacement = active_pane_id(&app);
+    assert_ne!(replacement, pane_id);
+    assert_eq!(
+        app.pane_terminal_directory(replacement),
+        Some(fixture.task.repo_root.clone())
+    );
+    let branch = console_command("git")
+        .current_dir(&fixture.task.repo_root)
+        .args(["show-ref", "--verify", "refs/heads/task-regression"])
+        .output()
+        .expect("retained branch");
+    assert!(branch.status.success());
+}
+
+#[test]
+fn dirty_task_completion_is_keyboard_accessible_and_cancel_default() {
+    let fixture = TaskPaneFixture::new();
+    let (mut app, pane_id) = fixture.app();
+    let unfinished = fixture.task.path.join("unfinished");
+    std::fs::write(&unfinished, "keep until confirmed").expect("unfinished work");
+    let _ = app.update(Message::ToggleCommandPalette);
+    let _ = app.update(Message::CommandQueryChanged("Complete Task".into()));
+    let effects = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::default()));
+    resolve_task_effects(&mut app, effects);
+    assert!(
+        app.complete_task_prompt
+            .as_ref()
+            .expect("risk prompt")
+            .warning
+            .is_some()
+    );
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::default()));
+    assert!(
+        app.complete_task_prompt.is_none(),
+        "Cancel is the initial keyboard action"
+    );
+    assert!(unfinished.exists());
+    let _ = app.update(Message::ToggleCommandPalette);
+    let _ = app.update(Message::CommandQueryChanged("Complete Task".into()));
+    let effects = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::default()));
+    resolve_task_effects(&mut app, effects);
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::Tab), Modifiers::default()));
+    let effects = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::default()));
+    assert!(app.task_removal_busy());
+    assert!(
+        app.update(Message::ConfirmCompleteTask).is_empty(),
+        "duplicate confirmation must not start another removal"
+    );
+    let _ = app.update(Message::RestartPane(pane_id));
+    resolve_task_effects(&mut app, effects);
+    assert!(!fixture.task.path.exists());
+    assert!(app.task_worktree(pane_id).is_none());
+}
+
+#[test]
+fn task_changes_after_clean_inspection_are_not_discarded() {
+    let fixture = TaskPaneFixture::new();
+    let (mut app, pane_id) = fixture.app();
+    let effects = app.update(Message::CompleteTask(pane_id));
+    let [Effect::Perform(inspection)] = effects.as_slice() else {
+        panic!("inspection effect")
+    };
+    let removal = app.update(inspection.resolve(None));
+    std::fs::write(
+        fixture.task.path.join("arrived-after-inspection"),
+        "do not discard",
+    )
+    .expect("late task change");
+    resolve_task_effects(&mut app, removal);
+    assert!(fixture.task.path.join("arrived-after-inspection").exists());
+    assert_eq!(app.task_worktree(pane_id), Some(&fixture.task));
+    assert!(
+        app.complete_task_prompt
+            .as_ref()
+            .expect("retry prompt")
+            .error
+            .is_some()
+    );
+    assert!(!app.task_removal_busy());
+    let effects = app.update(Message::ConfirmCompleteTask);
+    resolve_task_effects(&mut app, effects);
+    assert!(
+        app.complete_task_prompt
+            .as_ref()
+            .expect("new inspection")
+            .warning
+            .is_some()
+    );
+    assert!(
+        fixture.task.path.exists(),
+        "retry must request fresh discard confirmation"
+    );
+}
+
+#[test]
+fn another_pane_in_a_task_descendant_blocks_completion_without_losing_metadata() {
+    let fixture = TaskPaneFixture::new();
+    let (mut app, pane_id) = fixture.app();
+    let nested = fixture.task.path.join("nested");
+    std::fs::create_dir(&nested).expect("nested task directory");
+    let profile = app.default_terminal_profile().expect("default profile");
+    let other = app
+        .active_workspace_mut()
+        .expect("workspace")
+        .split_focused(
+            SplitAxis::Horizontal,
+            SplitRatio::EQUAL,
+            Surface::terminal(
+                "other",
+                TerminalSurface {
+                    profile_id: profile.id,
+                    working_directory: Some(nested),
+                },
+            ),
+        )
+        .expect("other task pane");
+    let effects = app.update(Message::CompleteTask(pane_id));
+    resolve_task_effects(&mut app, effects);
+    assert!(fixture.task.path.exists());
+    assert_eq!(app.task_worktree(pane_id), Some(&fixture.task));
+    assert!(
+        app.active_workspace()
+            .expect("workspace")
+            .pane(other)
+            .is_some()
+    );
+    assert!(
+        app.complete_task_prompt
+            .as_ref()
+            .expect("blocked prompt")
+            .error
+            .is_some()
+    );
+}
+
+#[test]
+fn canceling_inflight_inspection_cannot_complete_a_later_task_prompt() {
+    let fixture = TaskPaneFixture::new();
+    let (mut app, pane_id) = fixture.app();
+    let old = app.update(Message::CompleteTask(pane_id));
+    let _ = app.update(Message::CancelCompleteTask);
+    std::fs::write(fixture.task.path.join("new-work"), "keep").expect("new work");
+    let current = app.update(Message::CompleteTask(pane_id));
+    resolve_task_effects(&mut app, old);
+    assert!(
+        app.complete_task_prompt
+            .as_ref()
+            .expect("current prompt")
+            .busy
+    );
+    resolve_task_effects(&mut app, current);
+    assert!(fixture.task.path.join("new-work").exists());
+    assert!(
+        app.complete_task_prompt
+            .as_ref()
+            .expect("risk prompt")
+            .warning
+            .is_some()
+    );
+}
+
+#[test]
+fn task_creation_keeps_its_original_tab_and_reports_a_missing_session_target() {
+    let fixture = TaskPaneFixture::new();
+    let (mut app, source) = fixture.app();
+    app.settings.default_agent = Some(Agent::Codex);
+    app.settings.codex_command = "true".into();
+    app.hook_statuses.push(HookStatus {
+        agent: Agent::Codex,
+        scope: HookScope::User,
+        target: fixture.root.join("hooks.json"),
+        installed: true,
+        managed_entries: 8,
+        backup_available: false,
+        unreachable_entries: 0,
+    });
+    let original_tab = active_tab(&app).id;
+    let _creation = app.update(Message::RunCommand(CommandAction::CreateTaskPane));
+    let request = app
+        .pending_task_creation
+        .clone()
+        .expect("anchored creation");
+    app.new_tab()
+        .expect("switch focus before creation finishes");
+    let later_tab = active_tab(&app).id;
+    let later_pane = active_pane_id(&app);
+    let _ = app.update(Message::TaskPaneCreated(Box::new((
+        request,
+        Ok(fixture.task.clone()),
+    ))));
+    assert_eq!(active_tab(&app).id, later_tab);
+    assert_eq!(active_pane_id(&app), later_pane);
+    let old_tab = app
+        .session
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .find(|tab| tab.id == original_tab)
+        .expect("original tab");
+    let new_task = old_tab
+        .panes
+        .values()
+        .find(|pane| pane.id != source)
+        .expect("task beside captured source");
+    assert_eq!(new_task.task_worktree.as_ref(), Some(&fixture.task));
+    assert_eq!(app.agent_statuses[&new_task.id].agent, "codex");
+
+    let _creation = app.update(Message::RunCommand(CommandAction::CreateTaskPane));
+    let request = app.pending_task_creation.clone().expect("second creation");
+    app.task_session_epoch = app.task_session_epoch.wrapping_add(1);
+    app.pending_task_creation = None;
+    let panes_before = active_tab(&app).panes.len();
+    let _ = app.update(Message::TaskPaneCreated(Box::new((
+        request,
+        Ok(fixture.task.clone()),
+    ))));
+    assert_eq!(active_tab(&app).panes.len(), panes_before);
+    assert!(fixture.task.path.exists());
+    assert!(app.global_alerts.iter().any(|alert| {
+        alert
+            .body
+            .contains(fixture.task.path.to_str().expect("task path"))
+    }));
+}
+
+#[test]
+fn crowded_task_creation_opens_a_new_tab_without_changing_existing_panes() {
+    let fixture = TaskPaneFixture::new();
+    let (mut app, _) = fixture.app();
+    for _ in 0..3 {
+        app.split_terminal(SplitAxis::Horizontal)
+            .expect("existing pane");
+    }
+    let original_tab = active_tab(&app).id;
+    let original_panes = active_tab(&app).root.pane_ids();
+    for runtime in app.terminals.values_mut() {
+        runtime.viewport = Some(Size::new(3000.0, 1600.0));
+    }
+    app.settings.default_agent = Some(Agent::Codex);
+    app.settings.codex_command = "true".into();
+    app.hook_statuses.push(HookStatus {
+        agent: Agent::Codex,
+        scope: HookScope::User,
+        target: fixture.root.join("hooks.json"),
+        installed: true,
+        managed_entries: 8,
+        backup_available: false,
+        unreachable_entries: 0,
+    });
+    let _creation = app.update(Message::RunCommand(CommandAction::CreateTaskPane));
+    let request = app.pending_task_creation.clone().expect("task creation");
+    let _ = app.update(Message::TaskPaneCreated(Box::new((
+        request,
+        Ok(fixture.task.clone()),
+    ))));
+    assert_ne!(active_tab(&app).id, original_tab);
+    assert_eq!(active_tab(&app).panes.len(), 1);
+    assert_eq!(app.task_worktree(active_pane_id(&app)), Some(&fixture.task));
+    let original = app
+        .active_workspace()
+        .expect("workspace")
+        .tabs
+        .iter()
+        .find(|tab| tab.id == original_tab)
+        .expect("original tab retained");
+    assert_eq!(original.root.pane_ids(), original_panes);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn task_agent_launches_in_generated_checkout_before_real_process_completion() {
+    let fixture = TaskPaneFixture::new();
+    let (mut app, source) = fixture.app();
+    for profile in &mut app.session.profiles {
+        profile.program = "/bin/sh".into();
+        profile.arguments = vec!["-i".into()];
+    }
+    let pane = app
+        .session
+        .workspaces
+        .iter_mut()
+        .find_map(|workspace| workspace.pane_mut(source))
+        .expect("source pane");
+    pane.task_worktree = None;
+    let muxtrix_domain::SurfaceKind::Terminal(terminal) = &mut pane.surfaces[0].kind else {
+        panic!("source terminal")
+    };
+    terminal.working_directory = Some(fixture.task.repo_root.clone());
+    let marker = fixture.root.join("agent-pwd");
+    app.settings.default_agent = Some(Agent::Codex);
+    app.settings.codex_command = format!(
+        "exec /bin/sh -c 'printf \"%s\" \"$PWD\" > \"{}\"; exec </dev/null >/dev/null 2>&1; sleep 30'",
+        marker.display()
+    );
+    app.hook_statuses.push(HookStatus {
+        agent: Agent::Codex,
+        scope: HookScope::User,
+        target: fixture.root.join("hooks.json"),
+        installed: true,
+        managed_entries: 8,
+        backup_available: false,
+        unreachable_entries: 0,
+    });
+    app.launch_in_background = true;
+    app.terminal_launcher = Arc::new(SystemTerminalLauncher::default());
+    let effects = app.update(Message::RunCommand(CommandAction::CreateTaskPane));
+    resolve_task_effects(&mut app, effects);
+    let task_pane = app
+        .session
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .flat_map(|tab| tab.panes.values())
+        .find(|pane| pane.task_worktree.is_some())
+        .expect("generated task")
+        .id;
+    let task = app
+        .task_worktree(task_pane)
+        .expect("durable task metadata")
+        .clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline
+        && !app
+            .terminals
+            .get(&task_pane)
+            .is_some_and(|runtime| matches!(runtime.launch_state, TerminalLaunchState::Exited))
+    {
+        app.poll_terminal();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let observed = std::fs::read_to_string(&marker);
+    let running = app
+        .terminals
+        .get(&task_pane)
+        .is_some_and(|runtime| runtime.session.is_some());
+    let reached_eof = app
+        .terminals
+        .get(&task_pane)
+        .is_some_and(|runtime| matches!(runtime.launch_state, TerminalLaunchState::Exited));
+    let effects = app.update(Message::CompleteTask(task_pane));
+    let inspection = effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Perform(effect) => Some(effect),
+            _ => None,
+        })
+        .expect("task inspection");
+    let removal = app.update(inspection.resolve(None));
+    // A late Git failure happens after acknowledged process termination.
+    // Retrying must not require a second acknowledgment from the dead actor.
+    let lock = console_command("git")
+        .current_dir(&task.repo_root)
+        .args(["worktree", "lock"])
+        .arg(&task.path)
+        .status()
+        .expect("lock checkout after inspection");
+    assert!(lock.success());
+    resolve_task_effects(&mut app, removal);
+    assert!(
+        task.path.exists(),
+        "failed removal must retain the checkout"
+    );
+    assert!(
+        app.complete_task_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.error.is_some())
+    );
+    let unlock = console_command("git")
+        .current_dir(&task.repo_root)
+        .args(["worktree", "unlock"])
+        .arg(&task.path)
+        .status()
+        .expect("resolve checkout lock");
+    assert!(unlock.success());
+    let retry = app.update(Message::ConfirmCompleteTask);
+    resolve_task_effects(&mut app, retry);
+    assert_eq!(
+        observed.expect("configured agent command ran"),
+        task.path.to_string_lossy()
+    );
+    assert!(running, "the actual task shell must have launched");
+    assert!(
+        reached_eof,
+        "the task must retain its stop barrier when it closes the PTY before its child exits"
+    );
+    assert!(
+        !task.path.exists(),
+        "completion must stop the real process before removing its checkout: {}",
+        app.status
+    );
+    assert!(app.task_worktree(task_pane).is_none());
+    assert!(
+        app.session
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.pane(source).is_some())
+    );
+}
+
+#[test]
+fn task_removal_scheduling_failure_retains_stop_obligation_across_retry() {
+    let fixture = TaskPaneFixture::new();
+    let (mut app, pane_id) = fixture.app();
+    let effects = app.update(Message::CompleteTask(pane_id));
+    let [Effect::Perform(inspection)] = effects.as_slice() else {
+        panic!("inspection effect")
+    };
+    let effects = app.update(inspection.resolve(None));
+    let [Effect::Perform(removal)] = effects.as_slice() else {
+        panic!("removal effect")
+    };
+    let _ = app.update(removal.resolve(Some("worker unavailable".into())));
+    assert!(fixture.task.path.exists());
+    assert_eq!(app.task_worktree(pane_id), Some(&fixture.task));
+    assert!(
+        app.restart_pane(pane_id).is_err(),
+        "restart cannot overtake an unacknowledged stop"
+    );
+    let effects = app.update(Message::ConfirmCompleteTask);
+    resolve_task_effects(&mut app, effects);
+    assert!(
+        !fixture.task.path.exists(),
+        "retry must execute the retained stop before removal: {}",
+        app.status
+    );
+}

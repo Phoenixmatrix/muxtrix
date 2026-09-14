@@ -3988,6 +3988,7 @@ version = "0.1.73"
 dependencies = [
  "muxtrix-domain",
  "portable-pty",
+ "rustix 1.1.4",
  "thiserror 2.0.20",
 ]
 
