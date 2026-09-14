@@ -262,6 +262,15 @@ pub fn run(id: Uuid, name: String, endpoint: String) -> Result<(), String> {
                                     let generation = shared
                                         .next_generation
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    // Close an existing PTY without holding panes:
+                                    // ConPTY may wait for its output reader, which
+                                    // needs that lock to keep draining. Leave the
+                                    // id absent until close completes so the old
+                                    // reader drains instead of seeing a replacement
+                                    // generation and stopping early.
+                                    let previous =
+                                        shared.panes.lock().expect("panes").remove(&pane);
+                                    drop(previous);
                                     // Published before its reader starts, so
                                     // the reader always finds its own entry.
                                     shared.panes.lock().expect("panes").insert(
@@ -320,11 +329,12 @@ pub fn run(id: Uuid, name: String, endpoint: String) -> Result<(), String> {
                     // channel itself. Announcing the death here would race a
                     // relaunch, which reuses the pane's identity — the event
                     // would land on the session that replaced this one.
-                    let mut panes = shared.panes.lock().expect("panes");
-                    if let Some(state) = panes.get_mut(&pane) {
+                    // Removing first also lets the reader discard shutdown
+                    // output while it drains ConPTY to completion.
+                    let state = shared.panes.lock().expect("panes").remove(&pane);
+                    if let Some(mut state) = state {
                         let _ = state.session.kill();
                     }
-                    panes.remove(&pane);
                 }
                 Request::KillAndWait {
                     pane,
@@ -374,11 +384,12 @@ pub fn run(id: Uuid, name: String, endpoint: String) -> Result<(), String> {
                 }
                 Request::Detach => break,
                 Request::Shutdown => {
-                    let mut panes = shared.panes.lock().expect("panes");
-                    for state in panes.values_mut() {
+                    // Move ownership out before killing or dropping any PTY;
+                    // all output readers must remain free to drain.
+                    let panes = std::mem::take(&mut *shared.panes.lock().expect("panes"));
+                    for mut state in panes.into_values() {
                         let _ = state.session.kill();
                     }
-                    panes.clear();
                     crate::remove_session_record(id);
                     #[cfg(unix)]
                     {
