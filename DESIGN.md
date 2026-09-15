@@ -193,8 +193,10 @@ whole band. Focus and attention live on the card border, never on a separate
 top rail. Preserve native button semantics, tooltips, keyboard operation, and
 visible keyboard focus for every action.
 
-Task panes retain a quiet **Complete Task** text button before their layout
-controls. At compact widths, keep that action and overflow visible; ordinary
+Task panes retain a quiet **Complete Task** icon-and-label button before their
+layout controls. A short vertical rule separates status from actions, and a
+leading check-circle icon identifies completion as an action rather than state
+copy. At compact widths, keep that action and overflow visible; ordinary
 close remains in overflow. Completion is also a contextual palette command,
 so the destructive flow has a keyboard entry path. Its confirmation defaults
 to Cancel and explains file deletion, unmerged commits, and branch retention.

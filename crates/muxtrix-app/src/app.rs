@@ -1798,6 +1798,16 @@ impl Muxtrix {
         directory_policy: CreationDirectoryPolicy,
     ) -> Result<(), String> {
         if self
+            .pending_task_creation
+            .as_ref()
+            .is_some_and(|request| request.pane_id == pane_id)
+        {
+            return Err(
+                "The task worktree is still being created. Wait before restarting this pane."
+                    .into(),
+            );
+        }
+        if self
             .task_terminal_stops
             .get(&pane_id)
             .is_some_and(|stop| stop.pending.load(Ordering::Acquire))
@@ -5561,6 +5571,16 @@ impl Muxtrix {
         pane_id: PaneId,
         directory: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
+        if self
+            .pending_task_creation
+            .as_ref()
+            .is_some_and(|request| request.pane_id == pane_id)
+        {
+            return Err(
+                "The task worktree is still being created. Wait before restarting this pane."
+                    .into(),
+            );
+        }
         let profile_id = self
             .session
             .workspaces

@@ -86,8 +86,10 @@ and Cmd+P on macOS.
 
 **Create Task Pane** creates a Git worktree and branch with an automatic
 adjective/name pair such as `clever_hopper`, opens a terminal there, and starts
-the configured default agent. There is no naming dialog. The same integration
-setup gate and **Apply and continue** flow described above apply.
+the configured default agent. An empty pane appears immediately while the
+worktree is created, then the terminal and agent load into that same pane.
+There is no naming dialog. The same integration setup gate and **Apply and
+continue** flow described above apply.
 
 Placement is automatic: Muxtrix considers the tab's visible panes and chooses
 a horizontal or vertical split that leaves both terminals at least 60 columns
@@ -110,7 +112,12 @@ but discarded uncommitted files are not recoverable from that branch.
 
 Before deletion, Muxtrix requires acknowledged process termination and checks
 that no other pane references the checkout. A failed check keeps the worktree
-and presents a retryable error; it does not silently force removal.
+and presents a retryable error; it does not silently force removal. If stopping
+fails, the terminal attachment is restored so Cancel returns to any still-running
+process. If the process stopped but checkout removal failed, Cancel starts a
+fresh shell in the retained checkout. A pending stop still blocks replacement
+until termination is confirmed. Repeated stop requests accept an already-confirmed
+termination only for that same process incarnation, never a replacement.
 An older running session host must be restarted before it can acknowledge
 task termination. Linux and Windows have termination barriers; other Unix
 platforms currently refuse completion when a live session's termination
