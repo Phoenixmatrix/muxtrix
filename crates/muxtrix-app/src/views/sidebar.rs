@@ -6,9 +6,13 @@
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px, svg,
+    Anchor, AnyElement, ClickEvent, Context, Div, Entity, Focusable as _, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, px, svg,
 };
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_component::{Icon, Sizable as _};
 use muxtrix_domain::{PaneId, Workspace, WorkspaceId};
 
 use crate::app::{
@@ -23,6 +27,61 @@ use crate::runtime::gpui::{Root, color};
 use crate::settings::{FleetScope, FleetView};
 use crate::theme::DesignTokens;
 use crate::views::{TOP_CHROME_HEIGHT, icon_button, pane_key, rail_marker, terminal_family};
+
+/// Both entry points target the tile, not the active workspace.
+fn workspace_actions(
+    menu: PopupMenu,
+    root: &Entity<Root>,
+    workspace_id: WorkspaceId,
+    cx: &mut Context<PopupMenu>,
+    tokens: DesignTokens,
+) -> PopupMenu {
+    let app = root.read(cx).app();
+    let can_close = app.session.workspaces.len() > 1;
+    let font_size = app.settings.ui_pixels(9.0);
+    let width = app.settings.ui_pixels(150.0);
+    let focus = menu.focus_handle(cx);
+    root.update(cx, |root, _| root.workspace_menu_focus = Some(focus));
+    let item = |label: &'static str, message: Message, disabled: bool, danger: bool| {
+        let root = root.clone();
+        PopupMenuItem::element(move |_, _| {
+            div()
+                .id(label)
+                .aria_label(label)
+                .h(px(30.))
+                .flex()
+                .items_center()
+                .text_size(px(font_size))
+                .line_height(px(font_size) * 1.3)
+                .text_color(color(if disabled {
+                    tokens.faint
+                } else if danger {
+                    tokens.danger
+                } else {
+                    tokens.text
+                }))
+                .child(label)
+        })
+        .disabled(disabled)
+        .on_click(move |_, window, cx| {
+            root.update(cx, |root, cx| root.dispatch(message.clone(), window, cx));
+        })
+    };
+    menu.min_w(px(width))
+        .item(item(
+            "Rename workspace…",
+            Message::RequestRenameWorkspace(workspace_id),
+            false,
+            false,
+        ))
+        .separator()
+        .item(item(
+            "Close workspace…",
+            Message::RequestCloseWorkspace(workspace_id),
+            !can_close,
+            true,
+        ))
+}
 
 fn strongest_pane_signal(
     app: &Muxtrix,
@@ -765,32 +824,28 @@ impl Root {
         let panes = workspace.pane_count();
         let tab_count = workspace.tabs.len();
         let hover_group = format!("workspace-row-{}", workspace_key(workspace_id));
-        let close = icon_button(
-            ("close-workspace", workspace_key(workspace_id)),
-            IconKind::Close,
-            tokens,
-            true,
-        )
-        .role(gpui::accesskit::Role::Button)
-        .aria_label(format!("Close {} workspace", workspace.name))
-        .flex_none()
-        // Keep the reserved target hit-testable when a fast click follows
-        // hover or dialog dismissal before the reveal frame has painted.
-        .when(!targeted, |button| button.opacity(0.))
-        .when(app.close_workspace_prompt.is_none(), |button| {
-            button.tooltip(|window, cx| {
-                gpui_component::tooltip::Tooltip::new("Close workspace…").build(window, cx)
+        let menu_root = cx.entity();
+        let context_root = cx.entity();
+        let actions = Button::new(("workspace-actions", workspace_key(workspace_id)))
+            .xsmall()
+            .ghost()
+            .size(px(24.))
+            .child(
+                div()
+                    .id("workspace-actions-icon")
+                    .role(gpui::accesskit::Role::Label)
+                    .aria_label(format!("Actions for {} workspace", workspace.name))
+                    .child(Icon::default().path(crate::assets::icon_path(IconKind::Overflow))),
+            )
+            .tooltip("Workspace actions")
+            .flex_none()
+            // Reserve the same target on every frame; revealing it never moves text.
+            .when(!targeted, |button| button.opacity(0.))
+            .group_hover(hover_group.clone(), |button| button.opacity(1.))
+            .dropdown_menu(move |menu, _, cx| {
+                workspace_actions(menu, &menu_root, workspace_id, cx, tokens)
             })
-        })
-        .group_hover(hover_group.clone(), |button| button.opacity(1.))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
-        )
-        .on_click(cx.listener(move |root, _: &ClickEvent, window, cx| {
-            root.dispatch(Message::RequestCloseWorkspace(workspace_id), window, cx);
-            cx.stop_propagation();
-        }));
+            .anchor(Anchor::TopRight);
 
         // Text-derived translucent fills read correctly on every surface in
         // both appearances, which is why the iced rail uses them too.
@@ -878,19 +933,9 @@ impl Root {
                                         tokens.text
                                     }))
                                     .truncate()
-                                    .child(ellipsize(
-                                        &workspace.name,
-                                        app.settings.ui_char_budget(24),
-                                    )),
+                                    .child(workspace.name.clone()),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(app.settings.ui_pixels(9.0)))
-                                    .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
-                                    .text_color(color(signal_kind.label_color(tokens)))
-                                    .whitespace_nowrap()
-                                    .child(app.workspace_state_label(workspace)),
-                            ),
+                            .child(actions),
                     )
                     .child(
                         div()
@@ -902,12 +947,20 @@ impl Root {
                             .min_h(px(24.))
                             .line_height((px(app.settings.ui_pixels(9.0))) * 1.3)
                             .text_color(color(tokens.muted))
-                            .child(div().min_w(px(0.)).truncate().child(format!(
+                            .child(div().flex_grow(1.0).min_w(px(0.)).truncate().child(format!(
                                 "{tabs} tab{} · {panes} pane{}",
                                 if tabs == 1 { "" } else { "s" },
                                 if panes == 1 { "" } else { "s" }
                             )))
-                            .child(close),
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(app.settings.ui_pixels(9.0)))
+                                    .line_height(px(app.settings.ui_pixels(9.0)) * 1.3)
+                                    .text_color(color(signal_kind.label_color(tokens)))
+                                    .whitespace_nowrap()
+                                    .child(app.workspace_state_label(workspace)),
+                            ),
                     )
                     .child(
                         div()
@@ -924,6 +977,9 @@ impl Root {
                             }),
                     ),
             )
+            .context_menu(move |menu, _, cx| {
+                workspace_actions(menu, &context_root, workspace_id, cx, tokens)
+            })
             .into_any_element()
     }
 

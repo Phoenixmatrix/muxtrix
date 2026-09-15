@@ -1576,6 +1576,7 @@ pub(crate) enum Message {
     NewTab,
     ActivateTab(TabId),
     CloseTab(WorkspaceId, TabId),
+    RequestRenameWorkspace(WorkspaceId),
     RequestCloseWorkspace(WorkspaceId),
     ConfirmCloseWorkspace(WorkspaceId),
     CancelCloseWorkspace,
@@ -3043,6 +3044,20 @@ impl Muxtrix {
                 return Vec::new();
             }
             Message::CloseTab(workspace_id, tab_id) => self.close_tab(workspace_id, tab_id),
+            Message::RequestRenameWorkspace(workspace_id) => {
+                if let Some(workspace) = self
+                    .session
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == workspace_id)
+                {
+                    return self.open_rename_prompt(
+                        RenameTarget::Workspace(workspace_id),
+                        workspace.name.clone(),
+                    );
+                }
+                return Vec::new();
+            }
             Message::RequestCloseWorkspace(workspace_id) => {
                 self.request_close_workspace(workspace_id)
             }

@@ -534,34 +534,58 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         }
         if matches!(
             capture.as_str(),
-            "workspace-close-hover" | "workspace-close-confirm" | "close-workspace"
+            "workspace-menu-hover"
+                | "workspace-menu"
+                | "workspace-close-confirm"
+                | "close-workspace"
         ) {
             wait_workspace_close_state(&workspace_close_state_path, false, 2)?;
             let origin = pin_window(&connection, root, window)?;
-            // The 296px expanded rail keeps the close slot at its trailing
-            // 13px inset. Its 24px target is on the first tile's second line.
-            let close_x = origin.dst_x.saturating_add(270);
-            let close_y = origin.dst_y.saturating_add(79);
+            // The reserved 24px actions target is now on the title row.
+            let menu_x = origin.dst_x.saturating_add(270);
+            let menu_y = origin.dst_y.saturating_add(53);
             connection
-                .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, close_x, close_y, 0)?
+                .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, menu_x, menu_y, 0)?
                 .check()?;
             connection.flush()?;
             thread::sleep(Duration::from_millis(1_000));
-            if capture != "workspace-close-hover" {
-                click_at(&connection, root, close_x, close_y)?;
+            if capture != "workspace-menu-hover" {
+                click_at(&connection, root, menu_x, menu_y)?;
+                connection.flush()?;
+                thread::sleep(Duration::from_millis(350));
+            }
+            if capture == "workspace-close-confirm" || capture == "close-workspace" {
+                // Up from the unselected menu selects its last enabled item.
+                tap_keysym(&connection, 0xff52)?;
+                tap_keysym(&connection, 0xff0d)?;
                 connection.flush()?;
                 wait_workspace_close_state(&workspace_close_state_path, true, 2)?;
                 // Enter on the initial selection must cancel, never destroy.
                 tap_keysym(&connection, 0xff0d)?;
                 connection.flush()?;
                 wait_workspace_close_state(&workspace_close_state_path, false, 2)?;
-                click_at(&connection, root, close_x, close_y)?;
+                // Reopen through the other entry point: right-click the tile.
+                connection
+                    .xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, menu_x, menu_y, 0)?
+                    .check()?;
+                connection
+                    .xtest_fake_input(BUTTON_PRESS_EVENT, 3, 0, root, menu_x, menu_y, 0)?
+                    .check()?;
+                connection
+                    .xtest_fake_input(BUTTON_RELEASE_EVENT, 3, 0, root, menu_x, menu_y, 0)?
+                    .check()?;
+                connection.flush()?;
+                thread::sleep(Duration::from_millis(350));
+                tap_keysym(&connection, 0xff52)?;
+                tap_keysym(&connection, 0xff0d)?;
                 connection.flush()?;
                 wait_workspace_close_state(&workspace_close_state_path, true, 2)?;
                 thread::sleep(Duration::from_millis(750));
-                eprintln!("clicked inactive workspace close, canceled with Enter, and reopened");
+                eprintln!(
+                    "opened workspace menu, canceled close with Enter, and reopened via right-click"
+                );
             } else {
-                eprintln!("hovered the inactive workspace close control");
+                eprintln!("captured workspace actions hover/menu");
             }
         }
         if capture == "session-picker-hover" {
@@ -848,6 +872,32 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             "captured a {}x{} frame from the X server",
             frame.width, frame.height
         );
+        if capture == "workspace-menu" {
+            // Exercise Rename through the real popup, then ensure it changed the
+            // background workspace rather than activating or renaming the foreground.
+            tap_keysym(&connection, 0xff54)?;
+            tap_keysym(&connection, 0xff0d)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(350));
+            chord(&connection, 0xffe3, 'a' as u32)?;
+            type_text(&connection, "renamed background")?;
+            tap_keysym(&connection, 0xff0d)?;
+            connection.flush()?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let state: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&workspace_close_state_path)?)?;
+                assert_eq!(state["active"], "release-audit-with-a-long-workspace-name");
+                if state["names"][0] == "renamed background" {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!("workspace menu rename did not apply: {state}").into());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!("renamed only the inactive target through its title menu");
+        }
         if capture == "workspace-close-confirm" || capture == "close-workspace" {
             // Preserve the confirmation frame, then exercise its destructive
             // action through keyboard navigation before the app quits.

@@ -934,7 +934,8 @@ impl Scenario {
                 }
             }
             Stage::Screenshot => {
-                if self.capturing("workspace-close-hover")
+                if self.capturing("workspace-menu-hover")
+                    || self.capturing("workspace-menu")
                     || self.capturing("workspace-close-confirm")
                     || self.capturing("close-workspace")
                 {
@@ -945,6 +946,7 @@ impl Scenario {
                                 .map(|workspace| workspace.name.clone())
                         }),
                         "workspaces": app.session.workspaces.len(),
+                        "names": app.session.workspaces.iter().map(|workspace| &workspace.name).collect::<Vec<_>>(),
                         "cancel_selected": app.dialog_button == Some(crate::app::DialogButton::Cancel),
                     })
                     .to_string();
@@ -1918,7 +1920,8 @@ impl Scenario {
                 prompt.base_directory =
                     Some("/home/user/an-extraordinarily-long-home-directory-name/.muxtrix/worktrees/muxtrix".into());
             }
-        } else if self.capturing("workspace-close-hover")
+        } else if self.capturing("workspace-menu-hover")
+            || self.capturing("workspace-menu")
             || self.capturing("workspace-close-confirm")
             || self.capturing("close-workspace")
         {
