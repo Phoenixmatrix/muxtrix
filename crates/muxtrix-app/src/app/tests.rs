@@ -4140,6 +4140,38 @@ fn rename_input_arrows_keep_editing_until_the_button_row_is_entered() {
 }
 
 #[test]
+fn workspace_menu_renames_its_inactive_target_without_switching_workspaces() {
+    let mut app = Muxtrix::new();
+    let target = app.session.active_workspace_id;
+    create_test_workspace(&mut app);
+    let active = app.session.active_workspace_id;
+    let active_name = app
+        .active_workspace()
+        .expect("active workspace")
+        .name
+        .clone();
+
+    let _ = app.update(Message::RequestRenameWorkspace(target));
+    app.rename_draft = "renamed background workspace".into();
+    app.apply_rename().expect("rename target workspace");
+
+    assert_eq!(app.session.active_workspace_id, active);
+    assert_eq!(
+        app.active_workspace().expect("active workspace").name,
+        active_name
+    );
+    assert_eq!(
+        app.session
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == target)
+            .expect("target")
+            .name,
+        "renamed background workspace"
+    );
+}
+
+#[test]
 fn palette_rename_updates_workspaces_tabs_and_panes() {
     let mut app = Muxtrix::new();
     let workspace_id = app.session.active_workspace_id;

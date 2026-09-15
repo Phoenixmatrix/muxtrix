@@ -149,6 +149,8 @@ pub(crate) struct Root {
     pub(crate) settings_widgets: crate::views::settings_widgets::SettingsWidgets,
     /// A focus request waiting for a frame to apply it against.
     pending_focus: Option<crate::effect::FocusTarget>,
+    /// Native popup focus must survive terminal-driven repaints.
+    pub(crate) workspace_menu_focus: Option<FocusHandle>,
     /// Caps independent blocking effects without queueing one behind another.
     blocking_effects: BlockingEffectLimiter,
     /// The title the window already carries, so an unchanged one costs
@@ -340,6 +342,7 @@ impl Root {
             settings_widgets,
             blocking_effects: BlockingEffectLimiter::default(),
             pending_focus: None,
+            workspace_menu_focus: None,
             title: String::new(),
             component_theme: None,
             pane_bounds: std::rc::Rc::default(),
@@ -716,10 +719,19 @@ impl Root {
             && !self.focus.is_focused(window)
     }
 
+    fn workspace_menu_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
+        self.workspace_menu_focus
+            .as_ref()
+            .is_some_and(|focus| focus.contains_focused(window, cx))
+    }
+
     /// Every key the window receives, in the app's own vocabulary.
     /// The terminal receives every key the application does not explicitly
     /// claim; this adapter does not maintain a second keymap.
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace_menu_focused(window, cx) {
+            return;
+        }
         let input = crate::input::from_keystroke(&event.keystroke);
         if self.settings_component_focused(window, cx)
             && !matches!(input.modified_key.as_ref(), Key::Named(Named::Escape))
@@ -730,7 +742,7 @@ impl Root {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings_component_focused(window, cx) {
+        if self.workspace_menu_focused(window, cx) || self.settings_component_focused(window, cx) {
             return;
         }
         let modifiers = crate::input::modifiers_from_gpui(event.keystroke.modifiers);
@@ -747,7 +759,7 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.settings_component_focused(window, cx) {
+        if self.workspace_menu_focused(window, cx) || self.settings_component_focused(window, cx) {
             return;
         }
         let modifiers = crate::input::modifiers_from_gpui(event.modifiers);
@@ -877,7 +889,10 @@ impl Render for Root {
                     == crate::app::ActiveView::Settings
                     && (self.focus.contains_focused(window, cx)
                         || self.settings_widgets.picker_trigger_focused(window));
-                if !settings_control_focused && !self.focus.is_focused(window) {
+                if !settings_control_focused
+                    && !self.workspace_menu_focused(window, cx)
+                    && !self.focus.is_focused(window)
+                {
                     self.focus.focus(window, cx);
                 }
             }
