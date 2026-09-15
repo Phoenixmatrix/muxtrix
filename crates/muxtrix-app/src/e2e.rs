@@ -1312,6 +1312,18 @@ impl Scenario {
                 wsl_distribution: String::new(),
             });
             pane.custom_name = Some("clever_hopper".into());
+            app.agent_statuses.insert(
+                pane_id,
+                AgentPaneStatus {
+                    agent: "codex".into(),
+                    display_name: None,
+                    state: AgentState::Idle,
+                    activity: None,
+                    session_id: None,
+                    cwd: None,
+                    git_branch: None,
+                },
+            );
             if self.capturing("task-complete-confirm")
                 || self.capturing("task-complete-scrolled")
                 || self.capturing("task-complete-error")

@@ -10,7 +10,7 @@ use gpui::{
     ParentElement, Styled, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, Sizable as _};
+use gpui_component::{Disableable as _, Icon, Sizable as _};
 use muxtrix_domain::{PaneId, PaneTree, SplitAxis, Workspace, WorkspaceTab};
 
 use crate::app::{
@@ -381,18 +381,28 @@ impl Root {
                 .complete_task_prompt
                 .as_ref()
                 .is_some_and(|prompt| prompt.pane_id == pane_id && prompt.busy);
-            controls = controls.child(
-                Button::new(("complete-task", pane_key(pane_id)))
-                    .xsmall()
-                    .ghost()
-                    .label("Complete Task")
-                    .tooltip("Remove this task's worktree and close its pane")
-                    .disabled(busy)
-                    .on_click(cx.listener(move |root, _, window, cx| {
-                        cx.stop_propagation();
-                        root.dispatch(Message::CompleteTask(pane_id), window, cx);
-                    })),
-            );
+            controls = controls
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(1.))
+                        .h(px(14.))
+                        .mr(px(4.))
+                        .bg(color(tokens.line_strong)),
+                )
+                .child(
+                    Button::new(("complete-task", pane_key(pane_id)))
+                        .xsmall()
+                        .ghost()
+                        .icon(Icon::default().path(crate::assets::icon_path(IconKind::StatusReady)))
+                        .label("Complete Task")
+                        .tooltip("Remove this task's worktree and close its pane")
+                        .disabled(busy)
+                        .on_click(cx.listener(move |root, _, window, cx| {
+                            cx.stop_propagation();
+                            root.dispatch(Message::CompleteTask(pane_id), window, cx);
+                        })),
+                );
         }
         if !compact {
             if app.maximized_pane.is_none() {

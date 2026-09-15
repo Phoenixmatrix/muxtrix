@@ -16,7 +16,8 @@ pub(crate) struct TaskPaneCreation {
     epoch: u64,
     workspace_id: WorkspaceId,
     tab_id: TabId,
-    source_id: PaneId,
+    created_tab: bool,
+    pub(crate) pane_id: PaneId,
     profile: LaunchProfile,
     agent: Agent,
 }
@@ -86,7 +87,8 @@ impl Muxtrix {
                     epoch: self.task_session_epoch,
                     workspace_id: workspace.id,
                     tab_id: tab.id,
-                    source_id,
+                    created_tab: false,
+                    pane_id: source_id,
                     profile,
                     agent,
                 },
@@ -94,7 +96,7 @@ impl Muxtrix {
                 distribution,
             ))
         })();
-        let (request, directory, distribution) = match result {
+        let (mut request, directory, distribution) = match result {
             Ok(request) => request,
             Err(error) => {
                 self.global_alerts.push(GlobalAlert {
@@ -105,7 +107,16 @@ impl Muxtrix {
                 return Vec::new();
             }
         };
+        if let Err(error) = self.insert_task_placeholder(&mut request) {
+            self.global_alerts.push(GlobalAlert {
+                title: "Task creation failed".into(),
+                body: error.clone(),
+            });
+            self.status = error;
+            return Vec::new();
+        }
         self.pending_task_creation = Some(request.clone());
+        self.sync_session_layout();
         self.active_view = ActiveView::Workspace;
         self.status = "Creating task worktree…".into();
         perform_blocking(
@@ -119,50 +130,13 @@ impl Muxtrix {
         )
     }
 
-    pub(crate) fn finish_task_creation(
-        &mut self,
-        request: TaskPaneCreation,
-        result: Result<TaskWorktree, String>,
-    ) {
-        let current = self
-            .pending_task_creation
-            .as_ref()
-            .is_some_and(|pending| pending.id == request.id);
-        if current {
-            self.pending_task_creation = None;
-        }
-        let task = match result {
-            Ok(task) => task,
-            Err(error) => {
-                self.global_alerts.push(GlobalAlert {
-                    title: "Task creation failed".into(),
-                    body: error.clone(),
-                });
-                self.status = error;
-                return;
-            }
-        };
-        let target_exists = current
-            && request.epoch == self.task_session_epoch
-            && self
-                .session
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.id == request.workspace_id)
-                .and_then(|workspace| workspace.tabs.iter().find(|tab| tab.id == request.tab_id))
-                .is_some_and(|tab| tab.panes.contains_key(&request.source_id));
-        if !target_exists {
-            self.report_retained_task(&task, "The original pane or session is no longer available");
-            return;
-        }
-        let mut profile = request.profile;
-        profile.working_directory = Some(task.path.clone());
-        let title = task.branch.clone();
+    fn insert_task_placeholder(&mut self, request: &mut TaskPaneCreation) -> Result<(), String> {
+        let title = "Creating task…";
         let surface = Surface::terminal(
-            &title,
+            title,
             TerminalSurface {
-                profile_id: profile.id,
-                working_directory: Some(task.path.clone()),
+                profile_id: request.profile.id,
+                working_directory: request.profile.working_directory.clone(),
             },
         );
         let workspace = self
@@ -178,13 +152,13 @@ impl Muxtrix {
             .expect("task tab checked above");
         let focus_task = self.session.active_workspace_id == request.workspace_id
             && workspace.active_tab_id == request.tab_id
-            && tab.focused_pane_id == request.source_id;
+            && tab.focused_pane_id == request.pane_id;
         let placement = if self.maximized_pane.is_some() {
             None
         } else {
             crate::layout::task_pane_placement(
                 tab,
-                request.source_id,
+                request.pane_id,
                 |pane_id| {
                     self.terminals
                         .get(&pane_id)
@@ -202,6 +176,7 @@ impl Muxtrix {
             .iter_mut()
             .find(|workspace| workspace.id == request.workspace_id)
             .expect("task workspace checked above");
+        request.created_tab = placement.is_none();
         let inserted = if let Some((target, axis)) = placement {
             let tab = workspace
                 .tabs
@@ -217,7 +192,7 @@ impl Muxtrix {
             inserted
         } else {
             let old_tab = workspace.active_tab_id;
-            let tab = WorkspaceTab::new(&title, surface);
+            let tab = WorkspaceTab::new(title, surface);
             let pane_id = tab.focused_pane_id;
             let inserted = workspace.add_tab(tab).map(|()| pane_id);
             if !focus_task {
@@ -228,16 +203,92 @@ impl Muxtrix {
         let pane_id = match inserted {
             Ok(pane_id) => pane_id,
             Err(error) => {
-                self.report_retained_task(&task, &error.to_string());
+                return Err(error.to_string());
+            }
+        };
+        request.tab_id = workspace
+            .tab_containing_pane(pane_id)
+            .expect("new task tab")
+            .id;
+        request.pane_id = pane_id;
+        if focus_task {
+            self.maximized_pane = None;
+        }
+        self.terminals
+            .insert(pane_id, TerminalRuntime::preparing_host(title));
+        Ok(())
+    }
+
+    pub(crate) fn finish_task_creation(
+        &mut self,
+        request: TaskPaneCreation,
+        result: Result<TaskWorktree, String>,
+    ) {
+        let current = self
+            .pending_task_creation
+            .as_ref()
+            .is_some_and(|pending| pending.id == request.id);
+        if current {
+            self.pending_task_creation = None;
+        }
+        let target_exists = current
+            && request.epoch == self.task_session_epoch
+            && self
+                .session
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == request.workspace_id)
+                .and_then(|workspace| workspace.tabs.iter().find(|tab| tab.id == request.tab_id))
+                .is_some_and(|tab| tab.panes.contains_key(&request.pane_id));
+        let task = match result {
+            Ok(task) => task,
+            Err(error) => {
+                if target_exists {
+                    if let Some(runtime) = self.terminals.get_mut(&request.pane_id) {
+                        runtime.launch_state = TerminalLaunchState::Failed(error.clone());
+                        runtime.preview = format!(
+                            "Task creation failed: {error}. Restart this pane to open a shell, or close it and create another task."
+                        );
+                    }
+                    self.global_alerts.push(GlobalAlert {
+                        title: "Task creation failed".into(),
+                        body: error.clone(),
+                    });
+                    self.status = error;
+                }
                 return;
             }
         };
-        workspace
-            .pane_mut(pane_id)
-            .expect("new task pane")
-            .task_worktree = Some(task);
-        if focus_task {
-            self.maximized_pane = None;
+        if !target_exists {
+            self.report_retained_task(&task, "The original pane or session is no longer available");
+            return;
+        }
+        let pane_id = request.pane_id;
+        let mut profile = request.profile;
+        profile.working_directory = Some(task.path.clone());
+        let title = task.branch.clone();
+        let pane = self
+            .session
+            .workspaces
+            .iter_mut()
+            .find_map(|workspace| workspace.pane_mut(pane_id))
+            .expect("task placeholder checked above");
+        let surface = pane.surfaces.first_mut().expect("task terminal surface");
+        surface.title = title.clone();
+        if let muxtrix_domain::SurfaceKind::Terminal(terminal) = &mut surface.kind {
+            terminal.working_directory = Some(task.path.clone());
+        }
+        pane.task_worktree = Some(task);
+        if request.created_tab
+            && let Some(tab) = self
+                .session
+                .workspaces
+                .iter_mut()
+                .flat_map(|workspace| &mut workspace.tabs)
+                .find(|tab| tab.id == request.tab_id)
+            && tab.name == "Creating task…"
+        {
+            tab.name = title.clone();
         }
         // Durable ownership precedes either launch; a failed launch remains restartable.
         self.sync_session_layout();
@@ -363,9 +414,26 @@ impl Muxtrix {
         if self.task_removal_busy() {
             return;
         }
+        let resume = self
+            .task_completion
+            .as_ref()
+            .map(|operation| operation.pane_id)
+            .filter(|pane_id| {
+                self.task_terminal_stops
+                    .get(pane_id)
+                    .is_some_and(|stop| !stop.pending.load(Ordering::Acquire))
+                    && self.terminals.get(pane_id).is_some_and(|runtime| {
+                        matches!(runtime.launch_state, TerminalLaunchState::Suppressed)
+                    })
+            });
         self.task_completion = None;
         self.complete_task_prompt = None;
         self.dialog_button = None;
+        if let Some(pane_id) = resume
+            && let Err(error) = self.launch_terminal_for_pane(pane_id)
+        {
+            self.status = format!("Task retained; terminal restart failed: {error}");
+        }
     }
 
     pub(crate) fn confirm_complete_task(&mut self) -> Vec<Effect> {
@@ -506,10 +574,25 @@ impl Muxtrix {
                 .task_terminal_stops
                 .get(&operation.pane_id)
                 .is_some_and(|stop| stop.pending.load(Ordering::Acquire));
+            if stop_pending {
+                // A failed stop may not have reached the process. Restore its
+                // input/output attachment, but retain the stop barrier so a
+                // restart cannot create a second untracked process.
+                let session = self
+                    .task_terminal_stops
+                    .get(&operation.pane_id)
+                    .and_then(|stop| stop.session.try_lock().ok()?.take());
+                if let Some(session) = session
+                    && let Some(runtime) = self.terminals.get_mut(&operation.pane_id)
+                {
+                    runtime.session = Some(session);
+                    runtime.launch_state = TerminalLaunchState::Running;
+                }
+            }
             let guidance = if stop_pending {
-                "Task retained; its process has not confirmed stopping. Retry completion before restarting"
+                "Task retained; stopping is unconfirmed. Cancel to return to the terminal, or retry completion before restarting"
             } else {
-                "Task retained. Restart the pane to keep working, or retry completion"
+                "Task retained. Cancel to restart its shell, or retry completion"
             };
             self.task_completion_error(format!("{guidance}: {error}"));
             return;

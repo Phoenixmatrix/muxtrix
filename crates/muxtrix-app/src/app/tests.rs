@@ -9934,6 +9934,12 @@ fn task_creation_keeps_its_original_tab_and_reports_a_missing_session_target() {
         .pending_task_creation
         .clone()
         .expect("anchored creation");
+    let placeholder = active_pane_id(&app);
+    assert_ne!(placeholder, source);
+    assert_eq!(active_tab(&app).id, original_tab);
+    assert!(app.terminals[&placeholder].session.is_none());
+    assert!(app.task_worktree(placeholder).is_none());
+    assert!(app.restart_pane(placeholder).is_err());
     app.new_tab()
         .expect("switch focus before creation finishes");
     let later_tab = active_tab(&app).id;
@@ -9957,6 +9963,7 @@ fn task_creation_keeps_its_original_tab_and_reports_a_missing_session_target() {
         .find(|pane| pane.id != source)
         .expect("task beside captured source");
     assert_eq!(new_task.task_worktree.as_ref(), Some(&fixture.task));
+    assert_eq!(new_task.id, placeholder);
     assert_eq!(app.agent_statuses[&new_task.id].agent, "codex");
 
     let _creation = app.update(Message::RunCommand(CommandAction::CreateTaskPane));
@@ -10003,10 +10010,17 @@ fn crowded_task_creation_opens_a_new_tab_without_changing_existing_panes() {
     });
     let _creation = app.update(Message::RunCommand(CommandAction::CreateTaskPane));
     let request = app.pending_task_creation.clone().expect("task creation");
+    let placeholder = active_pane_id(&app);
+    let placeholder_tab = active_tab(&app).id;
+    assert_ne!(placeholder_tab, original_tab);
+    assert!(app.terminals[&placeholder].session.is_none());
     let _ = app.update(Message::TaskPaneCreated(Box::new((
         request,
         Ok(fixture.task.clone()),
     ))));
+    assert_eq!(active_pane_id(&app), placeholder);
+    assert_eq!(active_tab(&app).id, placeholder_tab);
+    assert_eq!(active_tab(&app).name, fixture.task.branch);
     assert_ne!(active_tab(&app).id, original_tab);
     assert_eq!(active_tab(&app).panes.len(), 1);
     assert_eq!(app.task_worktree(active_pane_id(&app)), Some(&fixture.task));
@@ -10177,4 +10191,80 @@ fn task_removal_scheduling_failure_retains_stop_obligation_across_retry() {
         "retry must execute the retained stop before removal: {}",
         app.status
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn task_completion_failure_and_cancel_restore_real_terminal_input() {
+    let fixture = TaskPaneFixture::new();
+    let (mut app, pane_id) = fixture.app();
+    for profile in &mut app.session.profiles {
+        profile.program = "/bin/sh".into();
+        profile.arguments = vec!["-i".into()];
+    }
+    app.terminal_launcher = Arc::new(SystemTerminalLauncher::default());
+    app.launch_in_background = false;
+    app.launch_terminal_for_pane(pane_id)
+        .expect("live task shell");
+
+    // A scheduling error never sent the stop: cancellation must preserve
+    // the original shell, its input attachment, and its stop obligation.
+    let inspection = app.update(Message::CompleteTask(pane_id));
+    let [Effect::Perform(inspection)] = inspection.as_slice() else {
+        panic!("inspection")
+    };
+    let removal = app.update(inspection.resolve(None));
+    let [Effect::Perform(removal)] = removal.as_slice() else {
+        panic!("removal")
+    };
+    let _ = app.update(removal.resolve(Some("worker unavailable".into())));
+    let _ = app.update(Message::CancelCompleteTask);
+    let marker = fixture.root.join("recovered-input");
+    app.send_terminal_input_to(
+        pane_id,
+        format!("printf original > '{}'\r", marker.display()).into_bytes(),
+    )
+    .expect("reattached terminal input");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        app.poll_terminal();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("shell ran input"),
+        "original"
+    );
+    assert!(
+        app.restart_pane(pane_id).is_err(),
+        "unacknowledged stop still blocks replacement"
+    );
+
+    // A Git error after successful stopping must instead start a fresh
+    // shell when canceled, still inside the retained task checkout.
+    let inspection = app.update(Message::CompleteTask(pane_id));
+    let [Effect::Perform(inspection)] = inspection.as_slice() else {
+        panic!("retry inspection")
+    };
+    let removal = app.update(inspection.resolve(None));
+    std::fs::write(fixture.task.path.join("late-work"), "keep").expect("late change");
+    resolve_task_effects(&mut app, removal);
+    assert!(fixture.task.path.join("late-work").exists());
+    let _ = app.update(Message::CancelCompleteTask);
+    let restarted = fixture.root.join("restarted-input");
+    app.send_terminal_input_to(
+        pane_id,
+        format!("printf '%s' \"$PWD\" > '{}'\r", restarted.display()).into_bytes(),
+    )
+    .expect("restarted terminal input");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !restarted.exists() && std::time::Instant::now() < deadline {
+        app.poll_terminal();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&restarted).expect("fresh shell ran input"),
+        fixture.task.path.to_string_lossy()
+    );
+    assert_eq!(app.task_worktree(pane_id), Some(&fixture.task));
+    assert!(!app.task_removal_busy());
 }

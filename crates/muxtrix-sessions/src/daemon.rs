@@ -189,6 +189,10 @@ pub fn run(id: Uuid, name: String, endpoint: String) -> Result<(), String> {
             });
     }
 
+    // A client can time out before a successful stop acknowledgment arrives.
+    // Retain the proof, not the PTY, so retrying that exact incarnation is
+    // idempotent. A subsequent spawn invalidates the old proof.
+    let mut terminated_generations = HashMap::new();
     while let Ok(stream) = listener.accept() {
         let (read_half, writer) = Stream::split(stream);
         *shared.client.lock().expect("client") = Some(writer);
@@ -271,6 +275,7 @@ pub fn run(id: Uuid, name: String, endpoint: String) -> Result<(), String> {
                                     let previous =
                                         shared.panes.lock().expect("panes").remove(&pane);
                                     drop(previous);
+                                    terminated_generations.remove(&pane);
                                     // Published before its reader starts, so
                                     // the reader always finds its own entry.
                                     shared.panes.lock().expect("panes").insert(
@@ -362,9 +367,12 @@ pub fn run(id: Uuid, name: String, endpoint: String) -> Result<(), String> {
                                 .map_err(|error| error.to_string());
                             if result.is_err() {
                                 shared.panes.lock().expect("panes").insert(pane, state);
+                            } else {
+                                terminated_generations.insert(pane, generation);
                             }
                             result
                         }
+                        None if terminated_generations.get(&pane) == Some(&generation) => Ok(()),
                         None => {
                             Err("pane incarnation is no longer owned by this daemon".to_owned())
                         }
@@ -730,6 +738,9 @@ mod tests {
         {}
         assert_eq!(client.pane_exit(pane), Some(true));
         client.kill_and_wait(pane).expect("already exited");
+        client
+            .kill_and_wait(pane)
+            .expect("retry retains proof if the first acknowledgment was missed");
         client.send(&Request::Shutdown).expect("shutdown");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -738,6 +749,26 @@ mod tests {
     fn acknowledged_kill_rejects_a_stale_pane_incarnation() {
         let (_, dir, client) = start_test_daemon("kill-wait-stale");
         let pane = Uuid::new_v4();
+        let previous_output = client.register_pane(pane);
+        client
+            .send(&Request::Spawn {
+                pane,
+                executable: "sh".into(),
+                arguments: vec!["-c".into(), "exit 0".into()],
+                working_directory: None,
+                environment: vec![],
+                rows: 24,
+                cols: 80,
+            })
+            .expect("spawn previous incarnation");
+        while previous_output
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok()
+        {}
+        client
+            .kill_and_wait(pane)
+            .expect("stop previous incarnation");
+        let previous_generation = client.pane_generations.lock().expect("generations")[&pane];
         let output = client.register_pane(pane);
         client.send(&Request::Spawn {
             pane, executable: "sh".into(), arguments: vec!["-c".into(),
@@ -759,7 +790,7 @@ mod tests {
             .send(&Request::KillAndWait {
                 pane,
                 request,
-                generation: u64::MAX,
+                generation: previous_generation,
             })
             .expect("stale request");
         assert!(
