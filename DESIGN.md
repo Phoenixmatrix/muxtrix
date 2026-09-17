@@ -73,6 +73,10 @@ rename dialog; workspace action menus also open that dialog without switching
 workspaces. A pane rename is an override: clearing it restores the automatic
 terminal/agent title.
 
+Single-field dialogs use the input's intrinsic height with a non-shrinking
+wrapper and 4 px of inset for its outer focus ring. The scrollable body must
+contain the complete field and ring above the separate action row.
+
 Workspace tiles reserve a 24 px actions target at the trailing edge of the
 title row, 13 px inside the rail. Its quiet overflow icon appears on tile hover
 or workspace keyboard targeting, with a Workspace actions tooltip. The fixed
