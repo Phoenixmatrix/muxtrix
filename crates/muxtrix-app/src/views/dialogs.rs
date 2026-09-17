@@ -700,14 +700,9 @@ impl Root {
             body,
             vec![
                 div()
-                    .h(px(32.))
-                    .px(px(6.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(6.))
-                    .bg(color(tokens.panel))
-                    .border_1()
-                    .border_color(color(tokens.line))
+                    .flex_shrink_0()
+                    // Keep the input's outer focus ring inside the scroll clip.
+                    .p(px(4.))
                     .child(gpui_component::input::Input::new(field))
                     .into_any_element(),
             ],
