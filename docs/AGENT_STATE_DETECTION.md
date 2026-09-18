@@ -239,15 +239,20 @@ Precedence for a matched pane:
 
 - The record decides `Running` (`busy`), `Needs input` (`waiting`, with
   `waitingFor` as the row's activity), and `Idle` (`idle`, `shell`). An `idle`
-  record after a turn ran is that turn finishing, so it reads as `Completed`
-  until the next `busy`; `Failed` likewise persists until the next turn.
+  record after a turn ran means completion only when no tracked subagents
+  remain. `Failed` persists until the next turn.
 - Hooks are exact edges applied immediately: `UserPromptSubmit` starts the
-  turn, `Stop` completes it (and triggers the PR refresh), `StopFailure` fails
-  it, `Elicitation` blocks it, `SessionStart` resets it, `SessionEnd` removes
-  it. `PermissionRequest` and `SubagentStart` are advisory while a record is
-  matched: the first fires before another hook or auto mode may resolve the
-  request without a dialog, and the second fires for background subagents
-  after the turn has stopped; the record already answers both. A record whose
+  turn, `Stop` completes it (and triggers the PR refresh) unless subagents
+  remain, `StopFailure` fails it, `Elicitation` blocks it, `SessionStart` resets
+  it, and `SessionEnd` removes it. `SubagentStart` and `SubagentStop` track each
+  helper by `agent_id`; duplicate events cannot finish a sibling. While any
+  helper runs, a parent's `Stop`, idle record, or fallback idle composer keeps
+  the pane `Running` with activity `Subagents are working`. A real input wait
+  still wins. The final helper completes an already-yielded parent, but never
+  completes a parent that is still working. Cancellation, failure, and session
+  reset discard the tracked helpers.
+  `PermissionRequest` remains advisory while a record is matched: another
+  hook or auto mode may resolve it without a dialog. A record whose
   `status` this build cannot read leaves the screen in charge. A `Notification` counts only when it names
   `permission_prompt` or an elicitation dialog; the harness sends those after a
   dialog has waited about six seconds, so the record has long since said so.
@@ -257,10 +262,16 @@ Precedence for a matched pane:
 - A pane whose record disappears or whose process dies falls back to hook
   edges and the screen classifier until a record matches again.
 
-The hook client forwards the payload intact (event name, session, cwd, tool,
-notification type, permission mode, message) as a typed `ClaudeHook` request
+The hook client forwards the relevant payload fields (event name, session, cwd,
+tool, subagent ID, notification type, permission mode, message) as a typed `ClaudeHook` request
 instead of a pre-decided state. A hook client from before this contract is
 folded into the same pipeline from its coarse event name.
+
+Subagent tracking requires the current managed hooks: use **Repair** or
+**Re-add** after upgrading to install `SubagentStop`, then restart Claude Code
+so its hook configuration is refreshed. Tracking is pane-local and starts with
+observed hooks; a Muxtrix restart cannot reconstruct already-running helpers
+from the parent-only session record.
 
 Every prior Claude signal is now demoted: the OSC title spinner (which the
 harness makes static under a multiplexer anyway), the `esc to interrupt`

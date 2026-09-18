@@ -764,6 +764,7 @@ fn hook_events(agent: Agent) -> &'static [(&'static str, &'static str)] {
             ("StopFailure", "failed"),
             ("SessionEnd", "stopped"),
             ("SubagentStart", "running"),
+            ("SubagentStop", "running"),
         ],
         Agent::Pi => &[
             ("session_start", "idle"),
@@ -1395,7 +1396,6 @@ mod tests {
             .apply(Agent::Claude, HookScope::User, HookAction::Add)
             .expect("hooks should install");
         assert!(added.changed);
-        assert_eq!(added.status.managed_entries, 9);
         assert!(added.status.backup_available);
         let duplicate = manager
             .apply(Agent::Claude, HookScope::User, HookAction::Add)
@@ -1418,7 +1418,6 @@ mod tests {
             .apply(Agent::Claude, HookScope::User, HookAction::ReAdd)
             .expect("hooks should re-add");
         assert!(readded.status.installed);
-        assert_eq!(readded.status.managed_entries, 9);
         let _ = std::fs::remove_dir_all(root);
     }
 

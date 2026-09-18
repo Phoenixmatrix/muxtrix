@@ -175,8 +175,12 @@ even when its prompt hook was delayed or unavailable.
 
 Claude Code is read from the session record the harness itself writes
 (`~/.claude/sessions/<pid>.json`): `busy`, `idle`, `waiting` with the reason,
-or `shell`. Hooks add the exact turn edges and session identity; the screen is
-only a fallback for a pane no live record matches. See
+or `shell`. Hooks add the exact turn edges, session identity, and subagent IDs.
+The pane stays **Running** while tracked subagents work, even when the parent
+has stopped responding or shows an idle composer; actual input requests still
+show **Needs input**. The screen is only a fallback for a pane no live record
+matches. After upgrading, use **Repair** or **Re-add** for Claude Code and
+restart Claude to enable the new `SubagentStop` hook. See
 [Agent state detection](AGENT_STATE_DETECTION.md#claude-code-session-records).
 
 Oh My Pi keeps exact approval and active-turn lifecycle events. From

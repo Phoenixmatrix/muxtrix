@@ -9345,6 +9345,16 @@ impl Muxtrix {
             return;
         }
         let state = screen_state(classification.state);
+        // A parent can paint its idle composer while helpers are still
+        // running. Hooks remain evidence even without a live session record.
+        if state == AgentState::Idle
+            && self
+                .claude_trackers
+                .get(&pane_id)
+                .is_some_and(ClaudeTracker::has_active_subagents)
+        {
+            return;
+        }
         // Keep a completed turn visible while its composer is merely idle, but
         // let positive working evidence start the next turn even if its prompt
         // hook was delayed or unavailable. Failed and stopped sessions remain
