@@ -1642,6 +1642,48 @@ impl Scenario {
             }
             status.display_name = Some("oh-my-pi-release-audit".into());
             app.settings.fleet_view = FleetView::Agents;
+        } else if self.capturing("claude-subagents") {
+            for (event, agent_id, stamp) in [
+                ("UserPromptSubmit", None, 100),
+                ("SubagentStart", Some("reviewer"), 101),
+                ("SubagentStart", Some("tester"), 102),
+                ("Stop", None, 103),
+            ] {
+                let mut hook = muxtrix_control::ClaudeHook::from_payload(
+                    &serde_json::json!({
+                        "session_id": "capture-claude-subagents",
+                        "agent_id": agent_id,
+                    }),
+                    event,
+                );
+                hook.sent_at_ms = stamp;
+                let response = app.handle_control_request(ControlRequest::ClaudeHook {
+                    pane_id: Some(self.initial_pane.as_uuid().to_string()),
+                    hook,
+                });
+                if !response.ok {
+                    return Err("Claude subagent capture could not deliver its hook".into());
+                }
+            }
+            let revision = app.terminals[&self.initial_pane].snapshot_revision;
+            app.apply_agent_screen_classification(
+                self.initial_pane,
+                "claude",
+                revision.wrapping_add(1),
+                agent_screen::Classification {
+                    state: agent_screen::ScreenState::Idle,
+                    rule: "claude.idle_composer",
+                },
+            );
+            let status = app
+                .agent_statuses
+                .get_mut(&self.initial_pane)
+                .ok_or_else(|| "Claude capture lost its agent state".to_owned())?;
+            if status.state != AgentState::Running {
+                return Err("Claude parent idle demoted its running subagents".into());
+            }
+            status.display_name = Some("claude-delegated-review".into());
+            app.settings.fleet_view = FleetView::Agents;
         } else if self.capturing("fleet-agents") {
             // Stage different harnesses across both tabs so the capture
             // proves Agents is one flat selected-workspace projection.

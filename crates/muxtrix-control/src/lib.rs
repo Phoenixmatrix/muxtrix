@@ -97,6 +97,9 @@ pub struct ClaudeHook {
     pub tool_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
+    /// Subagent lifecycle identity, shared by `SubagentStart` and `SubagentStop`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     /// `Notification` payloads name their kind: `permission_prompt`,
     /// `idle_prompt`, `elicitation_dialog`, `auth_success`, ...
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,6 +136,7 @@ impl ClaudeHook {
             cwd: text("cwd"),
             tool_name: text("tool_name"),
             tool_use_id: text("tool_use_id"),
+            agent_id: text("agent_id"),
             notification_type: text("notification_type").or_else(|| text("matcher")),
             permission_mode: text("permission_mode"),
             message: text("message"),

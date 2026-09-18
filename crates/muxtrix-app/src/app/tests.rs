@@ -4477,6 +4477,76 @@ fn a_live_session_record_decides_the_claude_pane_over_its_painted_composer() {
 }
 
 #[test]
+fn claude_subagents_keep_the_pane_running_while_the_parent_is_idle() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    let send = |app: &mut Muxtrix, event: &str, agent_id: Option<&str>, stamp| {
+        let mut hook = ClaudeHook::from_payload(
+            &serde_json::json!({
+                "session_id": "live-session",
+                "agent_id": agent_id,
+            }),
+            event,
+        );
+        hook.sent_at_ms = stamp;
+        assert!(
+            app.handle_control_request(ControlRequest::ClaudeHook {
+                pane_id: Some(pane_id.as_uuid().to_string()),
+                hook,
+            })
+            .ok
+        );
+    };
+    send(&mut app, "UserPromptSubmit", None, 100);
+    app.claude_records = vec![claude_record("live-session", "busy", 101)];
+    app.reconcile_claude_records();
+    send(&mut app, "SubagentStart", Some("first"), 102);
+    send(&mut app, "SubagentStart", Some("second"), 103);
+    send(&mut app, "SubagentStart", Some("second"), 104);
+    send(&mut app, "Stop", None, 105);
+    app.claude_records = vec![claude_record("live-session", "idle", 106)];
+    app.reconcile_claude_records();
+    assert_eq!(app.pane_state_label(pane_id), "Running");
+    assert_eq!(app.pane_signal_kind(pane_id, false), PaneSignalKind::Active);
+
+    // Losing the parent record must not let an empty composer hide the work.
+    app.claude_records.clear();
+    app.reconcile_claude_records();
+    let runtime = app.terminals.get_mut(&pane_id).expect("terminal runtime");
+    runtime.session = None;
+    runtime.snapshot = Some(claude_idle_snapshot());
+    runtime.snapshot_revision += 1;
+    app.poll_terminal();
+    assert_eq!(app.pane_state_label(pane_id), "Running");
+
+    // Finishing one helper (even twice) does not finish its sibling.
+    send(&mut app, "SubagentStop", Some("first"), 107);
+    send(&mut app, "SubagentStop", Some("first"), 108);
+    app.claude_records = vec![claude_record("live-session", "idle", 109)];
+    app.reconcile_claude_records();
+    assert_eq!(app.pane_state_label(pane_id), "Running");
+
+    // Actual user attention still wins over background work.
+    let mut waiting = claude_record("live-session", "waiting", 110);
+    waiting.waiting_for = Some("permission prompt".into());
+    app.claude_records = vec![waiting];
+    app.reconcile_claude_records();
+    assert_eq!(app.pane_state_label(pane_id), "Needs input");
+    send(&mut app, "SubagentStop", Some("second"), 111);
+    assert_eq!(app.pane_state_label(pane_id), "Needs input");
+
+    // The parent consumes the result and ends its own turn.
+    app.claude_records = vec![claude_record("live-session", "busy", 112)];
+    app.reconcile_claude_records();
+    assert_eq!(app.pane_state_label(pane_id), "Running");
+    send(&mut app, "Stop", None, 113);
+    app.claude_records = vec![claude_record("live-session", "idle", 114)];
+    app.reconcile_claude_records();
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Completed);
+    assert_eq!(app.pane_state_label(pane_id), "Idle");
+}
+
+#[test]
 fn a_waiting_record_raises_attention_and_its_resolution_clears_it() {
     let mut app = Muxtrix::new();
     let original = active_pane_id(&app);

@@ -7,11 +7,11 @@
 //! `procStart`, `statusUpdatedAt`) and costs a Node process per read. Reading
 //! the files directly is exact, immediate, and free.
 //!
-//! The record is the authority for a matched pane. Hooks add the exact turn
-//! edges (`UserPromptSubmit`, `Stop`, `StopFailure`) and pane identity, and
-//! can lead the record by a few milliseconds; a record older than the last
-//! hook edge never regresses it. The terminal screen is only consulted for a
-//! pane no record could be matched to.
+//! The record describes the parent harness, not its background subagents.
+//! Hooks track those by ID and add exact turn edges and pane identity. An
+//! idle parent is still working while its subagents run; a real input wait
+//! takes precedence. A record older than the last hook edge never regresses
+//! it. The terminal screen is consulted only when no record could be matched.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -323,6 +323,10 @@ pub(crate) struct ClaudeTracker {
     pub(crate) record_matched: bool,
     /// A turn has run in this session, so `idle` means a finished turn.
     saw_turn: bool,
+    /// A parent's idle composer does not mean its background work finished.
+    active_subagents: BTreeSet<String>,
+    /// The parent has yielded; the final helper can complete the combined work.
+    parent_stopped: bool,
 }
 
 impl ClaudeTracker {
@@ -332,15 +336,20 @@ impl ClaudeTracker {
                 // A new conversation in the same pane (`/clear`, a resume):
                 // its first turn has not run yet.
                 self.saw_turn = false;
+                self.active_subagents.clear();
+                self.parent_stopped = false;
             }
             self.session_id = Some(session_id.to_owned());
         }
         let decision = match hook.event.as_str() {
             "SessionStart" => {
                 self.saw_turn = false;
+                self.active_subagents.clear();
+                self.parent_stopped = false;
                 Decision::to(AgentState::Idle, "Ready for input")
             }
             "UserPromptSubmit" => {
+                self.parent_stopped = false;
                 self.saw_turn = true;
                 Decision::to(AgentState::Running, "Agent is working")
             }
@@ -374,7 +383,16 @@ impl ClaudeTracker {
                 // Idle reminders, auth, background-agent chatter: not state.
                 _ => Decision::default(),
             },
+            "Stop" if self.has_active_subagents() => {
+                self.parent_stopped = true;
+                if current == AgentState::Waiting {
+                    Decision::default()
+                } else {
+                    Decision::to(AgentState::Running, "Subagents are working")
+                }
+            }
             "Stop" => {
+                self.parent_stopped = true;
                 self.saw_turn = true;
                 Decision {
                     state: Some((
@@ -389,19 +407,54 @@ impl ClaudeTracker {
                     session_ended: false,
                 }
             }
-            "StopFailure" => Decision::to(
-                AgentState::Failed,
-                hook.message
-                    .as_deref()
-                    .map(short_body)
-                    .filter(|body| !body.is_empty())
-                    .unwrap_or_else(|| "Turn failed".to_owned()),
-            ),
-            // Background subagents start after the main turn has stopped;
-            // the record already says whether the harness is busy.
-            "SubagentStart" if current != AgentState::Waiting && !self.record_matched => {
-                self.saw_turn = true;
-                Decision::to(AgentState::Running, "Agent is working")
+            "StopFailure" => {
+                self.active_subagents.clear();
+                Decision::to(
+                    AgentState::Failed,
+                    hook.message
+                        .as_deref()
+                        .map(short_body)
+                        .filter(|body| !body.is_empty())
+                        .unwrap_or_else(|| "Turn failed".to_owned()),
+                )
+            }
+            "SubagentStart" => {
+                if let Some(id) = hook.agent_id.as_deref().filter(|id| !id.is_empty()) {
+                    self.active_subagents.insert(id.to_owned());
+                }
+                if current == AgentState::Waiting
+                    || (!self.has_active_subagents() && self.record_matched)
+                {
+                    Decision::default()
+                } else {
+                    self.saw_turn = true;
+                    Decision::to(AgentState::Running, "Subagents are working")
+                }
+            }
+            "SubagentStop" => {
+                if let Some(id) = hook.agent_id.as_deref()
+                    && self.active_subagents.remove(id)
+                {
+                    // Do not complete a still-running parent with its helper.
+                    self.hook_edge_ms = Some(hook.sent_at_ms);
+                    if current != AgentState::Waiting {
+                        if !self.has_active_subagents() && self.parent_stopped {
+                            return Decision {
+                                turn_completed: true,
+                                ..Decision::to(AgentState::Completed, "Turn complete")
+                            };
+                        }
+                        return Decision::to(
+                            AgentState::Running,
+                            if self.has_active_subagents() {
+                                "Subagents are working"
+                            } else {
+                                "Agent is working"
+                            },
+                        );
+                    }
+                }
+                Decision::default()
             }
             "SessionEnd" => Decision {
                 session_ended: true,
@@ -436,6 +489,7 @@ impl ClaudeTracker {
         match record.status {
             Some(RecordStatus::Busy) => {
                 self.saw_turn = true;
+                self.parent_stopped = false;
                 Decision::to(AgentState::Running, "Agent is working")
             }
             Some(RecordStatus::Waiting) => {
@@ -444,6 +498,10 @@ impl ClaudeTracker {
                     AgentState::Waiting,
                     waiting_activity(record.waiting_for.as_deref()),
                 )
+            }
+            Some(RecordStatus::Idle) if self.has_active_subagents() => {
+                self.parent_stopped = true;
+                Decision::to(AgentState::Running, "Subagents are working")
             }
             Some(RecordStatus::Idle) => match current {
                 // A failed or completed turn stays reported while the
@@ -457,6 +515,10 @@ impl ClaudeTracker {
         }
     }
 
+    pub(crate) fn has_active_subagents(&self) -> bool {
+        !self.active_subagents.is_empty()
+    }
+
     /// The matched record disappeared or its process died. Screen evidence
     /// regains authority; hook edges remain valid.
     pub(crate) fn record_lost(&mut self) {
@@ -466,6 +528,7 @@ impl ClaudeTracker {
     /// The user interrupted the turn from the keyboard.
     pub(crate) fn interrupted(&mut self) {
         self.saw_turn = false;
+        self.active_subagents.clear();
     }
 }
 
@@ -636,6 +699,77 @@ mod tests {
             updated_at_ms: Some(stamped),
             liveness: Liveness::Alive,
         }
+    }
+
+    #[test]
+    fn the_final_helper_completes_only_an_already_stopped_parent() {
+        let mut tracker = ClaudeTracker::default();
+        tracker.hook(AgentState::Idle, &hook("UserPromptSubmit"));
+        let mut start = hook("SubagentStart");
+        start.agent_id = Some("helper".into());
+        let mut stop = hook("SubagentStop");
+        stop.agent_id = start.agent_id.clone();
+        tracker.hook(AgentState::Running, &start);
+        let helper_done = tracker.hook(AgentState::Running, &stop);
+        assert_eq!(
+            helper_done.state.map(|(state, _)| state),
+            Some(AgentState::Running)
+        );
+        assert!(!helper_done.turn_completed);
+
+        // Resuming the same helper is a new run, not a duplicate stop.
+        tracker.hook(AgentState::Running, &start);
+        let yielded = tracker.hook(AgentState::Running, &hook("Stop"));
+        assert_eq!(
+            yielded.state.map(|(state, _)| state),
+            Some(AgentState::Running)
+        );
+        assert!(!yielded.turn_completed);
+        let done = tracker.hook(AgentState::Running, &stop);
+        assert_eq!(
+            done.state.map(|(state, _)| state),
+            Some(AgentState::Completed)
+        );
+        assert!(done.turn_completed);
+        assert_eq!(
+            tracker.hook(AgentState::Completed, &stop),
+            Decision::default()
+        );
+    }
+
+    #[test]
+    fn subagent_tracking_does_not_leak_across_cancellation_failure_or_sessions() {
+        let mut start = hook("SubagentStart");
+        start.agent_id = Some("helper".into());
+        let mut tracker = ClaudeTracker::default();
+        tracker.hook(AgentState::Idle, &start);
+        tracker.interrupted();
+        assert_eq!(
+            tracker
+                .record(AgentState::Idle, &record("idle", 2_000))
+                .state
+                .map(|(state, _)| state),
+            Some(AgentState::Idle)
+        );
+
+        tracker.hook(AgentState::Idle, &start);
+        tracker.hook(AgentState::Running, &hook("StopFailure"));
+        assert_eq!(
+            tracker.record(AgentState::Failed, &record("idle", 2_001)),
+            Decision::default()
+        );
+
+        tracker.hook(AgentState::Failed, &start);
+        let mut session = hook("SessionStart");
+        session.session_id = Some("new-session".into());
+        tracker.hook(AgentState::Running, &session);
+        assert_eq!(
+            tracker
+                .record(AgentState::Idle, &record("idle", 2_002))
+                .state
+                .map(|(state, _)| state),
+            Some(AgentState::Idle)
+        );
     }
 
     #[test]
