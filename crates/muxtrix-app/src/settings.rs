@@ -531,6 +531,7 @@ pub(crate) struct AppSettings {
     pub(crate) default_agent: Option<Agent>,
     pub(crate) codex_command: String,
     pub(crate) claude_command: String,
+    pub(crate) omp_command: String,
     pub(crate) pi_command: String,
 }
 
@@ -556,7 +557,8 @@ impl Default for AppSettings {
             default_agent: None,
             codex_command: "codex".into(),
             claude_command: "claude".into(),
-            pi_command: "omp".into(),
+            omp_command: "omp".into(),
+            pi_command: "pi".into(),
         }
     }
 }
@@ -574,13 +576,18 @@ impl AppSettings {
         }
         let path = config_path();
         match std::fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice::<Self>(&bytes) {
-                Ok(settings) => (settings.sanitized(), None),
-                Err(error) => (
-                    Self::default(),
-                    Some(format!("Could not read {}: {error}", path.display())),
-                ),
-            },
+            Ok(bytes) => {
+                match serde_json::from_slice::<serde_json::Value>(&bytes).and_then(|mut value| {
+                    migrate_legacy_pi_settings(&mut value);
+                    serde_json::from_value::<Self>(value)
+                }) {
+                    Ok(settings) => (settings.sanitized(), None),
+                    Err(error) => (
+                        Self::default(),
+                        Some(format!("Could not read {}: {error}", path.display())),
+                    ),
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Self::default(), None),
             Err(error) => (
                 Self::default(),
@@ -657,11 +664,45 @@ impl AppSettings {
         if self.claude_command.trim().is_empty() {
             self.claude_command = "claude".into();
         }
+        if self.omp_command.trim().is_empty() {
+            self.omp_command = "omp".into();
+        }
         if self.pi_command.trim().is_empty() {
-            self.pi_command = "omp".into();
+            self.pi_command = "pi".into();
         }
         self
     }
+}
+
+/// Reads a settings file written while `pi` meant Oh My Pi.
+///
+/// Such a file keeps Oh My Pi's launch command under `pi_command` and may
+/// name it as the default agent with `"pi"`. The old key is what identifies
+/// one: a file that already has `omp_command` uses today's names, and a
+/// hand-written file with neither is read as written. Returns whether the
+/// value was rewritten.
+pub(crate) fn migrate_legacy_pi_settings(value: &mut serde_json::Value) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    if object.contains_key("omp_command") {
+        return false;
+    }
+    let Some(command) = object.remove("pi_command") else {
+        return false;
+    };
+    object.insert("omp_command".into(), command);
+    if object
+        .get("default_agent")
+        .and_then(serde_json::Value::as_str)
+        == Some("pi")
+    {
+        object.insert(
+            "default_agent".into(),
+            serde_json::Value::String("omp".into()),
+        );
+    }
+    true
 }
 
 pub(crate) fn config_path() -> PathBuf {
@@ -769,6 +810,7 @@ mod tests {
             default_agent: Some(Agent::Claude),
             codex_command: String::new(),
             claude_command: "claude --model opus".into(),
+            omp_command: String::new(),
             pi_command: String::new(),
         }
         .sanitized();
@@ -809,7 +851,8 @@ mod tests {
         );
         assert_eq!(restored.codex_command, "codex");
         assert_eq!(restored.claude_command, "claude --model opus");
-        assert_eq!(restored.pi_command, "omp");
+        assert_eq!(restored.omp_command, "omp");
+        assert_eq!(restored.pi_command, "pi");
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir(directory);
     }
@@ -864,7 +907,39 @@ mod tests {
         );
         assert_eq!(restored.github_host, DEFAULT_GITHUB_HOST);
         assert_eq!(restored.codex_command, "codex");
-        assert_eq!(restored.pi_command, "omp");
+        assert_eq!(restored.omp_command, "omp");
+        assert_eq!(restored.pi_command, "pi");
+    }
+
+    #[test]
+    fn settings_written_when_pi_meant_oh_my_pi_keep_their_meaning() {
+        let mut legacy = serde_json::json!({
+            "default_agent": "pi",
+            "pi_command": "omp --model opus",
+        });
+        assert!(migrate_legacy_pi_settings(&mut legacy));
+        let restored: AppSettings =
+            serde_json::from_value(legacy).expect("legacy settings should deserialize");
+        assert_eq!(restored.default_agent, Some(Agent::OhMyPi));
+        assert_eq!(restored.omp_command, "omp --model opus");
+        assert_eq!(restored.pi_command, "pi");
+
+        // Today's files are read as written, whichever agent they name.
+        let mut current = serde_json::json!({
+            "default_agent": "pi",
+            "omp_command": "omp",
+            "pi_command": "pi --no-session",
+        });
+        assert!(!migrate_legacy_pi_settings(&mut current));
+        let restored: AppSettings =
+            serde_json::from_value(current).expect("current settings should deserialize");
+        assert_eq!(restored.default_agent, Some(Agent::Pi));
+        assert_eq!(restored.omp_command, "omp");
+        assert_eq!(restored.pi_command, "pi --no-session");
+
+        // A file from before any Pi-family agent has nothing to migrate.
+        let mut older = serde_json::json!({ "default_agent": "codex" });
+        assert!(!migrate_legacy_pi_settings(&mut older));
     }
 
     #[test]

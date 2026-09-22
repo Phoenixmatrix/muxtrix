@@ -9,7 +9,11 @@ use thiserror::Error;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 const MANAGED_MARKER: &str = "muxtrix-hook-v1";
-const PI_EXTENSION_VERSION: u32 = 5;
+/// Behavior version of the managed Pi-family extension modules. Bump it when
+/// the generated module's semantics change: a module carrying an older number
+/// migrates during the next hook synchronization.
+const EXTENSION_VERSION: u32 = 6;
+const EXTENSION_FILE_NAME: &str = "muxtrix-lifecycle.ts";
 const WORKTREE_HOME_FOLDER: &str = ".muxtrix/worktrees";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,22 +21,51 @@ const WORKTREE_HOME_FOLDER: &str = ".muxtrix/worktrees";
 pub enum Agent {
     Codex,
     Claude,
+    /// Oh My Pi, the Pi fork that keeps its own `.omp` configuration tree.
+    #[serde(rename = "omp", alias = "oh-my-pi")]
+    OhMyPi,
+    /// Pi itself, configured under `.pi`.
     Pi,
 }
 
 impl Agent {
-    pub const ALL: [Self; 3] = [Self::Codex, Self::Claude, Self::Pi];
+    pub const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::OhMyPi, Self::Pi];
 
     const fn slug(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::OhMyPi => "omp",
             Self::Pi => "pi",
         }
     }
 
+    /// The name people see for the agent, and the title its managed
+    /// extension reports with every lifecycle event.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+            Self::OhMyPi => "Oh My Pi",
+            Self::Pi => "Pi",
+        }
+    }
+
     const fn uses_extension_file(self) -> bool {
-        matches!(self, Self::Pi)
+        matches!(self, Self::OhMyPi | Self::Pi)
+    }
+
+    /// The directory the agent reads its configuration from: under the home
+    /// directory (with an `agent` level below it for the Pi family) or the
+    /// project root.
+    const fn config_dir_name(self) -> &'static str {
+        match self {
+            Self::Codex => ".codex",
+            Self::Claude => ".claude",
+            Self::OhMyPi => ".omp",
+            Self::Pi => ".pi",
+        }
     }
 }
 
@@ -49,7 +82,8 @@ impl FromStr for Agent {
         match value.to_ascii_lowercase().as_str() {
             "codex" => Ok(Self::Codex),
             "claude" | "claude-code" => Ok(Self::Claude),
-            "pi" | "omp" | "oh-my-pi" | "oh_my_pi" => Ok(Self::Pi),
+            "omp" | "oh-my-pi" | "oh_my_pi" | "ohmypi" => Ok(Self::OhMyPi),
+            "pi" | "pi-coding-agent" => Ok(Self::Pi),
             _ => Err(HookError::UnknownAgent(value.into())),
         }
     }
@@ -196,6 +230,7 @@ impl HookManager {
         scope: HookScope,
         action: HookAction,
     ) -> Result<ManagedHookResult, HookError> {
+        self.adopt_legacy_state(scope)?;
         // Refuse before touching anything. Writing hooks for an absent
         // executable trades a broken integration for a differently broken one,
         // and doing it inside Re-add would remove the working entries first.
@@ -215,6 +250,7 @@ impl HookManager {
     }
 
     pub fn status(&self, agent: Agent, scope: HookScope) -> Result<HookStatus, HookError> {
+        self.adopt_legacy_state(scope)?;
         if agent.uses_extension_file() {
             return self.extension_status(agent, scope);
         }
@@ -563,17 +599,17 @@ impl HookManager {
             (Agent::Claude, HookScope::Project) => {
                 self.project.join(".claude").join("settings.local.json")
             }
-            (Agent::Pi, HookScope::User) => self
+            (Agent::OhMyPi | Agent::Pi, HookScope::User) => self
                 .home
-                .join(".omp")
+                .join(agent.config_dir_name())
                 .join("agent")
                 .join("extensions")
-                .join("muxtrix-lifecycle.ts"),
-            (Agent::Pi, HookScope::Project) => self
+                .join(EXTENSION_FILE_NAME),
+            (Agent::OhMyPi | Agent::Pi, HookScope::Project) => self
                 .project
-                .join(".omp")
+                .join(agent.config_dir_name())
                 .join("extensions")
-                .join("muxtrix-lifecycle.ts"),
+                .join(EXTENSION_FILE_NAME),
         }
     }
 
@@ -637,6 +673,35 @@ impl HookManager {
         }
         if self.state_dir.exists() && self.state_dir.read_dir()?.next().is_none() {
             std::fs::remove_dir(&self.state_dir)?;
+        }
+        Ok(())
+    }
+
+    /// Moves an Oh My Pi installation's private record and backup from the
+    /// state-file names they had while `pi` was still Oh My Pi's slug.
+    ///
+    /// Those names now belong to Pi itself. Left in place, Oh My Pi would
+    /// report its recovery backup missing and Pi would inherit a record that
+    /// describes another agent's file. The record names its target, so the
+    /// two are told apart without guessing.
+    fn adopt_legacy_state(&self, scope: HookScope) -> Result<(), HookError> {
+        let legacy_record = self.state_dir.join(format!("pi-{scope}.json"));
+        let record_path = self.record_path(Agent::OhMyPi, scope);
+        if record_path.exists() || !legacy_record.exists() {
+            return Ok(());
+        }
+        let record: BackupRecord = serde_json::from_slice(&std::fs::read(&legacy_record)?)?;
+        let names_oh_my_pi = record
+            .target
+            .components()
+            .any(|component| component.as_os_str() == Agent::OhMyPi.config_dir_name());
+        if !names_oh_my_pi {
+            return Ok(());
+        }
+        std::fs::rename(&legacy_record, &record_path)?;
+        let legacy_backup = self.state_dir.join(format!("pi-{scope}.backup"));
+        if legacy_backup.exists() {
+            std::fs::rename(&legacy_backup, self.backup_path(Agent::OhMyPi, scope))?;
         }
         Ok(())
     }
@@ -766,7 +831,7 @@ fn hook_events(agent: Agent) -> &'static [(&'static str, &'static str)] {
             ("SubagentStart", "running"),
             ("SubagentStop", "running"),
         ],
-        Agent::Pi => &[
+        Agent::OhMyPi => &[
             ("session_start", "idle"),
             ("session_switch", "idle"),
             ("session_branch", "idle"),
@@ -778,6 +843,24 @@ fn hook_events(agent: Agent) -> &'static [(&'static str, &'static str)] {
             ("auto_compaction_start", "running"),
             ("auto_compaction_end", "running"),
             ("agent_end", "completed"),
+            ("session_shutdown", "stopped"),
+        ],
+        // Pi's `--state` values are the module's defaults. The generated
+        // module tracks the run and prompt edges itself and reports the live
+        // state for the events that happen both inside and outside a run.
+        // `agent_settled` rather than `agent_end` completes a turn: Pi may
+        // still retry, compact, or continue with queued follow-ups after
+        // `agent_end`, and `ui_prompt_start`/`ui_prompt_end` bracket every
+        // blocking `ctx.ui` prompt an extension raises.
+        Agent::Pi => &[
+            ("session_start", "idle"),
+            ("agent_start", "running"),
+            ("ui_prompt_start", "waiting"),
+            ("ui_prompt_end", "running"),
+            ("session_before_compact", "running"),
+            ("session_compact", "running"),
+            ("session_compact_failed", "running"),
+            ("agent_settled", "completed"),
             ("session_shutdown", "stopped"),
         ],
     }
@@ -956,9 +1039,9 @@ fn count_expected_managed_text(text: &str, agent: Agent, executable: &Path) -> u
 }
 
 fn extension_version_is_current(text: &str, agent: Agent) -> bool {
-    agent != Agent::Pi
+    !agent.uses_extension_file()
         || text.contains(&format!(
-            "const MUXTRIX_EXTENSION_VERSION = {PI_EXTENSION_VERSION};"
+            "const MUXTRIX_EXTENSION_VERSION = {EXTENSION_VERSION};"
         ))
 }
 
@@ -975,8 +1058,25 @@ fn count_unreachable_managed_text(text: &str, agent: Agent) -> usize {
 
 fn managed_text_has_event(text: &str, agent: Agent, event: &str, state: &str) -> bool {
     text.contains(MANAGED_MARKER)
-        && text.contains(&format!("agent: \"{}\"", agent.slug()))
+        && managed_text_names_agent(text, agent)
         && text.contains(&format!("onLifecycle(\"{event}\", \"{state}\""))
+}
+
+/// Whether a managed module reports as `agent`.
+///
+/// Modules written while `pi` was Oh My Pi's slug still say `agent: "pi"`.
+/// The title they report tells them apart from a Pi module, so they count
+/// as Oh My Pi's outdated installation and migrate instead of being
+/// abandoned in place while a new module is written beside them.
+fn managed_text_names_agent(text: &str, agent: Agent) -> bool {
+    let names_slug = |slug: &str| text.contains(&format!("agent: \"{slug}\""));
+    let legacy_oh_my_pi =
+        names_slug("pi") && text.contains(&format!("title: \"{}\"", Agent::OhMyPi.display_name()));
+    match agent {
+        Agent::OhMyPi => names_slug(agent.slug()) || legacy_oh_my_pi,
+        Agent::Pi => names_slug(agent.slug()) && !legacy_oh_my_pi,
+        Agent::Codex | Agent::Claude => names_slug(agent.slug()),
+    }
 }
 
 fn managed_text_executable(text: &str) -> Option<String> {
@@ -991,19 +1091,11 @@ fn managed_text_executable(text: &str) -> Option<String> {
 fn managed_extension_source(agent: Agent, executable: &Path) -> String {
     let executable = js_string_literal(&executable.to_string_lossy());
     let agent_slug = agent.slug();
-    let registrations = if agent == Agent::Pi {
-        pi_extension_registrations(agent_slug)
+    let title = agent.display_name();
+    let (body_for, module) = if agent == Agent::Pi {
+        (PI_BODY_FOR, pi_extension_module())
     } else {
-        hook_events(agent)
-            .iter()
-            .map(|(event, state)| {
-                format!(
-                    "    onLifecycle(\"{event}\", \"{state}\", \"{}\");",
-                    default_body(agent_slug, state)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        (OH_MY_PI_BODY_FOR, oh_my_pi_extension_module())
     };
     format!(
         r#"// Managed by Muxtrix ({MANAGED_MARKER}). Remove through `muxtrixctl hooks remove {agent_slug}`.
@@ -1011,19 +1103,27 @@ import {{ spawn }} from "node:child_process";
 
 const MUXTRIXCTL = {executable};
 const MANAGED_BY = "{MANAGED_MARKER}";
-const MUXTRIX_EXTENSION_VERSION = {PI_EXTENSION_VERSION};
+const MUXTRIX_EXTENSION_VERSION = {EXTENSION_VERSION};
 
 
-function sendLifecycle(event, state, message, payload) {{
+function sendLifecycle(event, state, message, payload, ctx) {{
     const paneId = process.env.MUXTRIX_PANE_ID;
     if (!paneId) return Promise.resolve();
+    let sessionId = payload?.sessionId ?? payload?.session_id;
+    if (sessionId === undefined) {{
+        try {{
+            sessionId = ctx?.sessionManager?.getSessionId?.();
+        }} catch {{
+            sessionId = undefined;
+        }}
+    }}
     const body = JSON.stringify({{
         hook_event_name: event,
         agent: "{agent_slug}",
-        title: "Oh My Pi",
+        title: "{title}",
         message,
-        session_id: payload?.sessionId ?? payload?.session_id,
-        cwd: process.cwd(),
+        session_id: sessionId,
+        cwd: ctx?.cwd ?? process.cwd(),
     }});
     return new Promise((resolve) => {{
         try {{
@@ -1054,28 +1154,40 @@ function sendLifecycle(event, state, message, payload) {{
     }});
 }}
 
-function bodyFor(event, payload, fallback) {{
-    if (event === "tool_approval_requested" && payload?.toolName) {{
-        return `Approval needed: ${{payload.toolName}}`;
-    }}
-    if (event === "session.compacting") {{
+{body_for}
+
+{module}
+"#
+    )
+}
+
+const OH_MY_PI_BODY_FOR: &str = r#"function bodyFor(event, payload, fallback) {
+    if (event === "tool_approval_requested" && payload?.toolName) {
+        return `Approval needed: ${payload.toolName}`;
+    }
+    if (event === "session.compacting") {
         return "Compacting context";
-    }}
-    if (event === "session_compact") {{
+    }
+    if (event === "session_compact") {
         return "Context compacted";
-    }}
-    if (event === "auto_compaction_start") {{
+    }
+    if (event === "auto_compaction_start") {
         if (payload?.action === "handoff") return "Preparing handoff";
         return "Compacting context";
-    }}
-    if (event === "auto_compaction_end") {{
+    }
+    if (event === "auto_compaction_end") {
         if (payload?.action === "handoff") return "Handoff ready";
         return "Context compacted";
-    }}
+    }
     return fallback;
-}}
+}"#;
 
-export default function muxtrixLifecycle(pi) {{
+/// Oh My Pi's module: every registered event reports its installed state,
+/// except that a continuing `agent_end` stays running and approvals are
+/// counted so overlapping requests resolve together.
+fn oh_my_pi_extension_module() -> String {
+    format!(
+        r#"export default function muxtrixLifecycle(pi) {{
     const pendingApprovals = new Set();
     let staleFooterCleared = false;
     function onLifecycle(event, state, message, beforeSend) {{
@@ -1096,13 +1208,13 @@ export default function muxtrixLifecycle(pi) {{
     }}
 
 {registrations}
-}}
-"#
+}}"#,
+        registrations = oh_my_pi_extension_registrations()
     )
 }
 
-fn pi_extension_registrations(agent: &str) -> String {
-    hook_events(Agent::Pi)
+fn oh_my_pi_extension_registrations() -> String {
+    hook_events(Agent::OhMyPi)
         .iter()
         .map(|(event, state)| match (*event, *state) {
             ("tool_approval_requested", "waiting") => {
@@ -1111,7 +1223,7 @@ fn pi_extension_registrations(agent: &str) -> String {
         pendingApprovals.add(payload?.toolCallId ?? \"unknown\");
         return true;
     }});",
-                    default_body(agent, state)
+                    default_body(state)
                 )
             }
             ("tool_approval_resolved", "running") => {
@@ -1120,19 +1232,19 @@ fn pi_extension_registrations(agent: &str) -> String {
         pendingApprovals.delete(payload?.toolCallId ?? \"unknown\");
         return pendingApprovals.size === 0;
     }});",
-                    default_body(agent, state)
+                    default_body(state)
                 )
             }
             ("auto_compaction_end", "running") => {
                 format!(
                     "    onLifecycle(\"{event}\", \"{state}\", \"{}\", (payload) => !payload?.skipped && !payload?.willRetry);",
-                    default_body(agent, state)
+                    default_body(state)
                 )
             }
             _ => {
                 format!(
                     "    onLifecycle(\"{event}\", \"{state}\", \"{}\");",
-                    default_body(agent, state)
+                    default_body(state)
                 )
             }
         })
@@ -1140,8 +1252,137 @@ fn pi_extension_registrations(agent: &str) -> String {
         .join("\n")
 }
 
-fn default_body(agent: &str, state: &str) -> &'static str {
-    let _ = agent;
+const PI_BODY_FOR: &str = r#"function bodyFor(event, payload, fallback) {
+    if (event === "ui_prompt_start" && payload?.title) {
+        return `Input needed: ${payload.title}`;
+    }
+    if (event === "session_before_compact") {
+        return "Compacting context";
+    }
+    if (event === "session_compact") {
+        return "Context compacted";
+    }
+    if (event === "session_compact_failed") {
+        return payload?.aborted ? "Compaction cancelled" : "Compaction failed";
+    }
+    return fallback;
+}"#;
+
+/// Pi's module. Each registration's resolver may answer `false` to report
+/// nothing or a state string to replace the installed one; the module keeps
+/// just enough of Pi's own edges to know whether a run or a prompt is open.
+fn pi_extension_module() -> String {
+    format!(
+        r#"export default function muxtrixLifecycle(pi) {{
+    // Pi's events are exact, but compaction and prompts can happen inside or
+    // outside an agent run. The run and prompt edges are remembered so those
+    // events report the pane's live state instead of a fixed one.
+    let agentRunning = false;
+    let promptOpen = false;
+    let runFailure = null;
+    function liveState() {{
+        if (promptOpen) return "waiting";
+        return agentRunning ? "running" : "idle";
+    }}
+    function onLifecycle(event, state, message, resolve) {{
+        pi.on(event, async (payload, ctx) => {{
+            // Print, JSON, and RPC runs have no pane of their own: a `pi -p`
+            // started by a tool inside this pane must not repaint it.
+            if (ctx?.mode && ctx.mode !== "tui") return;
+            const resolved = resolve ? resolve(payload, ctx) : undefined;
+            if (resolved === false) return;
+            const effective = typeof resolved === "string" ? resolved : state;
+            const body = effective === "failed" && runFailure
+                ? runFailure
+                : bodyFor(event, payload, message);
+            await sendLifecycle(event, effective, body, payload, ctx);
+        }});
+    }}
+    // Pi settles without saying how the run ended; the last assistant
+    // message of the run does.
+    pi.on("message_end", (payload) => {{
+        const message = payload?.message;
+        if (message?.role !== "assistant" || message.stopReason !== "error") return;
+        runFailure = message.errorMessage
+            ? `Agent reported an error: ${{message.errorMessage}}`
+            : "Agent reported an error";
+    }});
+
+{registrations}
+}}"#,
+        registrations = pi_extension_registrations()
+    )
+}
+
+fn pi_extension_registrations() -> String {
+    hook_events(Agent::Pi)
+        .iter()
+        .map(|(event, state)| {
+            let resolver = match *event {
+                // A reload replaces the module while a run may be active.
+                "session_start" => Some(
+                    "(payload, ctx) => {
+        promptOpen = false;
+        runFailure = null;
+        agentRunning = ctx?.isIdle?.() === false;
+        return liveState();
+    }",
+                ),
+                "agent_start" => Some(
+                    "() => {
+        agentRunning = true;
+        runFailure = null;
+        return \"running\";
+    }",
+                ),
+                "ui_prompt_start" => Some(
+                    "() => {
+        promptOpen = true;
+        return \"waiting\";
+    }",
+                ),
+                "ui_prompt_end" => Some(
+                    "() => {
+        promptOpen = false;
+        return liveState();
+    }",
+                ),
+                // A manual `/compact` at the prompt is not agent activity.
+                "session_before_compact" | "session_compact" | "session_compact_failed" => {
+                    Some("() => agentRunning && liveState()")
+                }
+                "agent_settled" => Some(
+                    "(payload, ctx) => {
+        // A settled run whose successor is already queued is not done.
+        if (ctx?.isIdle?.() === false) return false;
+        agentRunning = false;
+        promptOpen = false;
+        return runFailure ? \"failed\" : \"completed\";
+    }",
+                ),
+                // `/new`, `/resume`, `/fork`, and `/reload` shut the session
+                // down and start the next one at once; only quitting stops.
+                "session_shutdown" => Some(
+                    "(payload) => payload?.reason === undefined || payload?.reason === \"quit\" ? \"stopped\" : false",
+                ),
+                _ => None,
+            };
+            match resolver {
+                Some(resolver) => format!(
+                    "    onLifecycle(\"{event}\", \"{state}\", \"{}\", {resolver});",
+                    default_body(state)
+                ),
+                None => format!(
+                    "    onLifecycle(\"{event}\", \"{state}\", \"{}\");",
+                    default_body(state)
+                ),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn default_body(state: &str) -> &'static str {
     match state {
         "idle" => "Ready for input",
         "running" => "Agent is running",
@@ -1274,9 +1515,8 @@ fn remove_empty_parents(target: &Path, agent: Agent) {
             .is_ok_and(|mut entries| entries.next().is_none())
     {
         let expected = match agent {
-            Agent::Codex => ".codex",
-            Agent::Claude => ".claude",
-            Agent::Pi => "extensions",
+            Agent::Codex | Agent::Claude => agent.config_dir_name(),
+            Agent::OhMyPi | Agent::Pi => "extensions",
         };
         if parent.file_name().is_some_and(|name| name == expected) {
             let _ = std::fs::remove_dir(parent);
@@ -1354,17 +1594,53 @@ mod tests {
             assert!(events.contains(&("SessionStart", "idle")));
             assert!(events.contains(&("UserPromptSubmit", "running")));
         }
+        let omp_events = hook_events(Agent::OhMyPi);
+        assert!(omp_events.contains(&("session_start", "idle")));
+        assert!(omp_events.contains(&("session_switch", "idle")));
+        assert!(omp_events.contains(&("session_branch", "idle")));
+        assert!(omp_events.contains(&("agent_start", "running")));
+        assert!(omp_events.contains(&("tool_approval_requested", "waiting")));
+        assert!(omp_events.contains(&("tool_approval_resolved", "running")));
+        assert!(omp_events.contains(&("session.compacting", "running")));
+        assert!(omp_events.contains(&("session_compact", "running")));
+        assert!(omp_events.contains(&("auto_compaction_start", "running")));
+        assert!(omp_events.contains(&("auto_compaction_end", "running")));
         let pi_events = hook_events(Agent::Pi);
         assert!(pi_events.contains(&("session_start", "idle")));
-        assert!(pi_events.contains(&("session_switch", "idle")));
-        assert!(pi_events.contains(&("session_branch", "idle")));
         assert!(pi_events.contains(&("agent_start", "running")));
-        assert!(pi_events.contains(&("tool_approval_requested", "waiting")));
-        assert!(pi_events.contains(&("tool_approval_resolved", "running")));
-        assert!(pi_events.contains(&("session.compacting", "running")));
-        assert!(pi_events.contains(&("session_compact", "running")));
-        assert!(pi_events.contains(&("auto_compaction_start", "running")));
-        assert!(pi_events.contains(&("auto_compaction_end", "running")));
+        assert!(pi_events.contains(&("ui_prompt_start", "waiting")));
+        assert!(pi_events.contains(&("ui_prompt_end", "running")));
+        assert!(pi_events.contains(&("session_before_compact", "running")));
+        assert!(pi_events.contains(&("session_compact_failed", "running")));
+        // Pi may retry, compact, or continue after `agent_end`; only a
+        // settled run is a completed turn.
+        assert!(pi_events.contains(&("agent_settled", "completed")));
+        assert!(!pi_events.iter().any(|(event, _)| *event == "agent_end"));
+        assert!(pi_events.contains(&("session_shutdown", "stopped")));
+    }
+
+    #[test]
+    fn agent_names_round_trip_between_cli_and_settings() {
+        for agent in Agent::ALL {
+            assert_eq!(
+                Agent::from_str(&agent.to_string()).expect("slug should parse"),
+                agent
+            );
+            let encoded = serde_json::to_string(&agent).expect("agent should serialize");
+            assert_eq!(encoded, format!("\"{agent}\""));
+            assert_eq!(
+                serde_json::from_str::<Agent>(&encoded).expect("agent should deserialize"),
+                agent
+            );
+        }
+        assert!(matches!(Agent::from_str("oh-my-pi"), Ok(Agent::OhMyPi)));
+        assert!(matches!(Agent::from_str("OMP"), Ok(Agent::OhMyPi)));
+        assert!(matches!(Agent::from_str("pi"), Ok(Agent::Pi)));
+        assert!(Agent::from_str("tau").is_err());
+        assert_eq!(Agent::OhMyPi.to_string(), "omp");
+        assert_eq!(Agent::Pi.to_string(), "pi");
+        assert_eq!(Agent::OhMyPi.display_name(), "Oh My Pi");
+        assert_eq!(Agent::Pi.display_name(), "Pi");
     }
 
     #[test]
@@ -1422,21 +1698,25 @@ mod tests {
     }
 
     #[test]
-    fn pi_extension_hooks_install_as_autodiscovered_omp_extension() {
+    fn oh_my_pi_extension_hooks_install_as_autodiscovered_omp_extension() {
         let (root, manager) = fixture();
         let target = root.join("home/.omp/agent/extensions/muxtrix-lifecycle.ts");
 
         let added = manager
-            .apply(Agent::Pi, HookScope::User, HookAction::Add)
-            .expect("Pi extension should install");
+            .apply(Agent::OhMyPi, HookScope::User, HookAction::Add)
+            .expect("Oh My Pi extension should install");
         assert!(added.changed);
         assert!(added.status.installed);
-        assert_eq!(added.status.managed_entries, hook_events(Agent::Pi).len());
+        assert_eq!(
+            added.status.managed_entries,
+            hook_events(Agent::OhMyPi).len()
+        );
 
         let source = std::fs::read_to_string(&target).expect("extension should exist");
         assert!(source.contains("pi.on(event"));
-        assert!(source.contains("agent: \"pi\""));
-        assert!(source.contains("muxtrixctl hooks remove pi"));
+        assert!(source.contains("agent: \"omp\""));
+        assert!(source.contains("title: \"Oh My Pi\""));
+        assert!(source.contains("muxtrixctl hooks remove omp"));
         assert!(source.contains("payload?.willContinue"));
         assert!(source.contains("pendingApprovals.add"));
         assert!(source.contains("pendingApprovals.size === 0"));
@@ -1450,7 +1730,7 @@ mod tests {
         assert!(source.contains("setStatus?.(\"muxtrix\", undefined)"));
         assert!(!source.contains("`Muxtrix: ${body}`"));
         assert!(source.contains(&format!(
-            "const MUXTRIX_EXTENSION_VERSION = {PI_EXTENSION_VERSION};"
+            "const MUXTRIX_EXTENSION_VERSION = {EXTENSION_VERSION};"
         )));
         // A broken WSL interop handler makes Bun throw synchronously on
         // spawn and the pipe fail on write; lifecycle reporting is
@@ -1466,10 +1746,195 @@ mod tests {
         assert!(source.contains("} catch {\n            resolve();\n        }"));
 
         let removed = manager
+            .apply(Agent::OhMyPi, HookScope::User, HookAction::Remove)
+            .expect("Oh My Pi extension should remove");
+        assert!(removed.changed);
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pi_extension_hooks_install_as_autodiscovered_pi_extension() {
+        let (root, manager) = fixture();
+        let target = root.join("home/.pi/agent/extensions/muxtrix-lifecycle.ts");
+
+        let added = manager
+            .apply(Agent::Pi, HookScope::User, HookAction::Add)
+            .expect("Pi extension should install");
+        assert!(added.changed);
+        assert!(added.status.installed);
+        assert_eq!(added.status.managed_entries, hook_events(Agent::Pi).len());
+        assert_eq!(added.status.target, target);
+
+        let source = std::fs::read_to_string(&target).expect("extension should exist");
+        assert!(source.contains("agent: \"pi\""));
+        assert!(source.contains("title: \"Pi\""));
+        assert!(source.contains("muxtrixctl hooks remove pi"));
+        assert!(source.contains(&format!(
+            "const MUXTRIX_EXTENSION_VERSION = {EXTENSION_VERSION};"
+        )));
+        // Pi's lifecycle is reported from its own events alone.
+        assert!(source.contains("onLifecycle(\"agent_start\", \"running\""));
+        assert!(source.contains("onLifecycle(\"ui_prompt_start\", \"waiting\""));
+        assert!(source.contains("onLifecycle(\"ui_prompt_end\", \"running\""));
+        assert!(source.contains("onLifecycle(\"agent_settled\", \"completed\""));
+        assert!(source.contains("onLifecycle(\"session_shutdown\", \"stopped\""));
+        assert!(!source.contains("onLifecycle(\"agent_end\""));
+        assert!(source.contains("if (ctx?.isIdle?.() === false) return false;"));
+        assert!(source.contains("agentRunning = ctx?.isIdle?.() === false;"));
+        assert!(source.contains("() => agentRunning && liveState()"));
+        assert!(source.contains("payload?.reason === \"quit\" ? \"stopped\" : false"));
+        assert!(source.contains("if (ctx?.mode && ctx.mode !== \"tui\") return;"));
+        assert!(source.contains("message.stopReason !== \"error\""));
+        assert!(source.contains("ctx?.sessionManager?.getSessionId?.()"));
+        assert!(source.contains("cwd: ctx?.cwd ?? process.cwd()"));
+        assert!(source.contains("Input needed: ${payload.title}"));
+        // Pi's own approval vocabulary never appears in this module.
+        assert!(!source.contains("tool_approval_requested"));
+        assert!(!source.contains("willContinue"));
+
+        let project_target = root.join("project/.pi/extensions/muxtrix-lifecycle.ts");
+        let project = manager
+            .apply(Agent::Pi, HookScope::Project, HookAction::Add)
+            .expect("project Pi extension should install");
+        assert!(project.status.installed);
+        assert_eq!(project.status.target, project_target);
+
+        let removed = manager
             .apply(Agent::Pi, HookScope::User, HookAction::Remove)
             .expect("Pi extension should remove");
         assert!(removed.changed);
         assert!(!target.exists());
+        assert!(
+            !target
+                .parent()
+                .expect("target should have a parent")
+                .exists(),
+            "an extensions directory Muxtrix created is removed with its module"
+        );
+        assert!(
+            manager
+                .apply(Agent::Pi, HookScope::Project, HookAction::Remove)
+                .expect("project Pi extension should remove")
+                .changed
+        );
+        assert!(!project_target.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A module written while `pi` was Oh My Pi's slug: the same events, the
+    /// old agent slug, and the previous behavior version.
+    fn legacy_oh_my_pi_module(manager: &HookManager) -> String {
+        managed_extension_source(Agent::OhMyPi, &manager.executable)
+            .replace("agent: \"omp\"", "agent: \"pi\"")
+            .replace(
+                "\"omp\",\n                \"--state\"",
+                "\"pi\",\n                \"--state\"",
+            )
+            .replace(
+                &format!("const MUXTRIX_EXTENSION_VERSION = {EXTENSION_VERSION};"),
+                "const MUXTRIX_EXTENSION_VERSION = 5;",
+            )
+    }
+
+    #[test]
+    fn legacy_oh_my_pi_module_migrates_instead_of_being_abandoned() {
+        let (root, manager) = fixture();
+        let target = root.join("home/.omp/agent/extensions/muxtrix-lifecycle.ts");
+        std::fs::create_dir_all(target.parent().expect("target should have a parent"))
+            .expect("extension directory should be created");
+        let legacy = legacy_oh_my_pi_module(&manager);
+        assert!(legacy.contains("agent: \"pi\""));
+        std::fs::write(&target, &legacy).expect("legacy module should be written");
+
+        // It is Oh My Pi's outdated installation, not Pi's.
+        assert_eq!(
+            count_managed_text(&legacy, Agent::OhMyPi),
+            hook_events(Agent::OhMyPi).len()
+        );
+        assert_eq!(count_managed_text(&legacy, Agent::Pi), 0);
+        let status = manager
+            .status(Agent::OhMyPi, HookScope::User)
+            .expect("status should load");
+        assert!(!status.installed);
+        assert_eq!(status.managed_entries, hook_events(Agent::OhMyPi).len());
+        assert!(
+            !manager
+                .status(Agent::Pi, HookScope::User)
+                .expect("Pi status should load")
+                .installed
+        );
+
+        let synced = manager
+            .synced_status(Agent::OhMyPi, HookScope::User)
+            .expect("legacy module should migrate");
+        assert!(synced.installed);
+        let migrated = std::fs::read_to_string(&target).expect("migrated module should exist");
+        assert!(migrated.contains("agent: \"omp\""));
+        assert!(!migrated.contains("agent: \"pi\""));
+        assert!(extension_version_is_current(&migrated, Agent::OhMyPi));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oh_my_pi_recovery_state_follows_its_new_name() {
+        let (root, manager) = fixture();
+        let omp_target = root.join("home/.omp/agent/extensions/muxtrix-lifecycle.ts");
+        std::fs::create_dir_all(&manager.state_dir).expect("state directory should be created");
+        // The record and backup an older build wrote for Oh My Pi under the
+        // `pi` name, alongside a record Pi wrote for itself.
+        std::fs::write(
+            manager.state_dir.join("pi-user.json"),
+            serde_json::to_vec(&BackupRecord {
+                target: omp_target.clone(),
+                target_existed: true,
+            })
+            .expect("record should serialize"),
+        )
+        .expect("legacy record should be written");
+        std::fs::write(
+            manager.state_dir.join("pi-user.backup"),
+            b"original omp module",
+        )
+        .expect("legacy backup should be written");
+        let pi_record = BackupRecord {
+            target: root.join("project/.pi/extensions/muxtrix-lifecycle.ts"),
+            target_existed: false,
+        };
+        std::fs::write(
+            manager.state_dir.join("pi-project.json"),
+            serde_json::to_vec(&pi_record).expect("record should serialize"),
+        )
+        .expect("Pi record should be written");
+
+        // Any status read adopts the misnamed files.
+        let pi_status = manager
+            .status(Agent::Pi, HookScope::User)
+            .expect("Pi status should load");
+        assert!(!pi_status.backup_available);
+        assert!(!manager.state_dir.join("pi-user.json").exists());
+        assert!(!manager.state_dir.join("pi-user.backup").exists());
+        assert!(manager.state_dir.join("omp-user.json").exists());
+        assert_eq!(
+            std::fs::read(manager.state_dir.join("omp-user.backup"))
+                .expect("adopted backup should exist"),
+            b"original omp module"
+        );
+        assert!(
+            manager
+                .status(Agent::OhMyPi, HookScope::User)
+                .expect("Oh My Pi status should load")
+                .backup_available
+        );
+        // A record that names Pi's own file is left where it is.
+        assert!(
+            manager
+                .status(Agent::Pi, HookScope::Project)
+                .expect("Pi project status should load")
+                .backup_available
+                == manager.state_dir.join("pi-project.backup").exists()
+        );
+        assert!(manager.state_dir.join("pi-project.json").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1758,10 +2223,10 @@ mod tests {
     }
 
     #[test]
-    fn synced_status_migrates_pi_extension_without_restoring_stale_uninstall() {
+    fn synced_status_migrates_oh_my_pi_extension_without_restoring_stale_uninstall() {
         let (root, original) = fixture();
         original
-            .apply(Agent::Pi, HookScope::User, HookAction::Add)
+            .apply(Agent::OhMyPi, HookScope::User, HookAction::Add)
             .expect("original extension should install");
 
         let target = root.join("home/.omp/agent/extensions/muxtrix-lifecycle.ts");
@@ -1774,13 +2239,13 @@ mod tests {
         );
         assert!(
             !updated
-                .status(Agent::Pi, HookScope::User)
+                .status(Agent::OhMyPi, HookScope::User)
                 .expect("status should load")
                 .installed
         );
 
         let synced = updated
-            .synced_status(Agent::Pi, HookScope::User)
+            .synced_status(Agent::OhMyPi, HookScope::User)
             .expect("synced status should load");
         assert!(synced.installed, "path-only staleness should self-migrate");
         assert!(
@@ -1790,7 +2255,7 @@ mod tests {
         );
 
         let removed = updated
-            .apply(Agent::Pi, HookScope::User, HookAction::Remove)
+            .apply(Agent::OhMyPi, HookScope::User, HookAction::Remove)
             .expect("migrated extension should remove");
         assert!(removed.changed);
         assert!(!target.exists(), "remove must not restore stale extension");
@@ -1798,17 +2263,17 @@ mod tests {
     }
 
     #[test]
-    fn synced_status_migrates_outdated_pi_extension_behavior() {
+    fn synced_status_migrates_outdated_oh_my_pi_extension_behavior() {
         let (root, manager) = fixture();
         manager
-            .apply(Agent::Pi, HookScope::User, HookAction::Add)
+            .apply(Agent::OhMyPi, HookScope::User, HookAction::Add)
             .expect("current extension should install");
 
         let target = root.join("home/.omp/agent/extensions/muxtrix-lifecycle.ts");
         let current = std::fs::read_to_string(&target).expect("extension should exist");
         let stale = current
             .replace(
-                &format!("const MUXTRIX_EXTENSION_VERSION = {PI_EXTENSION_VERSION};"),
+                &format!("const MUXTRIX_EXTENSION_VERSION = {EXTENSION_VERSION};"),
                 "const MUXTRIX_EXTENSION_VERSION = 4;",
             )
             .replace(
@@ -1818,17 +2283,17 @@ mod tests {
         std::fs::write(&target, stale).expect("stale extension should be written");
         assert!(
             !manager
-                .status(Agent::Pi, HookScope::User)
+                .status(Agent::OhMyPi, HookScope::User)
                 .expect("status should load")
                 .installed
         );
 
         let synced = manager
-            .synced_status(Agent::Pi, HookScope::User)
+            .synced_status(Agent::OhMyPi, HookScope::User)
             .expect("outdated extension should migrate");
         assert!(synced.installed);
         let migrated = std::fs::read_to_string(&target).expect("migrated extension should exist");
-        assert!(extension_version_is_current(&migrated, Agent::Pi));
+        assert!(extension_version_is_current(&migrated, Agent::OhMyPi));
         assert!(migrated.contains("setStatus?.(\"muxtrix\", undefined)"));
         assert!(!migrated.contains("`Muxtrix: ${body}`"));
         assert!(!migrated.contains("const MUXTRIX_EXTENSION_VERSION = 4;"));

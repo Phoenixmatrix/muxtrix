@@ -1275,7 +1275,8 @@ impl Scenario {
                     managed_entries: match agent {
                         Agent::Codex => 8,
                         Agent::Claude => 9,
-                        Agent::Pi => 4,
+                        Agent::OhMyPi => 12,
+                        Agent::Pi => 9,
                     },
                     backup_available: true,
                     unreachable_entries: 0,
@@ -1393,7 +1394,8 @@ impl Scenario {
                     let managed_entries = match agent {
                         Agent::Codex => 8,
                         Agent::Claude => 9,
-                        Agent::Pi => 4,
+                        Agent::OhMyPi => 12,
+                        Agent::Pi => 9,
                     };
                     HookStatus {
                         agent,
@@ -1401,7 +1403,10 @@ impl Scenario {
                         target: match agent {
                             Agent::Codex => "/home/user/.codex/hooks.json",
                             Agent::Claude => "/home/user/.claude/settings.json",
-                            Agent::Pi => "/home/user/.omp/agent/extensions/muxtrix-lifecycle.ts",
+                            Agent::OhMyPi => {
+                                "/home/user/.omp/agent/extensions/muxtrix-lifecycle.ts"
+                            }
+                            Agent::Pi => "/home/user/.pi/agent/extensions/muxtrix-lifecycle.ts",
                         }
                         .into(),
                         installed: agent == Agent::Codex,
@@ -1612,7 +1617,7 @@ impl Scenario {
             let pane = Some(self.initial_pane.as_uuid().to_string());
             let revision = app.terminals[&self.initial_pane].snapshot_revision;
             let response = app.handle_control_request(ControlRequest::AgentEvent {
-                agent: "pi".into(),
+                agent: "omp".into(),
                 state: AgentState::Running,
                 event: Some("agent_start".into()),
                 title: "Oh My Pi".into(),
@@ -1626,11 +1631,11 @@ impl Scenario {
             }
             app.apply_agent_screen_classification(
                 self.initial_pane,
-                "pi",
+                "omp",
                 revision.wrapping_add(1),
                 agent_screen::Classification {
                     state: agent_screen::ScreenState::Idle,
-                    rule: "pi.osc_title_idle",
+                    rule: "omp.osc_title_idle",
                 },
             );
             let status = app
@@ -1717,7 +1722,7 @@ impl Scenario {
                 self.tab_pane
                     .ok_or_else(|| "new-tab pane was not recorded".to_owned())?,
                 AgentPaneStatus {
-                    agent: "pi".into(),
+                    agent: "omp".into(),
                     display_name: Some("oh-my-pi-release-audit".into()),
                     state: AgentState::Completed,
                     activity: Some("Oh My Pi checks passed".into()),

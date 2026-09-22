@@ -215,8 +215,10 @@ Each installed handler has a Muxtrix marker, and uninstall selectively removes
 only those handlers. A pre-change backup is retained for recovery while the
 integration is active, but normal uninstall never restores the whole file and
 therefore cannot clobber later edits from a person or another tool.
-For Codex and Claude Code, those hooks own session identity and coarse turn
-boundaries, not live interactive state. Fresh Ghostty frames pass through a
+Oh My Pi and Pi get a native extension module instead of hook entries, removed
+or restored as one file. For Codex and Claude Code, those hooks own session
+identity and coarse turn boundaries, not live interactive state; Pi's module is
+the only state source for its pane. Fresh Ghostty frames pass through a
 conservative agent-screen classifier; only positive visible prompt evidence may
 author `Waiting`. Claude also polls its machine-readable interactive-session
 status off the UI thread and associates records to panes only by unique session

@@ -571,11 +571,12 @@ impl Root {
 
         let integrations = self.settings_section(
             "Agent lifecycle hooks",
-            "Reversible Codex, Claude Code, and Oh My Pi integration",
+            "Reversible Codex, Claude Code, Oh My Pi, and Pi integration",
             vec![
                 self.settings_row("Default worktree agent", "Used when a worktree command opens or restarts a pane with an agent", picker(&widgets.default_agent, 220.), tokens),
                 self.agent_hook_row(Agent::Codex, tokens, cx),
                 self.agent_hook_row(Agent::Claude, tokens, cx),
+                self.agent_hook_row(Agent::OhMyPi, tokens, cx),
                 self.agent_hook_row(Agent::Pi, tokens, cx),
                 div()
                     .flex()
@@ -853,6 +854,7 @@ impl Root {
         let command = match agent {
             Agent::Codex => &self.settings_widgets.codex_command,
             Agent::Claude => &self.settings_widgets.claude_command,
+            Agent::OhMyPi => &self.settings_widgets.omp_command,
             Agent::Pi => &self.settings_widgets.pi_command,
         };
         // Which actions the row offers, then the buttons for them — built in
@@ -930,11 +932,7 @@ impl Root {
                                     .text_size(ui(13.0))
                                     .line_height((ui(13.0)) * 1.3)
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .child(match agent {
-                                        Agent::Codex => "Codex",
-                                        Agent::Claude => "Claude Code",
-                                        Agent::Pi => "Oh My Pi",
-                                    }),
+                                    .child(agent.display_name()),
                             )
                             .child(
                                 div()

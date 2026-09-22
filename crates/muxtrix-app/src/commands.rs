@@ -94,7 +94,7 @@ pub(crate) struct Command {
     pub(crate) action: CommandAction,
 }
 
-const COMMANDS: [Command; 39] = [
+const COMMANDS: [Command; 40] = [
     Command {
         title: "Split pane right",
         subtitle: "Open an independent terminal beside the focused pane",
@@ -357,7 +357,14 @@ const COMMANDS: [Command; 39] = [
     Command {
         title: "Launch Oh My Pi",
         subtitle: "Start the configured Oh My Pi command in a new terminal pane",
-        keywords: "agent open run coding pi omp oh my pi",
+        keywords: "agent open run coding omp oh my pi",
+        shortcut: "",
+        action: CommandAction::LaunchAgent(Agent::OhMyPi),
+    },
+    Command {
+        title: "Launch Pi",
+        subtitle: "Start the configured Pi command in a new terminal pane",
+        keywords: "agent open run coding pi",
         shortcut: "",
         action: CommandAction::LaunchAgent(Agent::Pi),
     },
@@ -420,9 +427,25 @@ mod tests {
             commands[0].action,
             CommandAction::LaunchAgent(Agent::Claude)
         );
-        let commands = filtered("launch pi");
+        let commands = filtered("launch omp");
         assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].action, CommandAction::LaunchAgent(Agent::Pi));
+        assert_eq!(
+            commands[0].action,
+            CommandAction::LaunchAgent(Agent::OhMyPi)
+        );
+        // "Pi" is in Oh My Pi's name too, so both launches answer to it.
+        let commands = filtered("launch pi");
+        assert_eq!(commands.len(), 2);
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.action == CommandAction::LaunchAgent(Agent::Pi))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.action == CommandAction::LaunchAgent(Agent::OhMyPi))
+        );
     }
 
     #[test]
