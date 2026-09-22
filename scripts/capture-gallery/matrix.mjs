@@ -215,6 +215,13 @@ add({
   check: "Failed, Stopped and Idle in one frame — each state's pip and label must be distinguishable.",
 });
 add({
+  slug: "codex-subagents",
+  title: "Codex delegated work",
+  group: "Fleet",
+  capture: "codex-subagents",
+  check: "The Codex row remains Running after an idle parent classification during delegated work.",
+});
+add({
   slug: "agents-roster",
   title: "Claude agents roster roll-up",
   group: "Fleet",

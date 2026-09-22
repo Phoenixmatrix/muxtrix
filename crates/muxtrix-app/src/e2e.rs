@@ -1647,6 +1647,42 @@ impl Scenario {
             }
             status.display_name = Some("oh-my-pi-release-audit".into());
             app.settings.fleet_view = FleetView::Agents;
+        } else if self.capturing("codex-subagents") {
+            let pane = Some(self.initial_pane.as_uuid().to_string());
+            for event in ["UserPromptSubmit", "SubagentStart"] {
+                let response = app.handle_control_request(ControlRequest::AgentEvent {
+                    agent: "codex".into(),
+                    state: AgentState::Running,
+                    event: Some(event.into()),
+                    title: format!("Codex · {event}"),
+                    body: "Delegating release checks".into(),
+                    pane_id: pane.clone(),
+                    session_id: Some("capture-codex-subagents".into()),
+                    cwd: Some("/home/user/dev/muxtrix".into()),
+                });
+                if !response.ok {
+                    return Err("Codex subagent capture could not deliver its hook".into());
+                }
+            }
+            let revision = app.terminals[&self.initial_pane].snapshot_revision;
+            app.apply_agent_screen_classification(
+                self.initial_pane,
+                "codex",
+                revision.wrapping_add(1),
+                agent_screen::Classification {
+                    state: agent_screen::ScreenState::Idle,
+                    rule: "codex.live_prompt",
+                },
+            );
+            let status = app
+                .agent_statuses
+                .get_mut(&self.initial_pane)
+                .ok_or_else(|| "Codex capture lost its agent state".to_owned())?;
+            if status.state != AgentState::Running {
+                return Err("Codex parent idle demoted its delegated work".into());
+            }
+            status.display_name = Some("codex-delegated-review".into());
+            app.settings.fleet_view = FleetView::Agents;
         } else if self.capturing("claude-subagents") {
             for (event, agent_id, stamp) in [
                 ("UserPromptSubmit", None, 100),

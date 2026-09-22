@@ -187,7 +187,9 @@ as metadata and derives `Running`, `Idle`, or `Needs input` from the current
 terminal screen and OSC title. Only a recognized, visible approval or answer
 surface can create `Needs input`. `Done` preserves the previous completion
 while the composer is idle, but positive working evidence starts the next turn
-even when its prompt hook was delayed or unavailable.
+even when its prompt hook was delayed or unavailable. After `SubagentStart`,
+an idle-looking parent frame remains **Running** until the parent `Stop` hook;
+visible approval and answer prompts can still show **Needs input**.
 
 Claude Code is read from the session record the harness itself writes
 (`~/.claude/sessions/<pid>.json`): `busy`, `idle`, `waiting` with the reason,

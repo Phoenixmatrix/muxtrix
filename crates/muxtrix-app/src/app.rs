@@ -344,8 +344,11 @@ pub(crate) struct Muxtrix {
     /// Terminal-frame revision that was current when a pane most recently
     /// entered Running. Outside Pi's exact active lifecycle, an Idle
     /// classification may only demote it after a newer frame arrives; this
-    /// preserves the hook/frame race guard without making Running sticky.
+    /// preserves the hook/frame race guard outside exact lifecycle brackets.
     pub(crate) agent_running_frame_revisions: BTreeMap<PaneId, u64>,
+    /// Codex panes between `SubagentStart` and the parent turn's `Stop`.
+    /// The parent can paint idle chrome while it waits for delegated work.
+    pub(crate) codex_delegated_work: BTreeSet<PaneId>,
     /// Pi panes between an exact `agent_start` and terminal `agent_end`.
     /// Pi's lifecycle owns this interval: an erroneously idle OSC title must
     /// not demote work that the harness still reports as active.
@@ -2014,6 +2017,7 @@ impl Muxtrix {
         }
         self.pending_terminal_input.remove(&pane_id);
         self.agent_running_frame_revisions.remove(&pane_id);
+        self.codex_delegated_work.remove(&pane_id);
         self.pi_active_lifecycles.remove(&pane_id);
         self.claude_trackers.remove(&pane_id);
         if let Some(agent) = self.agent_statuses.get_mut(&pane_id) {
@@ -2253,6 +2257,7 @@ impl Muxtrix {
             control_endpoint,
             agent_statuses: BTreeMap::new(),
             agent_running_frame_revisions: BTreeMap::new(),
+            codex_delegated_work: BTreeSet::new(),
             pi_active_lifecycles: BTreeSet::new(),
             detected_agents: BTreeMap::new(),
             agents_view_panes: BTreeSet::new(),
@@ -5214,6 +5219,7 @@ impl Muxtrix {
         self.hovered_terminal = None;
         self.agent_statuses = restored_agent_statuses;
         self.agent_running_frame_revisions.clear();
+        self.codex_delegated_work.clear();
         self.pi_active_lifecycles.clear();
         self.detected_agents.clear();
         self.agents_view_panes.clear();
@@ -5542,6 +5548,7 @@ impl Muxtrix {
         self.agent_statuses.remove(&pane_id);
         self.claude_trackers.remove(&pane_id);
         self.agent_running_frame_revisions.remove(&pane_id);
+        self.codex_delegated_work.remove(&pane_id);
         self.pi_active_lifecycles.remove(&pane_id);
         self.detected_agents.remove(&pane_id);
         self.agents_view_panes.remove(&pane_id);
@@ -7800,6 +7807,7 @@ impl Muxtrix {
                     self.agent_statuses.remove(&pane_id);
                     self.claude_trackers.remove(&pane_id);
                     self.agent_running_frame_revisions.remove(&pane_id);
+                    self.codex_delegated_work.remove(&pane_id);
                     self.pi_active_lifecycles.remove(&pane_id);
                     self.detected_agents.remove(&pane_id);
                 }
@@ -7918,6 +7926,7 @@ impl Muxtrix {
         if !bytes.contains(&0x03) {
             return;
         }
+        self.codex_delegated_work.remove(&pane_id);
         self.pi_active_lifecycles.remove(&pane_id);
         if let Some(tracker) = self.claude_trackers.get_mut(&pane_id) {
             tracker.interrupted();
@@ -8468,6 +8477,7 @@ impl Muxtrix {
             self.agent_statuses.remove(&pane_id);
             self.claude_trackers.remove(&pane_id);
             self.agent_running_frame_revisions.remove(&pane_id);
+            self.codex_delegated_work.remove(&pane_id);
             self.pi_active_lifecycles.remove(&pane_id);
             self.detected_agents.remove(&pane_id);
             self.agents_view_panes.remove(&pane_id);
@@ -9132,6 +9142,17 @@ impl Muxtrix {
                         return ControlResponse::success("stale agent lifecycle state ignored");
                     }
                     let is_oh_my_pi = pane_agent(&agent) == Some(PaneAgent::OhMyPi);
+                    if pane_agent(&agent) == Some(PaneAgent::Codex) {
+                        match event.as_deref() {
+                            Some("SubagentStart") => {
+                                self.codex_delegated_work.insert(pane_id);
+                            }
+                            Some("Stop" | "SessionStart" | "SessionEnd" | "UserPromptSubmit") => {
+                                self.codex_delegated_work.remove(&pane_id);
+                            }
+                            _ => {}
+                        }
+                    }
                     // Pi's managed extension brackets active work with
                     // `agent_start` and terminal `agent_end`. Maintenance
                     // completion used to be reported as Completed by older
@@ -9184,9 +9205,9 @@ impl Muxtrix {
                     let screen_confirmed_wait =
                         agent_screen::requires_screen_confirmed_wait(&agent);
                     let advisory_wait = screen_confirmed_wait && state == AgentState::Waiting;
-                    let post_tool_cannot_clear_wait = screen_confirmed_wait
+                    let advisory_running_cannot_clear_wait = screen_confirmed_wait
                         && state == AgentState::Running
-                        && event.as_deref() == Some("PostToolUse")
+                        && matches!(event.as_deref(), Some("PostToolUse" | "SubagentStart"))
                         && self
                             .agent_statuses
                             .get(&pane_id)
@@ -9204,7 +9225,7 @@ impl Muxtrix {
                         .terminals
                         .get(&pane_id)
                         .map_or(0, |runtime| runtime.snapshot_revision);
-                    if advisory_wait || post_tool_cannot_clear_wait {
+                    if advisory_wait || advisory_running_cannot_clear_wait {
                         if let Some(current) = self.agent_statuses.get_mut(&pane_id) {
                             if session_id.is_some() {
                                 current.session_id = session_id;
@@ -9240,6 +9261,7 @@ impl Muxtrix {
                         self.agent_statuses.remove(&pane_id);
                         self.claude_trackers.remove(&pane_id);
                         self.agent_running_frame_revisions.remove(&pane_id);
+                        self.codex_delegated_work.remove(&pane_id);
                         self.pi_active_lifecycles.remove(&pane_id);
                         self.terminal_command_buffers.remove(&pane_id);
                         self.detected_agents.remove(&pane_id);
@@ -9397,7 +9419,16 @@ impl Muxtrix {
         {
             return;
         }
-        let state = screen_state(classification.state);
+        let mut state = screen_state(classification.state);
+        // Codex's parent can stop its own spinner while a helper runs. The
+        // helper's start hook is positive work evidence until the parent Stop;
+        // a visible approval still retains its stronger Waiting evidence.
+        if pane_agent(agent) == Some(PaneAgent::Codex)
+            && state == AgentState::Idle
+            && self.codex_delegated_work.contains(&pane_id)
+        {
+            state = AgentState::Running;
+        }
         // A parent can paint its idle composer while helpers are still
         // running. Hooks remain evidence even without a live session record.
         if state == AgentState::Idle
@@ -9443,7 +9474,13 @@ impl Muxtrix {
             return;
         }
         let resolved_waiting = current.state == AgentState::Waiting && state != AgentState::Waiting;
-        let activity = agent_state_activity(classification.state);
+        let activity = if state == AgentState::Running
+            && classification.state == agent_screen::ScreenState::Idle
+        {
+            "Subagents are working"
+        } else {
+            agent_state_activity(classification.state)
+        };
         if let Some(current) = self.agent_statuses.get_mut(&pane_id) {
             current.state = state;
             current.activity = Some(activity.into());
@@ -9506,6 +9543,7 @@ impl Muxtrix {
             },
         );
         self.pi_active_lifecycles.remove(&pane_id);
+        self.codex_delegated_work.remove(&pane_id);
         self.claude_trackers.remove(&pane_id);
         if state == AgentState::Running {
             self.agent_running_frame_revisions

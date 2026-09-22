@@ -8916,6 +8916,60 @@ fn retained_idle_screen_only_yields_to_a_newer_frame() {
 }
 
 #[test]
+fn codex_delegated_work_keeps_the_fleet_running_until_the_parent_stops() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    let pane = Some(pane_id.as_uuid().to_string());
+    let send = |app: &mut Muxtrix, event: &str, state: AgentState| {
+        let response = app.handle_control_request(ControlRequest::AgentEvent {
+            agent: "codex".into(),
+            state,
+            event: Some(event.into()),
+            title: format!("Codex · {event}"),
+            body: format!("Codex {event}"),
+            pane_id: pane.clone(),
+            session_id: Some("thread-1".into()),
+            cwd: None,
+        });
+        assert!(response.ok, "{event}: {:?}", response.message);
+    };
+    let classify = |app: &mut Muxtrix, revision, state| {
+        app.apply_agent_screen_classification(
+            pane_id,
+            "codex",
+            revision,
+            agent_screen::Classification {
+                state,
+                rule: "codex.live_prompt",
+            },
+        );
+    };
+
+    send(&mut app, "UserPromptSubmit", AgentState::Running);
+    send(&mut app, "SubagentStart", AgentState::Running);
+    classify(&mut app, 10, agent_screen::ScreenState::Idle);
+    assert_eq!(app.pane_state_label(pane_id), "Running");
+    assert_eq!(app.pane_signal_kind(pane_id, false), PaneSignalKind::Active);
+
+    classify(&mut app, 11, agent_screen::ScreenState::Waiting);
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Waiting);
+    send(&mut app, "SubagentStart", AgentState::Running);
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Waiting);
+    classify(&mut app, 12, agent_screen::ScreenState::Idle);
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+    assert_eq!(
+        app.agent_statuses[&pane_id].activity.as_deref(),
+        Some("Subagents are working")
+    );
+
+    send(&mut app, "Stop", AgentState::Completed);
+    assert!(!app.codex_delegated_work.contains(&pane_id));
+    classify(&mut app, 13, agent_screen::ScreenState::Idle);
+    assert_eq!(app.pane_state_label(pane_id), "Idle");
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Completed);
+}
+
+#[test]
 fn redesigned_workspace_chrome_is_stateful_without_affecting_terminals() {
     let mut app = Muxtrix::new();
     assert!(!app.sidebar_collapsed);
