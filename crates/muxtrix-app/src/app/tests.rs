@@ -1879,7 +1879,7 @@ fn completed_agent_turn_invalidates_hidden_pull_request_cache() {
     app.github_panel = Some(panel);
 
     let response = app.handle_control_request(ControlRequest::AgentEvent {
-        agent: "pi".into(),
+        agent: "omp".into(),
         state: AgentState::Completed,
         event: Some("agent_end".into()),
         title: "Oh My Pi".into(),
@@ -4731,7 +4731,7 @@ fn a_pane_hands_over_to_the_agent_its_screen_belongs_to() {
     app.agent_statuses.insert(
         pane_id,
         AgentPaneStatus {
-            agent: "pi".into(),
+            agent: "omp".into(),
             display_name: Some("pi-2".into()),
             state: AgentState::Idle,
             activity: Some("Ready for input".into()),
@@ -7918,22 +7918,23 @@ fn pane_local_agent_commands_set_identity_before_the_first_hook() {
         agent_command("/home/user/bin/claude --continue", &app.settings),
         Some(Agent::Claude)
     );
-    assert_eq!(agent_command("omp", &app.settings), Some(Agent::Pi));
+    assert_eq!(agent_command("omp", &app.settings), Some(Agent::OhMyPi));
+    assert_eq!(agent_command("pi", &app.settings), Some(Agent::Pi));
     assert_eq!(agent_command("cargo test", &app.settings), None);
 }
 
 #[test]
-fn pi_session_start_cannot_relabel_a_launched_agent_idle() {
+fn oh_my_pi_session_start_cannot_relabel_a_launched_agent_idle() {
     let mut app = Muxtrix::new();
     let pane_id = active_pane_id(&app);
     let pane = Some(pane_id.as_uuid().to_string());
 
     app.observe_terminal_command(pane_id, b"omp\r");
-    assert_eq!(app.agent_statuses[&pane_id].agent, "pi");
+    assert_eq!(app.agent_statuses[&pane_id].agent, "omp");
     assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
 
     let start = app.handle_control_request(ControlRequest::AgentEvent {
-        agent: "pi".into(),
+        agent: "omp".into(),
         state: AgentState::Idle,
         event: Some("session_start".into()),
         title: "Oh My Pi".into(),
@@ -8601,14 +8602,14 @@ fn completed_agent_stays_done_until_a_working_screen_starts_the_next_turn() {
 }
 
 #[test]
-fn pi_idle_title_does_not_override_an_active_lifecycle() {
+fn oh_my_pi_idle_title_does_not_override_an_active_lifecycle() {
     let mut app = Muxtrix::new();
     let pane_id = active_pane_id(&app);
     let pane = Some(pane_id.as_uuid().to_string());
     let running_revision = app.terminals[&pane_id].snapshot_revision;
 
     let started = app.handle_control_request(ControlRequest::AgentEvent {
-        agent: "pi".into(),
+        agent: "omp".into(),
         state: AgentState::Running,
         event: Some("agent_start".into()),
         title: "Oh My Pi".into(),
@@ -8621,11 +8622,11 @@ fn pi_idle_title_does_not_override_an_active_lifecycle() {
 
     app.apply_agent_screen_classification(
         pane_id,
-        "pi",
+        "omp",
         running_revision.wrapping_add(1),
         agent_screen::Classification {
             state: agent_screen::ScreenState::Idle,
-            rule: "pi.osc_title_idle",
+            rule: "omp.osc_title_idle",
         },
     );
     assert_eq!(
@@ -8635,7 +8636,7 @@ fn pi_idle_title_does_not_override_an_active_lifecycle() {
     );
 
     let compacted = app.handle_control_request(ControlRequest::AgentEvent {
-        agent: "pi".into(),
+        agent: "omp".into(),
         state: AgentState::Completed,
         event: Some("session_compact".into()),
         title: "Oh My Pi".into(),
@@ -8652,7 +8653,7 @@ fn pi_idle_title_does_not_override_an_active_lifecycle() {
     );
 
     let ended = app.handle_control_request(ControlRequest::AgentEvent {
-        agent: "pi".into(),
+        agent: "omp".into(),
         state: AgentState::Completed,
         event: Some("agent_end".into()),
         title: "Oh My Pi".into(),
@@ -8666,13 +8667,13 @@ fn pi_idle_title_does_not_override_an_active_lifecycle() {
 }
 
 #[test]
-fn newer_pi_idle_title_clears_a_stale_running_lifecycle() {
+fn newer_oh_my_pi_idle_title_clears_a_stale_running_lifecycle() {
     let mut app = Muxtrix::new();
     let pane_id = active_pane_id(&app);
     app.agent_statuses.insert(
         pane_id,
         AgentPaneStatus {
-            agent: "pi".into(),
+            agent: "omp".into(),
             display_name: None,
             state: AgentState::Running,
             activity: Some("Agent is running".into()),
@@ -8685,16 +8686,16 @@ fn newer_pi_idle_title_clears_a_stale_running_lifecycle() {
 
     let idle = agent_screen::Classification {
         state: agent_screen::ScreenState::Idle,
-        rule: "pi.osc_title_idle",
+        rule: "omp.osc_title_idle",
     };
-    app.apply_agent_screen_classification(pane_id, "pi", 10, idle);
+    app.apply_agent_screen_classification(pane_id, "omp", 10, idle);
     assert_eq!(
         app.agent_statuses[&pane_id].state,
         AgentState::Running,
         "the frame painted before the running event remains race-guarded"
     );
 
-    app.apply_agent_screen_classification(pane_id, "pi", 11, idle);
+    app.apply_agent_screen_classification(pane_id, "omp", 11, idle);
     assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Idle);
     assert_eq!(
         app.agent_statuses[&pane_id].activity.as_deref(),
@@ -10369,4 +10370,198 @@ fn task_completion_failure_and_cancel_restore_real_terminal_input() {
     );
     assert_eq!(app.task_worktree(pane_id), Some(&fixture.task));
     assert!(!app.task_removal_busy());
+}
+
+#[test]
+fn oh_my_pi_and_pi_are_distinct_pane_agents() {
+    let app = Muxtrix::new();
+    assert_eq!(agent_command("omp", &app.settings), Some(Agent::OhMyPi));
+    assert_eq!(agent_command("pi", &app.settings), Some(Agent::Pi));
+    assert_eq!(
+        agent_command("/usr/local/bin/pi --no-session", &app.settings),
+        Some(Agent::Pi)
+    );
+    assert_eq!(agent_command_setting(&app.settings, Agent::OhMyPi), "omp");
+    assert_eq!(agent_command_setting(&app.settings, Agent::Pi), "pi");
+    assert_eq!(pane_agent("omp"), Some(PaneAgent::OhMyPi));
+    assert_eq!(pane_agent("oh-my-pi"), Some(PaneAgent::OhMyPi));
+    assert_eq!(pane_agent("pi"), Some(PaneAgent::Pi));
+    assert_eq!(pane_agent_name(PaneAgent::OhMyPi), "omp");
+    assert_eq!(pane_agent_name(PaneAgent::Pi), "pi");
+    assert_eq!(agent_display_name("omp"), "Oh My Pi");
+    assert_eq!(agent_display_name("pi"), "Pi");
+    // Pi names its terminal after the session and directory; the brand
+    // alone is not a name.
+    assert_eq!(
+        harness_terminal_title("π - fleet-rail - muxtrix", "pi").as_deref(),
+        Some("fleet-rail - muxtrix")
+    );
+    assert_eq!(harness_terminal_title("π", "pi"), None);
+    assert_eq!(harness_terminal_title("Pi", "pi"), None);
+}
+
+#[test]
+fn legacy_oh_my_pi_modules_keep_reporting_as_oh_my_pi() {
+    // A module installed while `pi` was Oh My Pi's slug keeps running until
+    // Oh My Pi reloads the migrated one. Its events must not turn the pane
+    // into a Pi pane in the meantime.
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    let response = app.handle_control_request(ControlRequest::AgentEvent {
+        agent: "pi".into(),
+        state: AgentState::Running,
+        event: Some("agent_start".into()),
+        title: "Oh My Pi".into(),
+        body: "Agent is running".into(),
+        pane_id: Some(pane_id.as_uuid().to_string()),
+        session_id: Some("legacy-session".into()),
+        cwd: None,
+    });
+    assert!(response.ok);
+    assert_eq!(app.agent_statuses[&pane_id].agent, "omp");
+    assert!(app.pi_active_lifecycles.contains(&pane_id));
+
+    // A Pi module reports its own title and stays Pi.
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    let response = app.handle_control_request(ControlRequest::AgentEvent {
+        agent: "pi".into(),
+        state: AgentState::Running,
+        event: Some("agent_start".into()),
+        title: "Pi".into(),
+        body: "Agent is running".into(),
+        pane_id: Some(pane_id.as_uuid().to_string()),
+        session_id: Some("pi-session".into()),
+        cwd: None,
+    });
+    assert!(response.ok);
+    assert_eq!(app.agent_statuses[&pane_id].agent, "pi");
+    assert!(!app.pi_active_lifecycles.contains(&pane_id));
+}
+
+#[test]
+fn pi_lifecycle_is_exact_from_launch_to_settlement() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    // Attention accrues on panes the person is not looking at.
+    let _ = app.update(Message::Split(SplitAxis::Horizontal));
+    let pane = Some(pane_id.as_uuid().to_string());
+    let event = |event: &str, state: AgentState, body: &str| ControlRequest::AgentEvent {
+        agent: "pi".into(),
+        state,
+        event: Some(event.into()),
+        title: "Pi".into(),
+        body: body.into(),
+        pane_id: pane.clone(),
+        session_id: Some("pi-session-1".into()),
+        cwd: None,
+    };
+    let unread = |app: &Muxtrix| {
+        app.session
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.pane(pane_id))
+            .map_or(0, |pane| pane.attention.unread_count)
+    };
+
+    // Typing `pi` marks the pane Running until Pi says otherwise. Unlike
+    // Oh My Pi, no title will ever correct that, so Pi's own idle edge is
+    // accepted even though the launch recorded no session.
+    app.observe_terminal_command(pane_id, b"pi\r");
+    assert_eq!(app.agent_statuses[&pane_id].agent, "pi");
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+    assert!(
+        app.handle_control_request(event("session_start", AgentState::Idle, "Ready for input"))
+            .ok
+    );
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Idle);
+    assert_eq!(app.pane_state_label(pane_id), "Idle");
+
+    assert!(
+        app.handle_control_request(event(
+            "agent_start",
+            AgentState::Running,
+            "Agent is running"
+        ))
+        .ok
+    );
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+
+    // An extension prompt is exact: no visible dialog is required.
+    assert!(
+        app.handle_control_request(event(
+            "ui_prompt_start",
+            AgentState::Waiting,
+            "Input needed: Allow rm -rf?"
+        ))
+        .ok
+    );
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Waiting);
+    assert_eq!(app.pane_state_label(pane_id), "Needs input");
+    assert_eq!(
+        app.agent_statuses[&pane_id].activity.as_deref(),
+        Some("Input needed: Allow rm -rf?")
+    );
+    assert_eq!(unread(&app), 1);
+    assert!(
+        app.handle_control_request(event(
+            "ui_prompt_end",
+            AgentState::Running,
+            "Agent is running"
+        ))
+        .ok
+    );
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
+
+    // Only a settled run completes the turn.
+    assert!(!agent_event_completes_turn(
+        AgentState::Running,
+        Some("agent_end")
+    ));
+    assert!(agent_event_completes_turn(
+        AgentState::Completed,
+        Some("agent_settled")
+    ));
+    assert!(
+        app.handle_control_request(event(
+            "agent_settled",
+            AgentState::Completed,
+            "Agent completed a turn"
+        ))
+        .ok
+    );
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Completed);
+    assert_eq!(unread(&app), 0);
+
+    // A failed run asks for attention with Pi's own reason.
+    assert!(
+        app.handle_control_request(event(
+            "agent_start",
+            AgentState::Running,
+            "Agent is running"
+        ))
+        .ok
+    );
+    assert!(
+        app.handle_control_request(event(
+            "agent_settled",
+            AgentState::Failed,
+            "Agent reported an error: 429 rate limited"
+        ))
+        .ok
+    );
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Failed);
+    assert_eq!(app.pane_state_label(pane_id), "Failed");
+    assert_eq!(unread(&app), 1);
+
+    // Quitting removes the pane's agent altogether.
+    assert!(
+        app.handle_control_request(event(
+            "session_shutdown",
+            AgentState::Stopped,
+            "Agent session ended"
+        ))
+        .ok
+    );
+    assert!(!app.agent_statuses.contains_key(&pane_id));
 }

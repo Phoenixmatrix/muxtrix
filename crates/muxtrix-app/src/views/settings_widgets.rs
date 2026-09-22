@@ -56,6 +56,7 @@ pub(crate) struct SettingsWidgets {
     pub(crate) github_host: Entity<InputState>,
     pub(crate) codex_command: Entity<InputState>,
     pub(crate) claude_command: Entity<InputState>,
+    pub(crate) omp_command: Entity<InputState>,
     pub(crate) pi_command: Entity<InputState>,
 }
 
@@ -76,7 +77,8 @@ impl SettingsWidgets {
             github_host: field(window, cx, "github.com"),
             codex_command: field(window, cx, "codex"),
             claude_command: field(window, cx, "claude"),
-            pi_command: field(window, cx, "omp"),
+            omp_command: field(window, cx, "omp"),
+            pi_command: field(window, cx, "pi"),
         };
         widgets.subscribe(cx);
         widgets
@@ -179,11 +181,12 @@ impl SettingsWidgets {
             .detach();
         }
 
-        let fields: [BoundField<'_>; 5] = [
+        let fields: [BoundField<'_>; 6] = [
             (&self.scrollback, Message::SettingsScrollbackLimit),
             (&self.github_host, Message::SettingsGitHubHost),
             (&self.codex_command, Message::SettingsCodexCommand),
             (&self.claude_command, Message::SettingsClaudeCommand),
+            (&self.omp_command, Message::SettingsOmpCommand),
             (&self.pi_command, Message::SettingsPiCommand),
         ];
         for (field, message) in fields {
@@ -364,7 +367,7 @@ impl Root {
             }
         }
 
-        let fields: [(&Entity<InputState>, String); 5] = [
+        let fields: [(&Entity<InputState>, String); 6] = [
             (
                 &self.settings_widgets.scrollback,
                 self.app.settings_scrollback_lines_input.clone(),
@@ -380,6 +383,10 @@ impl Root {
             (
                 &self.settings_widgets.claude_command,
                 draft.claude_command.clone(),
+            ),
+            (
+                &self.settings_widgets.omp_command,
+                draft.omp_command.clone(),
             ),
             (&self.settings_widgets.pi_command, draft.pi_command.clone()),
         ];

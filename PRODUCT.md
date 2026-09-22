@@ -92,8 +92,8 @@ not yet published.
   `crates/`, with the GPUI application in `crates/muxtrix-app`.
 - `docs/ARCHITECTURE.md` records the GPU, terminal, process-host, persistence,
   and control-service boundaries.
-- `docs/AGENT_INTEGRATIONS.md` documents reversible Codex and Claude Code
-  lifecycle integration.
+- `docs/AGENT_INTEGRATIONS.md` documents reversible Codex, Claude Code,
+  Oh My Pi, and Pi lifecycle integration.
 - `docs/TESTING.md` documents deterministic integration coverage and the
   private-display GPUI E2E harness.
 - The repository contains no testimonials, customer claims, benchmarks,

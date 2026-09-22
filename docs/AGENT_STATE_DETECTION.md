@@ -12,18 +12,24 @@ matched to. Oh My Pi supplies exact
 active-turn and approval transitions through its managed extension, while OMP's
 documented state-bearing OSC title supplies the correction and recovery layer.
 `π >` means idle, `π !` means attention, and `π` followed by a supported Braille
-spinner means working; ConPTY uses the static working form `π :`.
+spinner means working; ConPTY uses the static working form `π :`. Pi itself is
+described only by its managed extension: it has no state-bearing title, its
+owner can replace whatever chrome it paints, and its extension API reports
+every edge the fleet row needs (`agent_start`, `agent_settled`,
+`ui_prompt_start`, `ui_prompt_end`), so no screen rule applies to a Pi pane.
 
 Other lifecycle hooks still identify the agent, session, working directory,
 prompt submission, completion, and shutdown. Codex permission and notification
 hooks are not allowed to create human attention because its harness may resolve
 those requests automatically. Claude Code's `PermissionRequest` fires only when
 a dialog is actually shown, so it is exact — and the session record confirms or
-clears it within milliseconds either way. Pi's `agent_start` through
+clears it within milliseconds either way. Oh My Pi's `agent_start` through
 terminal `agent_end` interval and its approval events are exact. During that
 interval, an idle title cannot demote the pane; this covers older OMP releases
 that briefly published `π >` while an async job or scheduled continuation still
-owned the turn.
+owned the turn. Pi's `agent_start` through `agent_settled` run and its
+`ui_prompt_start` through `ui_prompt_end` waits are exact as well, with no
+title to correct or be corrected by.
 
 An unrecognized Codex screen or title preserves the last trusted state. Claude
 can additionally recover from its exact structured session record. This favors
@@ -72,9 +78,12 @@ hook arriving just after a stable prompt paint cannot miss it on the next poll.
 Codex uses its live screen and title. Claude Code uses its session record and
 hooks, with the screen as the fallback for an unmatched pane. Oh My Pi uses its state-bearing title
 except that its exact `agent_start` through terminal `agent_end` lifecycle
-bracket prevents an idle title from ending active work. Pi also retains exact
+bracket prevents an idle title from ending active work. Oh My Pi also retains exact
 session switch/branch, approval-request, context compaction/handoff, and
-shutdown events from the managed extension.
+shutdown events from the managed extension. A Pi pane takes no screen
+classification at all; its extension's events are applied as reported, and
+its idle `session_start` may end the `Running` state a launch or a process
+scan started, because nothing else ever will.
 
 - Codex `Action Required` OSC titles and strong live confirmation/answer forms
   create `Needs input`.
@@ -86,7 +95,9 @@ shutdown events from the managed extension.
 - Oh My Pi's `π >` title creates `Idle` outside an active lifecycle bracket,
   `π !` creates `Needs input`, and its ten supported Braille separators create
   `Running`. `π :` is the static ConPTY working form. A state-disabled
-  `π: <label>` title identifies Pi but does not invent a state.
+  `π: <label>` title identifies Oh My Pi but does not invent a state.
+- Pi's `π - <session> - <directory>` title identifies Pi and names the pane;
+  it never creates a state, and neither does anything else on a Pi screen.
 - A Claude frame showing the Agents view returns no classification at all, and
   is evaluated before every rule below it. The roster draws its own composer and
   its own spinner-free title, either of which a later rule would otherwise read
@@ -107,23 +118,28 @@ shutdown events from the managed extension.
   wait, but the exact frame retained when `UserPromptSubmit` arrives cannot
   regress that newer running state. Muxtrix records the frame revision at the
   transition; a subsequently rendered idle frame can resolve `Running` unless
-  Pi's exact active-lifecycle bracket is still open.
+  Oh My Pi's exact active-lifecycle bracket is still open.
 - A completed turn remains `Done` while its idle composer is visible, preserving
   the useful completion signal. Strong working evidence starts the next turn
   even if `UserPromptSubmit` was lost, so `Done` cannot become a permanent latch
-  when hook delivery is unavailable. Pi maintenance completion remains
-  `Running`; only terminal `agent_end` completes its active turn.
+  when hook delivery is unavailable. Oh My Pi maintenance completion remains
+  `Running`; only terminal `agent_end` completes its active turn, and only
+  `agent_settled` completes Pi's.
 
 The typed control event carries the original hook event name. Codex and Claude
 waiting hooks remain metadata only, and `PostToolUse` cannot clear their
-screen-confirmed wait. Pi approval events and active-turn lifecycle brackets
-remain exact state transitions. Completion, failure, stop, and new-prompt
+screen-confirmed wait. Oh My Pi approval events and active-turn lifecycle
+brackets remain exact state transitions, as do Pi's prompt and settlement
+events. Completion, failure, stop, and new-prompt
 lifecycle events retain their coarse roles for every supported harness.
 
-The managed Pi extension is versioned. Existing modules without the current
-behavior marker are migrated during normal Muxtrix hook synchronization, while
-the explicit hook re-add path remains available. Migration preserves the
-original uninstall backup and removes the old Pi-footer status writes.
+The managed Oh My Pi and Pi extensions are versioned. Existing modules without
+the current behavior marker are migrated during normal Muxtrix hook
+synchronization, while the explicit hook re-add path remains available.
+Migration preserves the original uninstall backup and removes the old Oh My Pi
+footer status writes. An Oh My Pi module from before Pi support, which still
+reports as `pi`, is recognised by the title it reports and migrated the same
+way; until Oh My Pi reloads it, the app relabels its events as Oh My Pi's.
 
 ## Recovery across session reattach
 
@@ -285,7 +301,8 @@ fallbacks. `Needs input` no longer depends on recognising a dialog's text.
 - Claude's row is whatever Claude Code itself says it is, including every
   blocking dialog the harness can raise, within one watcher tick or one hook.
 - State clears from newer screen evidence (Codex) or the harness's own record
-  (Claude); Pi's active lifecycle remains the exception.
+  (Claude); Oh My Pi's active lifecycle remains the exception, and Pi's state
+  is its extension's word alone.
 - Historical transcript questions and parallel tool completions cannot own the
   current attention state.
 - Hooks remain useful for pane/session attribution and terminal-independent
@@ -310,6 +327,11 @@ fallbacks. `Needs input` no longer depends on recognising a dialog's text.
   this to primary-screen programs.
 - A brand-new prompt shape may not raise attention. The terminal itself remains
   fully usable and visible; only the sidebar projection can be incomplete.
+- A Pi pane without the managed module has no state source: a launched Pi
+  stays `Running` until the module is installed and Pi reloads it. Pi's
+  built-in dialogs that bypass its extension UI (the project trust prompt)
+  are not reported, and releases older than 0.84.4 never emit the prompt
+  events at all.
 - Claude's session record is an internal file whose shape is confirmed on
   2.1.246, not a documented contract. An unreadable directory or a changed
   schema degrades to hooks plus the screen classifier, never to an invented
@@ -338,8 +360,14 @@ Regression coverage pins the original five attention cases:
 2. a recognized visible prompt creates `Needs input`;
 3. a late `PostToolUse` cannot clear that visible prompt;
 4. a subsequent working screen frame clears it;
-5. a Pi idle title cannot override an active lifecycle, while the same title
+5. an Oh My Pi idle title cannot override an active lifecycle, while the same title
    can still clear a stale screen- or process-detected `Running` state.
+
+Pi fixtures pin the exact-lifecycle contract: a launched pane accepts Pi's
+idle `session_start`, `ui_prompt_start` raises attention without any screen
+evidence and `ui_prompt_end` clears it, only `agent_settled` completes the
+turn, a settled error fails the pane with Pi's message, and a legacy Oh My Pi
+module reporting as `pi` keeps its Oh My Pi identity.
 
 Claude fixtures pin the record contract: a live `busy` record decides the pane
 over its painted idle composer and the screen stays silent while matched; a

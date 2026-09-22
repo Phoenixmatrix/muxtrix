@@ -1,6 +1,6 @@
 # Agent integrations
 
-Muxtrix can launch Codex, Claude Code, and Oh My Pi in independent terminal
+Muxtrix can launch Codex, Claude Code, Oh My Pi, and Pi in independent terminal
 panes, track their lifecycle state, and surface waiting/completed events directly in the
 originating fleet entry.
 Integration is opt-in and reversible.
@@ -51,7 +51,7 @@ a development checkout to Scoop, because the hook command must follow the active
 Before the first edit Muxtrix keeps a private pre-change backup and installation
 record in its platform state directory. For Codex and Claude Code, cleanup is
 selective rather than a whole-file restore so later edits cannot be overwritten.
-For Oh My Pi, Muxtrix installs one auto-discovered extension module and removes
+For Oh My Pi and Pi, Muxtrix installs one auto-discovered extension module and removes
 or restores that file as a unit. If Muxtrix created the extension file and its
 parent directories, uninstall removes them. Invalid JSON in JSON-backed hook
 files is reported and never overwritten or backed up.
@@ -68,7 +68,7 @@ Open Settings, then use the Agent lifecycle card:
 - **Re-add** refreshes the managed commands without disturbing other tools.
 - **Launch** opens an independent pane and starts the configured agent command.
 
-The Codex, Claude Code, and Oh My Pi command fields are persistent settings.
+The Codex, Claude Code, Oh My Pi, and Pi command fields are persistent settings.
 Once an agent's user-level integration is installed, it can also be selected as
 the **Default worktree agent** in the same card. The command palette then offers
 matching worktree actions that open a pane right or down, restart the current
@@ -138,6 +138,7 @@ The CLI supports user and project scope:
 muxtrixctl hooks status all
 muxtrixctl hooks add codex --scope user
 muxtrixctl hooks add claude --scope project --project /path/to/repository
+muxtrixctl hooks add omp --scope user
 muxtrixctl hooks add pi --scope user
 muxtrixctl hooks remove all --scope user
 muxtrixctl hooks re-add codex --scope user
@@ -146,6 +147,13 @@ muxtrixctl hooks re-add codex --scope user
 `reinstall` is accepted as an alias for `re-add`. Status reports the target,
 managed entry count, and whether the recovery backup is present.
 
+`pi` names Pi itself; Oh My Pi is `omp` (`oh-my-pi` is accepted too). Builds
+from before Pi support used `pi` for Oh My Pi. Their installed Oh My Pi module,
+its private recovery backup, and a settings file that named Oh My Pi's command
+or default-agent choice under the old name are all migrated automatically the
+next time Muxtrix synchronizes hook status; the running Oh My Pi keeps
+reporting as Oh My Pi until it reloads the migrated module.
+
 Targets are:
 
 | Agent | User scope | Project scope |
@@ -153,14 +161,22 @@ Targets are:
 | Codex | `~/.codex/hooks.json` | `<project>/.codex/hooks.json` |
 | Claude Code | `~/.claude/settings.json` | `<project>/.claude/settings.local.json` |
 | Oh My Pi | `~/.omp/agent/extensions/muxtrix-lifecycle.ts` | `<project>/.omp/extensions/muxtrix-lifecycle.ts` |
+| Pi | `~/.pi/agent/extensions/muxtrix-lifecycle.ts` | `<project>/.pi/extensions/muxtrix-lifecycle.ts` |
+
+Pi loads a project-local module only once the project is trusted, and reads
+its user directory from `PI_CODING_AGENT_DIR` when that is set; Muxtrix always
+targets `~/.pi/agent`, so a relocated Pi needs the module installed by hand.
 
 Muxtrix subscribes to session start/end, prompt submission, permission, stop,
 and sub-agent events for Codex and Claude Code. Claude Code also contributes
 stop-failure, elicitation, and notification events, and its hook client
-forwards the whole payload rather than a pre-decided state. Oh My Pi does not use Codex/Claude-style
-JSON hook arrays; its managed module is a native `.omp` extension that listens
-to session lifecycle, agent lifecycle, approval, compaction, and handoff
-maintenance events. Hooks identify the pane, session, working directory, and
+forwards the whole payload rather than a pre-decided state. Oh My Pi and Pi do not use Codex/Claude-style
+JSON hook arrays; each managed module is a native extension for that agent.
+Oh My Pi's listens to session lifecycle, agent lifecycle, approval, compaction,
+and handoff maintenance events. Pi's listens to `session_start`,
+`agent_start`, `ui_prompt_start`, `ui_prompt_end`, `session_before_compact`,
+`session_compact`, `session_compact_failed`, `agent_settled`, and
+`session_shutdown`. Hooks identify the pane, session, working directory, and
 coarse turn boundaries. Completion and failure still create attention on the
 originating fleet entry.
 
@@ -194,7 +210,7 @@ turn. Outdated managed Pi extensions migrate automatically when Muxtrix
 synchronizes hook status; re-add remains the explicit repair path. See
 [Agent state detection](AGENT_STATE_DETECTION.md) for precedence and limits.
 
-Typing a configured `codex`, `claude`, or `omp` launch command assigns that
+Typing a configured `codex`, `claude`, `omp`, or `pi` launch command assigns that
 pane's agent before any managed hook or extension callback can arrive, which
 makes the fleet identity useful before the first callback. It is deliberately
 pane-local. Linux process-tree detection can also identify configured agent
@@ -204,11 +220,30 @@ ambiguous records never repaint a pane. Oh My Pi's approval extension events
 are exact observability events, so they can report `Needs input` immediately
 without waiting for the matching title paint.
 
+Pi is described by its managed extension alone. Pi has no state-bearing title
+(its default is `π - <session> - <directory>`, and its owner may replace it),
+so no screen rule ever applies to a Pi pane and nothing about Pi's chrome is
+scraped. `agent_start` opens a turn and `agent_settled` completes it:
+Pi's `agent_end` can be followed by an automatic retry, a compaction, or a
+queued follow-up, so it is deliberately not subscribed. `ui_prompt_start` and
+`ui_prompt_end` bracket every blocking `ctx.ui` prompt any extension raises,
+such as a permission gate's confirm dialog, and report `Needs input` exactly.
+A run whose last assistant message stopped with an error settles as
+**Failed**, carrying Pi's error text. Compaction events report activity only
+inside a run; a manual `/compact` at the prompt changes nothing. The module
+reports only from Pi's interactive mode, so a `pi -p` a tool starts inside the
+pane cannot repaint it, and it takes the session ID from Pi's session manager.
+`session_shutdown` stops the pane only when Pi quits; `/new`, `/resume`,
+`/fork`, and `/reload` start their next session at once. Pi 0.84.4 or newer is
+required for prompt detection and 0.80.4 for settlement; older releases never
+emit those events, so a pane would stay **Running** after its first turn.
+
 Agent pane names follow the same pane-local rule. A user rename wins first,
 then a meaningful terminal title emitted by the harness (including a named
-Claude Code session, Codex thread, or the label after Oh My Pi's `π <state>`
-prefix), then the linked-worktree directory name, and finally `Codex`,
-`Claude Code`, or `Oh My Pi`. Brand-only terminal titles do not replace the
+Claude Code session, Codex thread, the label after Oh My Pi's `π <state>`
+prefix, or the session and directory after Pi's `π - ` prefix), then the
+linked-worktree directory name, and finally `Codex`, `Claude Code`,
+`Oh My Pi`, or `Pi`. Brand-only terminal titles do not replace the
 worktree fallback. Animated Pi state separators never become pane identity.
 Long names stay on one line and are ellipsized before the separate lifecycle-state column.
 
@@ -218,7 +253,9 @@ when prompted. Claude Code exposes its active configuration through `/hooks`.
 Oh My Pi auto-discovers the managed extension from its native extension
 directory and reports session start/switch/branch, prompt execution, completion,
 shutdown, and tool-approval request/resolution events to Muxtrix. The extension
-does not write a Muxtrix status into Pi's own footer.
+does not write a Muxtrix status into Pi's own footer. Pi auto-discovers its
+module the same way; a Pi that was already running when the module was
+installed picks it up on `/reload` or its next start.
 
 ## Windows Muxtrix with agents in WSL2
 

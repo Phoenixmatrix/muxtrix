@@ -1335,7 +1335,20 @@ pub(crate) fn should_accept_agent_state(
 }
 
 pub(crate) fn agent_event_completes_turn(state: AgentState, event: Option<&str>) -> bool {
-    state == AgentState::Completed && matches!(event, Some("Stop" | "agent_end"))
+    state == AgentState::Completed && matches!(event, Some("Stop" | "agent_end" | "agent_settled"))
+}
+
+/// Re-labels a lifecycle event from an Oh My Pi module installed while `pi`
+/// was still its slug. Such a module keeps running until Oh My Pi reloads
+/// the migrated one, and the title it reports is one a Pi module never uses.
+pub(crate) fn relabel_legacy_oh_my_pi_event(mut request: ControlRequest) -> ControlRequest {
+    if let ControlRequest::AgentEvent { agent, title, .. } = &mut request
+        && agent == "pi"
+        && title == Agent::OhMyPi.display_name()
+    {
+        *agent = Agent::OhMyPi.to_string();
+    }
+    request
 }
 
 #[derive(Debug, Clone)]
@@ -1448,9 +1461,7 @@ impl std::fmt::Display for DefaultAgentChoice {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::None => "Not configured",
-            Self::Agent(Agent::Codex) => "Codex",
-            Self::Agent(Agent::Claude) => "Claude Code",
-            Self::Agent(Agent::Pi) => "Oh My Pi",
+            Self::Agent(agent) => agent.display_name(),
         })
     }
 }
@@ -1660,6 +1671,7 @@ pub(crate) enum Message {
     SettingsGitHubHost(String),
     SettingsCodexCommand(String),
     SettingsClaudeCommand(String),
+    SettingsOmpCommand(String),
     SettingsPiCommand(String),
     #[cfg(target_os = "windows")]
     SettingsWindowsShellBackend(WindowsShellBackend),
@@ -4015,6 +4027,10 @@ impl Muxtrix {
             }
             Message::SettingsClaudeCommand(command) => {
                 self.settings_draft.claude_command = command;
+                return Vec::new();
+            }
+            Message::SettingsOmpCommand(command) => {
+                self.settings_draft.omp_command = command;
                 return Vec::new();
             }
             Message::SettingsPiCommand(command) => {
@@ -7375,7 +7391,7 @@ impl Muxtrix {
             CommandAction::LaunchAgent(agent) => {
                 self.active_view = ActiveView::Workspace;
                 self.status = match self.launch_agent(agent) {
-                    Ok(()) => format!("Launched {agent} in a new pane"),
+                    Ok(()) => format!("Launched {} in a new pane", agent.display_name()),
                     Err(error) => error,
                 };
             }
@@ -7809,8 +7825,11 @@ impl Muxtrix {
         let claude = command_executable(&self.settings.claude_command)
             .unwrap_or("claude")
             .to_ascii_lowercase();
-        let pi = command_executable(&self.settings.pi_command)
+        let omp = command_executable(&self.settings.omp_command)
             .unwrap_or("omp")
+            .to_ascii_lowercase();
+        let pi = command_executable(&self.settings.pi_command)
+            .unwrap_or("pi")
             .to_ascii_lowercase();
         let mut queue = std::collections::VecDeque::from([root]);
         let mut inspected = 0;
@@ -7835,11 +7854,37 @@ impl Muxtrix {
                         process_id: pid,
                     });
                 }
-                if comm == "omp" || comm == "pi" || comm == pi {
+                if comm == "omp" || comm == omp {
+                    return Some(PaneAgentProcess {
+                        agent: "omp".into(),
+                        process_id: pid,
+                    });
+                }
+                if comm == "pi" || comm == pi {
                     return Some(PaneAgentProcess {
                         agent: "pi".into(),
                         process_id: pid,
                     });
+                }
+                // Either Pi may run under its JavaScript runtime's name
+                // instead of its own: Pi from npm is `node` running
+                // `@earendil-works/pi-coding-agent`.
+                if matches!(comm.as_str(), "node" | "bun")
+                    && let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline"))
+                {
+                    let cmdline = String::from_utf8_lossy(&cmdline);
+                    if cmdline.contains("oh-my-pi") {
+                        return Some(PaneAgentProcess {
+                            agent: "omp".into(),
+                            process_id: pid,
+                        });
+                    }
+                    if cmdline.contains("pi-coding-agent") {
+                        return Some(PaneAgentProcess {
+                            agent: "pi".into(),
+                            process_id: pid,
+                        });
+                    }
                 }
             }
             if let Ok(children) =
@@ -8999,6 +9044,7 @@ impl Muxtrix {
     }
 
     pub(crate) fn handle_control_request(&mut self, request: ControlRequest) -> ControlResponse {
+        let request = relabel_legacy_oh_my_pi_event(request);
         if self.task_removal_busy()
             && !matches!(&request, ControlRequest::Ping | ControlRequest::E2eStatus)
         {
@@ -9071,21 +9117,28 @@ impl Muxtrix {
                             "event names a different agent than the pane is running; ignored",
                         );
                     }
-                    if !should_accept_agent_state(
-                        self.agent_statuses.get(&pane_id),
-                        state,
-                        session_id.as_deref(),
-                    ) {
+                    // Pi's managed extension is the only authority over its
+                    // pane and says idle only when Pi is at its prompt, so
+                    // its idle edge may end the Running state that a launch
+                    // or a process scan started.
+                    let exact_lifecycle = pane_agent(&agent) == Some(PaneAgent::Pi);
+                    if !exact_lifecycle
+                        && !should_accept_agent_state(
+                            self.agent_statuses.get(&pane_id),
+                            state,
+                            session_id.as_deref(),
+                        )
+                    {
                         return ControlResponse::success("stale agent lifecycle state ignored");
                     }
-                    let is_pi = pane_agent(&agent) == Some(PaneAgent::OhMyPi);
+                    let is_oh_my_pi = pane_agent(&agent) == Some(PaneAgent::OhMyPi);
                     // Pi's managed extension brackets active work with
                     // `agent_start` and terminal `agent_end`. Maintenance
                     // completion used to be reported as Completed by older
                     // extension versions even when it ran inside that bracket;
                     // preserve the active run for those already-installed
                     // modules while automatic migration replaces them.
-                    let state = if is_pi
+                    let state = if is_oh_my_pi
                         && self.pi_active_lifecycles.contains(&pane_id)
                         && state == AgentState::Completed
                         && matches!(
@@ -9096,7 +9149,7 @@ impl Muxtrix {
                     } else {
                         state
                     };
-                    if is_pi {
+                    if is_oh_my_pi {
                         match (event.as_deref(), state) {
                             (
                                 Some(
@@ -12413,7 +12466,8 @@ pub(crate) fn pane_agent(agent: &str) -> Option<PaneAgent> {
     match agent.to_ascii_lowercase().as_str() {
         "codex" => Some(PaneAgent::Codex),
         "claude" | "claude-code" => Some(PaneAgent::ClaudeCode),
-        "pi" | "omp" | "oh-my-pi" => Some(PaneAgent::OhMyPi),
+        "omp" | "oh-my-pi" => Some(PaneAgent::OhMyPi),
+        "pi" => Some(PaneAgent::Pi),
         _ => None,
     }
 }
@@ -12422,7 +12476,8 @@ pub(crate) fn pane_agent_name(agent: PaneAgent) -> &'static str {
     match agent {
         PaneAgent::Codex => "codex",
         PaneAgent::ClaudeCode => "claude",
-        PaneAgent::OhMyPi => "pi",
+        PaneAgent::OhMyPi => "omp",
+        PaneAgent::Pi => "pi",
     }
 }
 
@@ -12476,7 +12531,8 @@ pub(crate) fn agent_display_name(agent: &str) -> &str {
     match agent {
         "codex" => "Codex",
         "claude" | "claude-code" => "Claude Code",
-        "pi" | "omp" | "oh-my-pi" => "Oh My Pi",
+        "omp" | "oh-my-pi" => "Oh My Pi",
+        "pi" => "Pi",
         _ => agent,
     }
 }
@@ -12485,6 +12541,7 @@ pub(crate) fn agent_command_setting(settings: &AppSettings, agent: Agent) -> &st
     match agent {
         Agent::Codex => &settings.codex_command,
         Agent::Claude => &settings.claude_command,
+        Agent::OhMyPi => &settings.omp_command,
         Agent::Pi => &settings.pi_command,
     }
 }
@@ -12505,8 +12562,9 @@ pub(crate) fn harness_terminal_title(title: &str, agent: &str) -> Option<String>
         || title.eq_ignore_ascii_case(agent_display_name(agent))
         || (agent == "codex" && title.eq_ignore_ascii_case("Codex CLI"))
         || ((agent == "claude" || agent == "claude-code") && title.eq_ignore_ascii_case("Claude"))
-        || ((agent == "pi" || agent == "omp" || agent == "oh-my-pi")
+        || ((agent == "omp" || agent == "oh-my-pi")
             && (title == "π" || title.eq_ignore_ascii_case("omp")))
+        || (agent == "pi" && title == "π")
     {
         None
     } else {
@@ -12518,15 +12576,15 @@ pub(crate) fn agent_command(command: &str, settings: &AppSettings) -> Option<Age
     let executable = command_executable(command)?;
     let codex = command_executable(&settings.codex_command).unwrap_or("codex");
     let claude = command_executable(&settings.claude_command).unwrap_or("claude");
-    let pi = command_executable(&settings.pi_command).unwrap_or("omp");
+    let omp = command_executable(&settings.omp_command).unwrap_or("omp");
+    let pi = command_executable(&settings.pi_command).unwrap_or("pi");
     if executable.eq_ignore_ascii_case(codex) || executable.eq_ignore_ascii_case("codex") {
         Some(Agent::Codex)
     } else if executable.eq_ignore_ascii_case(claude) || executable.eq_ignore_ascii_case("claude") {
         Some(Agent::Claude)
-    } else if executable.eq_ignore_ascii_case(pi)
-        || executable.eq_ignore_ascii_case("omp")
-        || executable.eq_ignore_ascii_case("pi")
-    {
+    } else if executable.eq_ignore_ascii_case(omp) || executable.eq_ignore_ascii_case("omp") {
+        Some(Agent::OhMyPi)
+    } else if executable.eq_ignore_ascii_case(pi) || executable.eq_ignore_ascii_case("pi") {
         Some(Agent::Pi)
     } else {
         None

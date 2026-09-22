@@ -315,6 +315,7 @@ pub enum PaneAgent {
     Codex,
     ClaudeCode,
     OhMyPi,
+    Pi,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

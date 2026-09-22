@@ -60,9 +60,9 @@ Linux, Windows, WSL2, and macOS.
 - Pane attention rings and unread counts (complete); desktop notifications and sounds
 - Sidebar metadata: process, working directory, git branch, listening ports,
   and notification text
-- Reversible hooks for Codex and Claude Code (complete); adapters for other
-  agent CLIs remain
-- Configured Codex/Claude launch actions and lifecycle pane badges (complete)
+- Reversible hooks for Codex and Claude Code, and managed extensions for
+  Oh My Pi and Pi (complete); adapters for other agent CLIs remain
+- Configured Codex/Claude/Oh My Pi/Pi launch actions and lifecycle pane badges (complete)
 - Session activity history and notification center (in-app notification center complete)
 
 ## M3: programmability and remote work

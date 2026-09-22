@@ -30,7 +30,7 @@ pub(crate) struct Identification {
     pub(crate) classification: Option<Classification>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PiTitle<'a> {
+struct OhMyPiTitle<'a> {
     state: Option<ScreenState>,
     label: &'a str,
     rule: &'static str,
@@ -111,10 +111,15 @@ pub(crate) fn is_view_chrome_title(agent: &str, title: &str) -> bool {
 /// window chrome, where publishing every spinner frame creates visual jitter.
 pub(crate) fn stable_title(agent: &str, title: &str) -> String {
     let agent = agent.to_ascii_lowercase();
-    if matches!(agent.as_str(), "pi" | "omp" | "oh-my-pi")
-        && let Some(title) = parse_pi_title(title)
+    if matches!(agent.as_str(), "omp" | "oh-my-pi")
+        && let Some(title) = parse_oh_my_pi_title(title)
     {
         return title.label.to_owned();
+    }
+    if agent == "pi"
+        && let Some(label) = parse_pi_title(title)
+    {
+        return label.to_owned();
     }
     title
         .split_whitespace()
@@ -133,11 +138,17 @@ pub(crate) fn stable_title(agent: &str, title: &str) -> String {
 
 pub(crate) fn classify(agent: &str, snapshot: &GridSnapshot) -> Option<Classification> {
     let title = snapshot.title.as_deref().unwrap_or_default();
-    if ["pi", "omp", "oh-my-pi"]
+    if ["omp", "oh-my-pi"]
         .iter()
         .any(|candidate| agent.eq_ignore_ascii_case(candidate))
     {
-        return classify_pi(title);
+        return classify_oh_my_pi(title);
+    }
+    // Pi's managed extension reports every state edge itself, and its
+    // terminal chrome is whatever its owner configured: nothing on screen
+    // may speak for it.
+    if agent.eq_ignore_ascii_case("pi") {
+        return None;
     }
     let rows = snapshot
         .rows
@@ -152,7 +163,7 @@ pub(crate) fn classify(agent: &str, snapshot: &GridSnapshot) -> Option<Classific
 /// nonempty titles and ambiguous spinner glyphs are deliberately insufficient.
 pub(crate) fn identify(snapshot: &GridSnapshot) -> Option<Identification> {
     let title = snapshot.title.as_deref().unwrap_or_default();
-    if let Some(identification) = pi_identification(title) {
+    if let Some(identification) = pi_family_identification(title) {
         return Some(identification);
     }
     let rows = snapshot
@@ -180,7 +191,8 @@ fn carries_signature_text(agent: &str, title: &str, rows: &[String]) -> bool {
     match agent.to_ascii_lowercase().as_str() {
         "claude" | "claude-code" => has_claude_signature(title, rows),
         "codex" => has_codex_signature(title, rows),
-        "pi" | "omp" | "oh-my-pi" => parse_pi_title(title).is_some(),
+        "omp" | "oh-my-pi" => parse_oh_my_pi_title(title).is_some(),
+        "pi" => parse_pi_title(title).is_some(),
         _ => false,
     }
 }
@@ -200,20 +212,27 @@ fn identify_text(title: &str, rows: &[String]) -> Option<Identification> {
             classification: Some(classification),
         });
     }
-    if let Some(identification) = pi_identification(title) {
+    if let Some(identification) = pi_family_identification(title) {
         return Some(identification);
     }
     None
 }
 
-fn pi_identification(title: &str) -> Option<Identification> {
-    let title = parse_pi_title(title)?;
-    Some(Identification {
+/// Oh My Pi's state-bearing titles and Pi's `π - ` prefix each name their
+/// harness; only the former says anything about state.
+fn pi_family_identification(title: &str) -> Option<Identification> {
+    if let Some(title) = parse_oh_my_pi_title(title) {
+        return Some(Identification {
+            agent: "omp",
+            classification: title.state.map(|state| Classification {
+                state,
+                rule: title.rule,
+            }),
+        });
+    }
+    parse_pi_title(title).map(|_| Identification {
         agent: "pi",
-        classification: title.state.map(|state| Classification {
-            state,
-            rule: title.rule,
-        }),
+        classification: None,
     })
 }
 
@@ -270,17 +289,24 @@ fn classify_text(agent: &str, title: &str, rows: &[String]) -> Option<Classifica
     match agent.as_str() {
         "codex" => classify_codex(title, rows),
         "claude" | "claude-code" => classify_claude(title, rows),
-        "pi" | "omp" | "oh-my-pi" => classify_pi(title),
+        "omp" | "oh-my-pi" => classify_oh_my_pi(title),
         _ => None,
     }
 }
 
-fn classify_pi(title: &str) -> Option<Classification> {
-    let title = parse_pi_title(title)?;
+fn classify_oh_my_pi(title: &str) -> Option<Classification> {
+    let title = parse_oh_my_pi_title(title)?;
     title.state.map(|state| Classification {
         state,
         rule: title.rule,
     })
+}
+
+/// Pi titles its terminal `π - <session> - <directory>` or `π - <directory>`
+/// (`APP_TITLE` in its `config.ts`). The prefix identifies the harness and
+/// carries no state; that comes from its managed extension.
+fn parse_pi_title(title: &str) -> Option<&str> {
+    title.trim().strip_prefix("π - ").map(str::trim)
 }
 
 /// OMP 17.3.4 publishes a documented state separator in every authoritative
@@ -288,20 +314,20 @@ fn classify_pi(title: &str) -> Option<Classification> {
 /// a static `:` while working under ConPTY. `π: label` has no spaces and means
 /// title-state reporting is disabled, so it identifies Pi without inventing a
 /// lifecycle state.
-fn parse_pi_title(title: &str) -> Option<PiTitle<'_>> {
+fn parse_oh_my_pi_title(title: &str) -> Option<OhMyPiTitle<'_>> {
     let title = title.trim();
     if title == "π" {
-        return Some(PiTitle {
+        return Some(OhMyPiTitle {
             state: None,
             label: "",
-            rule: "pi.osc_title_disabled",
+            rule: "omp.osc_title_disabled",
         });
     }
     if let Some(label) = title.strip_prefix("π:") {
-        return Some(PiTitle {
+        return Some(OhMyPiTitle {
             state: None,
             label: label.trim(),
-            rule: "pi.osc_title_disabled",
+            rule: "omp.osc_title_disabled",
         });
     }
     let state_title = title.strip_prefix("π ")?;
@@ -311,13 +337,13 @@ fn parse_pi_title(title: &str) -> Option<PiTitle<'_>> {
             (separator, label.trim())
         });
     let (state, rule) = match separator {
-        ">" => (ScreenState::Idle, "pi.osc_title_idle"),
-        "!" => (ScreenState::Waiting, "pi.osc_title_attention"),
-        ":" => (ScreenState::Running, "pi.osc_title_working"),
-        spinner if is_codex_spinner(spinner) => (ScreenState::Running, "pi.osc_title_spinner"),
+        ">" => (ScreenState::Idle, "omp.osc_title_idle"),
+        "!" => (ScreenState::Waiting, "omp.osc_title_attention"),
+        ":" => (ScreenState::Running, "omp.osc_title_working"),
+        spinner if is_codex_spinner(spinner) => (ScreenState::Running, "omp.osc_title_spinner"),
         _ => return None,
     };
-    Some(PiTitle {
+    Some(OhMyPiTitle {
         state: Some(state),
         label,
         rule,
@@ -839,6 +865,11 @@ mod tests {
         // The frame of one agent never vouches for another: a Pi identity
         // needs Pi's own title, and Codex its own prompt or blocker.
         assert!(!carries_signature_text(
+            "omp",
+            "◑ Fleet sidebar Running to Idle",
+            &working
+        ));
+        assert!(!carries_signature_text(
             "pi",
             "◑ Fleet sidebar Running to Idle",
             &working
@@ -851,6 +882,19 @@ mod tests {
         assert!(carries_signature_text("oh-my-pi", "π : Fix Pi state", &[]));
         assert!(carries_signature_text("omp", "π: Fix Pi state", &[]));
         assert!(!carries_signature_text("claude", "π : Fix Pi state", &[]));
+        // Pi and Oh My Pi title their terminals differently, and neither
+        // form vouches for the other.
+        assert!(carries_signature_text(
+            "pi",
+            "π - fleet-rail - muxtrix",
+            &[]
+        ));
+        assert!(!carries_signature_text("pi", "π > Fix Pi state", &[]));
+        assert!(!carries_signature_text(
+            "omp",
+            "π - fleet-rail - muxtrix",
+            &[]
+        ));
         assert!(carries_signature_text(
             "codex",
             "Fix resume status",
@@ -864,27 +908,44 @@ mod tests {
     }
 
     #[test]
-    fn pi_title_state_distinguishes_idle_working_and_attention() {
+    fn oh_my_pi_title_state_distinguishes_idle_working_and_attention() {
         assert_eq!(
-            classify_text("pi", "π > Fix Pi state", &[]),
-            classification(ScreenState::Idle, "pi.osc_title_idle")
+            classify_text("omp", "π > Fix Pi state", &[]),
+            classification(ScreenState::Idle, "omp.osc_title_idle")
         );
         assert_eq!(
             classify_text("omp", "π ! Fix Pi state", &[]),
-            classification(ScreenState::Waiting, "pi.osc_title_attention")
+            classification(ScreenState::Waiting, "omp.osc_title_attention")
         );
         assert_eq!(
             classify_text("oh-my-pi", "π : Fix Pi state", &[]),
-            classification(ScreenState::Running, "pi.osc_title_working")
+            classification(ScreenState::Running, "omp.osc_title_working")
         );
         for spinner in ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] {
             assert_eq!(
-                classify_text("pi", &format!("π {spinner} Fix Pi state"), &[]),
-                classification(ScreenState::Running, "pi.osc_title_spinner")
+                classify_text("omp", &format!("π {spinner} Fix Pi state"), &[]),
+                classification(ScreenState::Running, "omp.osc_title_spinner")
             );
         }
-        assert_eq!(classify_text("pi", "π: Fix Pi state", &[]), None);
-        assert_eq!(classify_text("pi", "π ? Fix Pi state", &[]), None);
+        assert_eq!(classify_text("omp", "π: Fix Pi state", &[]), None);
+        assert_eq!(classify_text("omp", "π ? Fix Pi state", &[]), None);
+    }
+
+    #[test]
+    fn pi_screens_never_decide_state() {
+        // Pi's extension is the only authority over a Pi pane: its default
+        // title names the session and directory, its owner may replace that
+        // title entirely, and neither may paint a state.
+        for title in [
+            "π - fleet-rail - muxtrix",
+            "π - muxtrix",
+            "π > Fix Pi state",
+            "π ⠋ Fix Pi state",
+            "π",
+            "",
+        ] {
+            assert_eq!(classify_text("pi", title, &[]), None, "{title}");
+        }
     }
 
     #[test]
@@ -921,8 +982,14 @@ mod tests {
             "π ⠏ Fix Pi state",
             "π: Fix Pi state",
         ] {
-            assert_eq!(stable_title("pi", title), "Fix Pi state");
+            assert_eq!(stable_title("omp", title), "Fix Pi state");
         }
+        assert_eq!(
+            stable_title("pi", "π - fleet-rail - muxtrix"),
+            "fleet-rail - muxtrix"
+        );
+        assert_eq!(stable_title("pi", "π - muxtrix"), "muxtrix");
+        assert_eq!(stable_title("pi", "π > Fix Pi state"), "π > Fix Pi state");
     }
 
     /// Verbatim tail of a Claude Code 2.1.229 conversation frame.
@@ -1031,15 +1098,22 @@ mod tests {
         assert_eq!(
             identify_text("π: status support", &[]),
             Some(Identification {
-                agent: "pi",
+                agent: "omp",
                 classification: None,
             })
         );
         assert_eq!(
             identify_text("π > status support", &[]),
             Some(Identification {
+                agent: "omp",
+                classification: classification(ScreenState::Idle, "omp.osc_title_idle"),
+            })
+        );
+        assert_eq!(
+            identify_text("π - status support - muxtrix", &[]),
+            Some(Identification {
                 agent: "pi",
-                classification: classification(ScreenState::Idle, "pi.osc_title_idle"),
+                classification: None,
             })
         );
     }
