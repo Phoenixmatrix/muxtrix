@@ -19,7 +19,8 @@ every edge the fleet row needs (`agent_start`, `agent_settled`,
 `ui_prompt_start`, `ui_prompt_end`), so no screen rule applies to a Pi pane.
 
 Other lifecycle hooks still identify the agent, session, working directory,
-prompt submission, completion, and shutdown. Codex permission and notification
+prompt submission, completion, and shutdown. Codex `SubagentStart` also keeps
+delegated work active through the parent `Stop`. Codex permission and notification
 hooks are not allowed to create human attention because its harness may resolve
 those requests automatically. Claude Code's `PermissionRequest` fires only when
 a dialog is actually shown, so it is exact — and the session record confirms or
@@ -88,7 +89,10 @@ scan started, because nothing else ever will.
 - Codex `Action Required` OSC titles and strong live confirmation/answer forms
   create `Needs input`.
 - Codex spinner titles or its bottom `Working (... esc to interrupt)` footer
-  create `Running`; a plain nonempty Codex title supplies idle evidence.
+  create `Running`; a plain nonempty Codex title supplies idle evidence. Between
+  `SubagentStart` and the parent `Stop`, idle-looking chrome is treated as
+  `Running` because Codex can park its parent spinner while helpers work.
+  Visible input blockers still create `Needs input` during that interval.
 - Claude spinner titles and its active `/btw` overlay create `Running`.
 - Claude confirmation/navigation forms and dynamic-workflow prompts create
   `Needs input`; its idle OSC title creates `Idle`.
@@ -118,7 +122,8 @@ scan started, because nothing else ever will.
   wait, but the exact frame retained when `UserPromptSubmit` arrives cannot
   regress that newer running state. Muxtrix records the frame revision at the
   transition; a subsequently rendered idle frame can resolve `Running` unless
-  Oh My Pi's exact active-lifecycle bracket is still open.
+  Codex's delegated-work bracket or Oh My Pi's exact active-lifecycle bracket
+  is still open.
 - A completed turn remains `Done` while its idle composer is visible, preserving
   the useful completion signal. Strong working evidence starts the next turn
   even if `UserPromptSubmit` was lost, so `Done` cannot become a permanent latch
