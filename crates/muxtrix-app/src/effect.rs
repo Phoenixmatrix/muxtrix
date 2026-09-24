@@ -44,6 +44,13 @@ pub(crate) enum Effect {
     /// Ask the native platform to open an HTTP(S) URL immediately.
     OpenUrl(String),
     Focus(FocusTarget),
+    /// Show an operating-system notification. A click on it comes back as
+    /// `Message::DesktopNotificationClicked` carrying its tag.
+    DesktopNotify(crate::desktop_notify::Notice),
+    /// Withdraw a pane's notification once it no longer needs the user.
+    DismissDesktopNotification(muxtrix_domain::PaneId),
+    /// Bring the window to the front, as a click on a notification asks.
+    ActivateWindow,
     /// Scroll to a fraction of the scrollable's length, 0.0 top to 1.0 end.
     ScrollToRatio(ScrollTarget, f32),
     /// Scroll to an absolute offset in pixels from the top.

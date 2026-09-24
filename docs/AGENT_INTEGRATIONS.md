@@ -82,6 +82,36 @@ Settings is open; choosing **Apply and continue** resumes it after setup.
 The launch and worktree-agent actions are available from Ctrl+P on Windows/Linux
 and Cmd+P on macOS.
 
+### Desktop notifications
+
+Settings → **Notifications** turns on operating-system notifications, off by
+default, for two edges of any supervised agent:
+
+- **When an agent needs you**: a permission request or question that blocks
+  it (the pane enters Waiting), or an error that stops it (Failed).
+- **When an agent finishes**: a turn that ends back at the prompt (Running to
+  Idle or Completed).
+
+Notifications go out only while the Muxtrix window is in the background; in
+front, the pane's attention marker already carries the same news. Each pane
+has at most one notification on screen, a newer one replaces it, and it is
+withdrawn when the agent resumes work or the pane is focused (where the
+platform allows). Clicking one brings the window forward on that pane. A pane
+repeats the same kind of notice at most once every 20 seconds, so a flickering
+state at the edge of a turn does not produce a burst. **Send test** shows a
+sample right away, which is also when a platform asks for permission, and says
+under the button when the platform refused it — no notification service on
+the session bus, or a macOS binary running outside its app bundle.
+
+| Platform | Delivery |
+| --- | --- |
+| Linux | freedesktop notification service (GNOME, KDE, dunst, mako…), with Muxtrix's icon and desktop entry. WSLg usually runs no notification service, so nothing appears there; the taskbar attention hint still does. |
+| Windows | Toast notifications under the "Muxtrix" identity, registered per user on first use (no installer or shortcut needed). Toasts are silent. |
+| macOS | Notification Center. Requires running from the app bundle; a bare binary cannot post notifications. |
+
+When a notification goes out, Muxtrix also asks the window manager to flag the
+window (taskbar flash on Windows, urgency hint on X11, dock bounce on macOS).
+
 ### Task panes
 
 **Create Task Pane** creates a Git worktree and branch with an automatic

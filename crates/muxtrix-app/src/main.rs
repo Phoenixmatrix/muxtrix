@@ -15,6 +15,7 @@ mod assets;
 mod box_drawing;
 mod claude_status;
 mod commands;
+mod desktop_notify;
 mod doctor;
 mod effect;
 mod geom;

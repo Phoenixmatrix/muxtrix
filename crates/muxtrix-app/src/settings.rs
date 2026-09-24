@@ -519,6 +519,12 @@ pub(crate) struct AppSettings {
     pub(crate) ui_font_size: f32,
     pub(crate) fleet_view: FleetView,
     pub(crate) fleet_scope: FleetScope,
+    /// Raise a desktop notification when an agent finishes its turn while
+    /// Muxtrix is in the background.
+    pub(crate) notify_when_idle: bool,
+    /// Raise a desktop notification when an agent stops to ask for input, or
+    /// stops on an error, while Muxtrix is in the background.
+    pub(crate) notify_when_waiting: bool,
     pub(crate) terminal_theme: TerminalThemeId,
     pub(crate) terminal_font: TerminalFont,
     pub(crate) terminal_font_weight: FontWeight,
@@ -545,6 +551,8 @@ impl Default for AppSettings {
             ui_font_size: 16.0,
             fleet_view: FleetView::Tabs,
             fleet_scope: FleetScope::CurrentWorkspace,
+            notify_when_idle: false,
+            notify_when_waiting: false,
             terminal_theme: TerminalThemeId::MuxtrixDark,
             terminal_font: TerminalFont::SystemMonospace,
             terminal_font_weight: FontWeight::Normal,
@@ -798,6 +806,8 @@ mod tests {
             ui_font_size: 99.0,
             fleet_view: FleetView::Agents,
             fleet_scope: FleetScope::AllWorkspaces,
+            notify_when_idle: true,
+            notify_when_waiting: true,
             terminal_theme: TerminalThemeId::Dracula,
             terminal_font: TerminalFont::named("Cascadia Mono"),
             terminal_font_weight: FontWeight::Semibold,
@@ -830,6 +840,8 @@ mod tests {
         assert_eq!(restored.terminal_theme, TerminalThemeId::Dracula);
         assert_eq!(restored.appearance, Appearance::Dark);
         assert!(restored.show_status_bar);
+        assert!(restored.notify_when_idle);
+        assert!(restored.notify_when_waiting);
         assert_eq!(restored.terminal_font_size, 10.0);
         assert_eq!(restored.terminal_line_height, 1.6);
         assert_eq!(

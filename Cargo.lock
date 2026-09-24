@@ -3947,6 +3947,7 @@ dependencies = [
  "muxtrix-platform",
  "muxtrix-sessions",
  "muxtrix-terminal",
+ "notify-rust",
  "png 0.17.16",
  "pollster 0.4.0",
  "serde",

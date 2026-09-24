@@ -39,6 +39,12 @@ serde.workspace = true
 serde_json.workspace = true
 ttf-parser.workspace = true
 
+# Linux desktop notifications with Muxtrix's icon and per-pane replacement.
+# GPUI already links this exact crate for its own notifications, so it adds
+# nothing to the build. See `desktop_notify.rs::deliver`.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+notify-rust = "4.18"
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56.0"
 # Windows has no process group, so ending a console command's whole tree — and

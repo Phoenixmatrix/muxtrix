@@ -185,6 +185,7 @@ enum TickAction {
     ScrollSettingsToEnd,
     ScrollSettingsToTerminal,
     ScrollSettingsToGitHub,
+    ScrollSettingsToNotifications,
     ScrollGitHubToEnd,
     ScrollGitHubPullRequestsToEnd,
     ScrollTaskWarning,
@@ -895,6 +896,9 @@ impl Scenario {
                 {
                     return Ok(TickAction::ScrollSettingsToGitHub);
                 }
+                if self.capturing("settings-notifications") && self.settle_ticks == 2 {
+                    return Ok(TickAction::ScrollSettingsToNotifications);
+                }
                 if self.capturing("settings-github-typing") && self.settle_ticks == 3 {
                     return Ok(TickAction::SeedClipboard);
                 }
@@ -1250,6 +1254,12 @@ impl Scenario {
             || self.capturing("settings-github-typing")
         {
             drop(app.open_settings());
+        } else if self.capturing("settings-notifications") {
+            drop(app.open_settings());
+            app.settings_draft.notify_when_waiting = true;
+            app.notification_test_outcome = Some(Err(
+                "No notification service is running. Install one such as dunst or mako, or use a desktop that provides it.".into(),
+            ));
         } else if self.capturing("settings-github-enterprise") {
             drop(app.open_settings());
             app.settings_draft.github_host = "github.corp.example.com".into();
@@ -2721,6 +2731,9 @@ impl Muxtrix {
             }
             Ok(TickAction::ScrollSettingsToGitHub) => {
                 vec![Effect::ScrollToRatio(ScrollTarget::Settings, 0.65)]
+            }
+            Ok(TickAction::ScrollSettingsToNotifications) => {
+                vec![Effect::ScrollToRatio(ScrollTarget::Settings, 0.57)]
             }
             Ok(TickAction::SeedClipboard) => {
                 vec![Effect::ClipboardWrite("github.pasted.example".into())]
