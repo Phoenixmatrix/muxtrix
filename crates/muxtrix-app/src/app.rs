@@ -428,6 +428,9 @@ pub(crate) struct TerminalRuntime {
     pub(crate) size: PtySize,
     pub(crate) viewport: Option<Size>,
     pub(crate) launch_state: TerminalLaunchState,
+    /// The user submitted `exit` at the shell prompt. A bare `exit` inherits
+    /// the previous command's status, so a nonzero code need not mean a crash.
+    pub(crate) explicit_shell_exit: bool,
     /// Whether this pane has a selection worth offering to copy. The emulator
     /// holds the selection itself; this only spares the view a round trip to
     /// the session thread on every frame.
@@ -7775,6 +7778,13 @@ impl Muxtrix {
                 .input(bytes.clone())
                 .map_err(|error| error.to_string())?;
         }
+        if bytes.iter().any(|byte| !matches!(byte, b'\r' | b'\n'))
+            && let Some(runtime) = self.terminals.get_mut(&pane_id)
+        {
+            // A later keystroke means a nested shell may have returned to
+            // its parent instead of exiting the pane's process.
+            runtime.explicit_shell_exit = false;
+        }
         self.observe_agent_interrupt(pane_id, &bytes);
         self.observe_terminal_command(pane_id, &bytes);
         Ok(())
@@ -7966,6 +7976,15 @@ impl Muxtrix {
         let Some(command) = submitted else {
             return;
         };
+        if matches!(
+            command.split_whitespace().collect::<Vec<_>>().as_slice(),
+            ["exit"] | ["exit", _]
+        ) {
+            if let Some(runtime) = self.terminals.get_mut(&pane_id) {
+                runtime.explicit_shell_exit = true;
+            }
+            return;
+        }
         let Some(agent) = agent_command(&command, &self.settings) else {
             return;
         };
@@ -8315,7 +8334,7 @@ impl Muxtrix {
                     .map(|notification| (*pane_id, notification)),
             );
             if poll.exited {
-                exited.push((*pane_id, poll.exited_clean));
+                exited.push((*pane_id, poll.exited_clean || runtime.explicit_shell_exit));
             }
             if let Some(title) = poll.title {
                 titles.push((*pane_id, title));
@@ -11769,6 +11788,7 @@ impl TerminalRuntime {
             size: initial_pty_size(),
             viewport,
             launch_state,
+            explicit_shell_exit: false,
             has_selection: false,
         }
     }

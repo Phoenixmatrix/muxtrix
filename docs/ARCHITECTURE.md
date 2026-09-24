@@ -180,6 +180,12 @@ claiming that their processes have exited. Daemon PTY removal and destruction
 happen outside the pane-map lock so ConPTY shutdown can drain output through
 its reader without a lock cycle.
 
+The application closes a pane after an explicitly submitted shell `exit`, even
+when the shell inherits a nonzero status from the preceding command. Other
+nonzero process exits keep their final frame available for inspection and
+restart. Later typed input clears the pending explicit-exit intent if a nested
+shell returned instead of ending the pane's process.
+
 The Windows host shares pane identity and an optional control endpoint with WSL
 through `WSLENV`. Linux-side hooks can invoke `muxtrixctl.exe` via standard WSL
 interop, keeping control on the Windows named pipe without opening TCP access.
