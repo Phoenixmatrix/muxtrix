@@ -3931,7 +3931,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3964,7 +3964,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-control"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "interprocess",
  "serde",
@@ -3975,7 +3975,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-domain"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "serde",
  "serde_json",
@@ -3985,7 +3985,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-platform"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "muxtrix-domain",
  "portable-pty",
@@ -3995,7 +3995,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-sessions"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "base64",
  "interprocess",
@@ -4007,7 +4007,7 @@ dependencies = [
 
 [[package]]
 name = "muxtrix-terminal"
-version = "0.1.75"
+version = "0.1.76"
 dependencies = [
  "libghostty-vt",
  "muxtrix-platform",
