@@ -412,6 +412,19 @@ impl Root {
             tokens,
         );
 
+        // Built while `switch` holds its borrow of the context; the section
+        // that shows them is laid out with the other agent settings below.
+        let notify_waiting = switch(
+            "notify-waiting",
+            draft.notify_when_waiting,
+            Message::SettingsNotifyWhenWaiting,
+        );
+        let notify_idle = switch(
+            "notify-idle",
+            draft.notify_when_idle,
+            Message::SettingsNotifyWhenIdle,
+        );
+
         let terminal_appearance = self.settings_section(
             "Terminal appearance",
             "Ghostty-compatible color presets and ANSI palette",
@@ -569,6 +582,72 @@ impl Root {
             tokens,
         );
 
+        let test_notification = self.settings_action_button(
+            "test-notification",
+            "Send test",
+            Message::SendTestNotification,
+            SettingsButtonKind::Secondary,
+            tokens,
+            cx,
+        );
+        // What the last test reported, under the copy it tests.
+        let mut notification_note = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .flex_grow(1.0)
+            .min_w(px(0.))
+            .child(
+                div()
+                    .text_size(ui(10.0))
+                    .line_height((ui(10.0)) * 1.3)
+                    .text_color(color(tokens.muted))
+                    .child(
+                        "Sent only while Muxtrix is in the background. Click one to open its pane.",
+                    ),
+            );
+        if let Some(outcome) = &app.notification_test_outcome {
+            let (copy, tone) = match outcome {
+                Ok(copy) => (copy.clone(), tokens.text),
+                Err(copy) => (copy.clone(), tokens.danger),
+            };
+            notification_note = notification_note.child(
+                div()
+                    .text_size(ui(9.0))
+                    .line_height((ui(9.0)) * 1.3)
+                    .text_color(color(tone))
+                    .child(copy),
+            );
+        }
+        let notifications = self.settings_section(
+            "Notifications",
+            "System notifications while Muxtrix is in the background",
+            vec![
+                self.settings_row(
+                    "When an agent needs you",
+                    "Questions, permission requests, and errors that stop it",
+                    notify_waiting,
+                    tokens,
+                ),
+                self.settings_row(
+                    "When an agent finishes",
+                    "A turn that ends back at the prompt",
+                    notify_idle,
+                    tokens,
+                ),
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(18.))
+                    .p(px(14.))
+                    .child(notification_note)
+                    .child(test_notification)
+                    .into_any_element(),
+            ],
+            tokens,
+        );
+
         let integrations = self.settings_section(
             "Agent lifecycle hooks",
             "Reversible Codex, Claude Code, Oh My Pi, and Pi integration",
@@ -587,6 +666,7 @@ impl Root {
                     .child(
                         div()
                             .flex_grow(1.0)
+                            .min_w(px(0.))
                             .text_size(ui(10.0)).line_height((ui(10.0)) * 1.3)
                             .text_color(color(tokens.muted))
                             .child("Hook changes apply immediately. Muxtrix updates only its tagged entries. Project hooks remain available in muxtrixctl."),
@@ -609,6 +689,7 @@ impl Root {
             .child(terminal_appearance)
             .child(terminal)
             .child(github)
+            .child(notifications)
             .child(integrations)
             .child(versions);
 
@@ -1261,6 +1342,8 @@ impl Root {
             .line_height((px(app.settings_draft.ui_pixels(9.0))) * 1.3)
             .text_color(color(text))
             .whitespace_nowrap()
+            // A button beside wrapping copy keeps its label; the copy wraps.
+            .flex_shrink_0()
             .hover(move |style| style.bg(hover).border_color(color(hover_edge)))
             .on_mouse_down(
                 MouseButton::Left,

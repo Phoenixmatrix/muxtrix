@@ -106,6 +106,12 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_assets(crate::assets::Assets)
         .run(|cx: &mut App| {
             gpui_component::init(cx);
+            // Toasts on an unpackaged Windows build need an identity, and it
+            // has to be in place before the first window exists.
+            cx.set_app_identity(
+                crate::desktop_notify::APP_ID,
+                crate::desktop_notify::APP_NAME,
+            );
 
             let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
             let opened = cx.open_window(
@@ -149,6 +155,11 @@ pub(crate) struct Root {
     pub(crate) settings_widgets: crate::views::settings_widgets::SettingsWidgets,
     /// A focus request waiting for a frame to apply it against.
     pending_focus: Option<crate::effect::FocusTarget>,
+    /// Window-level requests from effects, which run without a window:
+    /// raising it for a clicked notification, or flagging it in the taskbar
+    /// when a notification goes out while it sits in the background.
+    pending_activate: bool,
+    pending_attention: bool,
     /// Native popup focus must survive terminal-driven repaints.
     pub(crate) workspace_menu_focus: Option<FocusHandle>,
     /// Caps independent blocking effects without queueing one behind another.
@@ -342,6 +353,8 @@ impl Root {
             settings_widgets,
             blocking_effects: BlockingEffectLimiter::default(),
             pending_focus: None,
+            pending_activate: false,
+            pending_attention: false,
             workspace_menu_focus: None,
             title: String::new(),
             component_theme: None,
@@ -361,6 +374,15 @@ impl Root {
         };
         root.spawn_timers(cx);
         root.spawn_terminal_wakeups(cx);
+        let this = cx.entity().downgrade();
+        cx.on_system_notification_response(move |response, cx| {
+            let _ = this.update(cx, |root, cx| {
+                root.dispatch_detached(
+                    Message::DesktopNotificationClicked(response.tag.to_string()),
+                    cx,
+                );
+            });
+        });
         root.observe_window(window, cx);
         root.run_effects(effects, window, cx);
         // The startup terminal is launched by `WindowOpened`. There is a
@@ -640,6 +662,22 @@ impl Root {
             // can produce them. Recorded here and applied on the next frame,
             // which is soon enough for a caret to appear.
             Effect::Focus(target) => self.pending_focus = Some(target),
+            Effect::DesktopNotify(notice) => {
+                self.show_desktop_notification(notice, cx);
+            }
+            Effect::DismissDesktopNotification(pane_id) => {
+                // A freedesktop banner can be closed only through the handle
+                // its delivery thread holds; it is replaced by the pane's
+                // next notice instead, and ages out on its own.
+                #[cfg(not(all(unix, not(target_os = "macos"))))]
+                cx.dismiss_system_notification(&crate::desktop_notify::tag(Some(pane_id)));
+                #[cfg(all(unix, not(target_os = "macos")))]
+                let _ = pane_id;
+            }
+            Effect::ActivateWindow => {
+                self.pending_activate = true;
+                cx.notify();
+            }
             // Held rather than applied: an effect can name a surface that has
             // not been laid out yet — opening a panel and scrolling it are one
             // gesture — and a handle with no content reports nowhere to go.
@@ -671,6 +709,71 @@ impl Root {
             Effect::Exit => cx.quit(),
         }
     }
+    fn show_desktop_notification(
+        &mut self,
+        notice: crate::desktop_notify::Notice,
+        cx: &mut Context<Self>,
+    ) {
+        if notice.pane_id.is_some() && !self.app.window_focused {
+            self.pending_attention = true;
+            cx.notify();
+        }
+        let tag = crate::desktop_notify::tag(notice.pane_id);
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let (sender, receiver) = async_channel::bounded(1);
+            let thread_tag = tag.clone();
+            let spawned = std::thread::Builder::new()
+                .name("muxtrix-notification".into())
+                .spawn(move || {
+                    let message = match crate::desktop_notify::deliver(&notice) {
+                        Ok(true) => Message::DesktopNotificationClicked(thread_tag),
+                        Ok(false) => return,
+                        Err(error) => Message::DesktopNotificationFailed(
+                            thread_tag,
+                            crate::desktop_notify::delivery_failure(&error),
+                        ),
+                    };
+                    let _ = sender.send_blocking(message);
+                });
+            if let Err(error) = spawned {
+                let reason = format!("could not start the notification thread: {error}");
+                self.dispatch_detached(Message::DesktopNotificationFailed(tag, reason), cx);
+                return;
+            }
+            cx.spawn(async move |this, cx| {
+                if let Ok(message) = receiver.recv().await {
+                    let _ = this.update(cx, |root, cx| root.dispatch_detached(message, cx));
+                }
+            })
+            .detach();
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            // GPUI swallows a refused toast, so the one refusal knowable in
+            // advance is said here: macOS posts only for a bundled app.
+            #[cfg(target_os = "macos")]
+            if !crate::desktop_notify::running_from_app_bundle() {
+                self.dispatch_detached(
+                    Message::DesktopNotificationFailed(
+                        tag,
+                        "macOS shows notifications only for Muxtrix.app, not a bare binary".into(),
+                    ),
+                    cx,
+                );
+                return;
+            }
+            #[cfg(target_os = "windows")]
+            crate::desktop_notify::register_windows_icon();
+            cx.show_system_notification(gpui::SystemNotification {
+                tag: tag.into(),
+                title: notice.title.into(),
+                body: notice.body.into(),
+                actions: Vec::new(),
+            });
+        }
+    }
+
     /// Starts independent loops for periodic application work.
     ///
     /// Separate loops keep each cadence and its gating conditions local, so a
@@ -849,6 +952,12 @@ impl Render for Root {
             // Reveal against the new layout even when no terminal is producing
             // output to schedule another frame.
             window.request_animation_frame();
+        }
+        if std::mem::take(&mut self.pending_activate) {
+            window.activate_window();
+        }
+        if std::mem::take(&mut self.pending_attention) && !window.is_window_active() {
+            window.request_attention();
         }
         // Both of these read what the last frame laid out, so they belong at
         // the start of the next one.

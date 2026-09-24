@@ -284,6 +284,11 @@ pub(crate) struct Muxtrix {
     pub(crate) dialog_button: Option<DialogButton>,
     pub(crate) tab_drag: Option<TabDrag>,
     pub(crate) notifications: Vec<AgentNotification>,
+    /// Agent state edges already seen, for operating-system notifications.
+    pub(crate) desktop_notices: crate::desktop_notify::NoticeTracker,
+    /// What the settings page's last test notification came to, shown under
+    /// its button until settings is next opened.
+    pub(crate) notification_test_outcome: Option<Result<String, String>>,
     pub(crate) global_alerts: Vec<GlobalAlert>,
     pub(crate) github_auth: github::AuthStatus,
     pub(crate) github_auth_busy: bool,
@@ -1671,6 +1676,15 @@ pub(crate) enum Message {
     SettingsScrollbackLimit(String),
     SettingsUiFontSize(f32),
     SettingsShowAllWorkspaces(bool),
+    SettingsNotifyWhenIdle(bool),
+    SettingsNotifyWhenWaiting(bool),
+    /// Send a sample notification so the user sees one, and so the operating
+    /// system asks for its permission now rather than when an agent needs it.
+    SendTestNotification,
+    /// The user clicked the operating-system notification with this tag.
+    DesktopNotificationClicked(String),
+    /// The platform refused a notification: its tag and the reason.
+    DesktopNotificationFailed(String, String),
     SetFleetView(FleetView),
     ToggleFleetBranch(FleetBranch),
     SettingsDefaultAgent(DefaultAgentChoice),
@@ -2213,6 +2227,8 @@ impl Muxtrix {
             dialog_button: None,
             tab_drag: None,
             notifications: Vec::new(),
+            desktop_notices: Default::default(),
+            notification_test_outcome: None,
             global_alerts,
             github_auth: github::AuthStatus::Checking,
             github_auth_busy: false,
@@ -2490,6 +2506,87 @@ impl Muxtrix {
     }
 
     pub(crate) fn update(&mut self, message: Message) -> Vec<Effect> {
+        let mut effects = self.update_state(message);
+        effects.extend(self.desktop_notice_effects());
+        effects
+    }
+
+    /// Operating-system notifications for the agent state edges the last
+    /// message produced.
+    ///
+    /// State reaches `agent_statuses` from hooks, session records, process
+    /// scans, and screen classification alike, so the edge is read here, once
+    /// every message has landed, rather than at each of those writers.
+    /// Notices are raised only while the window is in the background: in
+    /// front, the pane's own attention marker already says the same thing
+    /// without pulling the user out of what they are doing.
+    fn desktop_notice_effects(&mut self) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let statuses = &self.agent_statuses;
+        for pane_id in self
+            .desktop_notices
+            .retain(|pane_id| statuses.contains_key(pane_id))
+        {
+            effects.push(Effect::DismissDesktopNotification(pane_id));
+        }
+        let now = std::time::Instant::now();
+        let mut raised = Vec::new();
+        for (pane_id, status) in &self.agent_statuses {
+            let kind = self.desktop_notices.observe(*pane_id, status.state, now);
+            if status.state == AgentState::Running && self.desktop_notices.take_shown(*pane_id) {
+                // Back at work: whatever the notice asked has been answered.
+                effects.push(Effect::DismissDesktopNotification(*pane_id));
+            }
+            if let Some(kind) = kind
+                && !self.window_focused
+                && crate::desktop_notify::wanted(kind, &self.settings)
+            {
+                raised.push((*pane_id, kind));
+            }
+        }
+        for (pane_id, kind) in raised {
+            if let Some(notice) = self.desktop_notice(pane_id, kind) {
+                self.desktop_notices.mark_shown(pane_id);
+                effects.push(Effect::DesktopNotify(notice));
+            }
+        }
+        // Looking at the pane answers its notice.
+        if self.window_focused
+            && self.active_view == ActiveView::Workspace
+            && let Some(pane_id) = self
+                .active_workspace()
+                .ok()
+                .and_then(|workspace| workspace.active_tab())
+                .map(|tab| tab.focused_pane_id)
+            && self.desktop_notices.take_shown(pane_id)
+        {
+            effects.push(Effect::DismissDesktopNotification(pane_id));
+        }
+        effects
+    }
+
+    fn desktop_notice(
+        &self,
+        pane_id: PaneId,
+        kind: crate::desktop_notify::NoticeKind,
+    ) -> Option<crate::desktop_notify::Notice> {
+        let status = self.agent_statuses.get(&pane_id)?;
+        let workspace = self
+            .session
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.pane(pane_id).is_some())?;
+        let subject = crate::desktop_notify::NoticeSubject {
+            agent: &status.agent,
+            pane: self.pane_title(workspace, pane_id),
+            // Naming the workspace only helps when there is more than one.
+            workspace: (self.session.workspaces.len() > 1).then_some(workspace.name.as_str()),
+            activity: status.activity.as_deref(),
+        };
+        Some(crate::desktop_notify::compose(kind, pane_id, &subject))
+    }
+
+    fn update_state(&mut self, message: Message) -> Vec<Effect> {
         if self.task_removal_busy()
             && !matches!(
                 &message,
@@ -3955,6 +4052,58 @@ impl Muxtrix {
             Message::SettingsShowStatusBar(show) => {
                 self.settings_draft.show_status_bar = show;
                 return Vec::new();
+            }
+            Message::SettingsNotifyWhenIdle(on) => {
+                self.settings_draft.notify_when_idle = on;
+                return Vec::new();
+            }
+            Message::SettingsNotifyWhenWaiting(on) => {
+                self.settings_draft.notify_when_waiting = on;
+                return Vec::new();
+            }
+            Message::SendTestNotification => {
+                self.notification_test_outcome = Some(Ok(
+                    "Sent. Nothing on screen? Check that your system allows notifications from Muxtrix."
+                        .into(),
+                ));
+                return vec![Effect::DesktopNotify(crate::desktop_notify::test_notice())];
+            }
+            Message::DesktopNotificationFailed(tag, reason) => {
+                if tag == crate::desktop_notify::tag(None) {
+                    self.notification_test_outcome = Some(Err(reason));
+                } else {
+                    self.status = format!("Could not show a notification: {reason}");
+                }
+                return Vec::new();
+            }
+            Message::DesktopNotificationClicked(tag) => {
+                let pane_id = crate::desktop_notify::pane_for_tag(
+                    &tag,
+                    self.session
+                        .workspaces
+                        .iter()
+                        .flat_map(Workspace::all_pane_ids)
+                        .collect::<Vec<_>>(),
+                );
+                if let Some(pane_id) = pane_id {
+                    // Full-page views give way to the pane the user asked
+                    // to see — except a settings page with edits, which a
+                    // click elsewhere must not throw away.
+                    let unsaved_settings = self.active_view == ActiveView::Settings
+                        && (settings_have_changes(&self.settings, &self.settings_draft)
+                            || self.pending_default_agent_command.is_some());
+                    if !unsaved_settings {
+                        if self.active_view == ActiveView::Settings {
+                            self.reset_settings_draft();
+                        }
+                        self.active_view = ActiveView::Workspace;
+                    }
+                    if let Err(error) = self.focus_pane(pane_id) {
+                        self.status = error;
+                    }
+                    self.desktop_notices.take_shown(pane_id);
+                }
+                return vec![Effect::ActivateWindow];
             }
             Message::SettingsUiFont(font) => {
                 self.settings_draft.ui_font = font;
@@ -7509,6 +7658,7 @@ impl Muxtrix {
 
     pub(crate) fn open_settings(&mut self) -> Vec<Effect> {
         self.reset_settings_draft();
+        self.notification_test_outcome = None;
         self.workspace_name_draft = self
             .active_workspace()
             .map_or_else(|_| String::new(), |workspace| workspace.name.clone());

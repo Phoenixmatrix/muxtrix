@@ -10705,3 +10705,211 @@ fn pi_lifecycle_is_exact_from_launch_to_settlement() {
     );
     assert!(!app.agent_statuses.contains_key(&pane_id));
 }
+
+fn pi_event(app: &mut Muxtrix, pane_id: PaneId, state: AgentState, event: &str, body: &str) {
+    let response = app.handle_control_request(ControlRequest::AgentEvent {
+        agent: "pi".into(),
+        state,
+        event: Some(event.into()),
+        title: format!("Pi · {event}"),
+        body: body.into(),
+        pane_id: Some(pane_id.as_uuid().to_string()),
+        session_id: Some("pi-1".into()),
+        cwd: None,
+    });
+    assert!(response.ok, "{:?}", response.message);
+}
+
+fn desktop_notices(effects: &[Effect]) -> Vec<crate::desktop_notify::Notice> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::DesktopNotify(notice) => Some(notice.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn background_agents_raise_desktop_notices_only_when_opted_in() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    app.window_focused = false;
+
+    // Off by default: the edge is seen but nothing is sent.
+    pi_event(
+        &mut app,
+        pane_id,
+        AgentState::Running,
+        "agent_start",
+        "Working",
+    );
+    drop(app.update(Message::PollTerminal));
+    pi_event(
+        &mut app,
+        pane_id,
+        AgentState::Idle,
+        "agent_end",
+        "Ready for input",
+    );
+    assert!(desktop_notices(&app.update(Message::PollTerminal)).is_empty());
+
+    app.settings.notify_when_waiting = true;
+    pi_event(
+        &mut app,
+        pane_id,
+        AgentState::Running,
+        "agent_start",
+        "Working",
+    );
+    drop(app.update(Message::PollTerminal));
+    pi_event(
+        &mut app,
+        pane_id,
+        AgentState::Waiting,
+        "tool_approval_requested",
+        "Approve running cargo test?",
+    );
+    let notices = desktop_notices(&app.update(Message::PollTerminal));
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].title, "Pi needs your input");
+    assert!(notices[0].body.ends_with("Approve running cargo test?"));
+    assert_eq!(notices[0].pane_id, Some(pane_id));
+
+    // Idle notices stay off while only waiting notices are wanted.
+    pi_event(
+        &mut app,
+        pane_id,
+        AgentState::Running,
+        "tool_approval_resolved",
+        "Working",
+    );
+    let resumed = app.update(Message::PollTerminal);
+    assert!(
+        resumed.iter().any(
+            |effect| matches!(effect, Effect::DismissDesktopNotification(id) if *id == pane_id)
+        ),
+        "returning to work withdraws the answered notice"
+    );
+    pi_event(
+        &mut app,
+        pane_id,
+        AgentState::Idle,
+        "agent_end",
+        "Ready for input",
+    );
+    assert!(desktop_notices(&app.update(Message::PollTerminal)).is_empty());
+}
+
+#[test]
+fn a_focused_window_keeps_desktop_notices_quiet() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    app.settings.notify_when_idle = true;
+    app.settings.notify_when_waiting = true;
+    app.window_focused = true;
+
+    pi_event(
+        &mut app,
+        pane_id,
+        AgentState::Running,
+        "agent_start",
+        "Working",
+    );
+    drop(app.update(Message::PollTerminal));
+    pi_event(
+        &mut app,
+        pane_id,
+        AgentState::Idle,
+        "agent_end",
+        "Ready for input",
+    );
+    assert!(desktop_notices(&app.update(Message::PollTerminal)).is_empty());
+}
+
+#[test]
+fn clicking_a_desktop_notice_raises_the_window_on_its_pane() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    app.settings.notify_when_idle = true;
+    app.window_focused = false;
+    pi_event(
+        &mut app,
+        pane_id,
+        AgentState::Running,
+        "agent_start",
+        "Working",
+    );
+    drop(app.update(Message::PollTerminal));
+    pi_event(
+        &mut app,
+        pane_id,
+        AgentState::Idle,
+        "agent_end",
+        "Ready for input",
+    );
+    let notices = desktop_notices(&app.update(Message::PollTerminal));
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].title, "Pi finished");
+
+    app.active_view = ActiveView::ThemeGallery;
+    let effects = app.update(Message::DesktopNotificationClicked(
+        crate::desktop_notify::tag(Some(pane_id)),
+    ));
+    assert!(matches!(effects.as_slice(), [Effect::ActivateWindow]));
+    assert_eq!(app.active_view, ActiveView::Workspace);
+}
+
+#[test]
+fn notification_settings_ride_the_settings_draft() {
+    let mut app = Muxtrix::new();
+    drop(app.update(Message::SettingsNotifyWhenIdle(true)));
+    drop(app.update(Message::SettingsNotifyWhenWaiting(true)));
+    assert!(app.settings_draft.notify_when_idle);
+    assert!(app.settings_draft.notify_when_waiting);
+    assert!(!app.settings.notify_when_idle);
+    assert!(settings_have_changes(&app.settings, &app.settings_draft));
+    let test = desktop_notices(&app.update(Message::SendTestNotification));
+    assert_eq!(test.len(), 1);
+    assert_eq!(test[0].pane_id, None);
+    assert!(matches!(app.notification_test_outcome, Some(Ok(_))));
+
+    // A refused test is said under its button, not in the status bar.
+    drop(app.update(Message::DesktopNotificationFailed(
+        crate::desktop_notify::tag(None),
+        "No notification service is running.".into(),
+    )));
+    assert_eq!(
+        app.notification_test_outcome,
+        Some(Err("No notification service is running.".into()))
+    );
+    drop(app.open_settings());
+    assert_eq!(app.notification_test_outcome, None);
+}
+
+#[test]
+fn an_agent_error_is_announced_with_requests_for_input() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    app.window_focused = false;
+    app.settings.notify_when_waiting = true;
+    pi_event(
+        &mut app,
+        pane_id,
+        AgentState::Running,
+        "agent_start",
+        "Working",
+    );
+    drop(app.update(Message::PollTerminal));
+    pi_event(
+        &mut app,
+        pane_id,
+        AgentState::Failed,
+        "agent_end",
+        "Provider returned 529",
+    );
+    let notices = desktop_notices(&app.update(Message::PollTerminal));
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].title, "Pi hit an error");
+    assert!(notices[0].body.ends_with("Provider returned 529"));
+}

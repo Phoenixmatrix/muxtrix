@@ -57,7 +57,8 @@ Linux, Windows, WSL2, and macOS.
 ## M2: agent supervision
 
 - OSC 9/99/777 notification handling (in-app complete)
-- Pane attention rings and unread counts (complete); desktop notifications and sounds
+- Pane attention rings and unread counts (complete); opt-in desktop notifications
+  for waiting and finished agents (complete); sounds
 - Sidebar metadata: process, working directory, git branch, listening ports,
   and notification text
 - Reversible hooks for Codex and Claude Code, and managed extensions for
