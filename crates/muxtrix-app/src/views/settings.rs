@@ -730,6 +730,7 @@ impl Root {
                 .line_height((ui(9.0)) * 1.3)
                 .text_color(color(tokens.faint))
                 .whitespace_nowrap()
+                .flex_shrink_0()
                 .child(apply_label)
                 .into_any_element();
         }
@@ -745,8 +746,14 @@ impl Root {
             .border_t(px(1.))
             .border_color(color(tokens.line))
             .child(
+                // The note yields its width to the buttons, wrapping and
+                // then ellipsizing within the bar's fixed height; without a
+                // zero minimum its unwrapped length pushed Apply off-screen.
                 div()
                     .flex_grow(1.0)
+                    .min_w(px(0.))
+                    .line_clamp(2)
+                    .text_ellipsis()
                     .text_size(ui(9.0)).line_height((ui(9.0)) * 1.3)
                     .text_color(color(tokens.faint))
                     .child(format!("{font_restart}Preferences apply when saved; shell and scrollback affect new and restarted panes; hook actions apply immediately")),
