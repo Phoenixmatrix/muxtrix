@@ -3282,6 +3282,90 @@ fn clean_terminal_exit_closes_its_pane_and_cascades() {
 
 #[cfg(unix)]
 #[test]
+fn shell_exit_after_failed_command_closes_its_pane() {
+    let mut app = Muxtrix::new();
+    let _ = app.update(Message::Split(SplitAxis::Horizontal));
+    let pane_id = active_pane_id(&app);
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < ready_deadline {
+        app.poll_terminal();
+        if app.terminals[&pane_id]
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.text().trim().is_empty())
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.send_terminal_input(b"false\r".to_vec())
+        .expect("shell should accept a failing command");
+    app.send_terminal_input(b"exit\r".to_vec())
+        .expect("shell should accept exit");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        app.poll_terminal();
+        if !app.terminals.contains_key(&pane_id) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        !app.terminals.contains_key(&pane_id),
+        "a typed exit should close its pane even after a failed command; launch state: {:?}",
+        app.terminals
+            .get(&pane_id)
+            .map(|runtime| &runtime.launch_state)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_process_without_typed_exit_keeps_its_output() {
+    let mut app = Muxtrix::new();
+    let _ = app.update(Message::Split(SplitAxis::Horizontal));
+    let pane_id = active_pane_id(&app);
+    let profile = app
+        .session
+        .profiles
+        .first_mut()
+        .expect("terminal profile should exist");
+    profile.program = "/bin/sh".into();
+    profile.arguments = vec![
+        "-c".into(),
+        "printf 'failed-command-output\\n'; exit 7".into(),
+    ];
+    app.restart_pane(pane_id)
+        .expect("failing command should start");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        app.poll_terminal();
+        if app
+            .terminals
+            .get(&pane_id)
+            .is_some_and(|runtime| matches!(runtime.launch_state, TerminalLaunchState::Exited))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let runtime = app
+        .terminals
+        .get(&pane_id)
+        .expect("failure output stays open");
+    assert!(matches!(runtime.launch_state, TerminalLaunchState::Exited));
+    assert!(
+        runtime
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.text().contains("failed-command-output"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn focused_split_receives_output_independently() {
     let mut app = Muxtrix::new();
     let original_pane = active_pane_id(&app);
@@ -5437,9 +5521,9 @@ fn worktree_names_are_safe_for_branches_and_directories() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn clean_exit_cascades_in_daemon_mode() {
-    // The regression class this pins: local-PTY panes cascaded on clean
-    // exit, daemon-owned panes silently stopped.
+fn typed_exit_after_failure_cascades_in_daemon_mode() {
+    // The daemon's nonzero exit report must still close an explicit shell
+    // exit, while preserving other failed commands for inspection.
     let id = uuid::Uuid::new_v4();
     let endpoint = muxtrix_sessions::session_endpoint(id);
     let daemon_endpoint = endpoint.clone();
@@ -5477,7 +5561,9 @@ fn clean_exit_cascades_in_daemon_mode() {
             .sum::<usize>()
     };
     assert_eq!(pane_count(&app), 2);
-    app.send_terminal_input(b"exit 0\r".to_vec())
+    app.send_terminal_input(b"false\r".to_vec())
+        .expect("shell should accept a failing command");
+    app.send_terminal_input(b"exit\r".to_vec())
         .expect("shell should accept exit");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
@@ -5490,7 +5576,7 @@ fn clean_exit_cascades_in_daemon_mode() {
     assert_eq!(
         pane_count(&app),
         1,
-        "a cleanly exited daemon pane must close and cascade"
+        "an explicitly exited daemon pane must close and cascade"
     );
     let _ = client.send(&muxtrix_sessions::Request::Shutdown);
     // Test daemons must not leave records behind: the session picker

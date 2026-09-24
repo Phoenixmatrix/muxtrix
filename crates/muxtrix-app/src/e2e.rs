@@ -716,7 +716,10 @@ impl Scenario {
                 let _ = app.update(Message::ToggleMaximize(second));
                 let _ = app.update(Message::TogglePaneMenu(second));
                 app.focus_pane(third)?;
-                app.send_terminal_input(b"exit 1\r".to_vec())?;
+                // Exercise an abnormal process exit that must stay available
+                // for inspection and restart. A typed `exit 1` is now an
+                // intentional close, even though it has a nonzero status.
+                app.send_terminal_input(b"kill -9 $$\r".to_vec())?;
                 self.stage = Stage::TerminalExit;
             }
             Stage::TerminalExit => {
