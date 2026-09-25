@@ -772,17 +772,7 @@ fn install_entries(root: &mut Value, agent: Agent, executable: &Path) -> Result<
         .ok_or(HookError::HooksNotObject)?;
 
     for &(event, state) in hook_events(agent) {
-        let command = hook_command(executable, agent, state);
-        let group = json!({
-            "hooks": [{
-                "type": "command",
-                "command": command,
-                // Delivery is acknowledged on queue, so this is only ever
-                // spent when the app is genuinely unreachable; generous so a
-                // slow WSL interop launch never surfaces as a hook failure.
-                "timeout": 10
-            }]
-        });
+        let group = json!({ "hooks": [hook_handler(executable, agent, event, state)] });
         hooks
             .entry(event)
             .or_insert_with(|| Value::Array(Vec::new()))
@@ -866,14 +856,53 @@ fn hook_events(agent: Agent) -> &'static [(&'static str, &'static str)] {
     }
 }
 
+/// The handler object installed for one hook event.
+fn hook_handler(executable: &Path, agent: Agent, event: &str, state: &str) -> Value {
+    let mut handler = json!({
+        "type": "command",
+        "command": hook_command(executable, agent, state),
+        // Delivery is acknowledged on queue, so this is only ever spent when
+        // the app is genuinely unreachable.
+        "timeout": 10
+    });
+    // Launching a Windows executable from WSL intermittently stalls for ten
+    // seconds or more inside WSL's interop relay, before `muxtrixctl` even
+    // starts. No timeout hides that from a synchronous hook, so Claude Code
+    // runs these in the background; the shell stamps each one at fire time
+    // so the app can discard an edge that arrives after a newer one.
+    // SessionEnd stays synchronous: the harness kills background hooks as it
+    // exits.
+    if runs_through_wsl_interop(executable, agent) && event != "SessionEnd" {
+        handler["async"] = Value::Bool(true);
+    }
+    handler
+}
+
+/// Whether a Claude Code hook would launch a Windows `muxtrixctl` from WSL.
+fn runs_through_wsl_interop(executable: &Path, agent: Agent) -> bool {
+    let executable = executable.to_string_lossy();
+    agent == Agent::Claude
+        && executable.starts_with("/mnt/")
+        && executable.to_ascii_lowercase().ends_with(".exe")
+}
+
+/// Trails a WSL interop command: the fire-time stamp, taken by the hook's
+/// own shell rather than by the executable whose launch may stall.
+const FIRED_AT_ARGUMENT: &str = r#" --fired-at-ms "$(date +%s%3N)""#;
+
 fn hook_command(executable: &Path, agent: Agent, state: &str) -> String {
+    let stamp = if runs_through_wsl_interop(executable, agent) {
+        FIRED_AT_ARGUMENT
+    } else {
+        ""
+    };
     let executable = executable.to_string_lossy();
     let executable = if cfg!(windows) {
         format!("\"{executable}\"")
     } else {
         format!("'{}'", executable.replace('\'', "'\\''"))
     };
-    format!("{executable} {}", hook_command_suffix(agent, state))
+    format!("{executable} {}{stamp}", hook_command_suffix(agent, state))
 }
 
 /// The executable-independent part of a managed hook command. Two commands
@@ -990,9 +1019,10 @@ fn count_expected_managed(root: &Value, agent: Agent, executable: &Path) -> usiz
     hook_events(agent)
         .iter()
         .filter(|(event, state)| {
-            let expected = hook_command(executable, agent, state);
+            let expected = hook_handler(executable, agent, event, state);
             event_handlers(hooks, event).any(|handler| {
-                handler.get("command").and_then(Value::as_str) == Some(expected.as_str())
+                handler.get("command") == expected.get("command")
+                    && handler.get("async") == expected.get("async")
             })
         })
         .count()
@@ -1013,6 +1043,7 @@ fn count_semantic_managed(root: &Value, agent: Agent) -> usize {
                     .get("command")
                     .and_then(Value::as_str)
                     .is_some_and(|command| {
+                        let command = command.strip_suffix(FIRED_AT_ARGUMENT).unwrap_or(command);
                         command.contains(MANAGED_MARKER) && command.ends_with(&suffix)
                     })
             })
@@ -2220,6 +2251,90 @@ mod tests {
             hook_events(Agent::Claude).len()
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wsl_interop_claude_hooks_run_in_the_background_and_migrate_from_synchronous() {
+        let (root, _) = fixture();
+        let interop = Path::new("/mnt/c/Users/user/scoop/apps/muxtrix/current/muxtrixctl.exe");
+        let manager = HookManager::with_paths(
+            root.join("home"),
+            root.join("project"),
+            root.join("state"),
+            interop,
+        )
+        .with_named_executable();
+        let target = root.join("home/.claude/settings.json");
+
+        // The synchronous hooks earlier releases installed.
+        let mut value = json!({});
+        {
+            let hooks = value
+                .as_object_mut()
+                .expect("root is an object")
+                .entry("hooks")
+                .or_insert_with(|| json!({}));
+            for &(event, state) in hook_events(Agent::Claude) {
+                hooks[event] = json!([{ "hooks": [{
+                    "type": "command",
+                    "command": format!(
+                        "\"{}\" {}",
+                        interop.display(),
+                        hook_command_suffix(Agent::Claude, state)
+                    ),
+                    "timeout": 10
+                }]}]);
+            }
+        }
+        std::fs::create_dir_all(target.parent().expect("settings has a parent"))
+            .expect("settings directory");
+        std::fs::write(
+            &target,
+            serde_json::to_vec(&value).expect("hooks serialize"),
+        )
+        .expect("old hooks written");
+
+        let synced = manager
+            .synced_status(Agent::Claude, HookScope::User)
+            .expect("synced status should load");
+        assert!(
+            synced.installed,
+            "synchronous interop hooks should self-migrate"
+        );
+
+        let value: Value = serde_json::from_slice(&std::fs::read(&target).expect("hooks exist"))
+            .expect("hooks parse");
+        let hooks = value["hooks"].as_object().expect("hooks object");
+        for &(event, _) in hook_events(Agent::Claude) {
+            let handler = event_handlers(hooks, event)
+                .next()
+                .expect("handler installed");
+            let command = handler["command"].as_str().expect("command");
+            assert!(command.ends_with(FIRED_AT_ARGUMENT), "{event}: {command}");
+            // The harness kills background hooks as it exits.
+            assert_eq!(
+                handler.get("async").and_then(Value::as_bool),
+                (event != "SessionEnd").then_some(true),
+                "{event}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_hooks_stay_synchronous_and_unstamped() {
+        let native = Path::new("/home/user/.muxtrix/bin/muxtrixctl");
+        let windows_codex = Path::new("/mnt/c/Users/user/muxtrixctl.exe");
+        for (executable, agent) in [(native, Agent::Claude), (windows_codex, Agent::Codex)] {
+            let handler = hook_handler(executable, agent, "Stop", "completed");
+            assert_eq!(handler.get("async"), None);
+            assert!(
+                !handler["command"]
+                    .as_str()
+                    .expect("command")
+                    .contains("--fired-at-ms")
+            );
+        }
     }
 
     #[test]

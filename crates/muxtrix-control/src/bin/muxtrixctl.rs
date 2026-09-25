@@ -217,7 +217,11 @@ fn run_hook_event(arguments: &[String]) {
         // and the harness's own session record, not by the installed
         // command's `--state`.
         let mut hook = ClaudeHook::from_payload(&payload, event);
-        hook.sent_at_ms = now_ms();
+        // A background hook launched through WSL interop may start seconds
+        // after it fired; its shell's stamp is the moment that counts.
+        hook.sent_at_ms = option(arguments, "--fired-at-ms")
+            .and_then(|stamp| stamp.parse().ok())
+            .unwrap_or_else(now_ms);
         let request = ControlRequest::ClaudeHook {
             pane_id: Some(pane_id.clone()),
             hook,
