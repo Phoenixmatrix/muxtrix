@@ -319,6 +319,9 @@ pub(crate) struct ClaudeTracker {
     /// Wall-clock milliseconds of the last hook that set state. A record
     /// stamped earlier than this describes the moment before the edge.
     hook_edge_ms: Option<u64>,
+    /// Stamp of the newest record read. A late hook that fired before it
+    /// cannot restart a turn the record has already seen end.
+    record_edge_ms: Option<u64>,
     /// A live record is currently matched, so the screen has no authority.
     pub(crate) record_matched: bool,
     /// A turn has run in this session, so `idle` means a finished turn.
@@ -331,6 +334,21 @@ pub(crate) struct ClaudeTracker {
 
 impl ClaudeTracker {
     pub(crate) fn hook(&mut self, current: AgentState, hook: &ClaudeHook) -> Decision {
+        // Hooks launched through WSL interop run in the background and can
+        // arrive seconds late, after edges that fired later. A stale edge
+        // must not regress newer state; only a finished helper still counts,
+        // so the parent does not wait on it forever.
+        let fired_before = |edge: Option<u64>| {
+            hook.sent_at_ms != 0 && edge.is_some_and(|edge| hook.sent_at_ms < edge)
+        };
+        if fired_before(self.hook_edge_ms) {
+            if hook.event == "SubagentStop"
+                && let Some(id) = hook.agent_id.as_deref()
+            {
+                self.active_subagents.remove(id);
+            }
+            return Decision::default();
+        }
         if let Some(session_id) = hook.session_id.as_deref().filter(|id| !id.is_empty()) {
             if self.session_id.as_deref() != Some(session_id) {
                 // A new conversation in the same pane (`/clear`, a resume):
@@ -341,7 +359,7 @@ impl ClaudeTracker {
             }
             self.session_id = Some(session_id.to_owned());
         }
-        let decision = match hook.event.as_str() {
+        let mut decision = match hook.event.as_str() {
             "SessionStart" => {
                 self.saw_turn = false;
                 self.active_subagents.clear();
@@ -462,6 +480,14 @@ impl ClaudeTracker {
             },
             _ => Decision::default(),
         };
+        // The record already reflects anything after this hook fired. Its
+        // waits and turn ends still carry detail the record lacks, but a
+        // late start must not paint a finished turn as running again.
+        if fired_before(self.record_edge_ms)
+            && matches!(decision.state, Some((AgentState::Running, _)))
+        {
+            decision.state = None;
+        }
         if decision.state.is_some() {
             self.hook_edge_ms = Some(hook.sent_at_ms);
         }
@@ -485,6 +511,9 @@ impl ClaudeTracker {
             && stamped < edge
         {
             return Decision::default();
+        }
+        if record.status.is_some() {
+            self.record_edge_ms = self.record_edge_ms.max(stamped);
         }
         match record.status {
             Some(RecordStatus::Busy) => {
@@ -898,6 +927,54 @@ mod tests {
             done.state,
             Some((AgentState::Completed, "Turn complete".into()))
         );
+    }
+
+    /// Hooks launched through WSL interop run in the background, so an edge
+    /// can arrive after ones that fired later.
+    #[test]
+    fn a_hook_that_arrives_late_cannot_regress_newer_state() {
+        let stamped = |event: &str, at: u64| ClaudeHook {
+            sent_at_ms: at,
+            ..hook(event)
+        };
+
+        // A prompt's start that lands after its own turn ended.
+        let mut tracker = ClaudeTracker::default();
+        let stop = tracker.hook(AgentState::Idle, &stamped("Stop", 2_000));
+        assert_eq!(
+            stop.state.map(|(state, _)| state),
+            Some(AgentState::Completed)
+        );
+        assert_eq!(
+            tracker.hook(AgentState::Completed, &stamped("UserPromptSubmit", 1_000)),
+            Decision::default()
+        );
+
+        // The record saw the turn end first; a late start cannot restart it,
+        // but the late stop still reports the turn and its summary.
+        let mut tracker = ClaudeTracker::default();
+        tracker.record(AgentState::Idle, &record("idle", 3_000));
+        let start = tracker.hook(AgentState::Idle, &stamped("UserPromptSubmit", 1_000));
+        assert_eq!(start.state, None);
+        let mut stop = stamped("Stop", 2_000);
+        stop.last_assistant_message = Some("All done".into());
+        let done = tracker.hook(AgentState::Idle, &stop);
+        assert_eq!(done.state, Some((AgentState::Completed, "All done".into())));
+        assert!(done.turn_completed);
+
+        // A helper's late stop still releases the parent.
+        let mut tracker = ClaudeTracker::default();
+        let mut helper_start = stamped("SubagentStart", 1_000);
+        helper_start.agent_id = Some("helper".into());
+        tracker.hook(AgentState::Running, &helper_start);
+        tracker.hook(AgentState::Running, &stamped("PermissionRequest", 3_000));
+        let mut helper_stop = stamped("SubagentStop", 2_000);
+        helper_stop.agent_id = Some("helper".into());
+        assert_eq!(
+            tracker.hook(AgentState::Waiting, &helper_stop),
+            Decision::default()
+        );
+        assert!(!tracker.has_active_subagents());
     }
 
     #[test]
