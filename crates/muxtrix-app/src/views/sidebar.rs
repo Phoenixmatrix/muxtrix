@@ -1105,7 +1105,9 @@ impl Root {
                     .h(px(52.))
                     .py(px(5.))
                     .pl(px(tree_inset(depth)))
-                    .pr(px(TREE_EDGE))
+                    // A pull request column takes over the row's right edge,
+                    // so the state lane ends at the same inset either way.
+                    .pr(px(if has_pull_request { 0. } else { TREE_EDGE }))
                     .bg(fill)
                     // The border exists in every state so the cursor landing
                     // here never shifts the row's content by a pixel.
@@ -1199,7 +1201,8 @@ impl Root {
                     .items_end()
                     .h(px(52.))
                     .py(px(5.))
-                    .px(px(2.))
+                    .pl(px(4.))
+                    .pr(px(TREE_EDGE))
                     .child(
                         div()
                             .id(("fleet-pr", pane_key(pane_id)))
@@ -1209,6 +1212,9 @@ impl Root {
                             .gap(px(3.))
                             .h(px(30.))
                             .px(px(3.))
+                            // The hover plate overhangs the edge so the
+                            // number's glyphs line up with the state below.
+                            .mr(px(-3.))
                             .rounded(px(5.))
                             .cursor_pointer()
                             .hover(move |style| style.bg(marker_hover))
