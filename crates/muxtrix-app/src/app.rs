@@ -27,8 +27,8 @@ use muxtrix_domain::{
 use muxtrix_platform::{LaunchPlan, PtySize};
 use muxtrix_terminal::{
     EventNotifier, GridSnapshot, LiveSession, LiveSessionEvent, ScrollbarSnapshot, TerminalActor,
-    TerminalMouseAction, TerminalMouseButton, TerminalMouseEvent, TerminalNotification,
-    TerminalTheme,
+    TerminalKey, TerminalKeyEvent, TerminalKeyModifiers, TerminalMouseAction, TerminalMouseButton,
+    TerminalMouseEvent, TerminalNotification, TerminalTheme,
 };
 
 use crate::claude_status::{ClaudeTracker, SessionRecord};
@@ -6536,13 +6536,17 @@ impl Muxtrix {
             return Vec::new();
         }
 
-        let Some(bytes) = encode_terminal_key(modified_key.as_ref(), modifiers, text.as_deref())
-        else {
+        let Some(event) = terminal_key_event(
+            key.as_ref(),
+            modified_key.as_ref(),
+            modifiers,
+            text.as_deref(),
+        ) else {
             return Vec::new();
         };
 
         self.cursor_phase_visible = true;
-        if let Err(error) = self.send_terminal_input(bytes) {
+        if let Err(error) = self.send_terminal_key(event) {
             self.status = format!("Terminal input failed: {error}");
         }
         Vec::new()
@@ -7904,6 +7908,7 @@ impl Muxtrix {
         effect::batch(tasks)
     }
 
+    #[cfg(any(test, feature = "e2e"))]
     pub(crate) fn send_terminal_input(&mut self, bytes: Vec<u8>) -> Result<(), String> {
         let focused_pane_id = self
             .active_workspace()?
@@ -7918,16 +7923,39 @@ impl Muxtrix {
         pane_id: PaneId,
         bytes: Vec<u8>,
     ) -> Result<(), String> {
-        {
-            let session = self
-                .terminals
-                .get(&pane_id)
-                .and_then(|runtime| runtime.session.as_ref())
-                .ok_or_else(|| format!("pane {pane_id:?} has no live terminal"))?;
-            session
-                .input(bytes.clone())
-                .map_err(|error| error.to_string())?;
-        }
+        self.live_session(pane_id)?
+            .input(bytes.clone())
+            .map_err(|error| error.to_string())?;
+        self.observe_terminal_input(pane_id, &bytes);
+        Ok(())
+    }
+
+    /// Delivers a key press to the focused pane. The session picks its final
+    /// encoding, but what the press means — an interrupt, a submitted command
+    /// — is read from its legacy bytes, which say the same thing in every
+    /// protocol.
+    pub(crate) fn send_terminal_key(&mut self, event: TerminalKeyEvent) -> Result<(), String> {
+        let pane_id = self
+            .active_workspace()?
+            .active_tab()
+            .ok_or_else(|| "active tab is missing".to_owned())?
+            .focused_pane_id;
+        let legacy = event.legacy.clone();
+        self.live_session(pane_id)?
+            .key(event)
+            .map_err(|error| error.to_string())?;
+        self.observe_terminal_input(pane_id, &legacy);
+        Ok(())
+    }
+
+    fn live_session(&self, pane_id: PaneId) -> Result<&LiveSession, String> {
+        self.terminals
+            .get(&pane_id)
+            .and_then(|runtime| runtime.session.as_ref())
+            .ok_or_else(|| format!("pane {pane_id:?} has no live terminal"))
+    }
+
+    fn observe_terminal_input(&mut self, pane_id: PaneId, bytes: &[u8]) {
         if bytes.iter().any(|byte| !matches!(byte, b'\r' | b'\n'))
             && let Some(runtime) = self.terminals.get_mut(&pane_id)
         {
@@ -7935,9 +7963,8 @@ impl Muxtrix {
             // its parent instead of exiting the pane's process.
             runtime.explicit_shell_exit = false;
         }
-        self.observe_agent_interrupt(pane_id, &bytes);
-        self.observe_terminal_command(pane_id, &bytes);
-        Ok(())
+        self.observe_agent_interrupt(pane_id, bytes);
+        self.observe_terminal_command(pane_id, bytes);
     }
 
     /// Detection beneath the hooks: an agent process running inside a pane is
@@ -12527,6 +12554,72 @@ pub(crate) fn initial_pty_size() -> PtySize {
         pixel_width: 800,
         pixel_height: 480,
     }
+}
+
+/// A key press as the terminal session needs it: the key itself, for an
+/// application that pushed the Kitty keyboard protocol, plus the legacy bytes
+/// every other application receives. Keys with no legacy encoding (window
+/// shortcuts, unmodelled keys) never reach the pane in either protocol.
+pub(crate) fn terminal_key_event(
+    key: Key<&str>,
+    modified_key: Key<&str>,
+    modifiers: Modifiers,
+    text: Option<&str>,
+) -> Option<TerminalKeyEvent> {
+    let legacy = encode_terminal_key(modified_key, modifiers, text)?;
+    let terminal_key = match key {
+        Key::Character(character) => TerminalKey::Character(character.chars().next()?),
+        Key::Named(named) => match named {
+            Named::Enter => TerminalKey::Enter,
+            Named::Tab => TerminalKey::Tab,
+            Named::Backspace => TerminalKey::Backspace,
+            Named::Escape => TerminalKey::Escape,
+            Named::Space => TerminalKey::Space,
+            Named::ArrowUp => TerminalKey::ArrowUp,
+            Named::ArrowDown => TerminalKey::ArrowDown,
+            Named::ArrowLeft => TerminalKey::ArrowLeft,
+            Named::ArrowRight => TerminalKey::ArrowRight,
+            Named::Home => TerminalKey::Home,
+            Named::End => TerminalKey::End,
+            Named::Insert => TerminalKey::Insert,
+            Named::Delete => TerminalKey::Delete,
+            Named::PageUp => TerminalKey::PageUp,
+            Named::PageDown => TerminalKey::PageDown,
+            Named::F1 => TerminalKey::Function(1),
+            Named::F2 => TerminalKey::Function(2),
+            Named::F3 => TerminalKey::Function(3),
+            Named::F4 => TerminalKey::Function(4),
+            Named::F5 => TerminalKey::Function(5),
+            Named::F6 => TerminalKey::Function(6),
+            Named::F7 => TerminalKey::Function(7),
+            Named::F8 => TerminalKey::Function(8),
+            Named::F9 => TerminalKey::Function(9),
+            Named::F10 => TerminalKey::Function(10),
+            Named::F11 => TerminalKey::Function(11),
+            Named::F12 => TerminalKey::Function(12),
+        },
+        Key::Unidentified => return None,
+    };
+    let text = text.filter(|text| !text.is_empty());
+    // Whatever produced the typed text is part of the character, not a
+    // modifier on it: Shift turns `2` into `@`, and Ctrl+Alt with composed
+    // text is AltGr — the same reading the legacy encoder already makes.
+    let consumed = TerminalKeyModifiers {
+        shift: text.is_some() && modifiers.shift(),
+        alt: text.is_some() && modifiers.control() && modifiers.alt(),
+        control: text.is_some() && modifiers.control() && modifiers.alt(),
+    };
+    Some(TerminalKeyEvent {
+        key: terminal_key,
+        text: text.map(ToOwned::to_owned),
+        modifiers: TerminalKeyModifiers {
+            shift: modifiers.shift(),
+            alt: modifiers.alt(),
+            control: modifiers.control(),
+        },
+        consumed,
+        legacy,
+    })
 }
 
 pub(crate) fn encode_terminal_key(
