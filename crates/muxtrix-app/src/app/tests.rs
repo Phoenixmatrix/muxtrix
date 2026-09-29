@@ -5084,6 +5084,45 @@ fn ctrl_enter_extends_an_agent_prompt_instead_of_submitting() {
 }
 
 #[test]
+fn terminal_key_events_carry_the_key_for_the_kitty_protocol() {
+    // Ctrl+Enter keeps its legacy line feed, but also names itself, so an
+    // application with the Kitty protocol pushed can tell it from Enter.
+    let ctrl_enter = terminal_key_event(
+        Key::Named(Named::Enter),
+        Key::Named(Named::Enter),
+        Modifiers::CTRL,
+        None,
+    )
+    .expect("Ctrl+Enter reaches the terminal");
+    assert_eq!(ctrl_enter.key, TerminalKey::Enter);
+    assert!(ctrl_enter.modifiers.control);
+    assert_eq!(ctrl_enter.legacy, b"\n");
+
+    // Shift made the `@`, so it is spent on the text rather than reported.
+    let at = terminal_key_event(
+        Key::Character("2"),
+        Key::Character("@"),
+        Modifiers::SHIFT,
+        Some("@"),
+    )
+    .expect("Shift+2 reaches the terminal");
+    assert_eq!(at.key, TerminalKey::Character('2'));
+    assert_eq!(at.text.as_deref(), Some("@"));
+    assert!(at.consumed.shift);
+
+    assert_eq!(
+        terminal_key_event(
+            Key::Character("x"),
+            Key::Character("x"),
+            Modifiers::LOGO,
+            Some("x")
+        ),
+        None,
+        "window shortcuts stay out of the pane in every protocol"
+    );
+}
+
+#[test]
 fn alt_arrows_walk_split_geometry_before_wrapping() {
     let profile_id = ProfileId::new();
     let mut tab = WorkspaceTab::new("Tab 1", terminal_surface(profile_id, "left"));

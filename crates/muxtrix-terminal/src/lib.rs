@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use libghostty_vt::alloc::{Allocator, Bytes};
 use libghostty_vt::fmt::Format;
-use libghostty_vt::key::Mods as GhosttyMods;
+use libghostty_vt::key::{
+    Action as GhosttyKeyAction, Encoder as KeyEncoder, Event as GhosttyKeyEvent, Key as GhosttyKey,
+    Mods as GhosttyMods,
+};
 use libghostty_vt::kitty::graphics::{self, ImageFormat, PlacementIterator};
 use libghostty_vt::mouse::{
     Action as GhosttyMouseAction, Button as GhosttyMouseButton, Encoder as MouseEncoder,
@@ -307,9 +310,63 @@ pub struct TerminalMouseEvent {
     pub control: bool,
 }
 
+/// A key the terminal can encode on its own. Characters carry the unshifted
+/// key — `2` for Shift+2 — because that is what the Kitty keyboard protocol
+/// reports; what the press actually typed travels in
+/// [`TerminalKeyEvent::text`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalKey {
+    Character(char),
+    Enter,
+    Tab,
+    Backspace,
+    Escape,
+    Space,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Home,
+    End,
+    Insert,
+    Delete,
+    PageUp,
+    PageDown,
+    /// A function key, `1..=12`.
+    Function(u8),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalKeyModifiers {
+    pub shift: bool,
+    pub alt: bool,
+    pub control: bool,
+}
+
+/// A key press bound for the application in the pane.
+///
+/// Which bytes it becomes is the application's choice, not the host's: an
+/// application that pushed Kitty keyboard flags gets the unambiguous
+/// `CSI … u` form — the only way Ctrl+Enter is distinguishable from Enter —
+/// while every other application gets the host's `legacy` bytes unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalKeyEvent {
+    pub key: TerminalKey,
+    /// The text the press typed, when it typed any.
+    pub text: Option<String>,
+    pub modifiers: TerminalKeyModifiers,
+    /// The modifiers the platform spent producing `text` — Shift for `@`,
+    /// Ctrl+Alt for an AltGr character — which are not reported as
+    /// modifiers of the key.
+    pub consumed: TerminalKeyModifiers,
+    /// The host's legacy encoding of this press.
+    pub legacy: Vec<u8>,
+}
+
 struct TerminalCore {
     terminal: Terminal<'static, 'static>,
     mouse_encoder: MouseEncoder<'static>,
+    key_encoder: KeyEncoder<'static>,
     /// The host's exact cell metrics in pixels. The encoder only takes whole
     /// pixels per cell, so pointer positions are rescaled from these into its
     /// integer grid before encoding; otherwise every row of fractional cell
@@ -371,6 +428,7 @@ impl TerminalCore {
         Ok(Self {
             terminal,
             mouse_encoder,
+            key_encoder: KeyEncoder::new().map_err(ghostty_error)?,
             mouse_cell_width: 1.0,
             mouse_cell_height: 1.0,
             mouse_encoder_cell_width: 1,
@@ -617,6 +675,86 @@ impl TerminalCore {
         );
         let mut bytes = Vec::new();
         self.mouse_encoder
+            .encode_to_vec(&encoded_event, &mut bytes)
+            .map_err(ghostty_error)?;
+        Ok(bytes)
+    }
+
+    /// Encodes a key press the way the application asked for. Until it
+    /// pushes Kitty keyboard flags the host's legacy bytes stand, so the
+    /// host's own conventions (Ctrl+Enter as a line feed) hold for every
+    /// program that never opted in.
+    fn encode_key(&mut self, event: TerminalKeyEvent) -> Result<Vec<u8>, TerminalActorError> {
+        let flags = self
+            .terminal
+            .kitty_keyboard_flags()
+            .map_err(ghostty_error)?;
+        if flags.is_empty() {
+            return Ok(event.legacy);
+        }
+
+        let key = match event.key {
+            // The protocol identifies a text key by its codepoint; the
+            // physical key would only add a base-layout alternate, which a
+            // layout-translated character cannot supply faithfully.
+            TerminalKey::Character(_) => GhosttyKey::Unidentified,
+            TerminalKey::Enter => GhosttyKey::Enter,
+            TerminalKey::Tab => GhosttyKey::Tab,
+            TerminalKey::Backspace => GhosttyKey::Backspace,
+            TerminalKey::Escape => GhosttyKey::Escape,
+            TerminalKey::Space => GhosttyKey::Space,
+            TerminalKey::ArrowUp => GhosttyKey::ArrowUp,
+            TerminalKey::ArrowDown => GhosttyKey::ArrowDown,
+            TerminalKey::ArrowLeft => GhosttyKey::ArrowLeft,
+            TerminalKey::ArrowRight => GhosttyKey::ArrowRight,
+            TerminalKey::Home => GhosttyKey::Home,
+            TerminalKey::End => GhosttyKey::End,
+            TerminalKey::Insert => GhosttyKey::Insert,
+            TerminalKey::Delete => GhosttyKey::Delete,
+            TerminalKey::PageUp => GhosttyKey::PageUp,
+            TerminalKey::PageDown => GhosttyKey::PageDown,
+            TerminalKey::Function(number) => match number {
+                1 => GhosttyKey::F1,
+                2 => GhosttyKey::F2,
+                3 => GhosttyKey::F3,
+                4 => GhosttyKey::F4,
+                5 => GhosttyKey::F5,
+                6 => GhosttyKey::F6,
+                7 => GhosttyKey::F7,
+                8 => GhosttyKey::F8,
+                9 => GhosttyKey::F9,
+                10 => GhosttyKey::F10,
+                11 => GhosttyKey::F11,
+                12 => GhosttyKey::F12,
+                _ => return Ok(event.legacy),
+            },
+        };
+        let unshifted = match event.key {
+            TerminalKey::Character(character) => Some(character),
+            TerminalKey::Space => Some(' '),
+            _ => None,
+        };
+        let mods = |modifiers: TerminalKeyModifiers| {
+            let mut mods = GhosttyMods::empty();
+            mods.set(GhosttyMods::SHIFT, modifiers.shift);
+            mods.set(GhosttyMods::ALT, modifiers.alt);
+            mods.set(GhosttyMods::CTRL, modifiers.control);
+            mods
+        };
+
+        let mut encoded_event = GhosttyKeyEvent::new().map_err(ghostty_error)?;
+        encoded_event
+            .set_action(GhosttyKeyAction::Press)
+            .set_key(key)
+            .set_mods(mods(event.modifiers))
+            .set_consumed_mods(mods(event.consumed))
+            .set_utf8(unshifted.and(event.text));
+        if let Some(codepoint) = unshifted {
+            encoded_event.set_unshifted_codepoint(codepoint);
+        }
+        self.key_encoder.set_options_from_terminal(&self.terminal);
+        let mut bytes = Vec::new();
+        self.key_encoder
             .encode_to_vec(&encoded_event, &mut bytes)
             .map_err(ghostty_error)?;
         Ok(bytes)
@@ -1421,6 +1559,7 @@ enum LiveCommand {
         cell: Option<(u16, u16)>,
     },
     Mouse(TerminalMouseEvent),
+    Key(TerminalKeyEvent),
     Snapshot(Sender<Result<GridSnapshot, LiveSessionError>>),
     SelectionStart {
         column: u16,
@@ -1697,6 +1836,12 @@ impl LiveSession {
     /// tracking mode and encoding format on the session thread.
     pub fn mouse(&self, event: TerminalMouseEvent) -> Result<(), LiveSessionError> {
         self.send(LiveCommand::Mouse(event))
+    }
+
+    /// Delivers a key press, encoded on the session thread in whichever
+    /// keyboard protocol the application currently has enabled.
+    pub fn key(&self, event: TerminalKeyEvent) -> Result<(), LiveSessionError> {
+        self.send(LiveCommand::Key(event))
     }
 
     /// Scroll the viewport to an absolute row in the scrollback buffer.
@@ -2036,6 +2181,15 @@ fn run_live_session(
                 }
             }
             LiveCommand::Mouse(event) => match terminal.encode_mouse(event) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    if let Err(error) = session.write_all(&bytes) {
+                        events.push(LiveSessionEvent::Error(error.to_string()));
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => events.push(LiveSessionEvent::Error(error.to_string())),
+            },
+            LiveCommand::Key(event) => match terminal.encode_key(event) {
                 Ok(bytes) if !bytes.is_empty() => {
                     if let Err(error) = session.write_all(&bytes) {
                         events.push(LiveSessionEvent::Error(error.to_string()));
@@ -2762,6 +2916,87 @@ mod tests {
 
         assert!(!responses.is_empty());
         actor.shutdown()
+    }
+
+    fn key(
+        key: TerminalKey,
+        text: Option<&str>,
+        modifiers: TerminalKeyModifiers,
+        legacy: &[u8],
+    ) -> TerminalKeyEvent {
+        TerminalKeyEvent {
+            key,
+            text: text.map(ToOwned::to_owned),
+            modifiers,
+            consumed: TerminalKeyModifiers::default(),
+            legacy: legacy.to_vec(),
+        }
+    }
+
+    const CTRL: TerminalKeyModifiers = TerminalKeyModifiers {
+        shift: false,
+        alt: false,
+        control: true,
+    };
+
+    #[test]
+    fn keys_use_the_kitty_protocol_only_while_the_application_has_it_pushed()
+    -> Result<(), TerminalActorError> {
+        let mut terminal = TerminalCore::new(options())?;
+        let ctrl_enter = || key(TerminalKey::Enter, None, CTRL, b"\n");
+
+        // Claude Code only enables extended keys for a terminal that answers
+        // the flags query, so the answer is what unlocks Ctrl+Enter at all.
+        terminal.feed(b"\x1b[?u");
+        assert_eq!(terminal.take_pty_responses(), vec![b"\x1b[?0u".to_vec()]);
+        assert_eq!(terminal.encode_key(ctrl_enter())?, b"\n");
+
+        // Disambiguate plus alternate keys: what Claude Code pushes.
+        terminal.feed(b"\x1b[>5u");
+        assert_eq!(terminal.encode_key(ctrl_enter())?, b"\x1b[13;5u");
+        assert_eq!(
+            terminal.encode_key(key(
+                TerminalKey::Enter,
+                None,
+                TerminalKeyModifiers::default(),
+                b"\r"
+            ))?,
+            b"\r",
+            "plain Enter keeps its legacy byte so a crashed app leaves a usable shell"
+        );
+        assert_eq!(
+            terminal.encode_key(key(TerminalKey::Character('c'), None, CTRL, &[0x03]))?,
+            b"\x1b[99;5u"
+        );
+
+        terminal.feed(b"\x1b[<u");
+        assert_eq!(terminal.encode_key(ctrl_enter())?, b"\n");
+        Ok(())
+    }
+
+    #[test]
+    fn shifted_text_types_its_character_under_the_kitty_protocol() -> Result<(), TerminalActorError>
+    {
+        let mut terminal = TerminalCore::new(options())?;
+        terminal.feed(b"\x1b[>5u");
+        let shift = TerminalKeyModifiers {
+            shift: true,
+            ..TerminalKeyModifiers::default()
+        };
+        let mut at = key(TerminalKey::Character('2'), Some("@"), shift, b"@");
+        at.consumed = shift;
+
+        assert_eq!(terminal.encode_key(at)?, b"@");
+        assert_eq!(
+            terminal.encode_key(key(
+                TerminalKey::Character('a'),
+                Some("a"),
+                TerminalKeyModifiers::default(),
+                b"a"
+            ))?,
+            b"a"
+        );
+        Ok(())
     }
 
     #[test]
