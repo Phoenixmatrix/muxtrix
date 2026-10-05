@@ -42,7 +42,13 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or -not $prefix) {
             throw "Scoop did not report an installed muxtrix package"
           }
-          $manifest = Get-Content (Join-Path $prefix "manifest.json") -Raw | ConvertFrom-Json
+          # Scoop 0.6.0 renamed the installed manifest to scoop-manifest.json;
+          # older Scoop releases still write manifest.json.
+          $manifestPath = Join-Path $prefix "scoop-manifest.json"
+          if (-not (Test-Path $manifestPath)) {
+            $manifestPath = Join-Path $prefix "manifest.json"
+          }
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
           if ($manifest.version -ne $env:RELEASE_VERSION) {
             throw "Installed Scoop version $($manifest.version), expected $env:RELEASE_VERSION"
           }
