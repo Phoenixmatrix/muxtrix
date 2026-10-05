@@ -278,7 +278,8 @@ pub fn run(id: Uuid, name: String, endpoint: String) -> Result<(), String> {
                                     terminated_generations.remove(&pane);
                                     // Published before its reader starts, so
                                     // the reader always finds its own entry.
-                                    shared.panes.lock().expect("panes").insert(
+                                    let mut panes = shared.panes.lock().expect("panes");
+                                    panes.insert(
                                         pane,
                                         Pane {
                                             session,
@@ -287,17 +288,23 @@ pub fn run(id: Uuid, name: String, endpoint: String) -> Result<(), String> {
                                             generation,
                                         },
                                     );
+                                    // Announced under the same lock the reader
+                                    // and reaper take before reporting output
+                                    // or exit, so a child that exits at once
+                                    // can never be reported before the client
+                                    // learns its generation.
+                                    shared.emit(&Event::Spawned {
+                                        pane,
+                                        process_id,
+                                        generation: Some(generation),
+                                    });
+                                    drop(panes);
                                     spawn_pane_reader(
                                         pane,
                                         generation,
                                         reader,
                                         Arc::clone(&shared),
                                     );
-                                    shared.emit(&Event::Spawned {
-                                        pane,
-                                        process_id,
-                                        generation: Some(generation),
-                                    });
                                 }
                                 Err(error) => shared.emit(&Event::SpawnFailed {
                                     pane,
