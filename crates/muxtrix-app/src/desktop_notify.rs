@@ -368,6 +368,10 @@ mod tests {
         assert_eq!(notice_for(Some(Idle), Completed), None);
         assert_eq!(notice_for(Some(Waiting), Waiting), None);
         assert_eq!(notice_for(Some(Idle), Running), None);
+        assert_eq!(notice_for(Some(Running), Unknown), None);
+        assert_eq!(notice_for(Some(Waiting), Unknown), None);
+        assert_eq!(notice_for(Some(Unknown), Completed), None);
+        assert_eq!(notice_for(Some(Unknown), Idle), None);
     }
 
     #[test]

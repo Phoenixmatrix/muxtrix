@@ -90,7 +90,8 @@ default, for two edges of any supervised agent:
 - **When an agent needs you**: a permission request or question that blocks
   it (the pane enters Waiting), or an error that stops it (Failed).
 - **When an agent finishes**: a turn that ends back at the prompt (Running to
-  Idle or Completed).
+  Idle or Completed). Claude requires aggregate completion: parent yield,
+  uncertain task evidence, and duplicate delivery do not send a finished notice.
 
 Notifications go out only while the Muxtrix window is in the background; in
 front, the pane's attention marker already carries the same news. Each pane
@@ -199,8 +200,9 @@ targets `~/.pi/agent`, so a relocated Pi needs the module installed by hand.
 
 Muxtrix subscribes to session start/end, prompt submission, permission, stop,
 and sub-agent events for Codex and Claude Code. Claude Code also contributes
-stop-failure, elicitation, and notification events, and its hook client
-forwards the whole payload rather than a pre-decided state. Oh My Pi and Pi do not use Codex/Claude-style
+stop-failure, elicitation, and notification events. Its client forwards bounded
+typed parent/task evidence rather than a pre-decided state, and journals it
+before attempting GUI delivery. Oh My Pi and Pi do not use Codex/Claude-style
 JSON hook arrays; each managed module is a native extension for that agent.
 Oh My Pi's listens to session lifecycle, agent lifecycle, approval, compaction,
 and handoff maintenance events. Pi's listens to `session_start`,
@@ -221,14 +223,26 @@ even when its prompt hook was delayed or unavailable. After `SubagentStart`,
 an idle-looking parent frame remains **Running** until the parent `Stop` hook;
 visible approval and answer prompts can still show **Needs input**.
 
-Claude Code is read from the session record the harness itself writes
-(`~/.claude/sessions/<pid>.json`): `busy`, `idle`, `waiting` with the reason,
-or `shell`. Hooks add the exact turn edges, session identity, and subagent IDs.
-The pane stays **Running** while tracked subagents work, even when the parent
-has stopped responding or shows an idle composer; actual input requests still
-show **Needs input**. The screen is only a fallback for a pane no live record
-matches. After upgrading, use **Repair** or **Re-add** for Claude Code and
-restart Claude to enable the new `SubagentStop` hook. See
+Claude Code's session record (`~/.claude/sessions/<pid>.json`) describes its
+parent UI: `busy`, `idle`, `waiting` with a reason, or `shell`. Hooks add exact
+turn edges, identity, and `background_tasks` inventories. Helpers **and shells**
+keep the pane **Running** after the parent yields; actual input requests still
+win as **Needs input**. System-generated, session-correlated transcript task
+notifications can finish a shell without another parent hook.
+
+An absent or malformed task inventory is not an empty one. If task evidence is
+missing, lost, or unsupported, the pane reports neutral **Unknown** instead of
+false **Done** or attention. The screen cannot clear active or uncertain child
+work. Explicit ambient tasks and future cron wakeups do not keep a pane busy;
+an unclassified monitor remains uncertain.
+
+Activity is persisted per pane, including hooks arriving while Muxtrix is
+closed, and reconciled when the GUI resumes its session daemon. Checkpoints
+exclude assistant-message bodies and transient display text. Restarting a
+pane into a new shell retires the previous session's activity. After upgrading,
+use **Repair** or **Re-add** if Claude's hooks need repair, then restart Claude
+to reload them. Claude versions without background-task inventories cannot
+prove aggregate completion from an idle parent alone. See
 [Agent state detection](AGENT_STATE_DETECTION.md#claude-code-session-records).
 
 Oh My Pi keeps exact approval and active-turn lifecycle events. From

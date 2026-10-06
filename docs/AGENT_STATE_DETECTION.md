@@ -3,12 +3,13 @@
 ## Decision
 
 Codex uses its live terminal screen for `Running`, `Idle`, and `Needs input`.
-Claude Code is described by Claude Code itself: the harness writes a session
-record (`~/.claude/sessions/<pid>.json`) from its own UI state on every change,
-naming whether it is `busy`, `idle`, `waiting` on a dialog, or in `shell` mode.
-Muxtrix reads that record directly, lets its hooks supply the exact turn edges
-and identity, and consults the screen only for a pane no live record could be
-matched to. Oh My Pi supplies exact
+Claude Code combines independent parent and background-task evidence. Its
+session record (`~/.claude/sessions/<pid>.json`) describes the parent UI:
+`busy`, `idle`, `waiting`, or `shell`. Hooks carry session identity, turn edges,
+and complete `background_tasks` inventories; exact system-generated transcript
+notifications can finish a task while the parent stays idle. A parent prompt
+is not proof that its helpers or shells finished. Missing evidence produces
+neutral `Unknown`, not invented completion. Oh My Pi supplies exact
 active-turn and approval transitions through its managed extension, while OMP's
 documented state-bearing OSC title supplies the correction and recovery layer.
 `π >` means idle, `π !` means attention, and `π` followed by a supported Braille
@@ -22,9 +23,9 @@ Other lifecycle hooks still identify the agent, session, working directory,
 prompt submission, completion, and shutdown. Codex `SubagentStart` also keeps
 delegated work active through the parent `Stop`. Codex permission and notification
 hooks are not allowed to create human attention because its harness may resolve
-those requests automatically. Claude Code's `PermissionRequest` fires only when
-a dialog is actually shown, so it is exact — and the session record confirms or
-clears it within milliseconds either way. Oh My Pi's `agent_start` through
+those requests automatically. Claude Code's `PermissionRequest` is advisory
+while a live session record is matched; that record confirms whether a
+blocking dialog actually remains open. Oh My Pi's `agent_start` through
 terminal `agent_end` interval and its approval events are exact. During that
 interval, an idle title cannot demote the pane; this covers older OMP releases
 that briefly published `π >` while an async job or scheduled continuation still
@@ -33,9 +34,8 @@ owned the turn. Pi's `agent_start` through `agent_settled` run and its
 title to correct or be corrected by.
 
 An unrecognized Codex screen or title preserves the last trusted state. Claude
-can additionally recover from its exact structured session record. This favors
-a missed new prompt over inventing activity or repeatedly telling the user that
-an automatic reviewer needs them.
+recovers its parent state from its exact structured record and its task state
+from durable evidence. Idle-looking chrome never resolves missing task evidence.
 
 ## Why the hook-only model was wrong
 
@@ -71,13 +71,24 @@ session-integration hooks are separated from live state authority, and Codex's
 was reworked again on 2026-08-26 after the screen-first model kept drifting:
 its state now comes from the harness's own session record (see below).
 
+The background-task model was checked against Claude Code 2.1.289 using
+controlled real shell and subagent runs. Claude added hook task inventories in
+[2.1.145](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md).
+The recent [iTerm2 implementation](https://github.com/gnachman/iTerm2/commit/18893448f5e4252916b03da6664f9db9f4630e33)
+demonstrates why `Stop` can still contain running tasks, why an idle prompt
+must preserve them, and why `SubagentStop` must exclude its own finishing ID.
+Muxtrix additionally observes silent task completion and persists evidence
+across GUI replacement; an in-memory task count alone cannot cover those cases.
+
 ## Implemented model
 
 On each terminal poll, the application evaluates each pane's latest Ghostty
 grid snapshot and OSC title. Retained frames are re-evaluated so an identity
 hook arriving just after a stable prompt paint cannot miss it on the next poll.
-Codex uses its live screen and title. Claude Code uses its session record and
-hooks, with the screen as the fallback for an unmatched pane. Oh My Pi uses its state-bearing title
+Codex uses its live screen and title. Claude Code combines its parent record,
+hook task inventories, and exact per-task terminal observations. Its screen is
+a limited fallback, never authority to clear active or uncertain child work.
+Oh My Pi uses its state-bearing title
 except that its exact `agent_start` through terminal `agent_end` lifecycle
 bracket prevents an idle title from ending active work. Oh My Pi also retains exact
 session switch/branch, approval-request, context compaction/handoff, and
@@ -95,7 +106,7 @@ scan started, because nothing else ever will.
   Visible input blockers still create `Needs input` during that interval.
 - Claude spinner titles and its active `/btw` overlay create `Running`.
 - Claude confirmation/navigation forms and dynamic-workflow prompts create
-  `Needs input`; its idle OSC title creates `Idle`.
+  `Needs input`; its idle OSC title is only fallback parent-idle evidence.
 - Oh My Pi's `π >` title creates `Idle` outside an active lifecycle bracket,
   `π !` creates `Needs input`, and its ten supported Braille separators create
   `Running`. `π :` is the static ConPTY working form. A state-disabled
@@ -107,9 +118,9 @@ scan started, because nothing else ever will.
   its own spinner-free title, either of which a later rule would otherwise read
   as this conversation's state.
 - Claude's rendered composer — a `❯` line inside the last pair of horizontal
-  rules, with no menu over it — creates `Idle`. It is ranked below every
-  blocking rule so it can never clear a wait that is still painted, and it
-  ignores a `❯ 1. Yes` answer line.
+  rules, with no menu over it — supplies fallback parent-idle evidence. It
+  cannot clear aggregate background work or `Unknown`, and ranks below a
+  visible blocker. A `❯ 1. Yes` answer line is not an idle composer.
 - Claude's session records are associated one-to-one by hook session ID, then
   by the exact harness PID from the pane's process tree, then by a cwd that
   is unique on both sides for a record the prober confirmed alive. Ambiguous records are ignored. While a live record is matched,
@@ -122,8 +133,8 @@ scan started, because nothing else ever will.
   wait, but the exact frame retained when `UserPromptSubmit` arrives cannot
   regress that newer running state. Muxtrix records the frame revision at the
   transition; a subsequently rendered idle frame can resolve `Running` unless
-  Codex's delegated-work bracket or Oh My Pi's exact active-lifecycle bracket
-  is still open.
+  Codex's delegated-work bracket, Claude's active or uncertain task inventory,
+  or Oh My Pi's exact active-lifecycle bracket is still open.
 - A completed turn remains `Done` while its idle composer is visible, preserving
   the useful completion signal. Strong working evidence starts the next turn
   even if `UserPromptSubmit` was lost, so `Done` cannot become a permanent latch
@@ -131,12 +142,12 @@ scan started, because nothing else ever will.
   `Running`; only terminal `agent_end` completes its active turn, and only
   `agent_settled` completes Pi's.
 
-The typed control event carries the original hook event name. Codex and Claude
-waiting hooks remain metadata only, and `PostToolUse` cannot clear their
-screen-confirmed wait. Oh My Pi approval events and active-turn lifecycle
-brackets remain exact state transitions, as do Pi's prompt and settlement
-events. Completion, failure, stop, and new-prompt
-lifecycle events retain their coarse roles for every supported harness.
+Typed control events retain the original hook event name. Codex waiting hooks
+remain metadata only. Claude combines record-confirmed waits with exact
+elicitation/notification evidence; `PostToolUse` cannot clear an unrelated
+wait. Oh My Pi approval events and active-turn lifecycle brackets remain exact
+state transitions, as do Pi's prompt and settlement events. Claude completion
+side effects require aggregate completion, not a parent-only stop.
 
 The managed Oh My Pi and Pi extensions are versioned. Existing modules without
 the current behavior marker are migrated during normal Muxtrix hook
@@ -153,10 +164,12 @@ Muxtrix instance restores that identity before attaching the pane's byte
 stream, then applies the screen classifier to the terminal grid rebuilt from
 backlog replay. Claude additionally re-associates its structured session by
 unique cwd when neither a new hook nor a host-visible process PID is available.
-Current state therefore does not depend on an already-running agent emitting a
-new hook into the replacement application instance. A Claude pane additionally
-re-matches its session record by PID or unique cwd as soon as the watcher's
-first read lands, so its state is exact again without any repaint.
+Its parent record cannot reconstruct independent task work. The hook client
+therefore journals typed activity before IPC, including while the GUI is
+absent. A replacement GUI replays the pane's checkpoint and unacknowledged
+events, then reconciles fresh parent and task evidence. Recovered evidence
+remains uncertain until corroborated; fresh parent waits and activity still
+take precedence. No new hook is required merely to recover the prior identity.
 
 Layouts created before durable identity was added remain recoverable. Once the
 replayed grid arrives, Muxtrix accepts only agent-specific signatures: Codex's
@@ -258,56 +271,62 @@ cwd alone. When a resumed session leaves an older file with the same
 
 Precedence for a matched pane:
 
-- The record decides `Running` (`busy`), `Needs input` (`waiting`, with
-  `waitingFor` as the row's activity), and `Idle` (`idle`, `shell`). An `idle`
-  record after a turn ran means completion only when no tracked subagents
-  remain. `Failed` persists until the next turn.
-- Hooks are exact edges applied immediately: `UserPromptSubmit` starts the
-  turn, `Stop` completes it (and triggers the PR refresh) unless subagents
-  remain, `StopFailure` fails it, `Elicitation` blocks it, `SessionStart` resets
-  it, and `SessionEnd` removes it. `SubagentStart` and `SubagentStop` track each
-  helper by `agent_id`; duplicate events cannot finish a sibling. While any
-  helper runs, a parent's `Stop`, idle record, or fallback idle composer keeps
-  the pane `Running` with activity `Subagents are working`. A real input wait
-  still wins. The final helper completes an already-yielded parent, but never
-  completes a parent that is still working. Cancellation, failure, and session
-  reset discard the tracked helpers.
-  `PermissionRequest` remains advisory while a record is matched: another
-  hook or auto mode may resolve it without a dialog. A record whose
-  `status` this build cannot read leaves the screen in charge. A `Notification` counts only when it names
-  `permission_prompt` or an elicitation dialog; the harness sends those after a
-  dialog has waited about six seconds, so the record has long since said so.
-- A record stamped earlier than the last hook edge cannot regress it: the
-  prompt hook can land a few milliseconds before the harness rewrites `busy`.
-  Both are stamped from the same wall clock.
-- A pane whose record disappears or whose process dies falls back to hook
-  edges and the screen classifier until a record matches again.
+- A fresh `waiting` record wins over background work. `busy` proves parent
+  activity. `idle` and `shell` describe only the parent and cannot finish
+  independently running tasks.
+- Hooks are scoped to a session. Parent edges, task edges, and complete
+  inventories have separate causal watermarks, so a delayed task start is not
+  discarded merely because a newer parent stop arrived first. Duplicate
+  delivery is idempotent. Equal-time conflicting evidence cannot prove a task
+  ended. A session switch/resume establishes a lifecycle fence.
+- `background_tasks: []` proves an empty inventory at that observation.
+  An absent field proves nothing; a malformed field records uncertainty.
+  `SubagentStart`/`SubagentStop` address exact IDs, and a `SubagentStop`
+  inventory cannot keep its own finishing ID alive.
+- Running shells and helpers keep a yielded parent `Running`. Explicit
+  ambient tasks do not count as blocking work. A monitor without ambient
+  classification is uncertain rather than silently ignored; see the upstream
+  [missing ambient metadata issue](https://github.com/anthropics/claude-code/issues/98816).
+  Registered `session_crons` describe future wakeups, not current activity.
+- The transcript observer accepts only session-correlated, system-origin
+  task-notification envelopes with an exact task ID and terminal status.
+  Ordinary transcript prose, user-pasted notifications, EOF, silence, and
+  elapsed time never finish a task. Partial records and unavailable/rotated
+  sources preserve uncertainty instead of guessing.
+- Ctrl+C and `StopFailure` affect the parent, not independent children.
+  A session end retires its identity without a success notification; known
+  remaining tasks must settle before that retirement is finalized.
+- `Done`, completion attention, finished desktop notifications, and PR refresh
+  require the aggregate completion edge. They do not fire when the parent
+  yields to a shell/helper, evidence is missing, or the same delivery repeats.
 
-The hook client forwards the relevant payload fields (event name, session, cwd,
-tool, subagent ID, notification type, permission mode, message) as a typed `ClaudeHook` request
-instead of a pre-decided state. A hook client from before this contract is
-folded into the same pipeline from its coarse event name.
+The hook client retains bounded typed identity/activity fields rather than
+persisting arbitrary hook JSON. Its per-pane journal is under the control
+registry's `claude-activity` directory. Event publication and checkpointing use
+cross-process locking and durable writes; only exact checkpointed delivery IDs
+and observed gap tokens are removed. A lost-event boundary invalidates older
+inventories but cannot invalidate a genuinely newer complete inventory.
+Durable state excludes assistant-message bodies and transient display copy.
+Pane-process replacement retires the old activity rather than restoring it
+into a new shell that happens to reuse the pane ID.
 
-Subagent tracking requires the current managed hooks: use **Repair** or
-**Re-add** after upgrading to install `SubagentStop`, then restart Claude Code
-so its hook configuration is refreshed. Tracking is pane-local and starts with
-observed hooks; a Muxtrix restart cannot reconstruct already-running helpers
-from the parent-only session record.
+Use **Repair** or **Re-add** after upgrading when the installed hooks are
+outdated, then restart Claude Code to reload its configuration. Legacy clients
+and Claude versions without task inventories can still report parent activity,
+but an idle parent is not sufficient to claim all work is complete.
 
-Every prior Claude signal is now demoted: the OSC title spinner (which the
-harness makes static under a multiplexer anyway), the `esc to interrupt`
-footer, the progress line, and the composer are identification and last-resort
-fallbacks. `Needs input` no longer depends on recognising a dialog's text.
+OSC titles, progress lines, footers, and composers remain identity and limited
+fallback evidence. They cannot erase the task ledger or clear its uncertainty.
 
 ## Benefits
 
 - Automatic approvals never flash or accumulate false human attention.
 - Manual approvals still turn amber from the UI the user can actually act on.
-- Claude's row is whatever Claude Code itself says it is, including every
-  blocking dialog the harness can raise, within one watcher tick or one hook.
-- State clears from newer screen evidence (Codex) or the harness's own record
-  (Claude); Oh My Pi's active lifecycle remains the exception, and Pi's state
-  is its extension's word alone.
+- Claude reports the parent and its independent work together, while preserving
+  the priority of an actual blocking dialog.
+- Missing evidence is visible as neutral `Unknown`, not false `Idle`, `Done`,
+  or `Needs input`. Fresh authoritative evidence resolves it.
+- Oh My Pi's active lifecycle and Pi's exact extension contract are unchanged.
 - Historical transcript questions and parallel tool completions cannot own the
   current attention state.
 - Hooks remain useful for pane/session attribution and terminal-independent
@@ -337,20 +356,21 @@ fallbacks. `Needs input` no longer depends on recognising a dialog's text.
   built-in dialogs that bypass its extension UI (the project trust prompt)
   are not reported, and releases older than 0.84.4 never emit the prompt
   events at all.
-- Claude's session record is an internal file whose shape is confirmed on
-  2.1.246, not a documented contract. An unreadable directory or a changed
-  schema degrades to hooks plus the screen classifier, never to an invented
-  state. Ambiguous session/PID/cwd matches are ignored rather than guessed.
+- Claude's parent record and system task-notification envelope are internal
+  formats, checked against 2.1.246 and 2.1.289 respectively. Unsupported
+  formats, unreadable sources, and journal gaps can produce `Unknown`;
+  Muxtrix does not claim exact state where the harness supplies no evidence.
+  Ambiguous session/PID/cwd matches are ignored rather than guessed.
 - A host without `/proc` (macOS, native Windows) cannot probe liveness; a
   stale file there is excluded only by hook identity, and cwd-only matching
   is off.
 - A Windows host reads a WSL distribution's records over `\\wsl.localhost`
   once hook discovery has resolved that distribution's home, and keeps one
   hidden `wsl.exe` prober alive while any record exists.
-- Rollout parsing could later add tool names, subagent activity, transcript
-  recovery, and richer summaries. It should remain descriptive metadata unless
-  records are request-correlated and prove that a person currently has an
-  actionable prompt.
+- The task observer reads only the hook-provided transcript path and strict
+  task-notification envelopes. It is not a general transcript or output parser.
+  Unsupported completion formats remain uncertain until a newer complete
+  inventory or another exact terminal observation resolves them.
 - Direct Codex app-server events could distinguish automatic review from an
   explicit approval request exactly. Adopting them would require a supported
   ownership/transport boundary for sessions launched as ordinary terminal
@@ -374,11 +394,17 @@ evidence and `ui_prompt_end` clears it, only `agent_settled` completes the
 turn, a settled error fails the pane with Pi's message, and a legacy Oh My Pi
 module reporting as `pi` keeps its Oh My Pi identity.
 
-Claude fixtures pin the record contract: a live `busy` record decides the pane
-over its painted idle composer and the screen stays silent while matched; a
-`waiting` record raises attention that the next `busy` clears; a lost record
-returns authority to the screen; a hook edge leads and a record stamped before
-it cannot regress it; `SessionEnd` removes the pane; ambiguous cwd matches are
-rejected, a unique cwd needs a prober-confirmed process, and exact PID
-matching succeeds. Parser fixtures use a verbatim 2.1.246 record, and the
-prober is exercised against the test process itself.
+Claude fixtures cover independent parent/task ordering, equal timestamps,
+duplicates, missing/malformed/empty inventories, mixed helpers and shells,
+silent exact task completion, interruption/failure, real input waits, ambient
+monitors, scheduled wakeups, session switches/resume, and bounded durable
+history. Offline hook tests launch the real `muxtrixctl` executable with an
+isolated registry and exercise checkpoint/delivery races. Application cases
+cover causal journal gaps, stale identity rejection, pane-process retirement,
+and completion side effects. Record matching still rejects ambiguous cwd,
+requires confirmed liveness for unique cwd, and accepts exact PID.
+
+Headless `claude-background-work`, `claude-activity-unknown`, and
+`claude-activity-recovery` scenarios exercise the production application.
+Recovery includes an offline hook, transcript-only shell completion, actual
+GUI process replacement, and reattachment to the original session daemon.

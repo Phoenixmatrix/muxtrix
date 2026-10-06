@@ -14,6 +14,7 @@ mod app;
 mod assets;
 mod box_drawing;
 mod claude_status;
+mod claude_tasks;
 mod commands;
 mod desktop_notify;
 mod doctor;
