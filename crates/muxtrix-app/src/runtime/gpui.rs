@@ -697,10 +697,9 @@ impl Root {
                 // the tick's fingerprint thought, this is the one frame that
                 // has to be drawn before anyone looks.
                 cx.notify();
-                // The frame is grabbed from outside this process; all that
-                // happens here is asserting state and saying so on the control
-                // socket, which `capture_ready` already reports. The window
-                // deliberately stays up until the harness sends `Quit`.
+                // The harness grabs the frame and leaves the window up until
+                // `Quit`. Restart readiness additionally waits for the render
+                // callback below to acknowledge presentation.
                 if let Err(error) = self.app.report_e2e_capture() {
                     eprintln!("muxtrix: e2e capture failed: {error}");
                     cx.quit();
@@ -1005,6 +1004,32 @@ impl Render for Root {
                     self.focus.focus(window, cx);
                 }
             }
+        }
+        #[cfg(feature = "e2e")]
+        if self
+            .app
+            .e2e
+            .as_mut()
+            .is_some_and(crate::e2e::Scenario::queue_capture_frame)
+        {
+            let root = cx.entity().downgrade();
+            // Arm only while rendering the recovered state. GPUI drains
+            // next-frame callbacks before presenting a frame drawn outside
+            // its platform frame loop, so cross a second frame boundary too:
+            // the first callback's turn has presented this scene before the
+            // acknowledgement can become visible on the control socket.
+            window.on_next_frame(move |window, _| {
+                window.on_next_frame(move |_, cx| {
+                    let _ = root.update(cx, |root, cx| {
+                        if let Some(scenario) = root.app.e2e.as_mut()
+                            && let Err(error) = scenario.acknowledge_capture_frame()
+                        {
+                            eprintln!("muxtrix: e2e presentation report failed: {error}");
+                            cx.quit();
+                        }
+                    });
+                });
+            });
         }
         let tokens = DesignTokens::for_appearance(self.app.settings.appearance);
         // Settings and the theme gallery replace the whole shell rather than

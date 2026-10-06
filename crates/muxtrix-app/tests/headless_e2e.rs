@@ -40,6 +40,27 @@ impl Drop for ProcessGuard {
         }
     }
 }
+struct PrivateHome(std::path::PathBuf);
+
+impl Drop for PrivateHome {
+    fn drop(&mut self) {
+        // Session daemons deliberately outlive the GUI; terminate only those
+        // whose records live in this run's private HOME, including on failure.
+        if let Ok(entries) = std::fs::read_dir(self.0.join(".muxtrix/sessions")) {
+            for entry in entries.flatten() {
+                if let Ok(bytes) = std::fs::read(entry.path())
+                    && let Ok(record) =
+                        serde_json::from_slice::<muxtrix_sessions::SessionRecord>(&bytes)
+                    && let Ok((client, _, _)) =
+                        muxtrix_sessions::SessionClient::connect_endpoint(&record.endpoint)
+                {
+                    let _ = client.send(&muxtrix_sessions::Request::Shutdown);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 #[test]
 fn real_app_runs_terminal_workspace_flow_on_private_x_server()
@@ -120,6 +141,24 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     let home_path =
         std::env::temp_dir().join(format!("muxtrix-e2e-home-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&home_path)?;
+    std::fs::set_permissions(&home_path, std::fs::Permissions::from_mode(0o700))?;
+    let _home_guard = PrivateHome(home_path.clone());
+    let registry_path = home_path.join("control-registry");
+    let fixture_path = home_path.join("claude-fixture");
+    std::fs::create_dir(&fixture_path)?;
+    // One GNU date invocation keeps these two representations on the same
+    // second, including at midnight. The app never sleeps or runs date.
+    let timestamp = Command::new("date")
+        .args(["-u", "+%s000|%Y-%m-%dT%H:%M:%S.000Z"])
+        .output()?;
+    if !timestamp.status.success() {
+        return Err("could not obtain the synthetic Claude fixture timestamp".into());
+    }
+    let timestamp = String::from_utf8(timestamp.stdout)?;
+    let (timestamp_ms, timestamp_utc) = timestamp
+        .trim()
+        .split_once('|')
+        .ok_or("date did not return both timestamp formats")?;
     let requested_screenshot = std::env::var_os("MUXTRIX_E2E_SCREENSHOT_RGBA");
     let capture = std::env::var("MUXTRIX_E2E_CAPTURE").unwrap_or_default();
     let screenshot_path = requested_screenshot.clone().map_or_else(
@@ -138,7 +177,8 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         std::fs::copy(&profile, &config_path)?;
         eprintln!("seeded settings profile from {}", profile.to_string_lossy());
     }
-    let mut app = Command::new(env!("CARGO_BIN_EXE_muxtrix"))
+    let mut launch = Command::new(env!("CARGO_BIN_EXE_muxtrix"));
+    launch
         .env("DISPLAY", &display)
         .env_remove("WAYLAND_DISPLAY")
         .env("WINIT_UNIX_BACKEND", "x11")
@@ -162,15 +202,27 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         .env("MUXTRIX_CONTROL_ENDPOINT", &control_path)
         .env("MUXTRIX_E2E_SCREENSHOT_RGBA", &screenshot_path)
         .env("HOME", &home_path)
+        .env("MUXTRIX_CONTROL_REGISTRY", &registry_path)
+        .env("CLAUDE_CONFIG_DIR", home_path.join(".claude"))
+        .env("MUXTRIX_E2E_CLAUDE_FIXTURE", &fixture_path)
+        .env("MUXTRIX_E2E_CLAUDE_TIMESTAMP_MS", timestamp_ms)
+        .env("MUXTRIX_E2E_CLAUDE_TIMESTAMP", timestamp_utc)
+        .env_remove("MUXTRIX_E2E_CLAUDE_RESTART")
         .env("SHELL", "/bin/sh")
         .env("WGPU_BACKEND", "vulkan")
         .env("GALLIUM_DRIVER", "llvmpipe")
         .env("MESA_D3D12_DEFAULT_ADAPTER_NAME", "none")
         .env("EGL_LOG_LEVEL", "fatal")
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map(|child| ProcessGuard(Some(child)))?;
+        .stderr(Stdio::inherit());
+    if capture == "claude-activity-recovery" {
+        launch
+            .env("MUXTRIX_E2E_SESSIOND", "1")
+            .env_remove("MUXTRIX_NO_SESSIOND");
+    } else {
+        launch.env_remove("MUXTRIX_E2E_SESSIOND");
+    }
+    let mut app = launch.spawn().map(|child| ProcessGuard(Some(child)))?;
 
     // No key repeat. A key is pressed and released by XTEST back to back, but
     // the app reads them when it next gets to its event queue; if that is
@@ -508,7 +560,7 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     // scenario has settled, and waits to be told to quit so the frame is
     // still on screen when it is taken.
     let captured = {
-        let ready = Instant::now() + Duration::from_secs(60);
+        let ready = Instant::now() + Duration::from_secs(90);
         loop {
             // The app closes its socket when it gives up, so a lost
             // connection means it has already written why.
@@ -933,12 +985,118 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     }
 
     let mut report: serde_json::Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
+    if capture == "claude-activity-recovery" {
+        for expected in [
+            "durable_stop_replayed_running",
+            "silent_task_notification_completed",
+            "completion_checkpoint_persisted",
+        ] {
+            assert!(
+                report["claude_activity_checks"]
+                    .as_array()
+                    .is_some_and(|checks| checks.iter().any(|check| check == expected)),
+                "missing Claude runtime observation {expected}: {report}"
+            );
+        }
+        let restart_report = fixture_path.join("restart-report.json");
+        let restart_control = fixture_path.join("restart.sock");
+        let mut restarted = launch
+            .env("MUXTRIX_E2E_CLAUDE_RESTART", "1")
+            .env("MUXTRIX_E2E_REPORT", &restart_report)
+            .env("MUXTRIX_CONTROL_ENDPOINT", &restart_control)
+            .spawn()
+            .map(|child| ProcessGuard(Some(child)))?;
+        let restart_window = wait_for_app_window(&connection, root, Duration::from_secs(8))?;
+        let deadline = Instant::now() + Duration::from_secs(35);
+        loop {
+            if restarted.child_mut().try_wait()?.is_some() {
+                return Err(format!(
+                    "restarted app exited: {}",
+                    std::fs::read_to_string(&restart_report).unwrap_or_default()
+                )
+                .into());
+            }
+            // For the restarted process this is a GPUI presentation ack,
+            // not just Scenario::Screenshot. It is armed by rendering the
+            // resumed pane and released after its frame was presented.
+            if control_request(&restart_control, r#"{"method":"e2e_status"}"#)?["capture_ready"]
+                == true
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("restarted app did not present its recovered Claude checkpoint".into());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&restart_report)?)?;
+        assert_eq!(
+            recovered["capture_presented"], true,
+            "recovered activity must be presented before reading X pixels: {recovered}"
+        );
+        assert_eq!(recovered["success"], true, "{recovered}");
+        assert_eq!(
+            recovered["recovered_pane_id"],
+            std::fs::read_to_string(fixture_path.join("pane"))?,
+            "the presented checkpoint must belong to the original daemon pane"
+        );
+        let frame = grab_window(&connection, restart_window)?;
+        assert!(frame.width > 0 && frame.height > 0);
+        assert!(
+            frame
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel != &frame.rgba[..4]),
+            "restarted activity frame was blank"
+        );
+        assert!(
+            recovered["claude_activity_checks"]
+                .as_array()
+                .is_some_and(|checks| checks
+                    .iter()
+                    .any(|check| check == "process_restart_restored_task_checkpoint"))
+        );
+        report["claude_activity_restart"] = recovered;
+        let _ = control_request(&restart_control, r#"{"method":"quit"}"#)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while restarted.child_mut().try_wait()?.is_none() {
+            if Instant::now() >= deadline {
+                return Err("restarted app did not quit".into());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(restarted.take().wait_with_output()?.status.success());
+    }
+    for expected in match capture.as_str() {
+        "claude-background-work" | "claude-subagents" => &[
+            "parent_stop_preserves_background_running",
+            "fallback_idle_preserves_background_running",
+            "approval_takes_precedence",
+            "approval_returns_to_background_running",
+            "shell_parent_preserves_background_running",
+        ][..],
+        "claude-activity-unknown" => &[
+            "missing_registry_is_unknown",
+            "invalid_registry_stays_unknown",
+            "unknown_does_not_raise_attention",
+        ][..],
+        _ => &[][..],
+    } {
+        assert!(
+            report["claude_activity_checks"]
+                .as_array()
+                .is_some_and(|checks| checks.iter().any(|check| check == *expected)),
+            "missing Claude activity observation {expected}: {report}"
+        );
+    }
     // The application answered for its state; the pixels are answered here,
     // because this is the process that holds them.
     merge_pixel_findings(&mut report, &captured);
     if std::env::var_os("MUXTRIX_E2E_KEEP_REPORT").is_none() {
         let _ = std::fs::remove_file(&report_path);
     } else {
+        std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
         eprintln!("report kept at {}", report_path.display());
     }
     let _ = std::fs::remove_file(&config_path);
@@ -951,7 +1109,6 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
     let _ = std::fs::remove_file(&mouse_probe_completed_path);
     let _ = std::fs::remove_file(&scrollback_marker);
     let _ = std::fs::remove_file(&mouse_probe_path);
-    let _ = std::fs::remove_dir_all(&home_path);
     if requested_screenshot.is_none() {
         let _ = std::fs::remove_file(&screenshot_path);
     }

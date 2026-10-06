@@ -289,12 +289,15 @@ accent instead, and the `Navigate — ↑↓ move · Enter select · Esc exit` h
 names the mode in words for as long as the cursor exists.
 
 Pane-state signals use green only while an agent is actively working; neutrals
-for an ordinary shell, idle agent, completed turn, or stopped process; amber
-only for work that needs a person; and red for failure. Focus remains the
-separate blue rail, and every pip retains a nearby text state instead of relying
-on color alone. A user-issued Ctrl+C is immediate pane-local evidence that a
-running turn stopped; the fleet must not remain green while waiting for an agent
-harness that may never emit an interruption lifecycle hook.
+for an ordinary shell, idle agent, completed turn, stopped process, or unknown
+activity; amber only for work that needs a person; and red for failure. Focus
+remains the separate blue rail, and every pip retains a nearby text state
+instead of relying on color alone. `Unknown` carries explanatory activity text
+but creates neither attention nor a finished notification.
+
+A user-issued Ctrl+C immediately interrupts the foreground turn. It does not
+prove that Claude's independent shells or helpers stopped: known remaining
+work stays green, and insufficient evidence is neutral rather than false Done.
 
 A pane may also project a *roster* rather than one conversation: Claude Code's
 Agents view, reached with `←` on an empty composer or launched directly. Such a
@@ -322,13 +325,13 @@ a failed read keeps the previous counts rather than inventing new ones, and a
 read that has never once succeeded says `Unavailable` with the reason on the
 activity line rather than leaving a row that waits forever.
 
-The same machine-readable payload corrects ordinary interactive Claude rows.
-Records associate one-to-one by session ID, exact process PID, or unique cwd;
-ambiguous records do nothing. A visible blocker remains authoritative,
-structured `busy` outranks an idle-looking composer, and positive working
-chrome outranks a lagging structured `idle`. Poll failures may preserve the
-Agents-view aggregate, but pane-local structured state is discarded immediately
-so an old `busy` record can never pin a row green.
+Claude's session records describe the parent, not all of its work. Records
+associate one-to-one by session ID, exact process PID, or unique cwd; ambiguous
+records do nothing. A fresh blocker takes precedence over child activity.
+Parent idle/shell mode and an idle-looking composer cannot clear running or
+uncertain tasks. Complete hook inventories and exact terminal task evidence
+resolve that aggregate; source loss produces neutral `Unknown`, not a false
+idle/completion signal. The Agents-view roll-up remains a separate projection.
 
 Titles that name the harness's current view rather than its work — the roster's
 own title and the `current session` label Claude Code emits on the way back —

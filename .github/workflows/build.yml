@@ -86,6 +86,12 @@ jobs:
       - name: Run Linux headless application E2E
         run: cargo test -p muxtrix --features e2e --test headless_e2e --locked -- --test-threads=1
 
+      - name: Verify Claude aggregate activity and GUI recovery
+        run: |
+          for capture in claude-background-work claude-activity-unknown claude-activity-recovery; do
+            MUXTRIX_E2E_CAPTURE="$capture" cargo test -p muxtrix --features e2e --test headless_e2e --locked -- --test-threads=1
+          done
+
   build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}

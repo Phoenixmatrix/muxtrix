@@ -151,6 +151,27 @@ Combine any capture with
 `MUXTRIX_E2E_SCREENSHOT_RGBA=/tmp/muxtrix-settings.rgba` when inspecting the GPU
 output without exposing a host window.
 
+Claude aggregate-activity captures:
+
+| Capture | Production path exercised |
+| --- | --- |
+| `claude-background-work` | Mixed shell/helper inventory, yielded parent, record and composer idle fallback, input-wait precedence, and parent shell mode |
+| `claude-activity-unknown` | Missing/malformed inventory remains neutral Unknown without completion or attention |
+| `claude-activity-recovery` | Offline journal delivery, exact transcript-only shell completion, actual first-GUI exit, second-GUI resume of the original daemon/pane, and recovered-frame presentation acknowledgement |
+
+Run each with `MUXTRIX_E2E_CAPTURE=<capture>` and the same E2E command above.
+For visual review, combine `MUXTRIX_E2E_SCREENSHOT_RGBA` with 1280x800 and
+820x560 viewports. `MUXTRIX_E2E_KEEP_REPORT=1` retains the scenario report.
+Recovery uses an isolated home/control registry and its own session daemon;
+it never resumes or modifies a host user's session.
+
+The deterministic Claude suite additionally covers absent versus empty task
+snapshots, out-of-order/equal-time task and parent evidence, duplicate delivery,
+session changes, failure/interruption, ambient monitors, scheduled wakeups,
+journal loss boundaries, checkpoint races, and pane-process retirement.
+`muxtrix-control` integration tests invoke the real hook client with no GUI
+endpoint and check private durable replay, not just mocked IPC.
+
 The app writes a temporary JSON report and, once told to quit over the control
 socket, exits. Process
 guards terminate the app and X server on failures. The E2E scenario is compiled

@@ -373,6 +373,17 @@ pub(crate) struct Muxtrix {
     /// identity, the harness PID, and whether a live session record is
     /// matched (in which case the screen has no state authority).
     pub(crate) claude_trackers: BTreeMap<PaneId, ClaudeTracker>,
+    claude_journal: Option<ClaudeJournalWorker>,
+    claude_journal_dirty: BTreeSet<PaneId>,
+    claude_journal_loaded: BTreeSet<PaneId>,
+    claude_delivery_ids: BTreeMap<PaneId, BTreeSet<String>>,
+    claude_completed_edges: BTreeSet<PaneId>,
+    claude_task_requests: Arc<Mutex<Vec<crate::claude_tasks::TaskRequest>>>,
+    claude_task_updates: Arc<Mutex<Vec<crate::claude_tasks::TaskObservation>>>,
+    claude_tasks_started: bool,
+    claude_recovery_checked: Option<std::time::Instant>,
+    claude_deferred_hooks: BTreeMap<PaneId, Vec<ClaudeHook>>,
+    claude_journal_incomplete: BTreeMap<PaneId, BTreeSet<String>>,
     /// Claude Code's own live session records, as last read from its
     /// sessions directory. Dead processes are already filtered out.
     pub(crate) claude_records: Vec<SessionRecord>,
@@ -1135,17 +1146,157 @@ pub(crate) struct AgentNotification {
     pub(crate) unread: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AgentPaneStatus {
     pub(crate) agent: String,
     /// Best pane-local identity below an explicit user rename: a title emitted
     /// by the harness, or the linked-worktree directory while it starts.
+    #[serde(skip)]
     pub(crate) display_name: Option<String>,
     pub(crate) state: AgentState,
+    #[serde(skip)]
     pub(crate) activity: Option<String>,
     pub(crate) session_id: Option<String>,
     pub(crate) cwd: Option<String>,
     pub(crate) git_branch: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ClaudeCheckpoint {
+    tracker: ClaudeTracker,
+    status: Option<AgentPaneStatus>,
+}
+
+#[derive(Default)]
+struct ClaudeJournalInput {
+    panes: BTreeSet<PaneId>,
+    checkpoints: BTreeMap<PaneId, (ClaudeCheckpoint, Vec<String>, Vec<String>)>,
+}
+
+enum ClaudeJournalUpdate {
+    Replay(PaneId, muxtrix_control::claude_journal::JournalReplay),
+    Saved(PaneId, Vec<String>, Vec<String>),
+    Unavailable(PaneId, String),
+}
+
+struct ClaudeJournalWorker {
+    input: Arc<Mutex<ClaudeJournalInput>>,
+    output: Arc<Mutex<Vec<ClaudeJournalUpdate>>>,
+}
+
+impl ClaudeJournalWorker {
+    fn spawn(notify: EventNotifier) -> Self {
+        let input = Arc::new(Mutex::new(ClaudeJournalInput::default()));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let worker_input = Arc::clone(&input);
+        let worker_output = Arc::clone(&output);
+        std::thread::spawn(move || {
+            let mut journals = BTreeMap::new();
+            let mut retry_load = BTreeSet::new();
+            let mut pending = BTreeSet::new();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if Arc::strong_count(&worker_input) == 1 {
+                    break;
+                }
+                // One batch in flight; never overwrite undrained replay.
+                if worker_output.lock().map_or(true, |slot| !slot.is_empty()) {
+                    continue;
+                }
+                let (panes, checkpoints) = {
+                    let Ok(mut input) = worker_input.lock() else {
+                        break;
+                    };
+                    (input.panes.clone(), std::mem::take(&mut input.checkpoints))
+                };
+                journals.retain(|pane, _| panes.contains(pane));
+                pending.retain(|pane| panes.contains(pane));
+                retry_load.retain(|pane| panes.contains(pane));
+                let mut updates = Vec::new();
+                for pane in panes {
+                    let journal = match journals.entry(pane) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            match muxtrix_control::claude_journal::ClaudeJournal::for_pane(
+                                &pane.as_uuid().to_string(),
+                            ) {
+                                Ok(journal) => entry.insert(journal),
+                                Err(error) => {
+                                    updates.push(ClaudeJournalUpdate::Unavailable(
+                                        pane,
+                                        error.to_string(),
+                                    ));
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    if let Some((checkpoint, ids, gaps)) = checkpoints.get(&pane) {
+                        let result = serde_json::to_value(checkpoint)
+                            .map_err(std::io::Error::other)
+                            .and_then(|value| journal.checkpoint(&value, ids, gaps));
+                        match result {
+                            Ok(()) => {
+                                pending.remove(&pane);
+                                updates.push(ClaudeJournalUpdate::Saved(
+                                    pane,
+                                    ids.clone(),
+                                    gaps.clone(),
+                                ));
+                            }
+                            Err(error) => {
+                                updates.push(ClaudeJournalUpdate::Unavailable(
+                                    pane,
+                                    error.to_string(),
+                                ));
+                                if let Ok(mut input) = worker_input.lock() {
+                                    input.checkpoints.entry(pane).or_insert_with(|| {
+                                        (checkpoint.clone(), ids.clone(), gaps.clone())
+                                    });
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    if pending.contains(&pane) {
+                        continue;
+                    }
+                    match if retry_load.remove(&pane) {
+                        Ok(true)
+                    } else {
+                        journal.changed()
+                    } {
+                        Ok(false) => {}
+                        Ok(true) => match journal.load() {
+                            Ok(replay) => {
+                                if !replay.events.is_empty() {
+                                    pending.insert(pane);
+                                }
+                                updates.push(ClaudeJournalUpdate::Replay(pane, replay));
+                            }
+                            Err(error) => {
+                                retry_load.insert(pane);
+                                updates.push(ClaudeJournalUpdate::Unavailable(
+                                    pane,
+                                    error.to_string(),
+                                ));
+                            }
+                        },
+                        Err(error) => {
+                            updates.push(ClaudeJournalUpdate::Unavailable(pane, error.to_string()))
+                        }
+                    }
+                }
+                if !updates.is_empty() {
+                    if let Ok(mut slot) = worker_output.lock() {
+                        *slot = updates;
+                    }
+                    notify();
+                }
+            }
+        });
+        Self { input, output }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2282,6 +2433,17 @@ impl Muxtrix {
             agents_view_panes: BTreeSet::new(),
             agents_roster: None,
             claude_trackers: BTreeMap::new(),
+            claude_journal: None,
+            claude_journal_dirty: BTreeSet::new(),
+            claude_journal_loaded: BTreeSet::new(),
+            claude_journal_incomplete: BTreeMap::new(),
+            claude_delivery_ids: BTreeMap::new(),
+            claude_deferred_hooks: BTreeMap::new(),
+            claude_recovery_checked: None,
+            claude_completed_edges: BTreeSet::new(),
+            claude_task_requests: Arc::new(Mutex::new(Vec::new())),
+            claude_task_updates: Arc::new(Mutex::new(Vec::new())),
+            claude_tasks_started: false,
             claude_records: Vec::new(),
             claude_record_slot: Arc::new(Mutex::new(None)),
             claude_watcher_started: false,
@@ -2532,7 +2694,18 @@ impl Muxtrix {
         let now = std::time::Instant::now();
         let mut raised = Vec::new();
         for (pane_id, status) in &self.agent_statuses {
-            let kind = self.desktop_notices.observe(*pane_id, status.state, now);
+            let observed = self.desktop_notices.observe(*pane_id, status.state, now);
+            let kind = if pane_agent(&status.agent) == Some(PaneAgent::ClaudeCode) {
+                if self.claude_completed_edges.remove(pane_id)
+                    && status.state == AgentState::Completed
+                {
+                    Some(crate::desktop_notify::NoticeKind::Finished)
+                } else {
+                    observed.filter(|kind| *kind != crate::desktop_notify::NoticeKind::Finished)
+                }
+            } else {
+                observed
+            };
             if status.state == AgentState::Running && self.desktop_notices.take_shown(*pane_id) {
                 // Back at work: whatever the notice asked has been answered.
                 effects.push(Effect::DismissDesktopNotification(*pane_id));
@@ -5376,6 +5549,13 @@ impl Muxtrix {
         self.detected_agents.clear();
         self.agents_view_panes.clear();
         self.claude_trackers.clear();
+        self.claude_journal = None;
+        self.claude_journal_loaded.clear();
+        self.claude_journal_incomplete.clear();
+        self.claude_deferred_hooks.clear();
+        self.claude_journal_dirty.clear();
+        self.claude_delivery_ids.clear();
+        self.claude_completed_edges.clear();
         self.pane_layouts.clear();
         self.base_pane_layouts.clear();
         self.pane_resize_history.clear();
@@ -5685,6 +5865,7 @@ impl Muxtrix {
         }
         forget_host_pane(pane_id);
         self.clear_pane_activity_state(pane_id);
+        self.claude_trackers.remove(&pane_id);
         self.queued_terminal_restarts.remove(&pane_id);
         if self.maximized_pane == Some(pane_id) {
             self.maximized_pane = None;
@@ -5698,7 +5879,20 @@ impl Muxtrix {
         self.notifications
             .retain(|notification| notification.pane_id != pane_id);
         self.agent_statuses.remove(&pane_id);
-        self.claude_trackers.remove(&pane_id);
+        // Replacing a process retires its durable identity, rather than forgetting
+        // it: a delayed hook must not attach the old session to the new shell.
+        self.claude_trackers
+            .entry(pane_id)
+            .or_default()
+            .retire_session();
+        self.claude_journal_loaded.insert(pane_id);
+        self.claude_journal_dirty.insert(pane_id);
+        self.claude_deferred_hooks.remove(&pane_id);
+        self.claude_completed_edges.remove(&pane_id);
+        if let Ok(mut requests) = self.claude_task_requests.lock() {
+            let pane = pane_id.as_uuid().to_string();
+            requests.retain(|request| request.pane_id != pane);
+        }
         self.agent_running_frame_revisions.remove(&pane_id);
         self.codex_delegated_work.remove(&pane_id);
         self.pi_active_lifecycles.remove(&pane_id);
@@ -8115,8 +8309,24 @@ impl Muxtrix {
         }
         self.codex_delegated_work.remove(&pane_id);
         self.pi_active_lifecycles.remove(&pane_id);
+        if let Some(status) = self.agent_statuses.get(&pane_id)
+            && pane_agent(&status.agent) == Some(PaneAgent::ClaudeCode)
+        {
+            self.claude_trackers.entry(pane_id).or_insert_with(|| {
+                let mut tracker = ClaudeTracker::default();
+                tracker.session_id = status.session_id.clone();
+                tracker
+            });
+        }
         if let Some(tracker) = self.claude_trackers.get_mut(&pane_id) {
-            tracker.interrupted();
+            let current = self
+                .agent_statuses
+                .get(&pane_id)
+                .map_or(AgentState::Unknown, |s| s.state);
+            let decision = tracker.interrupted(current);
+            self.apply_claude_decision(pane_id, decision);
+            self.claude_journal_dirty.insert(pane_id);
+            return;
         }
         let Some(status) = self.agent_statuses.get_mut(&pane_id) else {
             return;
@@ -8490,6 +8700,7 @@ impl Muxtrix {
 
     pub(crate) fn poll_terminal(&mut self) {
         self.drain_terminal_launches();
+        self.poll_claude_recovery();
         self.drain_claude_records();
         let mut notifications = Vec::new();
         let mut exited = Vec::new();
@@ -8548,6 +8759,14 @@ impl Muxtrix {
             .filter_map(|(pane_id, runtime)| {
                 let snapshot = runtime.snapshot.as_ref()?;
                 let identification = agent_screen::identify(snapshot)?;
+                if pane_agent(identification.agent) == Some(PaneAgent::ClaudeCode)
+                    && self
+                        .claude_trackers
+                        .get(pane_id)
+                        .is_some_and(ClaudeTracker::session_ended)
+                {
+                    return None;
+                }
                 let display_name = snapshot
                     .title
                     .as_deref()
@@ -8562,13 +8781,23 @@ impl Muxtrix {
                 .map_or(agent_screen::ScreenState::Idle, |classification| {
                     classification.state
                 });
+            let unknown = pane_agent(identification.agent) == Some(PaneAgent::ClaudeCode)
+                && screen == agent_screen::ScreenState::Idle;
             self.agent_statuses.insert(
                 pane_id,
                 AgentPaneStatus {
                     agent: identification.agent.into(),
                     display_name,
-                    state: screen_state(screen),
-                    activity: Some(agent_state_activity(screen).into()),
+                    state: if unknown {
+                        AgentState::Unknown
+                    } else {
+                        screen_state(screen)
+                    },
+                    activity: Some(if unknown {
+                        "Activity is unknown; waiting for fresh evidence".into()
+                    } else {
+                        agent_state_activity(screen).into()
+                    }),
                     session_id: None,
                     cwd: None,
                     git_branch: None,
@@ -8742,6 +8971,9 @@ impl Muxtrix {
     /// exists. The watcher lives for the rest of the process; it is a
     /// directory listing every few hundred milliseconds.
     fn ensure_claude_watcher(&mut self) {
+        if cfg!(test) {
+            return;
+        }
         if self.claude_watcher_started {
             return;
         }
@@ -8763,6 +8995,326 @@ impl Muxtrix {
         );
     }
 
+    fn restore_claude_journal(
+        &mut self,
+        pane: PaneId,
+        replay: muxtrix_control::claude_journal::JournalReplay,
+    ) {
+        let first = self.claude_journal_loaded.insert(pane);
+        if self
+            .agent_statuses
+            .get(&pane)
+            .is_some_and(|status| pane_agent(&status.agent) != Some(PaneAgent::ClaudeCode))
+        {
+            // A reused pane belongs to its current harness, not old journal identity.
+            let needs_ack = first || !replay.events.is_empty() || !replay.gaps.is_empty();
+            let ids = self.claude_delivery_ids.entry(pane).or_default();
+            ids.extend(
+                replay
+                    .events
+                    .into_iter()
+                    .filter_map(|hook| hook.delivery_id),
+            );
+            self.claude_journal_incomplete
+                .entry(pane)
+                .or_default()
+                .extend(replay.gaps);
+            self.claude_trackers.remove(&pane);
+            self.claude_deferred_hooks.remove(&pane);
+            if needs_ack {
+                self.claude_journal_dirty.insert(pane);
+            }
+            return;
+        }
+        let has_events = !replay.events.is_empty();
+        if first && let Some(value) = replay.checkpoint {
+            match serde_json::from_value::<ClaudeCheckpoint>(value) {
+                Ok(mut checkpoint) => {
+                    let state = checkpoint
+                        .status
+                        .as_ref()
+                        .map_or(AgentState::Unknown, |s| s.state);
+                    let decision = checkpoint.tracker.restored(state);
+                    self.claude_trackers.insert(pane, checkpoint.tracker);
+                    if let Some(status) = checkpoint.status {
+                        self.agent_statuses.insert(pane, status);
+                    } else if self
+                        .agent_statuses
+                        .get(&pane)
+                        .is_some_and(|s| pane_agent(&s.agent) == Some(PaneAgent::ClaudeCode))
+                    {
+                        self.agent_statuses.remove(&pane);
+                    }
+                    self.apply_claude_decision(pane, decision);
+                }
+                Err(_) => self.claude_recovery_unknown(pane, "Saved activity could not be read"),
+            }
+        }
+        // Apply the causal boundary before replay. The reducer also compares it
+        // with live inventories whose replay delivery may already be deduplicated.
+        let known_gaps = self.claude_journal_incomplete.entry(pane).or_default();
+        let mut new_gap = false;
+        for gap in replay.gaps {
+            new_gap |= known_gaps.insert(gap);
+        }
+        if replay.incomplete && (first || new_gap) {
+            self.claude_trackers.entry(pane).or_default();
+            self.claude_recovery_unknown_at(
+                pane,
+                "Activity journal is incomplete",
+                replay.gap_at_ms,
+            );
+            if replay.gap_at_ms == 0 {
+                // An unorderable gap covers both already reduced live evidence
+                // (the zero call above) and all evidence in this recovery batch.
+                let batch_at_ms = replay
+                    .events
+                    .iter()
+                    .chain(self.claude_deferred_hooks.get(&pane).into_iter().flatten())
+                    .map(|hook| hook.sent_at_ms)
+                    .max()
+                    .unwrap_or(0);
+                if batch_at_ms != 0 {
+                    self.claude_recovery_unknown_at(
+                        pane,
+                        "Activity journal is incomplete",
+                        batch_at_ms,
+                    );
+                }
+            }
+        }
+        for hook in replay.events {
+            self.apply_claude_hook(pane, hook);
+        }
+        if let Some(hooks) = self.claude_deferred_hooks.remove(&pane) {
+            for hook in hooks {
+                self.apply_claude_hook(pane, hook);
+            }
+        }
+        // Acknowledge even an empty initial read, so the worker can watch arrivals.
+        // Own checkpoint writes can trigger an empty read; don't rewrite them.
+        if first || has_events || new_gap {
+            self.claude_journal_dirty.insert(pane);
+        }
+    }
+
+    fn claude_recovery_unknown(&mut self, pane: PaneId, reason: &str) {
+        self.claude_recovery_unknown_at(pane, reason, 0);
+    }
+
+    fn claude_recovery_unknown_at(&mut self, pane: PaneId, reason: &str, at_ms: u64) {
+        let current = self
+            .agent_statuses
+            .get(&pane)
+            .map_or(AgentState::Unknown, |s| s.state);
+        if let Some(tracker) = self.claude_trackers.get_mut(&pane) {
+            let previous = self
+                .agent_statuses
+                .get(&pane)
+                .map(|s| (s.state, s.activity.clone()));
+            let decision = tracker.inventory_source_unknown_at(current, reason, at_ms);
+            self.apply_claude_decision(pane, decision);
+            if self
+                .agent_statuses
+                .get(&pane)
+                .map(|s| (s.state, s.activity.clone()))
+                != previous
+            {
+                self.claude_journal_dirty.insert(pane);
+            }
+        }
+    }
+
+    fn poll_claude_recovery(&mut self) {
+        let now = std::time::Instant::now();
+        if !cfg!(test)
+            && self.claude_recovery_checked.is_some_and(|last| {
+                now.duration_since(last) < std::time::Duration::from_millis(250)
+            })
+        {
+            return;
+        }
+        self.claude_recovery_checked = Some(now);
+        self.claude_journal_loaded
+            .retain(|pane| self.terminals.contains_key(pane));
+        self.claude_journal_dirty
+            .retain(|pane| self.terminals.contains_key(pane));
+        self.claude_delivery_ids
+            .retain(|pane, _| self.terminals.contains_key(pane));
+        self.claude_journal_incomplete
+            .retain(|pane, _| self.terminals.contains_key(pane));
+        self.claude_deferred_hooks
+            .retain(|pane, _| self.terminals.contains_key(pane));
+        self.claude_completed_edges
+            .retain(|pane| self.terminals.contains_key(pane));
+        self.claude_trackers
+            .retain(|pane, _| self.terminals.contains_key(pane));
+        // Removal must prune requests even when another unchanged Claude pane
+        // keeps the watcher alive and no checkpoint is dirty.
+        if let Ok(mut requests) = self.claude_task_requests.lock() {
+            requests.retain(|request| {
+                self.claude_trackers.keys().any(|pane| {
+                    let mut buffer = [0; 36];
+                    let pane_key: &str = pane.as_uuid().hyphenated().encode_lower(&mut buffer);
+                    self.agent_statuses.contains_key(pane) && pane_key == request.pane_id
+                })
+            });
+        }
+        // Unit tests use explicit replay fixtures and never touch the user's HOME.
+        if !cfg!(test) && self.claude_journal.is_none() {
+            self.claude_journal =
+                Some(ClaudeJournalWorker::spawn(Arc::clone(&self.event_notifier)));
+        }
+        let updates = self
+            .claude_journal
+            .as_ref()
+            .and_then(|worker| {
+                worker
+                    .output
+                    .lock()
+                    .ok()
+                    .map(|mut slot| std::mem::take(&mut *slot))
+            })
+            .unwrap_or_default();
+        for update in updates {
+            match update {
+                ClaudeJournalUpdate::Replay(pane, replay) if self.terminals.contains_key(&pane) => {
+                    self.restore_claude_journal(pane, replay);
+                }
+                ClaudeJournalUpdate::Saved(pane, ids, gaps) => {
+                    if let Some(pending) = self.claude_delivery_ids.get_mut(&pane) {
+                        for id in ids {
+                            pending.remove(&id);
+                        }
+                    }
+                    if let Some(pending) = self.claude_journal_incomplete.get_mut(&pane) {
+                        for gap in gaps {
+                            pending.remove(&gap);
+                        }
+                    }
+                }
+                ClaudeJournalUpdate::Unavailable(pane, reason) => {
+                    self.claude_recovery_unknown(pane, &reason)
+                }
+                _ => {}
+            }
+        }
+        let observations = self
+            .claude_task_updates
+            .lock()
+            .ok()
+            .map(|mut slot| std::mem::take(&mut *slot))
+            .unwrap_or_default();
+        for observation in observations {
+            let Some(pane) = self
+                .terminals
+                .keys()
+                .copied()
+                .find(|id| id.as_uuid().to_string() == observation.pane_id)
+            else {
+                continue;
+            };
+            let Some(tracker) = self.claude_trackers.get_mut(&pane) else {
+                continue;
+            };
+            if tracker.session_id.as_deref() != Some(observation.session_id.as_str())
+                || tracker.transcript_path.as_deref().map(std::path::Path::new)
+                    != Some(observation.transcript_path.as_path())
+            {
+                continue;
+            }
+            let current = self
+                .agent_statuses
+                .get(&pane)
+                .map_or(AgentState::Unknown, |s| s.state);
+            let decision = match observation.event {
+                crate::claude_tasks::TaskEvent::Finished {
+                    task_id,
+                    status,
+                    at_ms,
+                } => tracker.task_finished(
+                    current,
+                    &observation.session_id,
+                    &task_id,
+                    &status,
+                    at_ms,
+                ),
+                crate::claude_tasks::TaskEvent::Unavailable { reason } => {
+                    tracker.background_source_unknown(current, &reason)
+                }
+            };
+            self.apply_claude_decision(pane, decision);
+            self.claude_journal_dirty.insert(pane);
+        }
+        if (!self.claude_journal_dirty.is_empty()
+            || (!self.claude_tasks_started && !self.claude_trackers.is_empty()))
+            && let Some((_, host)) = self.claude_sessions_source()
+        {
+            let requests = self
+                .claude_trackers
+                .iter()
+                .filter_map(|(pane, tracker)| {
+                    if !self.agent_statuses.contains_key(pane) {
+                        return None;
+                    }
+                    Some(crate::claude_tasks::TaskRequest {
+                        pane_id: pane.as_uuid().to_string(),
+                        session_id: tracker.session_id.clone()?,
+                        transcript_path: PathBuf::from(tracker.transcript_path.as_ref()?),
+                        host: host.clone(),
+                    })
+                })
+                .collect();
+            if let Ok(mut slot) = self.claude_task_requests.lock() {
+                *slot = requests;
+            }
+            if !cfg!(test) && !self.claude_tasks_started && !self.claude_trackers.is_empty() {
+                self.claude_tasks_started = true;
+                crate::claude_tasks::spawn_watcher(
+                    Arc::clone(&self.claude_task_requests),
+                    Arc::clone(&self.claude_task_updates),
+                    Arc::clone(&self.event_notifier),
+                    std::time::Duration::from_millis(500),
+                );
+            }
+        }
+        if let Some(worker) = &self.claude_journal
+            && let Ok(mut input) = worker.input.lock()
+        {
+            if !input.panes.iter().eq(self.terminals.keys()) {
+                input.panes = self.terminals.keys().copied().collect();
+            }
+            for pane in std::mem::take(&mut self.claude_journal_dirty) {
+                if !self.claude_journal_loaded.contains(&pane) {
+                    continue;
+                }
+                let checkpoint = ClaudeCheckpoint {
+                    tracker: self
+                        .claude_trackers
+                        .get(&pane)
+                        .map(ClaudeTracker::durable_snapshot)
+                        .unwrap_or_default(),
+                    status: self
+                        .agent_statuses
+                        .get(&pane)
+                        .filter(|s| pane_agent(&s.agent) == Some(PaneAgent::ClaudeCode))
+                        .cloned(),
+                };
+                let ids = self
+                    .claude_delivery_ids
+                    .get(&pane)
+                    .map(|ids| ids.iter().cloned().collect())
+                    .unwrap_or_default();
+                let gaps = self
+                    .claude_journal_incomplete
+                    .get(&pane)
+                    .map(|gaps| gaps.iter().cloned().collect())
+                    .unwrap_or_default();
+                input.checkpoints.insert(pane, (checkpoint, ids, gaps));
+            }
+        }
+    }
+
     /// Takes the watcher's latest read, if any, and applies it.
     fn drain_claude_records(&mut self) {
         let records = self
@@ -8770,15 +9322,16 @@ impl Muxtrix {
             .lock()
             .ok()
             .and_then(|mut slot| slot.take());
-        if let Some(records) = records {
+        if let Some(records) = records
+            && records != self.claude_records
+        {
             self.claude_records = records;
             self.reconcile_claude_records();
         }
     }
 
-    /// Matches the retained records to Claude panes and lets each matched
-    /// record decide its pane's state. A pane whose record disappeared falls
-    /// back to hook edges and the screen.
+    /// Matches retained records to Claude panes. Losing a previously matched
+    /// record withdraws its parent evidence, never proves background completion.
     pub(crate) fn reconcile_claude_records(&mut self) {
         let panes = self.claude_pane_identities();
         let interactive = self
@@ -8795,8 +9348,17 @@ impl Muxtrix {
                     self.apply_claude_record(pane.pane_id, &record);
                 }
                 None => {
-                    if let Some(tracker) = self.claude_trackers.get_mut(&pane.pane_id) {
+                    if let Some(tracker) = self.claude_trackers.get_mut(&pane.pane_id)
+                        && tracker.record_matched
+                    {
                         tracker.record_lost();
+                        let current = self
+                            .agent_statuses
+                            .get(&pane.pane_id)
+                            .map_or(AgentState::Unknown, |s| s.state);
+                        let decision = tracker.reconcile(current);
+                        self.apply_claude_decision(pane.pane_id, decision);
+                        self.claude_journal_dirty.insert(pane.pane_id);
                     }
                 }
             }
@@ -8812,6 +9374,9 @@ impl Muxtrix {
             .entry(pane_id)
             .or_default()
             .record(current, record);
+        if !decision.accepted {
+            return;
+        }
         if let Some(status) = self.agent_statuses.get_mut(&pane_id) {
             if status.session_id.is_none() {
                 status.session_id = record.session_id.clone();
@@ -8824,15 +9389,19 @@ impl Muxtrix {
             }
         }
         self.apply_claude_decision(pane_id, decision);
+        self.claude_journal_dirty.insert(pane_id);
     }
 
     /// Applies what a hook or record decided: the state and its reason, the
     /// attention that a wait raises and its resolution clears, and the turn
     /// and session boundaries the rest of the app reacts to.
     fn apply_claude_decision(&mut self, pane_id: PaneId, decision: claude_status::Decision) {
+        if !decision.accepted {
+            return;
+        }
         if decision.session_ended {
+            self.claude_completed_edges.remove(&pane_id);
             self.agent_statuses.remove(&pane_id);
-            self.claude_trackers.remove(&pane_id);
             self.agent_running_frame_revisions.remove(&pane_id);
             self.terminal_command_buffers.remove(&pane_id);
             self.detected_agents.remove(&pane_id);
@@ -8882,7 +9451,8 @@ impl Muxtrix {
             AgentState::Completed => self.clear_pane_attention(pane_id),
             _ => {}
         }
-        if decision.turn_completed {
+        if decision.turn_completed && state == AgentState::Completed {
+            self.claude_completed_edges.insert(pane_id);
             self.queue_github_pull_request_refresh(pane_id);
         }
     }
@@ -8891,6 +9461,28 @@ impl Muxtrix {
     /// and session identity; the session record confirms or overrides them
     /// on its next write.
     fn apply_claude_hook(&mut self, pane_id: PaneId, hook: ClaudeHook) -> ControlResponse {
+        if !cfg!(test) && !self.claude_journal_loaded.contains(&pane_id) {
+            if hook.delivery_id.is_none() {
+                let pending = self.claude_deferred_hooks.entry(pane_id).or_default();
+                if pending.len() >= 128 {
+                    return ControlResponse::error(
+                        "Claude recovery is unavailable; pending legacy hook limit reached",
+                    );
+                }
+                pending.push(hook);
+            }
+            return ControlResponse::success("claude event queued for recovery");
+        }
+        if let Some(id) = &hook.delivery_id
+            && !self
+                .claude_delivery_ids
+                .entry(pane_id)
+                .or_default()
+                .insert(id.clone())
+        {
+            return ControlResponse::success("duplicate claude delivery ignored");
+        }
+        self.claude_journal_dirty.insert(pane_id);
         let agent = "claude".to_owned();
         if let Some(current) = self.agent_statuses.get(&pane_id)
             && pane_agent(&current.agent) != Some(PaneAgent::ClaudeCode)
@@ -8902,6 +9494,19 @@ impl Muxtrix {
             return ControlResponse::success(
                 "event names a different agent than the pane is running; ignored",
             );
+        }
+        let current = self
+            .agent_statuses
+            .get(&pane_id)
+            .map_or(AgentState::Unknown, |s| s.state);
+        let decision = self
+            .claude_trackers
+            .entry(pane_id)
+            .or_default()
+            .hook(current, &hook);
+        self.claude_journal_dirty.insert(pane_id);
+        if !decision.accepted {
+            return ControlResponse::success("stale claude event ignored");
         }
         let git_branch = git_branch_for_directory(hook.cwd.as_deref());
         let display_name = self
@@ -8940,15 +9545,8 @@ impl Muxtrix {
                         git_branch,
                     },
                 );
-                self.claude_trackers.remove(&pane_id);
             }
         }
-        let current = self.agent_statuses[&pane_id].state;
-        let decision = self
-            .claude_trackers
-            .entry(pane_id)
-            .or_default()
-            .hook(current, &hook);
         self.apply_claude_decision(pane_id, decision);
         self.ensure_claude_watcher();
         // The record may already describe the moment after this edge.
@@ -9494,7 +10092,10 @@ impl Muxtrix {
                                 self.queue_github_pull_request_refresh(pane_id);
                             }
                         }
-                        AgentState::Idle | AgentState::Running | AgentState::Stopped => {}
+                        AgentState::Idle
+                        | AgentState::Running
+                        | AgentState::Stopped
+                        | AgentState::Unknown => {}
                     }
                     ControlResponse::success("agent lifecycle state updated")
                 }
@@ -9628,10 +10229,13 @@ impl Muxtrix {
         // A parent can paint its idle composer while helpers are still
         // running. Hooks remain evidence even without a live session record.
         if state == AgentState::Idle
-            && self
-                .claude_trackers
-                .get(&pane_id)
-                .is_some_and(ClaudeTracker::has_active_subagents)
+            && (current.state == AgentState::Unknown
+                || (pane_agent(agent) == Some(PaneAgent::ClaudeCode)
+                    && current.state == AgentState::Running)
+                || self
+                    .claude_trackers
+                    .get(&pane_id)
+                    .is_some_and(ClaudeTracker::has_background_work))
         {
             return;
         }
@@ -9711,6 +10315,14 @@ impl Muxtrix {
         identification: agent_screen::Identification,
         display_name: Option<String>,
     ) {
+        if pane_agent(identification.agent) == Some(PaneAgent::ClaudeCode)
+            && self
+                .claude_trackers
+                .get(&pane_id)
+                .is_some_and(ClaudeTracker::session_ended)
+        {
+            return;
+        }
         let Some(previous) = self.agent_statuses.get(&pane_id) else {
             return;
         };
@@ -9721,7 +10333,13 @@ impl Muxtrix {
             .map_or(agent_screen::ScreenState::Idle, |classification| {
                 classification.state
             });
-        let state = screen_state(screen);
+        let state = if pane_agent(identification.agent) == Some(PaneAgent::ClaudeCode)
+            && screen == agent_screen::ScreenState::Idle
+        {
+            AgentState::Unknown
+        } else {
+            screen_state(screen)
+        };
         let frame_revision = self
             .terminals
             .get(&pane_id)
@@ -9732,7 +10350,11 @@ impl Muxtrix {
                 agent: identification.agent.into(),
                 display_name,
                 state,
-                activity: Some(agent_state_activity(screen).into()),
+                activity: Some(if state == AgentState::Unknown {
+                    "Activity is unknown; waiting for fresh evidence".into()
+                } else {
+                    agent_state_activity(screen).into()
+                }),
                 session_id: None,
                 cwd,
                 git_branch,
@@ -9740,7 +10362,9 @@ impl Muxtrix {
         );
         self.pi_active_lifecycles.remove(&pane_id);
         self.codex_delegated_work.remove(&pane_id);
-        self.claude_trackers.remove(&pane_id);
+        if pane_agent(identification.agent) != Some(PaneAgent::ClaudeCode) {
+            self.claude_trackers.remove(&pane_id);
+        }
         if state == AgentState::Running {
             self.agent_running_frame_revisions
                 .insert(pane_id, frame_revision);
@@ -10096,6 +10720,7 @@ impl Muxtrix {
                 AgentState::Completed => "Turn complete".into(),
                 AgentState::Failed => "Agent failed".into(),
                 AgentState::Stopped => "Agent stopped".into(),
+                AgentState::Unknown => "Activity is unknown; waiting for fresh evidence".into(),
             };
         }
         if let Some(notification) = notification.filter(|value| !value.is_empty()) {
@@ -10155,7 +10780,7 @@ impl Muxtrix {
             Some(AgentState::Idle | AgentState::Stopped) => PaneSignalKind::Subtle,
             Some(AgentState::Running) => PaneSignalKind::Active,
             Some(AgentState::Waiting) => PaneSignalKind::Warning,
-            Some(AgentState::Completed) => PaneSignalKind::Neutral,
+            Some(AgentState::Completed | AgentState::Unknown) => PaneSignalKind::Neutral,
             Some(AgentState::Failed) => PaneSignalKind::Danger,
             _ if self.terminals.get(&pane_id).is_some_and(|runtime| {
                 matches!(runtime.launch_state, TerminalLaunchState::Failed(_))
@@ -12741,6 +13366,7 @@ pub(crate) fn agent_state_label(state: AgentState) -> &'static str {
         AgentState::Waiting => "Needs input",
         AgentState::Failed => "Failed",
         AgentState::Stopped => "Stopped",
+        AgentState::Unknown => "Unknown",
     }
 }
 
@@ -12809,6 +13435,7 @@ pub(crate) fn agent_statuses_from_session(
         .flat_map(|tab| tab.panes.values())
         .filter_map(|pane| {
             let agent = pane_agent_name(pane.agent?).to_owned();
+            let unknown = pane.agent == Some(PaneAgent::ClaudeCode);
             let display_name = pane
                 .active_surface()
                 .and_then(|surface| harness_terminal_title(&surface.title, &agent));
@@ -12817,8 +13444,16 @@ pub(crate) fn agent_statuses_from_session(
                 AgentPaneStatus {
                     agent,
                     display_name,
-                    state: AgentState::Idle,
-                    activity: Some(agent_state_activity(agent_screen::ScreenState::Idle).into()),
+                    state: if unknown {
+                        AgentState::Unknown
+                    } else {
+                        AgentState::Idle
+                    },
+                    activity: Some(if unknown {
+                        "Recovering Claude activity".into()
+                    } else {
+                        agent_state_activity(agent_screen::ScreenState::Idle).into()
+                    }),
                     session_id: None,
                     cwd: None,
                     git_branch: None,
@@ -13358,7 +13993,8 @@ pub(crate) fn start_host_unless_resumable(
 /// resumable session. Startup discovery must happen before this function runs.
 pub(crate) fn start_session_host() -> Option<SessionHost> {
     if std::env::var_os("MUXTRIX_NO_SESSIOND").is_some()
-        || std::env::var_os("MUXTRIX_E2E_REPORT").is_some()
+        || (std::env::var_os("MUXTRIX_E2E_REPORT").is_some()
+            && std::env::var_os("MUXTRIX_E2E_SESSIOND").is_none())
     {
         return None;
     }
@@ -13532,7 +14168,8 @@ pub(crate) fn local_pty_allowed() -> bool {
     should_allow_local_pty(
         cfg!(test),
         std::env::var_os("MUXTRIX_NO_SESSIOND").is_some(),
-        std::env::var_os("MUXTRIX_E2E_REPORT").is_some(),
+        std::env::var_os("MUXTRIX_E2E_REPORT").is_some()
+            && std::env::var_os("MUXTRIX_E2E_SESSIOND").is_none(),
     )
 }
 

@@ -195,7 +195,7 @@ impl Drop for ControlRegistration {
     }
 }
 
-fn control_registry_directory() -> PathBuf {
+pub(crate) fn control_registry_directory() -> PathBuf {
     if let Some(directory) = std::env::var_os(CONTROL_REGISTRY_OVERRIDE) {
         return directory.into();
     }

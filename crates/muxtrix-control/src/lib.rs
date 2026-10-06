@@ -1,5 +1,6 @@
 //! Typed local control protocol and reversible agent lifecycle integrations.
 
+pub mod claude_journal;
 mod hooks;
 mod transport;
 
@@ -80,6 +81,8 @@ pub enum AgentState {
     Completed,
     Failed,
     Stopped,
+    /// Activity cannot be established from the available evidence.
+    Unknown,
 }
 
 /// The fields of a Claude Code hook payload that decide pane state or
@@ -117,6 +120,64 @@ pub struct ClaudeHook {
     /// hook edge against the record that may lag or lead it.
     #[serde(default)]
     pub sent_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_tasks: Option<Box<[ClaudeBackgroundTask]>>,
+    #[serde(default)]
+    pub background_tasks_invalid: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_crons: Option<Box<[ClaudeSessionCron]>>,
+    #[serde(default)]
+    pub session_crons_invalid: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeBackgroundTask {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambient: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeSessionCron {
+    pub id: String,
+    pub schedule: String,
+    pub recurring: bool,
+}
+
+fn bounded_snapshot<T: serde::de::DeserializeOwned>(
+    payload: &serde_json::Value,
+    key: &str,
+    valid: impl Fn(&T) -> bool,
+) -> (Option<Box<[T]>>, bool) {
+    let Some(value) = payload.get(key) else {
+        return (None, false);
+    };
+    let Some(items) = value.as_array() else {
+        return (None, true);
+    };
+    let mut invalid = items.len() > 256;
+    let mut result = Vec::with_capacity(items.len().min(256));
+    for item in items.iter().take(256) {
+        // Limit even unknown fields before allocating a typed item.
+        if item.to_string().len() > 16 * 1024 {
+            invalid = true;
+            continue;
+        }
+        match T::deserialize(item) {
+            Ok(item) if valid(&item) => result.push(item),
+            _ => invalid = true,
+        }
+    }
+    (Some(result.into_boxed_slice()), invalid)
+}
+
+fn valid_identity(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 4096
 }
 
 impl ClaudeHook {
@@ -128,10 +189,24 @@ impl ClaudeHook {
             payload
                 .get(key)
                 .and_then(serde_json::Value::as_str)
+                .filter(|value| value.len() <= 8192)
                 .map(str::to_owned)
         };
+        let (background_tasks, background_tasks_invalid) = bounded_snapshot(
+            payload,
+            "background_tasks",
+            |task: &ClaudeBackgroundTask| {
+                valid_identity(&task.id)
+                    && valid_identity(&task.kind)
+                    && valid_identity(&task.status)
+            },
+        );
+        let (session_crons, session_crons_invalid) =
+            bounded_snapshot(payload, "session_crons", |cron: &ClaudeSessionCron| {
+                valid_identity(&cron.id) && valid_identity(&cron.schedule)
+            });
         Self {
-            event: event.to_owned(),
+            event: event.chars().take(256).collect(),
             session_id: text("session_id"),
             cwd: text("cwd"),
             tool_name: text("tool_name"),
@@ -143,6 +218,11 @@ impl ClaudeHook {
             last_assistant_message: text("last_assistant_message"),
             transcript_path: text("transcript_path"),
             sent_at_ms: 0,
+            background_tasks,
+            background_tasks_invalid,
+            session_crons,
+            session_crons_invalid,
+            delivery_id: None,
         }
     }
 }
@@ -210,5 +290,83 @@ impl ControlResponse {
             panes: Vec::new(),
             capture_ready,
         }
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn background_shell_snapshot_survives_extraction() {
+        let hook = ClaudeHook::from_payload(
+            &serde_json::json!({
+                "background_tasks": [{"id":"shell-1","type":"shell","status":"running","ambient":false}],
+                "session_crons": [{"id":"cron-1","schedule":"*/5 * * * *","recurring":true}]
+            }),
+            "Stop",
+        );
+        let tasks = hook.background_tasks.expect("valid test fixture");
+        assert_eq!(tasks[0].id, "shell-1");
+        assert_eq!(tasks[0].kind, "shell");
+        assert_eq!(tasks[0].status, "running");
+        assert_eq!(tasks[0].ambient, Some(false));
+        assert!(!hook.background_tasks_invalid);
+        assert!(hook.session_crons.expect("valid test fixture")[0].recurring);
+    }
+
+    #[test]
+    fn missing_malformed_and_empty_snapshots_are_distinct() {
+        let absent = ClaudeHook::from_payload(&serde_json::json!({}), "Stop");
+        assert_eq!(absent.background_tasks, None);
+        assert!(!absent.background_tasks_invalid);
+        let empty = ClaudeHook::from_payload(&serde_json::json!({"background_tasks":[]}), "Stop");
+        assert_eq!(empty.background_tasks, Some(Box::default()));
+        assert!(!empty.background_tasks_invalid);
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!([{}]),
+        ] {
+            let hook = ClaudeHook::from_payload(
+                &serde_json::json!({"background_tasks":value, "session_crons":value}),
+                "Stop",
+            );
+            assert!(hook.background_tasks_invalid);
+            assert!(hook.session_crons_invalid);
+        }
+    }
+
+    #[test]
+    fn valid_unknown_values_are_preserved_amid_invalid_entries() {
+        let hook = ClaudeHook::from_payload(
+            &serde_json::json!({
+                "background_tasks": [
+                    {"id":"future","type":"new-kind","status":"new-status","ambient":true},
+                    {"id":"bad","type":"shell","status":"running","ambient":"yes"}
+                ]
+            }),
+            "Stop",
+        );
+        assert!(hook.background_tasks_invalid);
+        let tasks = hook.background_tasks.expect("valid test fixture");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].kind, "new-kind");
+        assert_eq!(tasks[0].status, "new-status");
+        assert_eq!(tasks[0].ambient, Some(true));
+    }
+
+    #[test]
+    fn bounded_snapshots_report_incomplete_evidence() {
+        let task = serde_json::json!({"id":"task","type":"shell","status":"running"});
+        let hook = ClaudeHook::from_payload(
+            &serde_json::json!({"background_tasks":vec![task; 257]}),
+            "Stop",
+        );
+        assert!(hook.background_tasks_invalid);
+        assert_eq!(
+            hook.background_tasks.expect("valid test fixture").len(),
+            256
+        );
     }
 }

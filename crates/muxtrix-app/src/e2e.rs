@@ -161,6 +161,10 @@ pub(super) struct Scenario {
     /// reader, so a new state costs one match arm rather than a new field.
     capture: String,
     workspace_close_state: String,
+    claude_activity_phase: u8,
+    claude_activity_checks: Vec<&'static str>,
+    capture_frame_queued: bool,
+    capture_presented: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +208,15 @@ impl Scenario {
     /// the run, because a wrong state produces a wrong frame no matter who
     /// photographs it.
     pub(crate) fn capture_state(&self) -> Result<(), String> {
+        if std::env::var_os("MUXTRIX_E2E_CLAUDE_RESTART").is_some() {
+            return self.write_report(json!({
+                "success": self.capture_presented
+                    && self.claude_activity_checks.contains(&"process_restart_restored_task_checkpoint"),
+                "capture_presented": self.capture_presented,
+                "recovered_pane_id": self.initial_pane.as_uuid().to_string(),
+                "claude_activity_checks": self.claude_activity_checks,
+            }));
+        }
         self.state_report()?;
         // The state half of the report, minus what only the pixels
         // can answer. Reaching here means every state assertion held, so these
@@ -211,6 +224,7 @@ impl Scenario {
         // and the frame's dimensions.
         self.write_report(json!({
             "success": true,
+            "claude_activity_checks": self.claude_activity_checks,
             "pointer_trace": self.pointer_trace,
             "checks": {
                 "real_window_and_wgpu_frame": true,
@@ -242,9 +256,28 @@ impl Scenario {
         }))
     }
 
-    /// Whether this scenario has settled on the frame it wants captured.
+    /// The restart capture is ready only after GPUI has presented its recovered
+    /// state, not merely after the scenario has requested that frame.
     pub(crate) fn capture_ready(&self) -> bool {
         matches!(self.stage, Stage::Screenshot)
+            && (std::env::var_os("MUXTRIX_E2E_CLAUDE_RESTART").is_none() || self.capture_presented)
+    }
+
+    /// Called from render, never from the scenario timer or control request.
+    pub(crate) fn queue_capture_frame(&mut self) -> bool {
+        if std::env::var_os("MUXTRIX_E2E_CLAUDE_RESTART").is_none()
+            || self.stage != Stage::Screenshot
+            || self.capture_frame_queued
+        {
+            return false;
+        }
+        self.capture_frame_queued = true;
+        true
+    }
+
+    pub(crate) fn acknowledge_capture_frame(&mut self) -> Result<(), String> {
+        self.capture_presented = true;
+        self.capture_state()
     }
 
     pub(super) fn from_environment(initial_pane: PaneId) -> Option<Self> {
@@ -259,6 +292,8 @@ impl Scenario {
                 .map(PathBuf::from),
             started: Instant::now(),
             stage: Stage::PaneMenuClickAway,
+            capture_frame_queued: false,
+            capture_presented: false,
             initial_pane,
             second_pane: None,
             third_pane: None,
@@ -295,6 +330,8 @@ impl Scenario {
             capture: std::env::var_os("MUXTRIX_E2E_CAPTURE")
                 .map_or_else(String::new, |value| value.to_string_lossy().into_owned()),
             workspace_close_state: String::new(),
+            claude_activity_phase: 0,
+            claude_activity_checks: Vec::new(),
         })
     }
 
@@ -403,13 +440,16 @@ impl Scenario {
     }
 
     fn tick(&mut self, app: &mut Muxtrix) -> Result<TickAction, String> {
+        if std::env::var_os("MUXTRIX_E2E_CLAUDE_RESTART").is_some() {
+            return self.advance_claude_restart(app);
+        }
         self.observe(app);
         // Generous on purpose: the harness drives real input through a real X
         // server at whatever pace a software renderer allows, and a two-core
         // CI runner spends most of this budget before the scenario's own
         // stages begin. The deadline exists to turn a hang into a report, not
         // to hold the run to a pace.
-        if self.started.elapsed() > Duration::from_secs(60) {
+        if self.started.elapsed() > Duration::from_secs(90) {
             let terminal = self.third_pane.and_then(|pane_id| {
                 app.terminals.get(&pane_id).map(|runtime| {
                     format!(
@@ -828,6 +868,15 @@ impl Scenario {
                 self.settle_ticks += 1;
                 if self.settle_ticks == 1 {
                     self.stage_capture(app)?;
+                }
+                if (self.capturing("claude-background-work")
+                    || self.capturing("claude-subagents")
+                    || self.capturing("claude-activity-unknown")
+                    || self.capturing("claude-activity-recovery"))
+                    && !self.advance_claude_activity(app)?
+                {
+                    self.settle_ticks = 1;
+                    return Ok(TickAction::Wait);
                 }
                 if self.settle_ticks == 2
                     && (self.capturing("session-picker")
@@ -1696,48 +1745,12 @@ impl Scenario {
             }
             status.display_name = Some("codex-delegated-review".into());
             app.settings.fleet_view = FleetView::Agents;
-        } else if self.capturing("claude-subagents") {
-            for (event, agent_id, stamp) in [
-                ("UserPromptSubmit", None, 100),
-                ("SubagentStart", Some("reviewer"), 101),
-                ("SubagentStart", Some("tester"), 102),
-                ("Stop", None, 103),
-            ] {
-                let mut hook = muxtrix_control::ClaudeHook::from_payload(
-                    &serde_json::json!({
-                        "session_id": "capture-claude-subagents",
-                        "agent_id": agent_id,
-                    }),
-                    event,
-                );
-                hook.sent_at_ms = stamp;
-                let response = app.handle_control_request(ControlRequest::ClaudeHook {
-                    pane_id: Some(self.initial_pane.as_uuid().to_string()),
-                    hook,
-                });
-                if !response.ok {
-                    return Err("Claude subagent capture could not deliver its hook".into());
-                }
-            }
-            let revision = app.terminals[&self.initial_pane].snapshot_revision;
-            app.apply_agent_screen_classification(
-                self.initial_pane,
-                "claude",
-                revision.wrapping_add(1),
-                agent_screen::Classification {
-                    state: agent_screen::ScreenState::Idle,
-                    rule: "claude.idle_composer",
-                },
-            );
-            let status = app
-                .agent_statuses
-                .get_mut(&self.initial_pane)
-                .ok_or_else(|| "Claude capture lost its agent state".to_owned())?;
-            if status.state != AgentState::Running {
-                return Err("Claude parent idle demoted its running subagents".into());
-            }
-            status.display_name = Some("claude-delegated-review".into());
-            app.settings.fleet_view = FleetView::Agents;
+        } else if self.capturing("claude-subagents")
+            || self.capturing("claude-background-work")
+            || self.capturing("claude-activity-unknown")
+            || self.capturing("claude-activity-recovery")
+        {
+            self.stage_claude_activity(app)?;
         } else if self.capturing("fleet-agents") {
             // Stage different harnesses across both tabs so the capture
             // proves Agents is one flat selected-workspace projection.
@@ -2601,6 +2614,348 @@ impl Scenario {
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    fn advance_claude_restart(&mut self, app: &mut Muxtrix) -> Result<TickAction, String> {
+        if self.started.elapsed() > Duration::from_secs(30) {
+            return Err("Restart did not restore the completed Claude task checkpoint".into());
+        }
+        if self.stage == Stage::Screenshot {
+            return Ok(TickAction::Wait);
+        }
+        if self.claude_activity_phase == 0 {
+            let pane = std::fs::read_to_string(self.claude_fixture_path("pane")?)
+                .map_err(|error| error.to_string())?;
+            app.open_session_picker(false);
+            let index = app.session_picker.as_ref().and_then(|picker| {
+                picker.entries.iter().position(|entry| {
+                    entry.alive
+                        && entry
+                            .record
+                            .layout
+                            .as_ref()
+                            .is_some_and(|layout| layout.contains(&pane))
+                })
+            });
+            let Some(index) = index else {
+                return Ok(TickAction::Wait);
+            };
+            app.resume_session(index);
+            let Some(pane_id) = app
+                .terminals
+                .keys()
+                .find(|id| id.as_uuid().to_string() == pane)
+                .copied()
+            else {
+                return Ok(TickAction::Wait);
+            };
+            self.initial_pane = pane_id;
+            self.claude_activity_phase = 1;
+            app.settings.fleet_view = FleetView::Agents;
+            return Ok(TickAction::Wait);
+        }
+        let Some(tracker) = app.claude_trackers.get(&self.initial_pane) else {
+            return Ok(TickAction::Wait);
+        };
+        if tracker.session_id.as_deref() != Some("capture-claude-activity") {
+            return Ok(TickAction::Wait);
+        }
+        if tracker.has_background_work() {
+            return Err("Restart resurrected a completed background task".into());
+        }
+        let state = app
+            .agent_statuses
+            .get(&self.initial_pane)
+            .map(|status| status.state);
+        if !matches!(state, Some(AgentState::Unknown | AgentState::Completed)) {
+            return Err(format!("Restart invented active work: {state:?}"));
+        }
+        if app.session_picker_visible()
+            || app.active_view != crate::app::ActiveView::Workspace
+            || !app
+                .terminals
+                .get(&self.initial_pane)
+                .is_some_and(|runtime| runtime.session.is_some() && runtime.snapshot.is_some())
+        {
+            return Ok(TickAction::Wait);
+        }
+        self.claude_activity_checks
+            .push("process_restart_restored_task_checkpoint");
+        self.stage = Stage::Screenshot;
+        Ok(TickAction::Capture)
+    }
+
+    fn claude_hook(
+        &self,
+        app: &mut Muxtrix,
+        event: &str,
+        tasks: Option<serde_json::Value>,
+        durable: bool,
+    ) -> Result<(), String> {
+        let mut payload = json!({"session_id": "capture-claude-activity"});
+        if let Some(tasks) = tasks {
+            payload["background_tasks"] = tasks;
+        }
+        if self.capturing("claude-activity-recovery") {
+            payload["transcript_path"] = json!(self.claude_fixture_path("tasks.jsonl")?);
+        }
+        let mut hook = muxtrix_control::ClaudeHook::from_payload(&payload, event);
+        if durable {
+            // Completion metadata and hooks share the harness's UTC clock.
+            hook.sent_at_ms = std::env::var("MUXTRIX_E2E_CLAUDE_TIMESTAMP_MS")
+                .map_err(|error| error.to_string())?
+                .parse::<u64>()
+                .map_err(|error| error.to_string())?
+                - 100;
+            muxtrix_control::claude_journal::ClaudeJournal::for_pane(
+                &self.initial_pane.as_uuid().to_string(),
+            )
+            .and_then(|journal| journal.append(&mut hook))
+            .map_err(|error| error.to_string())?;
+            // Simulate a hook whose IPC delivery was lost: only the app's
+            // journal worker may introduce this event into the reducer.
+            return Ok(());
+        }
+        let response = app.handle_control_request(ControlRequest::ClaudeHook {
+            pane_id: Some(self.initial_pane.as_uuid().to_string()),
+            hook,
+        });
+        if !response.ok {
+            return Err(format!("Claude activity hook {event} was rejected"));
+        }
+        Ok(())
+    }
+
+    fn claude_fixture_path(&self, name: &str) -> Result<PathBuf, String> {
+        Ok(PathBuf::from(
+            std::env::var_os("MUXTRIX_E2E_CLAUDE_FIXTURE")
+                .ok_or_else(|| "Claude capture fixture directory is missing".to_owned())?,
+        )
+        .join(name))
+    }
+
+    fn expect_claude_state(&self, app: &Muxtrix, expected: AgentState) -> Result<(), String> {
+        let actual = app
+            .agent_statuses
+            .get(&self.initial_pane)
+            .map(|status| status.state);
+        if actual != Some(expected) {
+            return Err(format!(
+                "Claude activity expected {expected:?}, observed {actual:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn stage_claude_activity(&mut self, app: &mut Muxtrix) -> Result<(), String> {
+        app.settings.fleet_view = FleetView::Agents;
+        if self.capturing("claude-activity-unknown") {
+            self.claude_hook(app, "Stop", None, false)?;
+            self.expect_claude_state(app, AgentState::Unknown)?;
+            self.claude_activity_checks
+                .push("missing_registry_is_unknown");
+        } else {
+            let recovery = self.capturing("claude-activity-recovery");
+            let tasks = if recovery {
+                std::fs::write(self.claude_fixture_path("tasks.jsonl")?, b"")
+                    .map_err(|error| error.to_string())?;
+                std::fs::write(
+                    self.claude_fixture_path("pane")?,
+                    self.initial_pane.as_uuid().to_string(),
+                )
+                .map_err(|error| error.to_string())?;
+                json!([{"id":"shell-check","type":"shell","status":"running","ambient":false}])
+            } else {
+                json!([
+                    {"id":"shell-check","type":"shell","status":"running","ambient":false},
+                    {"id":"reviewer","type":"subagent","status":"running","ambient":false}
+                ])
+            };
+            self.claude_hook(app, "Stop", Some(tasks), recovery)?;
+            if !recovery {
+                self.expect_claude_state(app, AgentState::Running)?;
+                self.claude_activity_checks
+                    .push("parent_stop_preserves_background_running");
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_claude_activity(&mut self, app: &mut Muxtrix) -> Result<bool, String> {
+        if self.capturing("claude-activity-unknown") {
+            if self.claude_activity_phase == 0 {
+                self.claude_hook(app, "Stop", Some(json!({"invalid":"registry"})), false)?;
+                self.claude_activity_phase = 1;
+                return Ok(false);
+            }
+            self.expect_claude_state(app, AgentState::Unknown)?;
+            if app
+                .active_workspace()?
+                .pane(self.initial_pane)
+                .is_some_and(|pane| pane.attention.unread_count > 0)
+                || !app.global_alerts.is_empty()
+            {
+                return Err("Unknown Claude activity incorrectly raised attention".into());
+            }
+            if self.claude_activity_phase == 1 {
+                self.claude_activity_checks
+                    .push("invalid_registry_stays_unknown");
+                self.claude_activity_checks
+                    .push("unknown_does_not_raise_attention");
+                self.claude_activity_phase = 2;
+            }
+            return Ok(true);
+        }
+        if self.capturing("claude-activity-recovery") {
+            match self.claude_activity_phase {
+                0 => {
+                    if app
+                        .agent_statuses
+                        .get(&self.initial_pane)
+                        .map(|status| status.state)
+                        != Some(AgentState::Running)
+                    {
+                        return Ok(false);
+                    }
+                    self.claude_activity_checks
+                        .push("durable_stop_replayed_running");
+                    // No new parent hook or record: only the real transcript
+                    // worker can discover this terminal task edge.
+                    let notification = json!({
+                        "type":"user", "isSidechain":false,
+                        "sessionId":"capture-claude-activity",
+                        "timestamp":std::env::var("MUXTRIX_E2E_CLAUDE_TIMESTAMP")
+                            .map_err(|error| error.to_string())?,
+                        "promptSource":"system", "queueSkipAttachments":true,
+                        "origin":{"kind":"task-notification","producer":"session-task"},
+                        "message":{"role":"user","content":
+                            "<task-notification>\n<task-id>shell-check</task-id>\n<status>completed</status>\n<summary>Checks complete</summary>\n</task-notification>"}
+                    });
+                    std::fs::write(
+                        self.claude_fixture_path("tasks.jsonl")?,
+                        format!("{notification}\n"),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    self.claude_activity_phase = 1;
+                    return Ok(false);
+                }
+                1 => {
+                    if app
+                        .agent_statuses
+                        .get(&self.initial_pane)
+                        .map(|status| status.state)
+                        != Some(AgentState::Completed)
+                    {
+                        return Ok(false);
+                    }
+                    if app
+                        .claude_trackers
+                        .get(&self.initial_pane)
+                        .is_none_or(|tracker| tracker.has_background_work())
+                    {
+                        return Err("Transcript completion left matching task running".into());
+                    }
+                    self.claude_activity_checks
+                        .push("silent_task_notification_completed");
+                    self.claude_activity_phase = 2;
+                }
+                _ => {}
+            }
+            let replay = muxtrix_control::claude_journal::ClaudeJournal::for_pane(
+                &self.initial_pane.as_uuid().to_string(),
+            )
+            .and_then(|journal| journal.load())
+            .map_err(|error| error.to_string())?;
+            if replay
+                .checkpoint
+                .as_ref()
+                .and_then(|value| value.get("status"))
+                .and_then(|value| value.get("state"))
+                .and_then(|value| value.as_str())
+                != Some("completed")
+                || !replay.events.is_empty()
+            {
+                return Ok(false);
+            }
+            if self.claude_activity_phase == 2 {
+                self.claude_activity_checks
+                    .push("completion_checkpoint_persisted");
+                self.claude_activity_phase = 3;
+            }
+            app.sync_session_layout();
+            return Ok(true);
+        }
+        match self.claude_activity_phase {
+            0 => {
+                let revision = app.terminals[&self.initial_pane].snapshot_revision;
+                app.apply_agent_screen_classification(
+                    self.initial_pane,
+                    "claude",
+                    revision.wrapping_add(1),
+                    agent_screen::Classification {
+                        state: agent_screen::ScreenState::Idle,
+                        rule: "claude.idle_composer",
+                    },
+                );
+                self.expect_claude_state(app, AgentState::Running)?;
+                self.claude_activity_checks
+                    .push("fallback_idle_preserves_background_running");
+                self.claude_hook(app, "PermissionRequest", None, false)?;
+                self.expect_claude_state(app, AgentState::Waiting)?;
+                self.claude_activity_checks
+                    .push("approval_takes_precedence");
+                self.claude_activity_phase = 1;
+                Ok(false)
+            }
+            1 => {
+                self.claude_hook(
+                    app,
+                    "Stop",
+                    Some(json!([
+                        {"id":"shell-check","type":"shell","status":"running","ambient":false},
+                        {"id":"reviewer","type":"subagent","status":"running","ambient":false}
+                    ])),
+                    false,
+                )?;
+                self.expect_claude_state(app, AgentState::Running)?;
+                self.claude_activity_checks
+                    .push("approval_returns_to_background_running");
+                let at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|error| error.to_string())?
+                    .as_millis() as u64;
+                app.claude_records = vec![crate::claude_status::SessionRecord {
+                    pid: None,
+                    proc_start: None,
+                    session_id: Some("capture-claude-activity".into()),
+                    cwd: None,
+                    kind: Some("interactive".into()),
+                    name: None,
+                    status: Some(crate::claude_status::RecordStatus::Shell),
+                    waiting_for: None,
+                    status_updated_at_ms: Some(at),
+                    updated_at_ms: Some(at),
+                    liveness: crate::claude_status::Liveness::Alive,
+                }];
+                app.reconcile_claude_records();
+                if app
+                    .claude_trackers
+                    .get(&self.initial_pane)
+                    .is_none_or(|tracker| !tracker.record_matched)
+                {
+                    return Err("Shell parent record did not match the Claude pane".into());
+                }
+                self.expect_claude_state(app, AgentState::Running)?;
+                self.claude_activity_checks
+                    .push("shell_parent_preserves_background_running");
+                self.claude_activity_phase = 2;
+                Ok(false)
+            }
+            _ => {
+                self.expect_claude_state(app, AgentState::Running)?;
+                Ok(true)
+            }
+        }
     }
 
     fn second_pane(&self) -> Result<PaneId, String> {

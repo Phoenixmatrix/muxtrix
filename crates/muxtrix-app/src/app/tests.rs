@@ -4410,7 +4410,7 @@ fn session_layout_persists_agent_identity_for_reattach() {
     );
     let restored = agent_statuses_from_session(&persisted);
     assert_eq!(restored[&pane_id].agent, "claude");
-    assert_eq!(restored[&pane_id].state, AgentState::Idle);
+    assert_eq!(restored[&pane_id].state, AgentState::Unknown);
 
     // Removing the live status must clear a previously persisted identity
     // on the next layout sync instead of preserving a stale agent forever.
@@ -4449,7 +4449,7 @@ fn replayed_claude_screen_recovers_status_without_a_hook() {
         .get(&pane_id)
         .expect("replayed Claude chrome should restore agent status");
     assert_eq!(status.agent, "claude");
-    assert_eq!(status.state, AgentState::Idle);
+    assert_eq!(status.state, AgentState::Unknown);
 }
 
 fn claude_snapshot(title: &str, frame: &str) -> GridSnapshot {
@@ -4483,6 +4483,11 @@ fn claude_idle_snapshot() -> GridSnapshot {
     )
 }
 
+fn claude_test_stamp(offset: u64) -> u64 {
+    static BASE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(unix_time_ms);
+    *BASE + offset
+}
+
 fn claude_record(session_id: &str, status: &str, stamped: u64) -> SessionRecord {
     SessionRecord {
         pid: Some(4242),
@@ -4499,8 +4504,8 @@ fn claude_record(session_id: &str, status: &str, stamped: u64) -> SessionRecord 
             _ => None,
         },
         waiting_for: None,
-        status_updated_at_ms: Some(stamped),
-        updated_at_ms: Some(stamped),
+        status_updated_at_ms: Some(claude_test_stamp(stamped)),
+        updated_at_ms: Some(claude_test_stamp(stamped)),
         liveness: claude_status::Liveness::Alive,
     }
 }
@@ -4512,7 +4517,7 @@ fn claude_hook(pane_id: PaneId, event: &str, sent_at_ms: u64) -> ControlRequest 
             event: event.into(),
             session_id: Some("live-session".into()),
             cwd: Some("/work/repo".into()),
-            sent_at_ms,
+            sent_at_ms: claude_test_stamp(sent_at_ms),
             ..ClaudeHook::default()
         },
     }
@@ -4553,11 +4558,11 @@ fn a_live_session_record_decides_the_claude_pane_over_its_painted_composer() {
     app.poll_terminal();
     assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
 
-    // Idle after a turn is that turn finishing.
+    // Parent idle alone cannot prove the background registry is empty.
     app.claude_records = vec![claude_record("live-session", "idle", 11)];
     app.reconcile_claude_records();
-    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Completed);
-    assert_eq!(app.pane_state_label(pane_id), "Idle");
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Unknown);
+    assert_eq!(app.pane_state_label(pane_id), "Unknown");
 }
 
 #[test]
@@ -4572,7 +4577,10 @@ fn claude_subagents_keep_the_pane_running_while_the_parent_is_idle() {
             }),
             event,
         );
-        hook.sent_at_ms = stamp;
+        hook.sent_at_ms = claude_test_stamp(stamp);
+        if stamp == 113 {
+            hook.background_tasks = Some(Box::default());
+        }
         assert!(
             app.handle_control_request(ControlRequest::ClaudeHook {
                 pane_id: Some(pane_id.as_uuid().to_string()),
@@ -4679,7 +4687,7 @@ fn a_waiting_record_raises_attention_and_its_resolution_clears_it() {
 }
 
 #[test]
-fn a_lost_record_returns_authority_to_the_screen() {
+fn a_lost_record_keeps_activity_unknown_instead_of_trusting_the_composer() {
     let mut app = Muxtrix::new();
     let pane_id = active_pane_id(&app);
     app.agent_statuses.insert(
@@ -4710,7 +4718,7 @@ fn a_lost_record_returns_authority_to_the_screen() {
         .expect("terminal runtime")
         .snapshot_revision += 1;
     app.poll_terminal();
-    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Idle);
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Unknown);
 }
 
 #[test]
@@ -4732,7 +4740,7 @@ fn a_claude_hook_edge_leads_and_a_stale_record_cannot_regress_it() {
 
     app.claude_records = vec![claude_record("live-session", "idle", 1_500)];
     app.reconcile_claude_records();
-    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Completed);
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Unknown);
 
     // With a live record matched, PermissionRequest is advisory — another
     // hook or auto mode may resolve it without a dialog — and the record
@@ -4741,7 +4749,7 @@ fn a_claude_hook_edge_leads_and_a_stale_record_cannot_regress_it() {
         app.handle_control_request(claude_hook(pane_id, "PermissionRequest", 2_000))
             .ok
     );
-    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Completed);
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Unknown);
     let mut waiting = claude_record("live-session", "waiting", 2_500);
     waiting.waiting_for = Some("permission prompt".into());
     app.claude_records = vec![waiting];
@@ -4755,7 +4763,10 @@ fn a_claude_hook_edge_leads_and_a_stale_record_cannot_regress_it() {
     let ended = app.handle_control_request(claude_hook(pane_id, "SessionEnd", 3_000));
     assert!(ended.ok);
     assert!(!app.agent_statuses.contains_key(&pane_id));
-    assert!(!app.claude_trackers.contains_key(&pane_id));
+    assert!(
+        app.claude_trackers.contains_key(&pane_id),
+        "retain the ended-session tombstone"
+    );
 }
 
 #[test]
@@ -4865,7 +4876,7 @@ fn a_pane_hands_over_to_the_agent_its_screen_belongs_to() {
         cwd: Some("/work/pi-2".into()),
     });
     assert!(stopped.ok);
-    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Completed);
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Unknown);
     assert_eq!(
         app.agent_statuses[&pane_id].session_id.as_deref(),
         Some("claude-session")
@@ -8225,6 +8236,7 @@ fn pane_signal_semantics_distinguish_activity_attention_and_failure() {
         (AgentState::Completed, PaneSignalKind::Neutral),
         (AgentState::Failed, PaneSignalKind::Danger),
         (AgentState::Stopped, PaneSignalKind::Subtle),
+        (AgentState::Unknown, PaneSignalKind::Neutral),
     ] {
         app.agent_statuses.insert(
             pane_id,
@@ -8369,7 +8381,7 @@ fn delayed_session_start_cannot_regress_the_first_running_prompt() {
 }
 
 #[test]
-fn ctrl_c_marks_only_the_interrupted_running_agent_idle() {
+fn ctrl_c_without_a_claude_inventory_cannot_claim_global_idle() {
     let mut app = Muxtrix::new();
     let pane_id = active_pane_id(&app);
     app.agent_statuses.insert(
@@ -8389,12 +8401,17 @@ fn ctrl_c_marks_only_the_interrupted_running_agent_idle() {
     assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Running);
 
     app.observe_agent_interrupt(pane_id, &[0x03]);
-    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Idle);
-    assert_eq!(
-        app.agent_statuses[&pane_id].activity.as_deref(),
-        Some("Prompt interrupted")
+    assert_eq!(app.agent_statuses[&pane_id].state, AgentState::Unknown);
+    assert!(
+        app.agent_statuses[&pane_id]
+            .activity
+            .as_ref()
+            .is_some_and(|activity| activity.contains("unavailable"))
     );
-    assert_eq!(app.pane_signal_kind(pane_id, false), PaneSignalKind::Subtle);
+    assert_eq!(
+        app.pane_signal_kind(pane_id, false),
+        PaneSignalKind::Neutral
+    );
 }
 
 #[test]
@@ -10951,4 +10968,504 @@ fn an_agent_error_is_announced_with_requests_for_input() {
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].title, "Pi hit an error");
     assert!(notices[0].body.ends_with("Provider returned 529"));
+}
+
+fn activity_hook(event: &str, session: &str, at: u64, tasks: serde_json::Value) -> ClaudeHook {
+    let mut hook = ClaudeHook::from_payload(
+        &serde_json::json!({
+            "session_id": session,
+            "background_tasks": tasks,
+        }),
+        event,
+    );
+    hook.sent_at_ms = at;
+    hook
+}
+
+#[test]
+fn claude_rejects_foreign_identity_before_mutating_pane_metadata() {
+    let mut app = Muxtrix::new();
+    let pane = active_pane_id(&app);
+    let now = unix_time_ms();
+    let mut first = activity_hook("SessionStart", "current", now, serde_json::json!([]));
+    first.cwd = Some("/current".into());
+    app.apply_claude_hook(pane, first);
+    let mut stale = activity_hook("Stop", "old", now + 1, serde_json::json!([]));
+    stale.cwd = Some("/old".into());
+    app.apply_claude_hook(pane, stale);
+    assert_eq!(
+        app.agent_statuses[&pane].session_id.as_deref(),
+        Some("current")
+    );
+    assert_eq!(app.agent_statuses[&pane].cwd.as_deref(), Some("/current"));
+}
+
+#[test]
+fn claude_interrupt_preserves_background_work_and_unknown_is_neutral() {
+    let mut app = Muxtrix::new();
+    let pane = active_pane_id(&app);
+    let now = unix_time_ms();
+    app.apply_claude_hook(
+        pane,
+        activity_hook(
+            "UserPromptSubmit",
+            "s",
+            now,
+            serde_json::json!([{"id":"shell-1","type":"local_bash","status":"running"}]),
+        ),
+    );
+    app.observe_agent_interrupt(pane, &[3]);
+    assert_eq!(app.agent_statuses[&pane].state, AgentState::Running);
+    app.claude_recovery_unknown(pane, "Transcript unavailable");
+    assert_eq!(app.agent_statuses[&pane].state, AgentState::Unknown);
+    assert_eq!(app.pane_signal_kind(pane, false), PaneSignalKind::Neutral);
+    assert_eq!(app.pane_state_label(pane), "Unknown");
+    assert!(app.claude_completed_edges.is_empty());
+}
+
+#[test]
+fn claude_durable_restart_replays_offline_completion_once() {
+    let root = std::env::temp_dir().join(format!(
+        "muxtrix-activity-restart-{}",
+        PaneId::new().as_uuid()
+    ));
+    let mut app = Muxtrix::new();
+    let pane = active_pane_id(&app);
+    let journal = muxtrix_control::claude_journal::ClaudeJournal::in_directory(
+        &root,
+        &pane.as_uuid().to_string(),
+    )
+    .expect("valid test fixture");
+    let now = unix_time_ms();
+    let mut started = activity_hook(
+        "UserPromptSubmit",
+        "s",
+        now,
+        serde_json::json!([{"id":"job","type":"local_bash","status":"running"}]),
+    );
+    journal.append(&mut started).expect("valid test fixture");
+    app.restore_claude_journal(pane, journal.load().expect("valid test fixture"));
+    let checkpoint = ClaudeCheckpoint {
+        tracker: app.claude_trackers[&pane].clone(),
+        status: app.agent_statuses.get(&pane).cloned(),
+    };
+    journal
+        .checkpoint(
+            &serde_json::to_value(checkpoint).expect("valid test fixture"),
+            &[started.delivery_id.expect("valid test fixture")],
+            &[],
+        )
+        .expect("valid test fixture");
+    let mut stop = activity_hook("Stop", "s", now + 1, serde_json::json!([]));
+    journal.append(&mut stop).expect("valid test fixture");
+    // The same stable pane ID belongs to the reattached session.
+    app.claude_trackers.clear();
+    app.agent_statuses.clear();
+    app.claude_journal_loaded.clear();
+    app.claude_delivery_ids.clear();
+    app.restore_claude_journal(pane, journal.load().expect("valid test fixture"));
+    assert_eq!(app.agent_statuses[&pane].state, AgentState::Completed);
+    assert!(app.claude_completed_edges.remove(&pane));
+    app.apply_claude_hook(pane, stop);
+    assert!(
+        app.claude_completed_edges.is_empty(),
+        "IPC duplicate cannot repeat completion"
+    );
+    std::fs::remove_dir_all(root).expect("valid test fixture");
+}
+
+#[test]
+fn claude_ended_checkpoint_cannot_resurrect_from_delayed_hooks() {
+    let mut app = Muxtrix::new();
+    let pane = active_pane_id(&app);
+    let now = unix_time_ms();
+    app.apply_claude_hook(
+        pane,
+        activity_hook("SessionStart", "s", now, serde_json::json!([])),
+    );
+    app.apply_claude_hook(
+        pane,
+        activity_hook("SessionEnd", "s", now + 1, serde_json::json!([])),
+    );
+    let checkpoint = ClaudeCheckpoint {
+        tracker: app.claude_trackers[&pane].clone(),
+        status: None,
+    };
+    app.claude_journal_loaded.clear();
+    app.restore_claude_journal(
+        pane,
+        muxtrix_control::claude_journal::JournalReplay {
+            checkpoint: Some(serde_json::to_value(checkpoint).expect("valid test fixture")),
+            events: vec![activity_hook("Stop", "s", now + 2, serde_json::json!([]))],
+            incomplete: false,
+            gaps: Vec::new(),
+            gap_at_ms: 0,
+        },
+    );
+    assert!(!app.agent_statuses.contains_key(&pane));
+    assert!(app.claude_completed_edges.is_empty());
+}
+
+#[test]
+fn claude_background_completion_does_not_clear_visible_wait() {
+    let mut app = Muxtrix::new();
+    let pane = active_pane_id(&app);
+    let now = unix_time_ms();
+    let tasks = serde_json::json!([{"id":"job","type":"local_bash","status":"running"}]);
+    app.apply_claude_hook(pane, activity_hook("Stop", "s", now, tasks));
+    app.agent_statuses
+        .get_mut(&pane)
+        .expect("valid test fixture")
+        .state = AgentState::Waiting;
+    let decision = app
+        .claude_trackers
+        .get_mut(&pane)
+        .expect("valid test fixture")
+        .task_finished(AgentState::Waiting, "s", "job", "completed", now + 1);
+    app.apply_claude_decision(pane, decision);
+    app.poll_claude_recovery();
+    assert_eq!(app.agent_statuses[&pane].state, AgentState::Waiting);
+    assert!(app.claude_completed_edges.is_empty());
+}
+
+#[test]
+fn claude_task_observer_rejects_wrong_session_and_transcript() {
+    let mut app = Muxtrix::new();
+    let pane = active_pane_id(&app);
+    let now = unix_time_ms();
+    let mut stop = activity_hook(
+        "Stop",
+        "live",
+        now,
+        serde_json::json!([{"id":"job","type":"local_bash","status":"running"}]),
+    );
+    stop.transcript_path = Some("/live.jsonl".into());
+    app.apply_claude_hook(pane, stop);
+    for (session, path) in [("old", "/live.jsonl"), ("live", "/old.jsonl")] {
+        app.claude_task_updates
+            .lock()
+            .expect("valid test fixture")
+            .push(crate::claude_tasks::TaskObservation {
+                pane_id: pane.as_uuid().to_string(),
+                session_id: session.into(),
+                transcript_path: PathBuf::from(path),
+                event: crate::claude_tasks::TaskEvent::Finished {
+                    task_id: "job".into(),
+                    status: "completed".into(),
+                    at_ms: now + 1,
+                },
+            });
+    }
+    app.poll_claude_recovery();
+    assert_eq!(app.agent_statuses[&pane].state, AgentState::Running);
+    app.claude_task_updates
+        .lock()
+        .expect("valid test fixture")
+        .push(crate::claude_tasks::TaskObservation {
+            pane_id: pane.as_uuid().to_string(),
+            session_id: "live".into(),
+            transcript_path: PathBuf::from("/live.jsonl"),
+            event: crate::claude_tasks::TaskEvent::Finished {
+                task_id: "job".into(),
+                status: "completed".into(),
+                at_ms: now + 1,
+            },
+        });
+    app.poll_claude_recovery();
+    assert_eq!(app.agent_statuses[&pane].state, AgentState::Completed);
+    assert!(app.claude_completed_edges.remove(&pane));
+    app.poll_claude_recovery();
+    assert!(app.claude_completed_edges.is_empty());
+}
+
+#[test]
+fn claude_missing_journal_and_scheduled_metadata_do_not_invent_work() {
+    let mut app = Muxtrix::new();
+    let pane = active_pane_id(&app);
+    app.agent_statuses.insert(
+        pane,
+        AgentPaneStatus {
+            agent: "claude".into(),
+            display_name: None,
+            state: AgentState::Unknown,
+            activity: Some("Recovering Claude activity".into()),
+            session_id: None,
+            cwd: None,
+            git_branch: None,
+        },
+    );
+    app.restore_claude_journal(
+        pane,
+        muxtrix_control::claude_journal::JournalReplay::default(),
+    );
+    assert_eq!(app.agent_statuses[&pane].state, AgentState::Unknown);
+    let mut scheduled = activity_hook("SessionStart", "s", unix_time_ms(), serde_json::json!([]));
+    scheduled.session_crons = Some(Box::new([muxtrix_control::ClaudeSessionCron {
+        id: "schedule".into(),
+        schedule: "0 * * * *".into(),
+        recurring: true,
+    }]));
+    app.apply_claude_hook(pane, scheduled);
+    assert_eq!(app.agent_statuses[&pane].state, AgentState::Idle);
+    assert!(
+        app.agent_statuses[&pane]
+            .activity
+            .as_ref()
+            .expect("valid test fixture")
+            .contains("Scheduled")
+    );
+    assert!(app.claude_completed_edges.is_empty());
+}
+
+#[test]
+fn claude_historical_gap_is_superseded_by_fresh_inventory() {
+    let mut app = Muxtrix::new();
+    let pane = active_pane_id(&app);
+    let now = unix_time_ms();
+    app.restore_claude_journal(
+        pane,
+        muxtrix_control::claude_journal::JournalReplay {
+            checkpoint: None,
+            events: vec![activity_hook("Stop", "s", now, serde_json::json!([]))],
+            incomplete: true,
+            gaps: vec!["old-gap".into()],
+            gap_at_ms: now - 1,
+        },
+    );
+    assert_eq!(app.agent_statuses[&pane].state, AgentState::Completed);
+    app.claude_completed_edges.clear();
+    app.restore_claude_journal(
+        pane,
+        muxtrix_control::claude_journal::JournalReplay {
+            checkpoint: None,
+            events: Vec::new(),
+            incomplete: true,
+            gaps: vec!["old-gap".into()],
+            gap_at_ms: now - 1,
+        },
+    );
+    assert_eq!(app.agent_statuses[&pane].state, AgentState::Completed);
+    assert!(app.claude_completed_edges.is_empty());
+}
+
+#[test]
+fn claude_checkpoint_never_serializes_assistant_or_prompt_derived_copy() {
+    let mut app = Muxtrix::new();
+    let pane = active_pane_id(&app);
+    let mut hook = activity_hook("Stop", "s", unix_time_ms(), serde_json::json!([]));
+    hook.last_assistant_message = Some("PRIVATE_ASSISTANT_TEXT".into());
+    app.apply_claude_hook(pane, hook);
+    app.agent_statuses
+        .get_mut(&pane)
+        .expect("valid test fixture")
+        .display_name = Some("PRIVATE_PROMPT_TITLE".into());
+    let checkpoint = ClaudeCheckpoint {
+        tracker: app.claude_trackers[&pane].durable_snapshot(),
+        status: app.agent_statuses.get(&pane).cloned(),
+    };
+    let encoded = serde_json::to_string(&checkpoint).expect("valid test fixture");
+    assert!(!encoded.contains("PRIVATE_"));
+    let recovered: ClaudeCheckpoint = serde_json::from_str(&encoded).expect("valid test fixture");
+    assert_eq!(
+        recovered.status.expect("valid test fixture").state,
+        AgentState::Completed
+    );
+}
+
+#[test]
+fn claude_journal_cannot_overwrite_a_reused_other_agent_pane() {
+    let mut app = Muxtrix::new();
+    let pane = active_pane_id(&app);
+    let now = unix_time_ms();
+    app.apply_claude_hook(
+        pane,
+        activity_hook("UserPromptSubmit", "old", now, serde_json::json!([])),
+    );
+    let checkpoint = ClaudeCheckpoint {
+        tracker: app.claude_trackers[&pane].durable_snapshot(),
+        status: app.agent_statuses.get(&pane).cloned(),
+    };
+    let status = app
+        .agent_statuses
+        .get_mut(&pane)
+        .expect("valid test fixture");
+    status.agent = "codex".into();
+    status.session_id = Some("codex-session".into());
+    app.restore_claude_journal(
+        pane,
+        muxtrix_control::claude_journal::JournalReplay {
+            checkpoint: Some(serde_json::to_value(checkpoint).expect("valid test fixture")),
+            events: vec![activity_hook("Stop", "old", now + 1, serde_json::json!([]))],
+            incomplete: false,
+            gaps: Vec::new(),
+            gap_at_ms: 0,
+        },
+    );
+    assert_eq!(app.agent_statuses[&pane].agent, "codex");
+    assert_eq!(
+        app.agent_statuses[&pane].session_id.as_deref(),
+        Some("codex-session")
+    );
+    assert_eq!(app.agent_statuses[&pane].state, AgentState::Running);
+    assert!(app.claude_completed_edges.is_empty());
+}
+
+#[test]
+fn claude_gap_and_live_delivery_orders_preserve_causality_and_acknowledgements() {
+    for live_first in [false, true] {
+        for gap_order in ["older", "equal", "newer", "unorderable"] {
+            let mut app = Muxtrix::new();
+            let pane = active_pane_id(&app);
+            let now = unix_time_ms();
+            app.restore_claude_journal(
+                pane,
+                muxtrix_control::claude_journal::JournalReplay::default(),
+            );
+            let mut hook = activity_hook("Stop", "s", now, serde_json::json!([]));
+            hook.delivery_id = Some("shared-delivery".into());
+            if live_first {
+                app.apply_claude_hook(pane, hook.clone());
+                app.claude_completed_edges.clear();
+            }
+            let gap_at_ms = match gap_order {
+                "older" => now - 1,
+                "equal" => now,
+                "newer" => now + 1,
+                _ => 0,
+            };
+            let replay = || muxtrix_control::claude_journal::JournalReplay {
+                checkpoint: None,
+                events: vec![hook.clone()],
+                incomplete: true,
+                gaps: vec!["causal-gap".into()],
+                gap_at_ms,
+            };
+            app.restore_claude_journal(pane, replay());
+            let expected = if gap_order != "older" {
+                AgentState::Unknown
+            } else {
+                AgentState::Completed
+            };
+            assert_eq!(app.agent_statuses[&pane].state, expected);
+            if expected == AgentState::Unknown {
+                assert!(app.claude_completed_edges.is_empty());
+            }
+            assert!(app.claude_delivery_ids[&pane].contains("shared-delivery"));
+            assert!(app.claude_journal_incomplete[&pane].contains("causal-gap"));
+            app.claude_completed_edges.clear();
+            app.restore_claude_journal(pane, replay());
+            app.apply_claude_hook(pane, hook.clone());
+            assert_eq!(app.agent_statuses[&pane].state, expected);
+            assert!(app.claude_completed_edges.is_empty());
+            app.apply_claude_hook(
+                pane,
+                activity_hook("Stop", "s", now + 2, serde_json::json!([])),
+            );
+            assert_eq!(app.agent_statuses[&pane].state, AgentState::Completed);
+        }
+    }
+}
+
+#[test]
+fn claude_replaced_shell_retirement_survives_journal_recreation() {
+    let root =
+        std::env::temp_dir().join(format!("muxtrix-retired-shell-{}", PaneId::new().as_uuid()));
+    let mut app = Muxtrix::new();
+    let pane = active_pane_id(&app);
+    let pane_key = pane.as_uuid().to_string();
+    let journal = muxtrix_control::claude_journal::ClaudeJournal::in_directory(&root, &pane_key)
+        .expect("valid test fixture");
+    let now = unix_time_ms();
+    let mut started = activity_hook("SessionStart", "old", now, serde_json::json!([]));
+    journal.append(&mut started).expect("valid test fixture");
+    app.restore_claude_journal(pane, journal.load().expect("valid test fixture"));
+    let checkpoint = ClaudeCheckpoint {
+        tracker: app.claude_trackers[&pane].durable_snapshot(),
+        status: app.agent_statuses.get(&pane).cloned(),
+    };
+    journal
+        .checkpoint(
+            &serde_json::to_value(checkpoint).expect("valid test fixture"),
+            &[started.delivery_id.clone().expect("valid test fixture")],
+            &[],
+        )
+        .expect("valid test fixture");
+    let _recorded = install_recording_launcher(&mut app);
+    app.restart_pane(pane).expect("valid test fixture");
+    assert!(app.claude_journal_dirty.contains(&pane));
+    assert!(!app.agent_statuses.contains_key(&pane));
+    let retired = ClaudeCheckpoint {
+        tracker: app.claude_trackers[&pane].durable_snapshot(),
+        status: None,
+    };
+    journal
+        .checkpoint(
+            &serde_json::to_value(retired).expect("valid test fixture"),
+            &[],
+            &[],
+        )
+        .expect("valid test fixture");
+    let mut delayed = activity_hook("UserPromptSubmit", "old", now + 1, serde_json::json!([]));
+    journal.append(&mut delayed).expect("valid test fixture");
+    drop(journal);
+    let session = app.session.clone();
+    drop(app);
+    let journal = muxtrix_control::claude_journal::ClaudeJournal::in_directory(&root, &pane_key)
+        .expect("valid test fixture");
+    let mut resumed = Muxtrix::new();
+    resumed.session = session;
+    resumed.restore_claude_journal(pane, journal.load().expect("valid test fixture"));
+    assert!(!resumed.agent_statuses.contains_key(&pane));
+    assert!(resumed.claude_completed_edges.is_empty());
+    let mut fresh = activity_hook("SessionStart", "new", now + 2, serde_json::json!([]));
+    journal.append(&mut fresh).expect("valid test fixture");
+    resumed.restore_claude_journal(pane, journal.load().expect("valid test fixture"));
+    assert_eq!(
+        resumed.agent_statuses[&pane].session_id.as_deref(),
+        Some("new")
+    );
+    assert_eq!(resumed.agent_statuses[&pane].state, AgentState::Idle);
+    std::fs::remove_dir_all(root).expect("valid test fixture");
+}
+
+#[test]
+fn claude_removing_one_of_two_panes_prunes_only_its_task_watch() {
+    let mut app = Muxtrix::new();
+    let pane = active_pane_id(&app);
+    let _recorded = install_recording_launcher(&mut app);
+    app.split_terminal(SplitAxis::Horizontal)
+        .expect("valid test fixture");
+    let other = active_pane_id(&app);
+    let now = unix_time_ms();
+    for (id, session, path) in [
+        (pane, "first", "/first.jsonl"),
+        (other, "second", "/second.jsonl"),
+    ] {
+        let mut hook = activity_hook("Stop", session, now, serde_json::json!([]));
+        hook.transcript_path = Some(path.into());
+        app.apply_claude_hook(id, hook);
+        if let Ok(mut requests) = app.claude_task_requests.lock() {
+            requests.push(crate::claude_tasks::TaskRequest {
+                pane_id: id.as_uuid().to_string(),
+                session_id: session.into(),
+                transcript_path: PathBuf::from(path),
+                host: claude_status::ProbeHost::Local,
+            });
+        } else {
+            panic!("task requests lock poisoned");
+        }
+    }
+    // No new activity on the survivor is needed to refresh the watch set.
+    app.claude_journal_dirty.clear();
+    app.cleanup_pane_state(other);
+    app.claude_journal_dirty.clear();
+    app.claude_tasks_started = true;
+    app.poll_claude_recovery();
+    let Ok(requests) = app.claude_task_requests.lock() else {
+        panic!("task requests lock poisoned");
+    };
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].pane_id, pane.as_uuid().to_string());
+    assert!(!app.claude_trackers.contains_key(&other));
+    assert!(app.claude_trackers.contains_key(&pane));
 }

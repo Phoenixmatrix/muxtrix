@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr as _;
 
+use muxtrix_control::claude_journal::ClaudeJournal;
 use muxtrix_control::{
-    Agent, AgentState, ClaudeHook, ControlRequest, ControlResponse, Endpoint, HookAction,
-    HookManager, HookScope, SplitDirection, send_request,
+    Agent, AgentState, ClaudeHook, ControlRequest, Endpoint, HookAction, HookManager, HookScope,
+    SplitDirection, send_request,
 };
 use serde_json::Value;
 
@@ -222,24 +223,20 @@ fn run_hook_event(arguments: &[String]) {
         hook.sent_at_ms = option(arguments, "--fired-at-ms")
             .and_then(|stamp| stamp.parse().ok())
             .unwrap_or_else(now_ms);
+        // A successful IPC send is not a durable acknowledgement. The app
+        // checkpoints the reducer before removing this exact delivery.
+        let durable =
+            ClaudeJournal::for_pane(&pane_id).and_then(|journal| journal.append(&mut hook));
+        if let Err(error) = durable {
+            eprintln!("muxtrixctl: could not persist Claude activity: {error}");
+            return;
+        }
         let request = ControlRequest::ClaudeHook {
             pane_id: Some(pane_id.clone()),
             hook,
         };
         if let Ok(endpoint) = Endpoint::discover_for_pane(Some(&pane_id)) {
-            let rejected = matches!(
-                send_request(&endpoint, &request),
-                Ok(ControlResponse { ok: false, message: Some(message), .. })
-                    if message.contains("claude_hook")
-            );
-            // An app from before the payload-carrying request still
-            // understands the coarse event it was installed with.
-            if rejected && event_changes_pane_state(event) {
-                let _ = send_request(
-                    &endpoint,
-                    &legacy_agent_event(&agent, state, event, &payload, pane_id),
-                );
-            }
+            let _ = send_request(&endpoint, &request);
         }
         return;
     }
@@ -364,6 +361,7 @@ fn parse_state(value: &str) -> Option<AgentState> {
         "completed" => Some(AgentState::Completed),
         "failed" | "error" => Some(AgentState::Failed),
         "stopped" => Some(AgentState::Stopped),
+        "unknown" => Some(AgentState::Unknown),
         _ => None,
     }
 }
@@ -377,6 +375,7 @@ fn default_body(agent: &str, state: AgentState) -> &'static str {
         AgentState::Completed => "Agent completed a turn",
         AgentState::Failed => "Agent reported an error",
         AgentState::Stopped => "Agent session ended",
+        AgentState::Unknown => "Agent activity is unknown",
     }
 }
 
@@ -412,6 +411,14 @@ fn hooks_usage() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unknown_activity_is_not_reported_as_completion() {
+        assert_eq!(parse_state("unknown"), Some(AgentState::Unknown));
+        assert_eq!(
+            default_body("claude", AgentState::Unknown),
+            "Agent activity is unknown"
+        );
+    }
     #[test]
     fn dangling_options_fail_instead_of_falling_back_to_the_focused_pane() {
         let arguments = vec!["send".into(), "echo test".into(), "--pane".into()];
