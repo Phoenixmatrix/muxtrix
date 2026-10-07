@@ -2020,6 +2020,102 @@ impl Scenario {
                 startup: true,
                 confirm_end: None,
             });
+        } else if self.capturing("worktree-name-conflict")
+            || self.capturing("worktree-pane-name-conflict")
+        {
+            let pane_id = app
+                .active_workspace()?
+                .active_tab()
+                .ok_or("conflict capture needs an active tab")?
+                .focused_pane_id;
+            let terminals = app
+                .terminals
+                .iter()
+                .map(|(id, runtime)| {
+                    (
+                        *id,
+                        runtime
+                            .session
+                            .as_ref()
+                            .and_then(|session| session.process_id()),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let tab_count = app.active_workspace()?.tabs.len();
+            let target = if self.capturing("worktree-pane-name-conflict") {
+                crate::app::WorktreePromptTarget::Open(commands::WorktreeKind::Pane(
+                    SplitAxis::Horizontal,
+                ))
+            } else {
+                crate::app::WorktreePromptTarget::RestartPane(pane_id)
+            };
+            let _ = app.open_worktree_prompt(target);
+            let prompt = app
+                .worktree_prompt
+                .as_mut()
+                .ok_or("worktree prompt did not open")?;
+            // Only the synchronous taken-name rejection uses these display
+            // paths. Never submit the corrected name against a fake repo.
+            prompt.repo_root = Some("/home/user/dev/muxtrix".into());
+            prompt.failure = None;
+            prompt.base_directory = Some("/home/user/.muxtrix/worktrees/muxtrix".into());
+            prompt.taken_names.insert("fix-login-bug".into());
+            for attempt in 0..2 {
+                if attempt == 1 {
+                    let _ = app.update(Message::WorktreeNameChanged("fix login retry".into()));
+                    if app
+                        .worktree_prompt
+                        .as_ref()
+                        .is_none_or(|prompt| prompt.error.is_some())
+                    {
+                        return Err("editing a worktree conflict did not clear its error".into());
+                    }
+                }
+                let draft = "  fix login bug  ";
+                let _ = app.update(Message::WorktreeNameChanged(draft.into()));
+                let effects = app.update(Message::ConfirmWorktree);
+                let prompt = app
+                    .worktree_prompt
+                    .as_ref()
+                    .ok_or("conflict dismissed worktree modal")?;
+                if !effects.is_empty()
+                    || prompt.busy
+                    || prompt.target != target
+                    || !prompt
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("fix-login-bug"))
+                    || app.worktree_name_draft != draft
+                {
+                    return Err(
+                        "duplicate worktree submission lost its draft/error or scheduled creation"
+                            .into(),
+                    );
+                }
+            }
+            if app.active_workspace()?.tabs.len() != tab_count
+                || app
+                    .active_workspace()?
+                    .active_tab()
+                    .map(|tab| tab.focused_pane_id)
+                    != Some(pane_id)
+                || app
+                    .terminals
+                    .iter()
+                    .map(|(id, runtime)| {
+                        (
+                            *id,
+                            runtime
+                                .session
+                                .as_ref()
+                                .and_then(|session| session.process_id()),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+                    != terminals
+            {
+                return Err("worktree conflict replaced a pane or its running terminal".into());
+            }
         } else if self.capturing("worktree-dialog") {
             let _ = app.run_command(CommandAction::RestartPaneInWorktree);
             app.worktree_name_draft = "worktree-2".into();

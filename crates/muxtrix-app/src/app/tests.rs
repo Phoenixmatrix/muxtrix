@@ -7639,6 +7639,136 @@ fn worktree_commands_require_a_git_repository() {
 }
 
 #[test]
+fn duplicate_worktree_names_preserve_every_target_and_allow_retry() {
+    let mut app = Muxtrix::new();
+    let pane_id = active_pane_id(&app);
+    let scratch = std::env::temp_dir().join(format!(
+        "muxtrix-worktree-conflict-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&scratch).expect("isolated worktree fixture");
+    let terminal_ids = app.terminals.keys().copied().collect::<BTreeSet<_>>();
+    let tab_count = app.active_workspace().expect("workspace").tabs.len();
+    let targets = [
+        WorktreePromptTarget::Open(commands::WorktreeKind::Pane(SplitAxis::Horizontal)),
+        WorktreePromptTarget::Open(commands::WorktreeKind::Tab),
+        WorktreePromptTarget::RestartPane(pane_id),
+        WorktreePromptTarget::OpenWithAgent(
+            commands::WorktreeKind::Pane(SplitAxis::Vertical),
+            Agent::Codex,
+        ),
+        WorktreePromptTarget::OpenWithAgent(commands::WorktreeKind::Tab, Agent::Codex),
+        WorktreePromptTarget::RestartPaneWithAgent(pane_id, Agent::Codex),
+    ];
+    for target in targets {
+        app.worktree_prompt = Some(WorktreePrompt {
+            target,
+            repo_root: Some(scratch.clone()),
+            failure: None,
+            base_directory: Some(scratch.join("worktrees")),
+            taken_names: BTreeSet::from(["fix-login-bug".into()]),
+            error: None,
+            busy: false,
+        });
+        let draft = "  fix login bug  ";
+        assert!(
+            app.update(Message::WorktreeNameChanged(draft.into()))
+                .is_empty()
+        );
+        assert!(app.update(Message::ConfirmWorktree).is_empty());
+        let prompt = app.worktree_prompt.as_ref().expect("conflict keeps modal");
+        assert_eq!(prompt.target, target);
+        assert!(!prompt.busy);
+        assert!(
+            prompt
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("fix-login-bug"))
+        );
+        assert_eq!(app.worktree_name_draft, draft);
+        assert_eq!(active_pane_id(&app), pane_id);
+        assert_eq!(
+            app.terminals.keys().copied().collect::<BTreeSet<_>>(),
+            terminal_ids
+        );
+        assert_eq!(
+            app.active_workspace().expect("workspace").tabs.len(),
+            tab_count
+        );
+        assert!(!scratch.join("worktrees").exists());
+
+        assert!(
+            app.update(Message::WorktreeNameChanged("fix login retry".into()))
+                .is_empty()
+        );
+        assert!(
+            app.worktree_prompt
+                .as_ref()
+                .expect("editable modal")
+                .error
+                .is_none()
+        );
+        let effects = app.update(Message::ConfirmWorktree);
+        let [Effect::Perform(creation)] = effects.as_slice() else {
+            panic!("valid retry must schedule exactly one creation for {target:?}");
+        };
+        assert!(app.worktree_prompt.as_ref().expect("pending modal").busy);
+        assert!(
+            app.update(Message::ConfirmWorktree).is_empty(),
+            "busy submit must not duplicate work"
+        );
+        // Resolve the actual queued effect's failure path without executing
+        // Git, launching an agent, or replacing a running terminal.
+        assert!(
+            app.update(creation.resolve(Some("creation worker unavailable".into())))
+                .is_empty()
+        );
+        let prompt = app
+            .worktree_prompt
+            .as_ref()
+            .expect("async failure keeps modal");
+        assert_eq!(prompt.target, target);
+        assert!(!prompt.busy);
+        assert!(
+            prompt
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("creation worker unavailable"))
+        );
+        assert_eq!(app.worktree_name_draft, "fix login retry");
+        assert_eq!(active_pane_id(&app), pane_id);
+        assert_eq!(
+            app.terminals.keys().copied().collect::<BTreeSet<_>>(),
+            terminal_ids
+        );
+        assert_eq!(
+            app.active_workspace().expect("workspace").tabs.len(),
+            tab_count
+        );
+        assert!(!scratch.join("worktrees").exists());
+
+        drop(app.update(Message::WorktreeNameChanged(draft.into())));
+        assert!(
+            app.worktree_prompt
+                .as_ref()
+                .expect("editable modal")
+                .error
+                .is_none()
+        );
+        assert!(app.update(Message::ConfirmWorktree).is_empty());
+        assert!(
+            app.worktree_prompt
+                .as_ref()
+                .expect("rejected retry")
+                .error
+                .is_some()
+        );
+        assert_eq!(app.worktree_name_draft, draft);
+    }
+    std::fs::remove_dir_all(scratch).expect("remove isolated fixture");
+}
+
+#[test]
 fn worktree_agent_commands_require_an_installed_default_agent() {
     let mut app = Muxtrix::new();
 

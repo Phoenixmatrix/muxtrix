@@ -3254,6 +3254,9 @@ impl Muxtrix {
             }
             Message::WorktreeNameChanged(name) => {
                 self.worktree_name_draft = name;
+                if let Some(prompt) = self.worktree_prompt.as_mut() {
+                    prompt.error = None;
+                }
                 return Vec::new();
             }
             Message::ConfirmWorktree => return self.confirm_worktree(),
@@ -4885,7 +4888,12 @@ impl Muxtrix {
             return Vec::new();
         };
         if prompt.taken_names.contains(&name) {
-            set_error(self, format!("{name} already exists for this repository"));
+            set_error(
+                self,
+                format!(
+                    "Worktree \"{name}\" already exists for this repository. Choose another name."
+                ),
+            );
             return Vec::new();
         }
         let destination = worktree_destination(&base, &name);

@@ -117,7 +117,14 @@ light and square heavy boxes with pixel-connectivity assertions, plus double,
 dashed, diagonal, junction, horizontal-rule, and full-block fixtures. The
 worktree flow exposes
 `worktree-dialog`, `worktree-manager`, `worktree-switcher`, and
-`worktree-restart-confirmation` captures. Its agent extension adds
+`worktree-restart-confirmation` captures. `worktree-name-conflict` and
+`worktree-pane-name-conflict` exercise duplicate-name rejection when restarting
+the current pane and opening a new pane, respectively. Both preserve the draft
+and live panes, clear the error on editing, and reject a repeated collision;
+the headless driver also submits with real X11 Enter input. Review these at
+1280x800 and the minimum 720x480 viewport. The deterministic regression covers
+pane, tab, restart, and agent variants, valid retry scheduling, and asynchronous
+failure recovery. Its agent extension adds
 `worktree-agent-settings` for the installed-agent default picker,
 `worktree-agent-setup` for the unconfigured command gate, and
 `worktree-agent-palette` for agent-specific command copy. The capture gallery

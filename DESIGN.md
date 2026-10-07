@@ -76,6 +76,10 @@ terminal/agent title.
 Single-field dialogs use the input's intrinsic height with a non-shrinking
 wrapper and 4 px of inset for its outer focus ring. The scrollable body must
 contain the complete field and ring above the separate action row.
+The New worktree dialog shows validation and creation failures below the name
+field in the semantic danger color. A duplicate names the normalized worktree
+and asks for another name; the dialog preserves the draft and existing panes.
+Editing the name clears stale feedback so the user can correct and resubmit.
 
 Workspace tiles reserve a 24 px actions target at the trailing edge of the
 title row, 13 px inside the rail. Its quiet overflow icon appears on tile hover
