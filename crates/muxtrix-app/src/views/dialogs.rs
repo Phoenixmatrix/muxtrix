@@ -37,6 +37,7 @@ impl Root {
                     "New workspace",
                     "Name the workspace before its first tab and terminal are created.",
                     &self.inputs.workspace_create,
+                    None,
                     ("Cancel", Message::CancelWorkspaceCreate),
                     ("Create", Message::CreateWorkspace),
                     tokens,
@@ -55,6 +56,7 @@ impl Root {
                     title,
                     "The new name applies immediately.",
                     &self.inputs.rename,
+                    None,
                     ("Cancel", Message::CancelRename),
                     ("Rename", Message::ConfirmRename),
                     tokens,
@@ -134,6 +136,7 @@ impl Root {
                     "New worktree",
                     &body,
                     &self.inputs.worktree,
+                    prompt.error.as_deref(),
                     ("Cancel", Message::CancelWorktree),
                     ("Create", Message::ConfirmWorktree),
                     tokens,
@@ -690,28 +693,36 @@ impl Root {
         title: &str,
         body: &str,
         field: &gpui::Entity<gpui_component::input::InputState>,
+        error: Option<&str>,
         cancel: (&str, Message),
         confirm: (&str, Message),
         tokens: DesignTokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.card(
-            title,
-            body,
-            vec![
+        let mut middle = Vec::with_capacity(1 + usize::from(error.is_some()));
+        middle.push(
+            div()
+                .flex_shrink_0()
+                // Keep the input's outer focus ring inside the scroll clip.
+                .p(px(4.))
+                .child(gpui_component::input::Input::new(field))
+                .into_any_element(),
+        );
+        if let Some(error) = error {
+            let font_size = px(self.app().settings.ui_pixels(10.0));
+            middle.push(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex_shrink_0()
-                    // Keep the input's outer focus ring inside the scroll clip.
-                    .p(px(4.))
-                    .child(gpui_component::input::Input::new(field))
+                    .text_size(font_size)
+                    .line_height(font_size * 1.4)
+                    .text_color(color(tokens.danger))
+                    .child(error.to_owned())
                     .into_any_element(),
-            ],
-            cancel,
-            confirm,
-            false,
-            tokens,
-            cx,
-        )
+            );
+        }
+        self.card(title, body, middle, cancel, confirm, false, tokens, cx)
     }
 
     /// A dialog that only asks a question.

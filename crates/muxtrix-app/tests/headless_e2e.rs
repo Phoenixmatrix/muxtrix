@@ -735,6 +735,17 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             );
             eprintln!("clicked the second workspace tab without shifting tab geometry");
         }
+        if matches!(
+            capture.as_str(),
+            "worktree-name-conflict" | "worktree-pane-name-conflict"
+        ) {
+            // Exercise the real window's submit dispatch as well as the
+            // production update/recovery assertions in stage_capture. The
+            // staged draft remains a taken name, so no Git work can run.
+            tap_keysym(&connection, 0xff0d)?;
+            connection.flush()?;
+            thread::sleep(Duration::from_millis(350));
+        }
         if capture == "github-pull-request-search" {
             let origin = pin_window(&connection, root, window)?;
             let search_x = origin
