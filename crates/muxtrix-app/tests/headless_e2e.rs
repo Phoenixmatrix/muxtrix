@@ -746,6 +746,37 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
             connection.flush()?;
             thread::sleep(Duration::from_millis(350));
         }
+        // The notice is dismissed below, so its frame is kept for the capture.
+        let mut notice_frame = None;
+        if capture == "worktree-not-repository" {
+            // The notice offers no name field, so a real Enter must dismiss it
+            // rather than leave an inert dialog behind.
+            let worktree_prompt = |open: bool| -> Result<(), Box<dyn std::error::Error>> {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Ok(bytes) = std::fs::read(&workspace_close_state_path) {
+                        let state: serde_json::Value = serde_json::from_slice(&bytes)?;
+                        if state["worktree_prompt"] == open {
+                            return Ok(());
+                        }
+                        if Instant::now() >= deadline {
+                            return Err(
+                                format!("worktree notice state did not settle: {state}").into()
+                            );
+                        }
+                    } else if Instant::now() >= deadline {
+                        return Err("worktree notice state was never published".into());
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+            };
+            worktree_prompt(true)?;
+            let before = grab_window(&connection, window)?;
+            tap_keysym(&connection, 0xff0d)?;
+            connection.flush()?;
+            worktree_prompt(false)?;
+            notice_frame = Some(before);
+        }
         if capture == "github-pull-request-search" {
             let origin = pin_window(&connection, root, window)?;
             let search_x = origin
@@ -912,7 +943,10 @@ fn real_app_runs_terminal_workspace_flow_on_private_x_server()
         } else {
             None
         };
-        let frame = grab_window(&connection, window)?;
+        let frame = match notice_frame {
+            Some(frame) => frame,
+            None => grab_window(&connection, window)?,
+        };
         if let Some(keycode) = held_key {
             connection
                 .xtest_fake_input(KEY_RELEASE_EVENT, keycode, 0, 0, 0, 0, 0)?

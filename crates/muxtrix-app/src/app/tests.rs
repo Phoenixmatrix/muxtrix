@@ -7639,7 +7639,7 @@ fn worktree_commands_require_a_git_repository() {
     // it at a deliberately missing path guarantees a non-repository
     // context even when a test harness places a .git marker in /tmp. The
     // dialog still opens with the explanation, but creation is impossible.
-    let _ = app.run_command(CommandAction::NewWorktree(commands::WorktreeKind::Pane(
+    let effects = app.run_command(CommandAction::NewWorktree(commands::WorktreeKind::Pane(
         SplitAxis::Horizontal,
     )));
     let prompt = app
@@ -7647,10 +7647,30 @@ fn worktree_commands_require_a_git_repository() {
         .as_ref()
         .expect("the dialog should open to explain the failure");
     assert!(prompt.repo_root.is_none());
+    assert!(
+        prompt
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("cannot be created")),
+        "the notice must say why no worktree can be created"
+    );
+    // The notice has no name field to focus; OK is the one action.
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Focus(FocusTarget::Worktree))),
+        "the notice must not focus a name field it does not show"
+    );
+    assert_eq!(app.dialog_button, Some(DialogButton::Confirm));
     let _ = app.update(Message::ConfirmWorktree);
     assert!(
         app.worktree_prompt.is_some(),
         "confirm must be inert without a repository"
+    );
+    let _ = app.handle_keyboard(key_press(Key::Named(Named::Enter), Modifiers::empty()));
+    assert!(
+        app.worktree_prompt.is_none(),
+        "Enter acknowledges the notice"
     );
 }
 
