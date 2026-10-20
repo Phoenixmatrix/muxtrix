@@ -1319,6 +1319,15 @@ struct ClaudePaneIdentity {
     cwd: Option<String>,
 }
 
+/// Generic name for a workspace the user has not named yet: the lowest
+/// `Workspace N` that is not already taken.
+pub(crate) fn default_workspace_name(workspaces: &[Workspace]) -> String {
+    (1..)
+        .map(|index| format!("Workspace {index}"))
+        .find(|name| !workspaces.iter().any(|workspace| &workspace.name == name))
+        .expect("an unused workspace number always exists")
+}
+
 fn same_claude_directory(left: &str, right: &str) -> bool {
     if cfg!(target_os = "windows") {
         left.trim_end_matches(['/', '\\'])
@@ -2259,7 +2268,7 @@ impl Muxtrix {
         }
         let profile = default_profile(&settings);
         let surface = terminal_surface(profile.id, "shell 1");
-        let workspace = Workspace::new("muxtrix", surface);
+        let workspace = Workspace::new(default_workspace_name(&[]), surface);
         let workspace_name_draft = workspace.name.clone();
         let initial_pane_id = workspace
             .active_tab()
@@ -4680,7 +4689,7 @@ impl Muxtrix {
     }
 
     pub(crate) fn open_workspace_create(&mut self) -> Vec<Effect> {
-        self.workspace_name_draft = format!("Workspace {}", self.session.workspaces.len() + 1);
+        self.workspace_name_draft = default_workspace_name(&self.session.workspaces);
         self.workspace_create_visible = true;
         self.dialog_button = None;
         self.rename_prompt = None;

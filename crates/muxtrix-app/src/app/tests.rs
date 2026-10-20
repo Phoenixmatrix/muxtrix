@@ -2793,8 +2793,24 @@ fn active_pane_id(app: &Muxtrix) -> PaneId {
 }
 
 fn create_test_workspace(app: &mut Muxtrix) {
-    app.workspace_name_draft = format!("Workspace {}", app.session.workspaces.len() + 1);
+    app.workspace_name_draft = default_workspace_name(&app.session.workspaces);
     app.create_workspace().expect("workspace should be created");
+}
+
+#[test]
+fn unnamed_workspaces_use_the_lowest_free_generic_name() {
+    let mut app = Muxtrix::new();
+    assert_eq!(app.session.workspaces[0].name, "Workspace 1");
+
+    let _ = app.open_workspace_create();
+    assert_eq!(app.workspace_name_draft, "Workspace 2");
+    app.create_workspace().expect("workspace should be created");
+    create_test_workspace(&mut app);
+    assert_eq!(app.session.workspaces[2].name, "Workspace 3");
+
+    app.session.workspaces.remove(1);
+    let _ = app.open_workspace_create();
+    assert_eq!(app.workspace_name_draft, "Workspace 2");
 }
 
 fn key_press(modified_key: Key, modifiers: Modifiers) -> KeyEvent {
