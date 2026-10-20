@@ -990,12 +990,19 @@ impl Scenario {
                 }
             }
             Stage::Screenshot => {
-                if self.capturing("workspace-menu-hover")
+                let state = if self.capturing("worktree-not-repository") {
+                    Some(
+                        json!({
+                            "worktree_prompt": app.worktree_prompt.is_some(),
+                        })
+                        .to_string(),
+                    )
+                } else if self.capturing("workspace-menu-hover")
                     || self.capturing("workspace-menu")
                     || self.capturing("workspace-close-confirm")
                     || self.capturing("close-workspace")
                 {
-                    let state = json!({
+                    Some(json!({
                         "active": app.active_workspace()?.name,
                         "prompt": app.close_workspace_prompt.and_then(|id| {
                             app.session.workspaces.iter().find(|workspace| workspace.id == id)
@@ -1005,16 +1012,20 @@ impl Scenario {
                         "names": app.session.workspaces.iter().map(|workspace| &workspace.name).collect::<Vec<_>>(),
                         "cancel_selected": app.dialog_button == Some(crate::app::DialogButton::Cancel),
                     })
-                    .to_string();
-                    if state != self.workspace_close_state {
-                        if let Some(path) = std::env::var_os("MUXTRIX_E2E_WORKSPACE_CLOSE_STATE") {
-                            let path = PathBuf::from(path);
-                            let pending = path.with_extension("pending");
-                            std::fs::write(&pending, &state).map_err(|error| error.to_string())?;
-                            std::fs::rename(pending, path).map_err(|error| error.to_string())?;
-                        }
-                        self.workspace_close_state = state;
+                    .to_string())
+                } else {
+                    None
+                };
+                if let Some(state) = state
+                    && state != self.workspace_close_state
+                {
+                    if let Some(path) = std::env::var_os("MUXTRIX_E2E_WORKSPACE_CLOSE_STATE") {
+                        let path = PathBuf::from(path);
+                        let pending = path.with_extension("pending");
+                        std::fs::write(&pending, &state).map_err(|error| error.to_string())?;
+                        std::fs::rename(pending, path).map_err(|error| error.to_string())?;
                     }
+                    self.workspace_close_state = state;
                 }
                 return Ok(TickAction::Wait);
             }
