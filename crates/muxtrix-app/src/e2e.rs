@@ -2125,6 +2125,25 @@ impl Scenario {
                 prompt.base_directory =
                     Some("/home/user/an-extraordinarily-long-home-directory-name/.muxtrix/worktrees/muxtrix".into());
             }
+        } else if self.capturing("worktree-not-repository") {
+            let _ = app.run_command(CommandAction::RestartPaneInWorktree);
+            let prompt = app
+                .worktree_prompt
+                .as_mut()
+                .ok_or("worktree prompt did not open")?;
+            if prompt.repo_root.is_some() {
+                return Err("worktree capture pane unexpectedly resolved a repository".into());
+            }
+            // Pin the explanation so the frame does not depend on whether the
+            // capture shell has reported its directory yet.
+            prompt.failure = Some(
+                "/home/user/sandbox/labmatrix-demo is not inside a git repository, so a \
+                 worktree cannot be created from it."
+                    .into(),
+            );
+            if app.dialog_button != Some(crate::app::DialogButton::Confirm) {
+                return Err("the not-a-repository notice did not preselect OK".into());
+            }
         } else if self.capturing("workspace-menu-hover")
             || self.capturing("workspace-menu")
             || self.capturing("workspace-close-confirm")

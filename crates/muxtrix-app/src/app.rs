@@ -4960,7 +4960,10 @@ impl Muxtrix {
         } else {
             String::new()
         };
-        self.dialog_button = None;
+        // Without a repository the dialog is only a notice: there is no name
+        // field to focus, and Enter acknowledges it.
+        let notice = repo_root.is_none();
+        self.dialog_button = notice.then_some(DialogButton::Confirm);
         self.worktree_prompt = Some(WorktreePrompt {
             target,
             repo_root,
@@ -4970,7 +4973,11 @@ impl Muxtrix {
             error: None,
             busy: false,
         });
-        vec![Effect::Focus(FocusTarget::Worktree)]
+        if notice {
+            Vec::new()
+        } else {
+            vec![Effect::Focus(FocusTarget::Worktree)]
+        }
     }
 
     /// Opens the worktree manager for the focused pane's repository,

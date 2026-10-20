@@ -121,7 +121,9 @@ worktree flow exposes
 `worktree-pane-name-conflict` exercise duplicate-name rejection when restarting
 the current pane and opening a new pane, respectively. Both preserve the draft
 and live panes, clear the error on editing, and reject a repeated collision;
-the headless driver also submits with real X11 Enter input. Review these at
+the headless driver also submits with real X11 Enter input.
+`worktree-not-repository` captures the notice shown outside a git repository,
+which has no name field, then dismisses it with real X11 Enter input. Review these at
 1280x800 and the minimum 720x480 viewport. The deterministic regression covers
 pane, tab, restart, and agent variants, valid retry scheduling, and asynchronous
 failure recovery. Its agent extension adds

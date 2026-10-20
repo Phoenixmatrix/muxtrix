@@ -105,7 +105,7 @@ impl Root {
                     "Complete task?",
                     &body,
                     details,
-                    ("Cancel", Message::CancelCompleteTask),
+                    Some(("Cancel", Message::CancelCompleteTask)),
                     (
                         if prompt.busy {
                             "Working…"
@@ -119,6 +119,27 @@ impl Root {
                         Message::ConfirmCompleteTask,
                     ),
                     prompt.warning.is_some(),
+                    tokens,
+                    cx,
+                ),
+            )
+        } else if let Some(failure) = app
+            .worktree_prompt
+            .as_ref()
+            .filter(|prompt| prompt.repo_root.is_none())
+            .and_then(|prompt| prompt.failure.as_deref())
+        {
+            // Without a repository there is nothing to name: offering the
+            // name field and Create would invite a submit that cannot work.
+            (
+                Message::CancelWorktree,
+                self.card(
+                    "Worktree unavailable",
+                    failure,
+                    Vec::new(),
+                    None,
+                    ("OK", Message::CancelWorktree),
+                    false,
                     tokens,
                     cx,
                 ),
@@ -280,7 +301,7 @@ impl Root {
                 &title,
                 description,
                 middle,
-                ("Cancel", Message::SessionPickerCancelEnd),
+                Some(("Cancel", Message::SessionPickerCancelEnd)),
                 (action, Message::SessionPickerConfirmEnd),
                 true,
                 tokens,
@@ -722,7 +743,16 @@ impl Root {
                     .into_any_element(),
             );
         }
-        self.card(title, body, middle, cancel, confirm, false, tokens, cx)
+        self.card(
+            title,
+            body,
+            middle,
+            Some(cancel),
+            confirm,
+            false,
+            tokens,
+            cx,
+        )
     }
 
     /// A dialog that only asks a question.
@@ -737,7 +767,16 @@ impl Root {
         tokens: DesignTokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.card(title, body, Vec::new(), cancel, confirm, danger, tokens, cx)
+        self.card(
+            title,
+            body,
+            Vec::new(),
+            Some(cancel),
+            confirm,
+            danger,
+            tokens,
+            cx,
+        )
     }
 
     #[allow(clippy::too_many_arguments, reason = "a dialog is its parts")]
@@ -746,7 +785,7 @@ impl Root {
         title: &str,
         body: &str,
         middle: Vec<AnyElement>,
-        cancel: (&str, Message),
+        cancel: Option<(&str, Message)>,
         confirm: (&str, Message),
         danger: bool,
         tokens: DesignTokens,
@@ -809,7 +848,9 @@ impl Root {
                     .flex_row()
                     .justify_end()
                     .gap(px(8.))
-                    .child(self.dialog_button(cancel.0, cancel.1, false, false, tokens, cx))
+                    .children(cancel.map(|(label, message)| {
+                        self.dialog_button(label, message, false, false, tokens, cx)
+                    }))
                     .child(self.dialog_button(confirm.0, confirm.1, true, danger, tokens, cx)),
             )
             .into_any_element()
